@@ -1476,7 +1476,10 @@ class SQLiteStore:
             if task.state is not TaskState.INTERRUPTED:
                 raise RuntimeError("prepared task is not interrupted")
             continuation = task.continuation_state or record.active_state
-            if task.continuation_state is not record.active_state and task.pending is not None:
+            if task.pending is not None and (
+                task.continuation_state is not record.active_state
+                or "sol_run_id" in task.pending
+            ):
                 pending = task.pending
             else:
                 pending = self._prepared_pending_projection(record, reason=reason)
@@ -1588,7 +1591,10 @@ class SQLiteStore:
                     raise RuntimeError("unfinished prepared action task changed")
                 else:
                     continuation = task.continuation_state or record.active_state
-                    if task.continuation_state is not record.active_state and task.pending is not None:
+                    if task.pending is not None and (
+                        task.continuation_state is not record.active_state
+                        or "sol_run_id" in task.pending
+                    ):
                         pending = task.pending
                     cursor = self._connection.execute(
                         """
@@ -1801,8 +1807,6 @@ class SQLiteStore:
             if existing:
                 raise RuntimeError("prepared resume requires a previous preparation")
             return
-        if not existing or existing[0]["preparation_id"] != previous_preparation_id:
-            raise RuntimeError("prepared resume predecessor is not the latest preparation")
         previous = self._prepared_required(previous_preparation_id)
         if (
             previous.project_id != project_id
@@ -1812,7 +1816,12 @@ class SQLiteStore:
             or previous.status not in {"ABORTED", "RECOVERED", "INTERRUPTED"}
         ):
             raise RuntimeError("prepared resume predecessor is invalid")
-        if generation <= previous.generation:
+        if not existing or existing[0]["preparation_id"] != previous_preparation_id:
+            raise RuntimeError("prepared resume predecessor is not the latest preparation")
+        if generation == COMPATIBILITY_PREPARATION_GENERATION:
+            if previous.generation != COMPATIBILITY_PREPARATION_GENERATION:
+                raise RuntimeError("prepared resume generation changed")
+        elif generation <= previous.generation:
             raise RuntimeError("prepared resume generation did not advance")
 
     @staticmethod
@@ -1832,32 +1841,55 @@ class SQLiteStore:
             if frozen != context:
                 raise RuntimeError("prepared continuation does not match task")
             return
+        def sol_context_matches(value: object) -> bool:
+            return (
+                isinstance(value, SolResumeContext)
+                and isinstance(task.sol_thread_id, str)
+                and value.sol_thread_id == task.sol_thread_id
+                and isinstance(pending.get("sol_run_id"), str)
+                and value.sol_run_id == pending["sol_run_id"]
+                and isinstance(pending.get("prompt"), str)
+                and value.prompt == pending["prompt"]
+            )
+
+        def scope_context_matches(value: object) -> bool:
+            return (
+                isinstance(value, ScopeApprovalContext)
+                and value.baseline_id == task.baseline_id
+                and value.approved_revision == task.revision
+                and (
+                    value.underlying_continuation is None
+                    or sol_context_matches(value.underlying_continuation)
+                )
+            )
+
         if task.continuation_state in _SOL_TASK_STATES:
             if isinstance(context, ScopeApprovalContext):
-                if context.baseline_id != task.baseline_id:
+                if not scope_context_matches(context):
+                    raise RuntimeError("prepared continuation does not match task")
+                if context.underlying_continuation is None:
+                    if task.sol_thread_id is None and not pending:
+                        return
                     raise RuntimeError("prepared continuation does not match task")
                 context = context.underlying_continuation
-            if not isinstance(context, SolResumeContext):
-                raise RuntimeError("prepared continuation does not match task")
-            prompt = pending.get("prompt")
-            if (
-                (task.sol_thread_id is not None and context.sol_thread_id != task.sol_thread_id)
-                or (isinstance(prompt, str) and context.prompt != prompt)
-            ):
+            if not sol_context_matches(context):
                 raise RuntimeError("prepared continuation does not match task")
             return
         if task.continuation_state is TaskState.FABLE_REVIEWING:
             if not isinstance(context, ReviewContext):
                 raise RuntimeError("prepared continuation does not match task")
             if (
-                (task.fable_session_id is not None and context.fable_session_id != task.fable_session_id)
+                not isinstance(task.fable_session_id, str)
+                or context.fable_session_id != task.fable_session_id
+                or not isinstance(pending.get("review_prompt"), str)
+                or context.review_prompt != pending["review_prompt"]
                 or (
-                    isinstance(pending.get("review_prompt"), str)
-                    and context.review_prompt != pending["review_prompt"]
+                    not isinstance(pending.get("completion_allowed"), bool)
+                    or context.completion_allowed != pending["completion_allowed"]
                 )
-                or (
-                    "completion_allowed" in pending
-                    and context.completion_allowed != bool(pending["completion_allowed"])
+                or not (
+                    scope_context_matches(context.underlying_continuation)
+                    or sol_context_matches(context.underlying_continuation)
                 )
             ):
                 raise RuntimeError("prepared continuation does not match task")
@@ -1866,10 +1898,13 @@ class SQLiteStore:
             if not isinstance(context, ClarificationContext):
                 raise RuntimeError("prepared continuation does not match task")
             if (
-                (task.fable_session_id is not None and context.fable_session_id != task.fable_session_id)
-                or (
-                    isinstance(pending.get("clarification_prompt"), str)
-                    and context.clarification_prompt != pending["clarification_prompt"]
+                not isinstance(task.fable_session_id, str)
+                or context.fable_session_id != task.fable_session_id
+                or not isinstance(pending.get("clarification_prompt"), str)
+                or context.clarification_prompt != pending["clarification_prompt"]
+                or not (
+                    scope_context_matches(context.underlying_continuation)
+                    or sol_context_matches(context.underlying_continuation)
                 )
             ):
                 raise RuntimeError("prepared continuation does not match task")

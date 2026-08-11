@@ -19,6 +19,8 @@ from agent_bridge.store import (
     NewRequestPayload,
     ResumeDriftProjection,
     ResumePayload,
+    ReviewContext,
+    ScopeApprovalContext,
     SQLiteStore,
     SolResumeContext,
 )
@@ -1515,13 +1517,17 @@ def test_prepared_answer_and_resume_preserve_the_exact_continuation_and_lineage(
     store = _store(tmp_path)
     store.create_session("session-1", "/repo")
     store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "thread-1")
     waiting = store.pause_for_continuation(
         valid_brief.task_id,
         valid_brief.revision,
         expected=TaskState.SOL_RUNNING,
         target=TaskState.AWAITING_USER_INPUT,
         continuation_state=TaskState.SOL_CORRECTING,
-        pending={"prompt": "continue the exact correction"},
+        pending={
+            "prompt": "continue the exact correction",
+            "sol_run_id": "run-1",
+        },
     )
     continuation = SolResumeContext(
         sol_thread_id="thread-1",
@@ -1820,6 +1826,13 @@ def test_prepared_resume_requires_the_latest_lineage_and_no_generation_zero_coll
     store = _store(tmp_path)
     store.create_session("session-1", "/repo")
     store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "thread-1")
+    store.set_pending_context(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "run-1", "prompt": "exact prompt"},
+    )
     store.mark_interrupted(
         valid_brief.task_id, valid_brief.revision, continuation=TaskState.SOL_RUNNING,
     )
@@ -1905,3 +1918,250 @@ def test_prepared_answer_rejects_a_cross_context_before_clearing_pending(
     unchanged = store.get_task(waiting.task_id, waiting.revision)
     assert unchanged.state is TaskState.AWAITING_USER_INPUT
     assert unchanged.pending == {"prompt": "exact prompt"}
+
+
+def test_generation_zero_resume_must_link_its_latest_terminal_generation_zero_predecessor(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    initial = store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-1",
+        generation=0,
+        payload=NewRequestPayload(text="Build the bridge"),
+    )
+    terminal = store.abort_prepared_action(
+        initial.preparation_id, generation=0, reason="scheduler_unavailable",
+    )
+
+    resumed = store.prepare_resume_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-1",
+        revision=0,
+        generation=0,
+        payload=ResumePayload(
+            continuation=None,
+            drift_event=ResumeDriftProjection(
+                status="unchanged", summary="Repository drift was checked.", evidence_hashes=(),
+            ),
+        ),
+        previous_preparation_id=terminal.preparation_id,
+    )
+
+    assert resumed.previous_preparation_id == terminal.preparation_id
+    assert resumed.generation == 0
+    latest = store.abort_prepared_action(
+        resumed.preparation_id, generation=0, reason="scheduler_unavailable",
+    )
+    payload = ResumePayload(
+        continuation=None,
+        drift_event=ResumeDriftProjection(
+            status="unchanged", summary="Repository drift was checked.", evidence_hashes=(),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="latest"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+            generation=0,
+            payload=payload,
+            previous_preparation_id=terminal.preparation_id,
+        )
+    with pytest.raises(RuntimeError, match="previous preparation"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+            generation=0,
+            payload=payload,
+            previous_preparation_id=None,
+        )
+
+    other = store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-2",
+        generation=0,
+        payload=NewRequestPayload(text="Build the other bridge"),
+    )
+    other = store.abort_prepared_action(
+        other.preparation_id, generation=0, reason="scheduler_unavailable",
+    )
+    with pytest.raises(RuntimeError, match="invalid"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+            generation=0,
+            payload=payload,
+            previous_preparation_id=other.preparation_id,
+        )
+
+    claimed = store.prepare_resume_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-1",
+        revision=0,
+        generation=0,
+        payload=payload,
+        previous_preparation_id=latest.preparation_id,
+    )
+    store.claim_prepared_action(claimed.preparation_id, generation=0)
+    store.mark_interrupted("task-1", 0, continuation=TaskState.FABLE_PLANNING)
+    with pytest.raises(RuntimeError, match="invalid"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+            generation=0,
+            payload=payload,
+            previous_preparation_id=claimed.preparation_id,
+        )
+
+
+def test_legacy_answer_rejects_missing_sol_run_id_without_clearing_task(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "thread-1")
+    waiting = store.pause_for_continuation(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"prompt": "continue exactly"},
+    )
+
+    with pytest.raises(RuntimeError, match="continuation does not match"):
+        store.prepare_answer_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=waiting.task_id,
+            revision=waiting.revision,
+            generation=0,
+            payload=AnswerPayload(
+                answer="Use option A.",
+                continuation=SolResumeContext(
+                    sol_thread_id="thread-1",
+                    sol_run_id="run-1",
+                    prompt="continue exactly",
+                ),
+            ),
+        )
+
+    unchanged = store.get_task(waiting.task_id, waiting.revision)
+    assert unchanged.state is TaskState.AWAITING_USER_INPUT
+    assert unchanged.pending == {"prompt": "continue exactly"}
+
+
+def test_legacy_scope_approval_rejects_missing_sol_run_id_without_clearing_task(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "thread-1")
+    store._connection.execute(
+        "UPDATE tasks SET baseline_id = ? WHERE task_id = ? AND revision = ?",
+        ("baseline-1", valid_brief.task_id, valid_brief.revision),
+    )
+    clarifying = store.pause_for_continuation(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.FABLE_CLARIFYING,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"clarification_prompt": "Clarify the exact scope."},
+    )
+    scope = store.retarget_continuation(
+        clarifying.task_id,
+        clarifying.revision,
+        expected=TaskState.FABLE_CLARIFYING,
+        target=TaskState.AWAITING_SCOPE_APPROVAL,
+        pending={"answer": "Add the approved path.", "prompt": "resume exactly"},
+    )
+
+    with pytest.raises(RuntimeError, match="continuation does not match"):
+        store.prepare_approval_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=scope.task_id,
+            revision=scope.revision,
+            generation=0,
+            payload=ApprovalPayload(
+                baseline_id="baseline-1",
+                baseline_setting=None,
+                scope=ScopeApprovalContext(
+                    baseline_id="baseline-1",
+                    approved_revision=scope.revision,
+                    underlying_continuation=SolResumeContext(
+                        sol_thread_id="thread-1",
+                        sol_run_id="run-1",
+                        prompt="resume exactly",
+                    ),
+                ),
+            ),
+        )
+
+    unchanged = store.get_task(scope.task_id, scope.revision)
+    assert unchanged.state is TaskState.AWAITING_SCOPE_APPROVAL
+    assert unchanged.pending == {
+        "answer": "Add the approved path.", "prompt": "resume exactly",
+    }
+
+
+def test_legacy_review_requires_an_actual_boolean_completion_guard(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.FABLE_REVIEWING)
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    waiting = store.pause_for_continuation(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.FABLE_REVIEWING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.FABLE_REVIEWING,
+        pending={"review_prompt": "Review the exact output.", "completion_allowed": 1},
+    )
+
+    with pytest.raises(RuntimeError, match="continuation does not match"):
+        store.prepare_answer_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=waiting.task_id,
+            revision=waiting.revision,
+            generation=0,
+            payload=AnswerPayload(
+                answer="Use option A.",
+                continuation=ReviewContext(
+                    fable_session_id="fable-session-1",
+                    review_prompt="Review the exact output.",
+                    completion_allowed=True,
+                    underlying_continuation=SolResumeContext(
+                        sol_thread_id="thread-1",
+                        sol_run_id="run-1",
+                        prompt="resume exactly",
+                    ),
+                ),
+            ),
+        )
+
+    unchanged = store.get_task(waiting.task_id, waiting.revision)
+    assert unchanged.state is TaskState.AWAITING_USER_INPUT
+    assert unchanged.pending == {
+        "review_prompt": "Review the exact output.", "completion_allowed": 1,
+    }

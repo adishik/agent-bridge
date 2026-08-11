@@ -806,6 +806,60 @@ def test_hub_run_retains_the_exact_lease_when_terminal_persistence_fails() -> No
     asyncio.run(exercise())
 
 
+def test_hub_terminal_retry_keeps_the_lease_and_never_restarts_the_child() -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        child_starts = 0
+        terminal_attempts = 0
+
+        async def retry_terminal_only(preparation_id: str) -> PreparedActionOutcome:
+            nonlocal child_starts, terminal_attempts
+            record = runtime.store.prepared_action(preparation_id)
+            assert record is not None
+            if record.status == "PREPARED":
+                child_starts += 1
+                runtime.store.prepared_rows[preparation_id] = replace(
+                    record, status="CLAIMED",
+                )
+            terminal_attempts += 1
+            if terminal_attempts == 1:
+                raise RuntimeError("prepared action failed")
+            claimed = runtime.store.prepared_action(preparation_id)
+            assert claimed is not None and claimed.status == "CLAIMED"
+            runtime.store.prepared_rows[preparation_id] = replace(
+                claimed, status="COMPLETED",
+            )
+            return PreparedActionOutcome("completed")
+
+        runtime.coordinator.run_prepared_action = retry_terminal_only  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="prepared action failed"):
+            await workflows.run(prepared)
+
+        claimed = runtime.store.prepared_action(prepared.preparation_id)
+        assert claimed is not None and claimed.status == "CLAIMED"
+        assert child_starts == 1
+        assert lease.snapshot() == prepared.token
+
+        await workflows.run(prepared)
+
+        terminal = runtime.store.prepared_action(prepared.preparation_id)
+        assert terminal is not None and terminal.status == "COMPLETED"
+        assert child_starts == 1
+        assert terminal_attempts == 2
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("route", ("approval", "answer", "resume"))
 def test_hub_route_specific_preparations_run_the_matching_durable_action(
     route: str,

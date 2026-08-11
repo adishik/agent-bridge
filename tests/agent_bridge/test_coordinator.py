@@ -29,7 +29,7 @@ from agent_bridge.coordinator import (
 from agent_bridge.process import ProcessRunner
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import NewRequestPayload, SQLiteStore
+from agent_bridge.store import NewRequestPayload, PreparedActionOutcome, SQLiteStore
 
 
 THREAD_ID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
@@ -1402,6 +1402,9 @@ def test_writer_lock_covers_baseline_capture_before_second_task_approval(harness
     async def scenario() -> None:
         await harness.coordinator.handle_user_request("session-1", "Build the bridge")
         second_brief = replace(harness.fable.brief, task_id="task-2")
+        harness.store.append_event(
+            "session-1", "task-2", "user", "message", {"text": "Build task two"},
+        )
         harness.store.save_task(
             "session-1", second_brief, TaskState.AWAITING_USER_APPROVAL
         )
@@ -1605,7 +1608,7 @@ def test_newer_revision_inserted_during_baseline_load_blocks_scope_approval(
     asyncio.run(scenario())
 
 
-def test_each_approval_holds_one_uninterrupted_writer_lock_through_its_sol_run(
+def test_each_approval_releases_the_preparation_lock_before_its_sol_run(
     harness, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RecordingLock:
@@ -1627,6 +1630,9 @@ def test_each_approval_holds_one_uninterrupted_writer_lock_through_its_sol_run(
     async def scenario() -> None:
         await harness.coordinator.handle_user_request("session-1", "Build the bridge")
         second_brief = replace(harness.fable.brief, task_id="task-2")
+        harness.store.append_event(
+            "session-1", "task-2", "user", "message", {"text": "Build task two"},
+        )
         harness.store.save_task(
             "session-1", second_brief, TaskState.AWAITING_USER_APPROVAL
         )
@@ -1657,14 +1663,14 @@ def test_each_approval_holds_one_uninterrupted_writer_lock_through_its_sol_run(
         )
         await asyncio.sleep(0)
 
-        assert sequence == [("capture", "task-1", 1), ("sol", "task-1", 1)]
+        assert sequence == [("capture", "task-1", 1), ("sol", "task-1", 2)]
         release.set()
         await asyncio.gather(first, second)
         assert sequence == [
             ("capture", "task-1", 1),
-            ("sol", "task-1", 1),
-            ("capture", "task-2", 2),
-            ("sol", "task-2", 2),
+            ("sol", "task-1", 2),
+            ("capture", "task-2", 3),
+            ("sol", "task-2", 4),
         ]
 
     asyncio.run(scenario())
@@ -2673,5 +2679,127 @@ def test_prepare_resume_persists_drift_failure_without_creating_a_child_action(
         ]
         assert len(drift_events) == 1
         assert "unapproved-drift.txt" not in repr(drift_events[0])
+
+    asyncio.run(scenario())
+
+
+def test_compatibility_initial_approval_does_not_hold_the_writer_lock_across_sol(
+    harness,
+) -> None:
+    async def scenario() -> None:
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+
+        await asyncio.wait_for(
+            harness.coordinator.approve_task("task-1", revision=1), timeout=0.2,
+        )
+
+        task = harness.store.latest_task("task-1")
+        assert task is not None
+        assert task.state is TaskState.COMPLETED
+        assert len(harness.sol.starts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_compatibility_scope_approval_does_not_hold_the_writer_lock_across_sol(
+    harness,
+) -> None:
+    async def scenario() -> None:
+        revised = replace(
+            harness.fable.brief,
+            revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.queue(_question("May I add bridge-extra.txt?"))
+        harness.fable.next_clarifications.append(
+            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+        )
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        initial = harness.coordinator.prepare_approval(
+            session_id="session-1", task_id="task-1", revision=1, generation=7,
+        )
+        await harness.coordinator.run_prepared_action(initial.preparation_id)
+        scope = harness.store.latest_task("task-1")
+        assert scope is not None
+        assert scope.state is TaskState.AWAITING_SCOPE_APPROVAL
+
+        await asyncio.wait_for(
+            harness.coordinator.approve_task("task-1", revision=2), timeout=0.2,
+        )
+
+        completed = harness.store.latest_task("task-1")
+        assert completed is not None
+        assert completed.state is TaskState.COMPLETED
+        assert harness.sol.resume_threads == [THREAD_ID]
+
+    asyncio.run(scenario())
+
+
+def test_terminal_cas_retry_does_not_run_the_prepared_child_twice(
+    harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        prepared = harness.coordinator.prepare_new_request(
+            session_id="session-1",
+            task_id="task-1",
+            text="Build the bridge",
+            generation=9,
+        )
+        original_complete = harness.store.complete_prepared_action
+        attempts = 0
+
+        def fail_terminal_once(*args: object, **kwargs: object):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected terminal CAS failure")
+            return original_complete(*args, **kwargs)
+
+        monkeypatch.setattr(harness.store, "complete_prepared_action", fail_terminal_once)
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
+            await harness.coordinator.run_prepared_action(prepared.preparation_id)
+
+        claimed = harness.store.prepared_action(prepared.preparation_id)
+        assert claimed is not None
+        assert claimed.status == "CLAIMED"
+        assert len(harness.fable.plan_calls) == 1
+
+        outcome = await harness.coordinator.run_prepared_action(prepared.preparation_id)
+
+        terminal = harness.store.prepared_action(prepared.preparation_id)
+        assert outcome == PreparedActionOutcome("completed")
+        assert terminal is not None
+        assert terminal.status == "COMPLETED"
+        assert len(harness.fable.plan_calls) == 1
+        assert attempts == 2
+
+    asyncio.run(scenario())
+
+
+def test_compatibility_answer_rejects_missing_legacy_sol_run_without_starting_sol(
+    harness,
+) -> None:
+    async def scenario() -> None:
+        task = harness.fable.brief
+        harness.store.save_task("session-1", task, TaskState.SOL_RUNNING)
+        harness.store.set_sol_thread(task.task_id, task.revision, THREAD_ID)
+        waiting = harness.store.pause_for_continuation(
+            task.task_id,
+            task.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=TaskState.AWAITING_USER_INPUT,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending={"prompt": "Use the exact persisted continuation."},
+        )
+
+        with pytest.raises(RuntimeError, match="exact Sol run"):
+            await harness.coordinator.answer_user_question(
+                waiting.task_id, "Use option A.",
+            )
+
+        unchanged = harness.store.get_task(waiting.task_id, waiting.revision)
+        assert unchanged.state is TaskState.AWAITING_USER_INPUT
+        assert unchanged.pending == {"prompt": "Use the exact persisted continuation."}
+        assert harness.sol.resume_threads == []
 
     asyncio.run(scenario())
