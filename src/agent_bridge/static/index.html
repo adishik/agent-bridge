@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    >
+    <title>Agent Bridge</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#conversation">Skip to conversation</a>
+
+    <header id="app-header">
+      <div class="brand-block">
+        <strong>Agent Bridge</strong>
+        <span id="repository-status">Repository · checking</span>
+      </div>
+      <div class="header-statuses" aria-label="Bridge status">
+        <span id="connection-status" class="status-pill status-checking">
+          Connection · checking
+        </span>
+        <span id="fable-status" class="status-pill status-checking">
+          Fable · Subscription · checking
+        </span>
+        <span id="sol-status" class="status-pill status-checking">
+          Sol · checking
+        </span>
+      </div>
+      <div class="drawer-toggles" aria-label="Workspace panels">
+        <button
+          id="task-drawer-toggle"
+          class="button button-quiet"
+          type="button"
+          aria-controls="task-list"
+          aria-expanded="false"
+        >
+          Tasks
+        </button>
+        <button
+          id="inspector-drawer-toggle"
+          class="button button-quiet"
+          type="button"
+          aria-controls="task-inspector"
+          aria-expanded="false"
+        >
+          Inspector
+        </button>
+      </div>
+    </header>
+
+    <main id="workspace">
+      <aside id="task-list" aria-label="Tasks">
+        <div class="panel-heading">
+          <p class="eyebrow">Work queue</p>
+          <h2>Tasks</h2>
+        </div>
+        <p class="empty-state" id="task-list-empty">
+          Tasks will appear after Fable prepares a brief.
+        </p>
+      </aside>
+
+      <section id="conversation" aria-label="Shared conversation" aria-live="polite">
+        <div class="conversation-intro" id="conversation-empty">
+          <p class="eyebrow">Shared chronological chat</p>
+          <h1>Plan with Fable. Execute with Sol.</h1>
+          <p>
+            Fable reads and plans. You approve each exact task revision. Sol is
+            the only participant allowed to change the repository.
+          </p>
+        </div>
+      </section>
+
+      <aside id="task-inspector" aria-label="Task inspector">
+        <div class="panel-heading">
+          <p class="eyebrow">Selected work</p>
+          <h2>Task inspector</h2>
+        </div>
+        <p class="empty-state" id="task-inspector-empty">
+          Select a task to review its contract, scope, evidence, and controls.
+        </p>
+      </aside>
+    </main>
+
+    <form id="composer" aria-label="Message Fable">
+      <label for="message-input">Message Fable</label>
+      <div class="composer-row">
+        <textarea
+          id="message-input"
+          name="message"
+          rows="2"
+          required
+          disabled
+          placeholder="Waiting for subscription readiness and usage-credit acknowledgement…"
+        ></textarea>
+        <button id="composer-submit" class="button button-primary" type="submit" disabled>
+          Send to Fable
+        </button>
+      </div>
+      <p id="composer-guidance" class="form-guidance" role="status">
+        Checking Fable subscription authentication…
+      </p>
+    </form>
+
+    <dialog
+      id="usage-modal"
+      aria-labelledby="usage-modal-title"
+      aria-describedby="usage-modal-description"
+    >
+      <form id="usage-credits-form" method="dialog">
+        <p class="eyebrow">One-time safety acknowledgement</p>
+        <h2 id="usage-modal-title">Confirm Claude usage-credit settings</h2>
+        <p id="usage-modal-description">
+          Fable uses your saved Claude subscription login. Before continuing,
+          confirm that Claude account usage credits are disabled. Agent Bridge
+          cannot verify or change this account setting.
+        </p>
+        <label class="acknowledgement-row" for="usage-credits-confirm">
+          <input id="usage-credits-confirm" name="confirmed" type="checkbox">
+          <span>I confirm Claude account usage credits are disabled.</span>
+        </label>
+        <p id="usage-error" class="form-error" role="alert"></p>
+        <button id="bootstrap-retry" class="button button-quiet" type="button" hidden>
+          Retry connection
+        </button>
+        <button
+          id="usage-credits-acknowledge"
+          class="button button-primary"
+          type="submit"
+          disabled
+        >
+          Save acknowledgement
+        </button>
+      </form>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="assertive"></div>
+    <script id="bridge-module" type="module" src="/static/app.js"></script>
+  </body>
+</html>
