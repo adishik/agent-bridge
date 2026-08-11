@@ -31,3 +31,15 @@ def test_apache_license_and_notice_are_exact() -> None:
     assert (ROOT / "NOTICE").read_text(encoding="utf-8") == (
         "Agent Bridge\nCopyright 2026 Adi Shik\n"
     )
+
+
+def test_readme_is_generic_and_copy_pasteable() -> None:
+    metadata = _metadata()["project"]
+    assert metadata["readme"] == "README.md"
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "pipx install ." in readme
+    assert "agent-bridge --repo /path/to/project" in readme
+    assert "ssh -N -L 56590:127.0.0.1:56590 YOUR_SSH_ALIAS" in readme
+    assert "Claude Code subscription" in readme
+    assert "usage credits" in readme.lower()
+    assert "Codex CLI" in readme
