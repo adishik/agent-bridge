@@ -48,6 +48,8 @@ prove that malformed output, two concatenated JSON documents, top-level `[]`,
 top-level `null`, and truly empty captured stdout fail closed. The existing
 nonzero-exit coverage remains. The auth-shape parameterization will also
 explicitly reject `loggedIn=1` and non-string `subscriptionType` values.
+After the focused adapter test file passes, the complete fake-only
+`tests/agent_bridge` suite will run before the implementation commit.
 
 No live CLI, model prompt, network call, browser server, or deployment action
 is part of the implementation or its verification.

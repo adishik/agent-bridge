@@ -190,7 +190,18 @@ PYTHONPATH="$PWD/src" python -m pytest -q \
 
 Expected: all Claude adapter tests pass, including compact JSON, pretty-printed JSON, malformed JSON, concatenated documents, non-subscription shapes, and nonzero exit status.
 
-- [ ] **Step 8: Verify the exact diff and commit**
+- [ ] **Step 8: Run the complete fake-only bridge suite**
+
+After the focused adapter file passes and before committing, run:
+
+```bash
+PYTHONPATH="$PWD/src" python -m pytest -q tests/agent_bridge
+```
+
+Expected: all Agent Bridge tests pass using only the repository's fake
+executables. The known Starlette `TestClient` deprecation warning may remain.
+
+- [ ] **Step 9: Verify the exact diff and commit**
 
 Run:
 
