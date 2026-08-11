@@ -290,6 +290,7 @@ class ActiveAgentLease:
     def snapshot(self) -> LeaseToken | None: ...
 
 PreparedActionKind = Literal["new_request", "approval", "answer", "resume"]
+COMPATIBILITY_PREPARATION_GENERATION = 0
 
 @dataclass(frozen=True, slots=True)
 class NewRequestPayload:
@@ -306,6 +307,11 @@ class ScopeApprovalContext:
     baseline_id: str
     approved_revision: int
     underlying_continuation: SolResumeContext | None
+
+@dataclass(frozen=True, slots=True)
+class BaselineSetting:
+    key: str
+    value: str
 
 @dataclass(frozen=True, slots=True)
 class ReviewContext:
@@ -327,6 +333,12 @@ class AnswerContext:
         ScopeApprovalContext | ReviewContext | ClarificationContext | SolResumeContext
     )
 
+@dataclass(frozen=True, slots=True)
+class ResumeDriftProjection:
+    status: Literal["unchanged", "drifted"]
+    summary: str
+    evidence_hashes: tuple[str, ...]
+
 PreparedContinuationContext = (
     ScopeApprovalContext
     | ReviewContext
@@ -338,6 +350,8 @@ PreparedContinuationContext = (
 
 @dataclass(frozen=True, slots=True)
 class ApprovalPayload:
+    baseline_id: str
+    baseline_setting: BaselineSetting | None
     scope: ScopeApprovalContext | None
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +362,7 @@ class AnswerPayload:
 @dataclass(frozen=True, slots=True)
 class ResumePayload:
     continuation: PreparedContinuationContext
+    drift_event: ResumeDriftProjection
 
 PreparedActionPayload = NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
 
@@ -389,7 +404,7 @@ def prepare_answer_action(
 ) -> PreparedActionRecord: ...
 def prepare_resume_action(
     self, *, project_id: str, session_id: str, task_id: str, revision: int, generation: int,
-    payload: ResumePayload, previous_preparation_id: str,
+    payload: ResumePayload, previous_preparation_id: str | None,
 ) -> PreparedActionRecord: ...
 def claim_prepared_action(
     self, preparation_id: str, *, generation: int,
@@ -403,7 +418,7 @@ def fail_prepared_action(
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
 ) -> PreparedActionRecord: ...
-def recover_claimed_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
+def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
 
 class ProjectRegistry:
     def runtime(self, project_id: str) -> AppProjectRuntime: ...
@@ -455,6 +470,7 @@ def prepare_resume(
     self, *, session_id: str, task_id: str, revision: int,
     generation: int,
 ) -> PreparedActionRecord: ...
+def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
 async def run_prepared_action(self, preparation_id: str) -> None: ...
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
@@ -476,7 +492,11 @@ typed pending context, previous preparation reference, status, and generation.
 Payload and continuation validation is structural and bounded before a
 transaction: it permits only the discriminator-matched immutable variants,
 bounded user text/answer/prompts, validated opaque run/thread/baseline/session
-IDs, and the typed contexts necessary to reconstruct exact scope approval,
+IDs, a bounded `BaselineSetting`, and a bounded safe
+`ResumeDriftProjection` (safe status, bounded summary, and existing
+safe-contract evidence hashes only). The projection deliberately excludes raw
+paths, commands, and provider output. These variants preserve the typed
+contexts necessary to reconstruct exact scope approval,
 Fable review (`review_prompt` and `completion_allowed`), Fable clarification
 (`clarification_prompt` and `underlying_continuation`), Sol resume (`prompt`),
 and answer continuations. It never stores raw command text, provider output,
@@ -487,35 +507,41 @@ Define route-specific transactional store operations rather than a generic
 prepare call. `prepare_new_request_action` atomically creates the generated
 task, persists its user message event, transitions to the existing planning
 active state, and inserts the prepared row. `prepare_approval_action`
-atomically performs the exact revision/baseline-setting CAS, preserves any
-scope-approval pending context, transitions to its existing active state, and
-inserts the row. `prepare_answer_action` atomically validates and resumes the
-exact continuation, writes the user answer event, transitions to the existing
-active state, and inserts the row. `prepare_resume_action` atomically consumes
-an already-validated drift outcome, carries forward the exact continuation and
-pending context, transitions to the existing active state, and inserts a new
-row referencing the prior aborted or recovered claimed preparation. Each route
-publishes its listener/event notification exactly once, after its transaction
-commits; no listener is called for a rollback.
+atomically commits the exact revision approval, coordinator-captured
+`baseline_id`, optional baseline setting key/value, existing active-state
+transition, and prepared row while preserving scope-approval pending context.
+The coordinator discards any captured baseline artifact if this transaction
+fails. `prepare_answer_action` atomically validates and resumes the exact
+continuation, writes the user answer event, transitions to the existing active
+state, and inserts the row. `prepare_resume_action` atomically consumes the
+already-validated, bounded safe drift projection, appends that exact
+`resume_drift` event, carries forward the exact continuation and pending
+context, transitions to the existing active state, and inserts a new row
+referencing the prior preparation when one exists. Each route publishes its
+listener/event notification exactly once, after its transaction commits; no
+listener is called for a rollback.
 
 `claim_prepared_action` is an exact-once CAS from `PREPARED` to `CLAIMED` for
 the matching ID and generation. `complete_prepared_action` and
 `fail_prepared_action` transition that exact claimed row to `COMPLETED` or
 `FAILED`; stale, different, forged, duplicate, or terminal identities reject
 before a child starts. Startup recovery never silently reclaims a claim: it
-marks an uncompleted `CLAIMED` row as `RECOVERED` with an interrupted task and
-preserved continuation. Explicit Resume creates a new generation-safe
-`PREPARED` row referencing that `ABORTED` or `RECOVERED` row; it never reuses a
-claim.
+marks every unfinished `PREPARED` or `CLAIMED` row as `RECOVERED` with an
+interrupted task and preserved continuation. Explicit Resume creates a new
+generation-safe `PREPARED` row referencing its valid `ABORTED` or `RECOVERED`
+predecessor when one exists; it never reuses a claim.
 
-`recover_claimed_prepared_actions` is the named startup-recovery operation.
+`recover_unfinished_prepared_actions` is the named startup-recovery operation.
 Before the runtime is admitted to `ProjectRegistry` or accepts requests, its
 coordinator calls it once after store migration/recovery setup. In one
-transaction it finds every uncompleted claimed row, transitions it to
-`RECOVERED`, and writes the matching task's existing `INTERRUPTED` state with
-the preserved active continuation and frozen pending context. It is idempotent:
-completed, failed, aborted, and already recovered rows are unchanged; each
-recovered task still requires explicit Resume to create a new row.
+transaction it finds every unfinished `PREPARED` and `CLAIMED` row, transitions
+each to the durable recoverable terminal status `RECOVERED`, and writes the
+matching task's existing `INTERRUPTED` state with the preserved active
+continuation and frozen pending context. `PREPARED` means no child was claimed;
+`CLAIMED` may already have begun, but neither status permits automatic child
+restart. It is idempotent: completed, failed, aborted, and already recovered
+rows are unchanged; each recovered task requires explicit Resume to create a
+new row.
 
 `abort_prepared_action` is a `PREPARED` to `ABORTED` CAS. It atomically writes
 the task's existing `INTERRUPTED` state with the active-state continuation and
@@ -523,7 +549,12 @@ a bounded durable pending projection containing the fixed action, fixed reason,
 preparation ID, and the frozen typed source context. An identical abort retry
 returns the same record; stale generation or any different identity/action/
 reason rejects. An abort persistence failure leaves the preparation and lease
-retryable rather than releasing the token.
+retryable rather than releasing the token. `previous_preparation_id` is optional
+only for exact legacy/normal Stop/adapter-interrupted tasks that have no prior
+prepared row. When non-null, the store requires the same project/session/task/
+revision identity and an `ABORTED` or `RECOVERED` terminal lineage before a new
+positive-generation Resume row may reference it; it never silently reuses a
+claim.
 
 The coordinator derives its project identity only from the canonical
 repository root and exposes route-specific synchronous preparation methods for
@@ -534,6 +565,13 @@ and claims the exact durable record, invokes only the operation reconstructible
 from its persisted context, and completes or fails that record. Existing public
 compatibility wrappers remain, but delegate through corresponding prepare-then-
 run paths rather than bypassing durable preparation.
+
+Generation zero is reserved exclusively for immediate one-process compatibility
+wrappers: their prepare-then-run delegation is one local call path and is
+tested separately. `create_hub_app` never uses those wrappers: every
+Hub-issued lease/preparation generation is positive and must exactly match the
+persisted record. Project binding and the store-owned preparation-ID contract
+remain identical in both modes.
 
 - [ ] **Step 1: Add registry isolation RED tests**
 
@@ -551,9 +589,13 @@ opaque ID collision retry and getter reconstruction; malformed/oversized typed
 payloads; trusted coordinator-derived project identity (including browser-ID
 substitution rejection); scope/review prompt plus completion guard/
 clarification prompt plus underlying continuation/Sol-resume prompt/answer
-context preservation; exact-once claim; `CLAIMED` complete/fail transitions;
-scheduler abort; named startup recovery's atomic `CLAIMED → RECOVERED` task
-interruption; explicit Resume's new record with previous reference;
+context preservation; approval's captured baseline plus optional setting CAS
+and baseline-discard-on-rollback; resume's exact safe `resume_drift` event with
+no raw paths/commands; exact-once claim; `CLAIMED` complete/fail transitions;
+scheduler abort; named startup recovery's atomic `PREPARED/CLAIMED →
+RECOVERED` task interruption; explicit Resume's new record with optional
+previous reference and valid terminal lineage; generation-zero compatibility
+prepare+run isolation versus positive Hub generations;
 idempotent same-identity abort; stale/different ID, identity, action, reason,
 or generation rejection; and an injected abort-persistence failure. Assert
 preparation uses the exact existing active state selected by the state graph,
@@ -573,8 +615,8 @@ succeeds; an abort failure retains the exact retryable token.
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action"
-python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action"
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or recover_unfinished_prepared_actions or compatibility"
+python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action or recovery or compatibility"
 ```
 
 Use an in-process lock plus monotonically increasing generation.
@@ -611,7 +653,7 @@ remains required.
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_projects.py tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action"
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or recover_unfinished_prepared_actions or compatibility"
 python -m pytest -q tests/agent_bridge/test_store.py
 git add \
   src/agent_bridge/hub.py \
