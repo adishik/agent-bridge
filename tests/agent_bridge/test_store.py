@@ -12,6 +12,7 @@ import agent_bridge.store as store_module
 from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
+    ApprovalPayload,
     AnswerPayload,
     BaselineSetting,
     MAX_TASK_OVERVIEWS,
@@ -1656,3 +1657,251 @@ def test_prepared_action_rejects_a_project_id_substituted_for_an_existing_sessio
         payload=NewRequestPayload(text="Build the bridge"),
     )
     assert prepared.project_id == project_id_for_root(repo.resolve())
+
+
+def test_resume_drift_failure_is_an_atomic_no_child_terminal_transition(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.mark_interrupted(
+        valid_brief.task_id,
+        valid_brief.revision,
+        continuation=TaskState.SOL_RUNNING,
+    )
+    observed = []
+    store.add_event_listener(observed.append)
+
+    failed = store.fail_resume_for_drift(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        drift_event=ResumeDriftProjection(
+            status="drifted",
+            summary="Repository drift prevented automatic resume.",
+            evidence_hashes=(),
+        ),
+    )
+
+    assert failed.state is TaskState.FAILED
+    assert failed.continuation_state is None
+    assert failed.pending is None
+    assert store.latest_prepared_action_for_task(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+    ) is None
+    assert [(event.kind, event.payload) for event in observed] == [
+        ("task_state", {"state": TaskState.FAILED.value, "revision": 1}),
+        ("resume_drift", {
+            "status": "drifted",
+            "summary": "Repository drift prevented automatic resume.",
+            "evidence_hashes": (),
+        }),
+    ]
+
+
+def test_prepared_resume_rejects_a_cross_context_before_clearing_interruption(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    interrupted = store.mark_interrupted(
+        valid_brief.task_id,
+        valid_brief.revision,
+        continuation=TaskState.SOL_RUNNING,
+    )
+
+    with pytest.raises(RuntimeError, match="continuation does not match"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=interrupted.task_id,
+            revision=interrupted.revision,
+            generation=0,
+            payload=ResumePayload(
+                continuation=None,
+                drift_event=ResumeDriftProjection(
+                    status="unchanged",
+                    summary="Repository drift was checked.",
+                    evidence_hashes=(),
+                ),
+            ),
+            previous_preparation_id=None,
+        )
+
+    unchanged = store.get_task(interrupted.task_id, interrupted.revision)
+    assert unchanged.state is TaskState.INTERRUPTED
+    assert unchanged.continuation_state is TaskState.SOL_RUNNING
+
+
+def test_prepared_stop_before_claim_is_durable_and_resumable(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    prepared = store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-1",
+        generation=9,
+        payload=NewRequestPayload(text="Build the bridge"),
+    )
+    store.mark_interrupted(
+        "task-1", 0, continuation=TaskState.FABLE_PLANNING,
+    )
+
+    interrupted = store.interrupt_claimed_prepared_action(
+        prepared.preparation_id, generation=9, reason="stop",
+    )
+
+    assert interrupted.status == "INTERRUPTED"
+    assert interrupted.reason == "stop"
+    task = store.get_task("task-1", 0)
+    assert task.state is TaskState.INTERRUPTED
+    assert task.continuation_state is TaskState.FABLE_PLANNING
+    assert task.pending == {
+        "prepared_action": {
+            "preparation_id": prepared.preparation_id,
+            "action": "new_request",
+            "reason": "stop",
+            "context": None,
+        },
+    }
+
+
+def test_prepared_approval_setting_conflict_rolls_back_all_route_mutation(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    key = "baseline-setting-1"
+    existing = '{"baseline_id":"old","manifest":{},"revision":1,"task_id":"task-1"}'
+    expected = '{"baseline_id":"baseline-1","manifest":{},"revision":1,"task_id":"task-1"}'
+    store._connection.execute(
+        "INSERT INTO settings (key, value_json) VALUES (?, ?)", (key, existing),
+    )
+    observed = []
+    store.add_event_listener(observed.append)
+
+    with pytest.raises(RuntimeError, match="baseline setting changed"):
+        store.prepare_approval_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=5,
+            payload=ApprovalPayload(
+                baseline_id="baseline-1",
+                baseline_setting=BaselineSetting(key=key, value_json=expected),
+                scope=None,
+            ),
+        )
+
+    task = store.get_task(valid_brief.task_id, valid_brief.revision)
+    assert task.state is TaskState.AWAITING_USER_APPROVAL
+    assert task.baseline_id is None
+    assert store.get_setting(key) == json.loads(existing)
+    assert observed == []
+    assert store.latest_prepared_action_for_task(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+    ) is None
+
+
+def test_prepared_resume_requires_the_latest_lineage_and_no_generation_zero_collision(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.mark_interrupted(
+        valid_brief.task_id, valid_brief.revision, continuation=TaskState.SOL_RUNNING,
+    )
+    continuation = SolResumeContext("thread-1", "run-1", "exact prompt")
+    drift = ResumeDriftProjection(
+        status="unchanged", summary="Repository drift was checked.", evidence_hashes=(),
+    )
+    first = store.prepare_resume_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=0,
+        payload=ResumePayload(continuation=continuation, drift_event=drift),
+        previous_preparation_id=None,
+    )
+    store.abort_prepared_action(
+        first.preparation_id, generation=0, reason="scheduler_unavailable",
+    )
+    second = store.prepare_resume_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=4,
+        payload=ResumePayload(continuation=continuation, drift_event=drift),
+        previous_preparation_id=first.preparation_id,
+    )
+    store.abort_prepared_action(
+        second.preparation_id, generation=4, reason="scheduler_unavailable",
+    )
+
+    with pytest.raises(RuntimeError, match="latest"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=5,
+            payload=ResumePayload(continuation=continuation, drift_event=drift),
+            previous_preparation_id=first.preparation_id,
+        )
+    with pytest.raises(RuntimeError, match="previous preparation"):
+        store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=0,
+            payload=ResumePayload(continuation=continuation, drift_event=drift),
+            previous_preparation_id=None,
+        )
+
+
+def test_prepared_answer_rejects_a_cross_context_before_clearing_pending(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    waiting = store.pause_for_continuation(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"prompt": "exact prompt"},
+    )
+
+    with pytest.raises(RuntimeError, match="continuation does not match"):
+        store.prepare_answer_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=waiting.task_id,
+            revision=waiting.revision,
+            generation=3,
+            payload=AnswerPayload(
+                answer="Use option A.",
+                continuation=SolResumeContext("thread-1", "run-1", "different prompt"),
+            ),
+        )
+
+    unchanged = store.get_task(waiting.task_id, waiting.revision)
+    assert unchanged.state is TaskState.AWAITING_USER_INPUT
+    assert unchanged.pending == {"prompt": "exact prompt"}

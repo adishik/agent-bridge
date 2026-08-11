@@ -21,7 +21,11 @@ from agent_bridge.contracts import (
     SolOutcome,
     TaskBrief,
 )
-from agent_bridge.coordinator import Coordinator
+from agent_bridge.coordinator import (
+    Coordinator,
+    PreparedActionFailed,
+    ResumeDriftBlocked,
+)
 from agent_bridge.process import ProcessRunner
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
@@ -419,6 +423,16 @@ def test_sol_never_starts_before_exact_revision_approval(harness) -> None:
         assert task is not None
         assert task.state is TaskState.AWAITING_USER_APPROVAL
         assert harness.sol.starts == []
+        initial = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+        )
+        assert initial is not None
+        assert (initial.action, initial.generation, initial.status) == (
+            "new_request", 0, "COMPLETED",
+        )
 
         with pytest.raises(ValueError, match="revision"):
             await harness.coordinator.approve_task("task-1", revision=task.revision - 1)
@@ -430,6 +444,16 @@ def test_sol_never_starts_before_exact_revision_approval(harness) -> None:
         assert approved.approved_at == "2026-08-10T12:00:00Z"
         assert approved.baseline_id is not None
         assert approved.state is TaskState.COMPLETED
+        approval = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=task.revision,
+        )
+        assert approval is not None
+        assert (approval.action, approval.generation, approval.status) == (
+            "approval", 0, "COMPLETED",
+        )
 
     asyncio.run(scenario())
 
@@ -1049,7 +1073,7 @@ def test_adapter_result_run_id_must_match_coordinator_owned_run_before_persisten
         harness.sol.returned_run_id = "run-attacker"
         await harness.coordinator.handle_user_request("session-1", "Build the bridge")
 
-        with pytest.raises(RuntimeError, match="coordinator-owned run"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.coordinator.approve_task("task-1", revision=1)
 
         assert harness.store.agent_run("run-2").status == "failed"
@@ -1068,7 +1092,7 @@ def test_adapter_session_id_is_validated_before_any_secret_can_be_persisted(
         harness.sol.returned_session_id = "SECRET MALICIOUS SESSION"
         await harness.coordinator.handle_user_request("session-1", "Build the bridge")
 
-        with pytest.raises(RuntimeError, match="session ID"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.coordinator.approve_task("task-1", revision=1)
 
         persisted = repr([
@@ -1420,11 +1444,7 @@ def test_initial_baseline_persistence_failure_discards_capture_artifacts(
         def fail_baseline_setting(*args: object, **kwargs: object) -> None:
             raise RuntimeError("injected initial baseline persistence failure")
 
-        monkeypatch.setattr(
-            harness.store,
-            "approve_task_with_setting",
-            fail_baseline_setting,
-        )
+        monkeypatch.setattr(harness.store, "prepare_approval_action", fail_baseline_setting)
         with pytest.raises(RuntimeError, match="initial baseline persistence"):
             await harness.coordinator.approve_task("task-1", revision=1)
 
@@ -1776,6 +1796,16 @@ def test_cancelled_planning_finishes_interrupted_and_explicit_resume_restarts_wi
         assert planned.state is TaskState.AWAITING_USER_APPROVAL
         assert len(harness.fable.plan_calls) == 2
         assert harness.fable.resume_plan_sessions == []
+        resumed = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+        )
+        assert resumed is not None
+        assert (resumed.action, resumed.generation, resumed.status) == (
+            "resume", 0, "COMPLETED",
+        )
 
     asyncio.run(scenario())
 
@@ -1824,6 +1854,16 @@ def test_answer_user_question_resumes_only_persisted_continuation(harness) -> No
         assert task.continuation_state is None
         assert harness.sol.resume_prompts == ["Use option A."]
         assert harness.sol.resume_threads == [THREAD_ID]
+        answer = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=task.revision,
+        )
+        assert answer is not None
+        assert (answer.action, answer.generation, answer.status) == (
+            "answer", 0, "COMPLETED",
+        )
 
     asyncio.run(scenario())
 
@@ -2098,7 +2138,7 @@ def test_clarification_manifest_serialization_failure_cleans_widening_for_retry(
         monkeypatch.setattr(
             harness.tracker, "baseline_manifest", fail_widened_serialization
         )
-        with pytest.raises(RuntimeError, match="injected clarification serialization"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.run_approved_task()
 
         failed = harness.store.latest_task("task-1")
@@ -2152,7 +2192,7 @@ def test_clarification_scope_revision_and_baseline_setting_are_atomic_and_retrya
             """
         )
 
-        with pytest.raises(sqlite3.IntegrityError, match="injected clarification"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.run_approved_task()
 
         failed = harness.store.latest_task("task-1")
@@ -2340,7 +2380,7 @@ def test_resume_rejects_missing_before_image_reference_before_sol_invocation(
 def test_agent_run_is_finished_when_fable_returns_wrong_task_identity(harness) -> None:
     async def scenario() -> None:
         harness.fable.brief = replace(harness.fable.brief, task_id="wrong-task")
-        with pytest.raises(ValueError, match="task identity"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.coordinator.handle_user_request("session-1", "Build the bridge")
 
         run = harness.store.agent_run("run-1")
@@ -2363,10 +2403,10 @@ def test_adapter_contract_error_persists_safe_result_evidence_and_actual_exit(
             events=({"type": "result", "has_structured_output": False},),
             exit_code=42,
         )
-        with pytest.raises(ClaudeRunError, match="controlled Fable failure"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.coordinator.handle_user_request(
                 "session-1", "Build the bridge"
-        )
+            )
         run_id = "run-1"
         expected_session = "fable-session-1"
 
@@ -2394,7 +2434,7 @@ def test_adapter_contract_error_persists_safe_result_evidence_and_actual_exit(
             events=(_command_event(command, exit_code=42),),
             exit_code=42,
         )
-        with pytest.raises(CodexRunError, match="controlled Sol failure"):
+        with pytest.raises(PreparedActionFailed, match="prepared action failed"):
             await harness.coordinator.approve_task("task-1", revision=1)
 
         run = harness.store.agent_run("run-2")
@@ -2518,16 +2558,46 @@ def test_run_prepared_action_persists_only_a_fixed_failure_category(
             raise RuntimeError(secret)
 
         monkeypatch.setattr(harness.coordinator, "_run_planning", fail_after_claim)
-        outcome = await harness.coordinator.run_prepared_action(prepared.preparation_id)
+        with pytest.raises(PreparedActionFailed) as surfaced:
+            await harness.coordinator.run_prepared_action(prepared.preparation_id)
 
         persisted = harness.store.prepared_action(prepared.preparation_id)
-        assert outcome.category == "nonresumable_failure"
+        assert str(surfaced.value) == "prepared action failed"
+        assert surfaced.value.__cause__ is None
         assert persisted is not None
         assert persisted.status == "FAILED"
         assert persisted.reason == "nonresumable_failure"
         assert secret not in repr(persisted)
         assert secret not in repr(harness.store.events_after("session-1", 0))
         assert secret not in repr(harness.store.get_task("prepared-task", 0).pending)
+
+    asyncio.run(scenario())
+
+
+def test_run_prepared_action_persists_before_reraising_a_clean_cancellation(
+    harness, monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        prepared = harness.coordinator.prepare_new_request(
+            session_id="session-1",
+            task_id="prepared-task",
+            text="Build the bridge",
+            generation=12,
+        )
+
+        async def cancel_after_claim(*args: object, **kwargs: object) -> None:
+            raise asyncio.CancelledError("raw cancellation sentinel")
+
+        monkeypatch.setattr(harness.coordinator, "_run_planning", cancel_after_claim)
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await harness.coordinator.run_prepared_action(prepared.preparation_id)
+
+        persisted = harness.store.prepared_action(prepared.preparation_id)
+        assert str(cancelled.value) == ""
+        assert persisted is not None
+        assert persisted.status == "FAILED"
+        assert persisted.reason == "nonresumable_failure"
+        assert "raw cancellation sentinel" not in repr(persisted)
 
     asyncio.run(scenario())
 
@@ -2561,5 +2631,47 @@ def test_interrupt_claimed_prepared_action_never_completes_an_interrupted_child(
         assert interrupted.state is TaskState.INTERRUPTED
         assert interrupted.pending is not None
         assert interrupted.pending["prepared_action"]["preparation_id"] == prepared.preparation_id
+
+    asyncio.run(scenario())
+
+
+def test_prepare_resume_persists_drift_failure_without_creating_a_child_action(
+    harness,
+) -> None:
+    async def scenario() -> None:
+        release = asyncio.Event()
+        harness.sol.hold_start = release
+        harness.runner.release_on_stop = release
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(
+            harness.coordinator.approve_task("task-1", revision=1)
+        )
+        while harness.store.active_run_for_task("task-1", 1) is None:
+            await asyncio.sleep(0)
+        await harness.coordinator.stop_task("task-1")
+        await approval
+        (harness.repo / "unapproved-drift.txt").write_text("drift\n", encoding="utf-8")
+
+        with pytest.raises(ResumeDriftBlocked) as blocked:
+            harness.coordinator.prepare_resume(
+                session_id="session-1", task_id="task-1", revision=1, generation=7,
+            )
+
+        assert blocked.value.task.state is TaskState.FAILED
+        prior = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+        )
+        assert prior is not None
+        assert prior.status == "INTERRUPTED"
+        assert harness.sol.resume_prompts == []
+        drift_events = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.task_id == "task-1" and event.kind == "resume_drift"
+        ]
+        assert len(drift_events) == 1
+        assert "unapproved-drift.txt" not in repr(drift_events[0])
 
     asyncio.run(scenario())

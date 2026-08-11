@@ -35,6 +35,7 @@ _ACTIVE_TASK_STATES = (
     TaskState.FABLE_REVIEWING,
     TaskState.SOL_CORRECTING,
 )
+_SOL_TASK_STATES = frozenset({TaskState.SOL_RUNNING, TaskState.SOL_CORRECTING})
 MAX_TASK_OVERVIEWS = 200
 EVENT_REPLAY_PAGE_SIZE = 100
 MAX_INITIAL_REPLAY_EVENTS = 300
@@ -1204,18 +1205,32 @@ class SQLiteStore:
                         raise RuntimeError("prepared scope approval has no continuation")
                     active = task.continuation_state
                 else:
-                    if payload.scope is not None or task.continuation_state is not None:
-                        raise RuntimeError("prepared approval has unexpected continuation")
-                    active = TaskState.SOL_RUNNING
+                    if task.continuation_state is None:
+                        if payload.scope is not None:
+                            raise RuntimeError("prepared approval has unexpected continuation")
+                        active = TaskState.SOL_RUNNING
+                    else:
+                        if payload.scope is None:
+                            raise RuntimeError("prepared approval has no exact continuation")
+                        active = task.continuation_state
+                if payload.scope is not None:
+                    self._validate_prepared_context(task, payload.scope)
                 require_transition(task.state, active)
                 if payload.baseline_setting is not None:
-                    self._connection.execute(
-                        """
-                        INSERT INTO settings (key, value_json) VALUES (?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
-                        """,
-                        (payload.baseline_setting.key, payload.baseline_setting.value_json),
-                    )
+                    existing = self._connection.execute(
+                        "SELECT value_json FROM settings WHERE key = ?",
+                        (payload.baseline_setting.key,),
+                    ).fetchone()
+                    if existing is None:
+                        self._connection.execute(
+                            "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                            (
+                                payload.baseline_setting.key,
+                                payload.baseline_setting.value_json,
+                            ),
+                        )
+                    elif existing["value_json"] != payload.baseline_setting.value_json:
+                        raise RuntimeError("prepared baseline setting changed")
                 cursor = self._connection.execute(
                     """
                     UPDATE tasks
@@ -1273,6 +1288,7 @@ class SQLiteStore:
                 if task.continuation_state is None:
                     raise RuntimeError("prepared answer has no continuation")
                 active = task.continuation_state
+                self._validate_prepared_context(task, payload.continuation)
                 require_transition(task.state, active)
                 cursor = self._connection.execute(
                     """
@@ -1323,6 +1339,7 @@ class SQLiteStore:
                 if task.continuation_state is None:
                     raise RuntimeError("prepared resume has no continuation")
                 active = task.continuation_state
+                self._validate_prepared_context(task, payload.continuation)
                 require_transition(task.state, active)
                 self._validate_predecessor(
                     project_id, session_id, task_id, revision, generation,
@@ -1355,6 +1372,68 @@ class SQLiteStore:
                 )
             self._publish_committed_events(emitted)
         return record
+
+    def fail_resume_for_drift(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        drift_event: ResumeDriftProjection,
+    ) -> TaskRecord:
+        """Persist an accepted drift block without creating runnable work."""
+        project_id, session_id, task_id, revision, _ = self._prepared_identity(
+            project_id, session_id, task_id, revision, 0,
+        )
+        if (
+            not isinstance(drift_event, ResumeDriftProjection)
+            or drift_event.status != "drifted"
+        ):
+            raise ValueError("resume drift failure must be a drifted projection")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                if task.state is not TaskState.INTERRUPTED:
+                    raise RuntimeError("task is not eligible for drift-blocked resume")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                    """,
+                    (
+                        TaskState.FAILED.value,
+                        task_id,
+                        revision,
+                        session_id,
+                        TaskState.INTERRUPTED.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("drift-blocked resume changed concurrently")
+                emitted.append(self._insert_event_in_transaction(
+                    session_id,
+                    task_id,
+                    "coordinator",
+                    "task_state",
+                    {"state": TaskState.FAILED.value, "revision": revision},
+                ))
+                emitted.append(self._insert_event_in_transaction(
+                    session_id,
+                    task_id,
+                    "coordinator",
+                    "resume_drift",
+                    {
+                        "status": drift_event.status,
+                        "summary": drift_event.summary,
+                        "evidence_hashes": list(drift_event.evidence_hashes),
+                    },
+                ))
+            self._publish_committed_events(emitted)
+        return self.get_task(task_id, revision)
 
     def claim_prepared_action(
         self, preparation_id: str, *, generation: int,
@@ -1391,19 +1470,23 @@ class SQLiteStore:
             self._require_record_generation(record, generation)
             if record.status == "INTERRUPTED" and record.reason == reason:
                 return record
-            if record.status != "CLAIMED":
-                raise RuntimeError("prepared action is not claimed")
+            if record.status not in {"PREPARED", "CLAIMED"}:
+                raise RuntimeError("prepared action is not interruptible")
             task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
             if task.state is not TaskState.INTERRUPTED:
-                raise RuntimeError("claimed prepared task is not interrupted")
-            pending = self._prepared_pending_projection(record, reason=reason)
+                raise RuntimeError("prepared task is not interrupted")
+            continuation = task.continuation_state or record.active_state
+            if task.continuation_state is not record.active_state and task.pending is not None:
+                pending = task.pending
+            else:
+                pending = self._prepared_pending_projection(record, reason=reason)
             task_cursor = self._connection.execute(
                 """
                 UPDATE tasks SET continuation_state = ?, pending_json = ?
                 WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                 """,
                 (
-                    record.active_state.value,
+                    continuation.value,
                     _encode_json(pending),
                     record.task_id,
                     record.revision,
@@ -1416,7 +1499,7 @@ class SQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE prepared_actions SET status = ?, reason = ?
-                WHERE preparation_id = ? AND generation = ? AND status = 'CLAIMED'
+                WHERE preparation_id = ? AND generation = ? AND status IN ('PREPARED', 'CLAIMED')
                 """,
                 ("INTERRUPTED", reason, record.preparation_id, generation),
             )
@@ -1504,13 +1587,16 @@ class SQLiteStore:
                 elif task.state is not TaskState.INTERRUPTED:
                     raise RuntimeError("unfinished prepared action task changed")
                 else:
+                    continuation = task.continuation_state or record.active_state
+                    if task.continuation_state is not record.active_state and task.pending is not None:
+                        pending = task.pending
                     cursor = self._connection.execute(
                         """
                         UPDATE tasks SET continuation_state = ?, pending_json = ?
                         WHERE task_id = ? AND revision = ? AND state = ?
                         """,
                         (
-                            record.active_state.value,
+                            continuation.value,
                             _encode_json(pending),
                             record.task_id,
                             record.revision,
@@ -1705,15 +1791,18 @@ class SQLiteStore:
     ) -> None:
         existing = tuple(self._connection.execute(
             """
-            SELECT preparation_id FROM prepared_actions
+            SELECT preparation_id, generation FROM prepared_actions
             WHERE project_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+            ORDER BY rowid DESC
             """,
             (project_id, session_id, task_id, revision),
         ))
         if previous_preparation_id is None:
-            if existing and generation != COMPATIBILITY_PREPARATION_GENERATION:
+            if existing:
                 raise RuntimeError("prepared resume requires a previous preparation")
             return
+        if not existing or existing[0]["preparation_id"] != previous_preparation_id:
+            raise RuntimeError("prepared resume predecessor is not the latest preparation")
         previous = self._prepared_required(previous_preparation_id)
         if (
             previous.project_id != project_id
@@ -1723,6 +1812,71 @@ class SQLiteStore:
             or previous.status not in {"ABORTED", "RECOVERED", "INTERRUPTED"}
         ):
             raise RuntimeError("prepared resume predecessor is invalid")
+        if generation <= previous.generation:
+            raise RuntimeError("prepared resume generation did not advance")
+
+    @staticmethod
+    def _validate_prepared_context(
+        task: TaskRecord, context: PreparedContinuationContext,
+    ) -> None:
+        """Reject a context substituted for the exact persisted continuation."""
+        if task.continuation_state is None:
+            raise RuntimeError("prepared continuation is missing")
+        pending = task.pending or {}
+        projection = pending.get("prepared_action")
+        if isinstance(projection, Mapping) and "context" in projection:
+            try:
+                frozen = _context_from_data(projection["context"])
+            except RuntimeError as error:
+                raise RuntimeError("prepared continuation does not match task") from error
+            if frozen != context:
+                raise RuntimeError("prepared continuation does not match task")
+            return
+        if task.continuation_state in _SOL_TASK_STATES:
+            if isinstance(context, ScopeApprovalContext):
+                if context.baseline_id != task.baseline_id:
+                    raise RuntimeError("prepared continuation does not match task")
+                context = context.underlying_continuation
+            if not isinstance(context, SolResumeContext):
+                raise RuntimeError("prepared continuation does not match task")
+            prompt = pending.get("prompt")
+            if (
+                (task.sol_thread_id is not None and context.sol_thread_id != task.sol_thread_id)
+                or (isinstance(prompt, str) and context.prompt != prompt)
+            ):
+                raise RuntimeError("prepared continuation does not match task")
+            return
+        if task.continuation_state is TaskState.FABLE_REVIEWING:
+            if not isinstance(context, ReviewContext):
+                raise RuntimeError("prepared continuation does not match task")
+            if (
+                (task.fable_session_id is not None and context.fable_session_id != task.fable_session_id)
+                or (
+                    isinstance(pending.get("review_prompt"), str)
+                    and context.review_prompt != pending["review_prompt"]
+                )
+                or (
+                    "completion_allowed" in pending
+                    and context.completion_allowed != bool(pending["completion_allowed"])
+                )
+            ):
+                raise RuntimeError("prepared continuation does not match task")
+            return
+        if task.continuation_state is TaskState.FABLE_CLARIFYING:
+            if not isinstance(context, ClarificationContext):
+                raise RuntimeError("prepared continuation does not match task")
+            if (
+                (task.fable_session_id is not None and context.fable_session_id != task.fable_session_id)
+                or (
+                    isinstance(pending.get("clarification_prompt"), str)
+                    and context.clarification_prompt != pending["clarification_prompt"]
+                )
+            ):
+                raise RuntimeError("prepared continuation does not match task")
+            return
+        if task.continuation_state is TaskState.FABLE_PLANNING and context is None:
+            return
+        raise RuntimeError("prepared continuation does not match task")
 
     def _transition_prepared_action(
         self,

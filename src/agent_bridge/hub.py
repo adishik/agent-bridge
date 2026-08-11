@@ -25,6 +25,9 @@ _FABLE_STATUSES = frozenset({
 })
 _SOL_STATUSES = frozenset({"checking", "ready", "running", "blocked", "unavailable"})
 _SCHEDULER_UNAVAILABLE = "scheduler_unavailable"
+_TERMINAL_PREPARED_STATUSES = frozenset({
+    "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,11 +85,10 @@ class RuntimeReadiness:
         if usage_credits_acknowledged is not True:
             raise PermissionError("usage credits must be acknowledged")
         async with self._refresh_lock:
-            probes = (
-                asyncio.create_task(self._fable_probe()),
-                asyncio.create_task(self._sol_probe()),
-            )
+            probes: list[asyncio.Future[object]] = []
             try:
+                probes.append(asyncio.ensure_future(self._fable_probe()))
+                probes.append(asyncio.ensure_future(self._sol_probe()))
                 fable_result, sol_status = await asyncio.wait_for(
                     asyncio.gather(*probes),
                     timeout=self._timeout_seconds,
@@ -104,7 +106,8 @@ class RuntimeReadiness:
                 for probe in probes:
                     if not probe.done():
                         probe.cancel()
-                await asyncio.gather(*probes, return_exceptions=True)
+                if probes:
+                    await asyncio.gather(*probes, return_exceptions=True)
                 self._status = RuntimeStatus(
                     False, "subscription_unavailable", "unavailable"
                 )
@@ -380,34 +383,6 @@ class HubWorkflowOrchestrator:
             self._lease.release(token)
             raise
 
-    async def prepare_existing_task(
-        self,
-        *,
-        project_id: str,
-        session_id: str,
-        task_id: str,
-        revision: int,
-        action: str,
-    ) -> PreparedWorkflow:
-        self._require_non_empty(task_id, "task_id")
-        self._require_non_negative_integer(revision, "revision")
-        if action == "approval":
-            return await self.prepare_approval(
-                project_id=project_id, session_id=session_id,
-                task_id=task_id, revision=revision,
-            )
-        if action == "resume":
-            return await self.prepare_resume(
-                project_id=project_id, session_id=session_id,
-                task_id=task_id, revision=revision,
-            )
-        if action == "answer":
-            return await self.prepare_answer(
-                project_id=project_id, session_id=session_id,
-                task_id=task_id, revision=revision, answer="Continue.",
-            )
-        raise ValueError("action is invalid")
-
     async def prepare_approval(
         self, *, project_id: str, session_id: str, task_id: str, revision: int,
     ) -> PreparedWorkflow:
@@ -461,7 +436,15 @@ class HubWorkflowOrchestrator:
         self._bound_record(runtime, prepared.preparation_id, prepared.token)
         try:
             await runtime.coordinator.run_prepared_action(prepared.preparation_id)
-        finally:
+        except BaseException:
+            record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
+            if record.status in _TERMINAL_PREPARED_STATUSES:
+                self._lease.release(prepared.token)
+            raise
+        record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
+        if record.status not in _TERMINAL_PREPARED_STATUSES:
+            raise RuntimeError("prepared action did not reach a terminal state")
+        else:
             self._lease.release(prepared.token)
 
     def abort_prepared(self, prepared: PreparedWorkflow, *, reason: str) -> None:
@@ -511,7 +494,7 @@ class HubWorkflowOrchestrator:
                 )
                 if (
                     record is not None
-                    and record.status == "CLAIMED"
+                    and record.status in {"PREPARED", "CLAIMED"}
                     and record.generation == token.generation
                 ):
                     runtime.coordinator.interrupt_claimed_prepared_action(

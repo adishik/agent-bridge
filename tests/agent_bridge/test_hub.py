@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -20,7 +20,16 @@ from agent_bridge.hub import (
 )
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import NewRequestPayload, PreparedActionOutcome, PreparedActionRecord
+from agent_bridge.store import (
+    AnswerPayload,
+    ApprovalPayload,
+    NewRequestPayload,
+    PreparedActionOutcome,
+    PreparedActionRecord,
+    ResumeDriftProjection,
+    ResumePayload,
+    SolResumeContext,
+)
 
 
 @dataclass
@@ -104,13 +113,38 @@ class _RuntimeCoordinator:
     stops: list[str]
     store: _RuntimeStore
     project_id: str
+    prepared_actions: list[str] = field(default_factory=list)
 
     def _record(
         self, *, session_id: str, task_id: str, revision: int, action: str,
         generation: int,
     ) -> PreparedActionRecord:
         preparation_id = f"prepared-{task_id}-{generation}"
-        payload = NewRequestPayload(text="Build it")
+        continuation = SolResumeContext("thread-1", "run-1", "resume exactly")
+        if action == "new_request":
+            payload = NewRequestPayload(text="Build it")
+            source = active = TaskState.FABLE_PLANNING
+        elif action == "approval":
+            payload = ApprovalPayload("baseline-1", None, None)
+            source = TaskState.AWAITING_USER_APPROVAL
+            active = TaskState.SOL_RUNNING
+        elif action == "answer":
+            payload = AnswerPayload("Use option A.", continuation)
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
+        elif action == "resume":
+            payload = ResumePayload(
+                continuation,
+                ResumeDriftProjection("unchanged", "Repository drift was checked.", ()),
+            )
+            source = TaskState.INTERRUPTED
+            active = TaskState.SOL_RUNNING
+        else:
+            raise AssertionError("unexpected route")
+        self.prepared_actions.append(action)
+        pending_context = (
+            None if action in {"new_request", "approval"} else continuation
+        )
         record = PreparedActionRecord(
             preparation_id=preparation_id,
             project_id=self.project_id,
@@ -118,11 +152,11 @@ class _RuntimeCoordinator:
             task_id=task_id,
             revision=revision,
             action=action,  # type: ignore[arg-type]
-            payload=payload if action == "new_request" else payload,  # type: ignore[arg-type]
-            source_state=TaskState.FABLE_PLANNING,
-            active_state=TaskState.FABLE_PLANNING,
+            payload=payload,
+            source_state=source,
+            active_state=active,
             continuation_state=None,
-            pending_context=None,
+            pending_context=pending_context,
             previous_preparation_id=None,
             status="PREPARED",
             reason=None,
@@ -130,7 +164,7 @@ class _RuntimeCoordinator:
         )
         self.store.prepared_rows[preparation_id] = record
         self.store.task_rows[(task_id, revision)] = SimpleNamespace(
-            session_id=session_id, revision=revision,
+            session_id=session_id, revision=revision, state=active,
         )
         return record
 
@@ -146,6 +180,31 @@ class _RuntimeCoordinator:
     def prepare_user_request(self, session_id: str, text: str, task_id: str) -> object:
         self.prepared.append((session_id, text, task_id))
         return SimpleNamespace(task_id=task_id, session_id=session_id, revision=0)
+
+    def prepare_approval(
+        self, *, session_id: str, task_id: str, revision: int, generation: int,
+    ) -> PreparedActionRecord:
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="approval", generation=generation,
+        )
+
+    def prepare_answer(
+        self, *, session_id: str, task_id: str, revision: int, answer: str, generation: int,
+    ) -> PreparedActionRecord:
+        assert answer == "Use option A."
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="answer", generation=generation,
+        )
+
+    def prepare_resume(
+        self, *, session_id: str, task_id: str, revision: int, generation: int,
+    ) -> PreparedActionRecord:
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="resume", generation=generation,
+        )
 
     async def run_prepared_request(self, task_id: str) -> None:
         self.run_task_ids.append(task_id)
@@ -171,12 +230,18 @@ class _RuntimeCoordinator:
     def interrupt_claimed_prepared_action(
         self, preparation_id: str, *, generation: int, reason: str,
     ) -> object:
-        return self.abort_prepared_action(
-            preparation_id, generation=generation, reason=reason,
+        record = self.store.prepared_action(preparation_id)
+        assert record is not None
+        self.store.prepared_rows[preparation_id] = replace(
+            record, status="INTERRUPTED", reason=reason,
         )
+        return self.store.prepared_rows[preparation_id]
 
     async def stop_task(self, task_id: str) -> None:
         self.stops.append(task_id)
+        for key, task in self.store.task_rows.items():
+            if key[0] == task_id:
+                task.state = TaskState.INTERRUPTED
 
 
 @dataclass
@@ -314,6 +379,79 @@ def test_runtime_readiness_cancels_and_awaits_a_hanging_sibling_when_a_probe_fai
         with pytest.raises(RuntimeError, match="not ready"):
             await readiness.require_model_start_ready(usage_credits_acknowledged=True)
 
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("second_factory", ["raises", "non_awaitable"])
+def test_runtime_readiness_cleans_up_the_first_probe_when_the_second_factory_fails(
+    second_factory: str,
+) -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def hangs() -> tuple[bool, str]:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_cancelled.set()
+
+        active = asyncio.create_task(hangs())
+        await started.wait()
+
+        if second_factory == "raises":
+            def invalid_second() -> str:
+                raise RuntimeError("synchronous probe factory failure")
+        else:
+            def invalid_second() -> str:
+                return "not-an-awaitable"
+
+        readiness = RuntimeReadiness(
+            initial=RuntimeStatus(False, "checking", "checking"),
+            fable_probe=lambda: active,  # type: ignore[arg-type]
+            sol_probe=invalid_second,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(RuntimeError, match="model runtime is not ready"):
+            await readiness.require_model_start_ready(usage_credits_acknowledged=True)
+
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_readiness_drains_active_probe_before_reraising_caller_cancellation() -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def hangs() -> tuple[bool, str]:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_cancelled.set()
+
+        async def also_hangs() -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        readiness = RuntimeReadiness(
+            initial=RuntimeStatus(False, "checking", "checking"),
+            fable_probe=hangs,
+            sol_probe=also_hangs,
+        )
+        waiting = asyncio.create_task(
+            readiness.require_model_start_ready(usage_credits_acknowledged=True)
+        )
+        await started.wait()
+        waiting.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
         assert sibling_cancelled.is_set()
 
     asyncio.run(exercise())
@@ -597,13 +735,21 @@ def test_held_lease_rejects_other_model_starting_routes_without_new_probes(
                 project_id="project-a", session_id="chat-2", text="New chat", ids=_Ids(),
             )
         with pytest.raises(RuntimeError, match="another workflow"):
-            await workflows.prepare_existing_task(
-                project_id="project-a",
-                session_id="chat-2",
-                task_id="task-existing",
-                revision=1,
-                action=action,
-            )
+            if action == "approval":
+                await workflows.prepare_approval(
+                    project_id="project-a", session_id="chat-2",
+                    task_id="task-existing", revision=1,
+                )
+            elif action == "resume":
+                await workflows.prepare_resume(
+                    project_id="project-a", session_id="chat-2",
+                    task_id="task-existing", revision=1,
+                )
+            else:
+                await workflows.prepare_answer(
+                    project_id="project-a", session_id="chat-2",
+                    task_id="task-existing", revision=1, answer="Use option A.",
+                )
 
         assert fable_calls == [None]
         assert sol_calls == [None]
@@ -629,6 +775,109 @@ def test_running_a_prepared_request_releases_its_exact_lease_in_a_finally_block(
 
         assert runtime.coordinator.run_task_ids == ["task-1"]
         assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_hub_run_retains_the_exact_lease_when_terminal_persistence_fails() -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        async def fail_before_terminal(preparation_id: str) -> PreparedActionOutcome:
+            assert preparation_id == prepared.preparation_id
+            raise RuntimeError("injected terminal persistence failure")
+
+        runtime.coordinator.run_prepared_action = fail_before_terminal  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="terminal persistence"):
+            await workflows.run(prepared)
+
+        assert runtime.store.prepared_action(prepared.preparation_id).status == "PREPARED"  # type: ignore[union-attr]
+        assert lease.snapshot() == prepared.token
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("route", ("approval", "answer", "resume"))
+def test_hub_route_specific_preparations_run_the_matching_durable_action(
+    route: str,
+) -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        runtime.store.task_rows[("task-existing", 1)] = SimpleNamespace(
+            session_id="chat-1", revision=1, state=TaskState.INTERRUPTED,
+        )
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        if route == "approval":
+            prepared = await workflows.prepare_approval(
+                project_id="project-a", session_id="chat-1",
+                task_id="task-existing", revision=1,
+            )
+        elif route == "answer":
+            prepared = await workflows.prepare_answer(
+                project_id="project-a", session_id="chat-1",
+                task_id="task-existing", revision=1, answer="Use option A.",
+            )
+        else:
+            prepared = await workflows.prepare_resume(
+                project_id="project-a", session_id="chat-1",
+                task_id="task-existing", revision=1,
+            )
+        await workflows.run(prepared)
+
+        assert runtime.coordinator.prepared_actions == [route]
+        assert runtime.store.prepared_action(prepared.preparation_id).status == "COMPLETED"  # type: ignore[union-attr]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("claimed", (False, True))
+def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
+    claimed: bool,
+) -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        if claimed:
+            record = runtime.store.prepared_action(prepared.preparation_id)
+            assert record is not None
+            runtime.store.prepared_rows[prepared.preparation_id] = replace(
+                record, status="CLAIMED",
+            )
+
+        await workflows.stop(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+        )
+
+        terminal = runtime.store.prepared_action(prepared.preparation_id)
+        assert terminal is not None
+        assert terminal.status == "INTERRUPTED"
+        assert terminal.reason == "stop"
+        assert runtime.coordinator.stops == ["task-1"]
+        assert lease.snapshot() == prepared.token
 
     asyncio.run(exercise())
 
