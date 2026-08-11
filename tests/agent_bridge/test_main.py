@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 import agent_bridge.__main__ as launcher
 from agent_bridge.adapters.codex_cli import CodexCLI
 from agent_bridge.process import ProcessRunner
+from agent_bridge.projects import ProjectSpec, project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import SQLiteStore
 from agent_bridge.__main__ import (
@@ -140,7 +142,7 @@ if (control_dir / "git-fail").exists():
 if sys.argv[-2:] == ["rev-parse", "--show-toplevel"]:
     override = control_dir / "git-root"
     print(override.read_text() if override.exists() else os.getcwd())
-elif sys.argv[-2:] == ["branch", "--show-current"]:
+elif sys.argv[-2:] == ["branch", "--show-current"] or sys.argv[-4:] == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
     print("feat/test-launcher")
 else:
     raise SystemExit(93)
@@ -284,7 +286,7 @@ def test_state_directory_is_external_owner_only_and_repository_specific(tmp_path
 
     state_dir = prepare_state_dir(settings)
 
-    assert state_dir == tmp_path / "state" / "agent-bridge" / "repo"
+    assert state_dir == tmp_path / "state" / "agent-bridge" / "hub"
     assert not state_dir.is_relative_to(repo)
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
     state_dir.chmod(0o777)
@@ -552,7 +554,7 @@ def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_c
             environ["PASSWORD"],
         ):
             assert secret not in serialized
-    state_dir = tmp_path / "state" / "agent-bridge" / "repo"
+    state_dir = tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)
     assert stat.S_IMODE((state_dir / "bridge.sqlite3").stat().st_mode) == 0o600
     calls = [
         json.loads(line)
@@ -593,7 +595,7 @@ def test_single_instance_lock_prevents_second_recovery_and_releases_after_exit(
     repo = _repo(tmp_path)
     environ = _environment(tmp_path, repo)
     args = _args(repo, tools)
-    state_dir = tmp_path / "state" / "agent-bridge" / "repo"
+    state_dir = tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)
     inner_attempted = False
 
     def first_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
@@ -730,3 +732,367 @@ def test_path_resolution_is_owned_only_by_main_module() -> None:
     for path in python_files:
         if path.name != "__main__.py":
             assert "shutil.which(" not in path.read_text(encoding="utf-8")
+
+
+def _project_spec(repo: Path, label: str, state_dir: Path) -> ProjectSpec:
+    return ProjectSpec(
+        project_id=project_id_for_root(repo),
+        label=label,
+        repo_root=repo,
+        branch="feat/test-launcher",
+        state_dir=state_dir,
+    )
+
+
+def test_project_cli_requires_one_immutable_allowlist_and_uses_digest_state(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+
+    with pytest.raises(SystemExit) as missing:
+        parse_settings(_args(repo, tools)[2:], environ=environment)
+    assert missing.value.code == 2
+    with pytest.raises(SystemExit) as mixed:
+        parse_settings(
+            [
+                *_args(repo, tools),
+                "--project", f"second={repo}",
+            ],
+            environ=environment,
+        )
+    assert mixed.value.code == 2
+
+    repo_settings = parse_settings(_args(repo, tools), environ=environment)
+    named_settings = parse_settings(
+        [
+            "--project", f"renamed={repo}",
+            "--claude-executable", str(tools["claude"]),
+            "--codex-executable", str(tools["codex"]),
+            "--git-executable", str(tools["git"]),
+            "--bash-executable", str(tools["bash"]),
+            "--sh-executable", str(tools["sh"]),
+        ],
+        environ=environment,
+    )
+
+    expected_id = project_id_for_root(repo)
+    assert repo_settings.projects == (
+        ProjectSpec(
+            project_id=expected_id,
+            label="repo",
+            repo_root=repo,
+            branch="feat/test-launcher",
+            state_dir=tmp_path / "state" / "agent-bridge" / "projects" / expected_id,
+        ),
+    )
+    assert named_settings.projects[0].project_id == expected_id
+    assert named_settings.projects[0].state_dir == repo_settings.projects[0].state_dir
+    assert named_settings.projects[0].label == "renamed"
+    assert repo_settings.hub_state_dir == tmp_path / "state" / "agent-bridge" / "hub"
+    help_text = launcher._parser().format_help().lower()
+    assert "restart-required" in help_text
+    assert "immutable allowlist" in help_text
+
+
+def test_main_acquires_every_lock_before_opening_any_database_and_releases_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _repo(tmp_path)
+    second_repo = tmp_path / "second-repo"
+    second_repo.mkdir()
+    (second_repo / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    third_repo = tmp_path / "third-repo"
+    third_repo.mkdir()
+    (third_repo / "AGENTS.md").write_text("# third\n", encoding="utf-8")
+    state_root = tmp_path / "state" / "agent-bridge"
+    specs = tuple(sorted((
+        _project_spec(first_repo, "first", state_root / "projects" / project_id_for_root(first_repo)),
+        ProjectSpec("2" * 32, "second", second_repo, "main", state_root / "projects" / ("2" * 32)),
+        ProjectSpec("1" * 32, "third", third_repo, "main", state_root / "projects" / ("1" * 32)),
+    ), key=lambda spec: spec.project_id))
+    settings = launcher.Settings(
+        projects=specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    events: list[str] = []
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+            events.append(f"release:{self.path.parent.name}")
+
+    acquired: list[FakeLock] = []
+
+    def prepare(candidate_settings: launcher.Settings, *, candidate: Path) -> Path:
+        assert candidate_settings is settings
+        events.append(f"validate:{candidate.name}")
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def acquire(path: Path) -> FakeLock:
+        events.append(f"lock:{path.parent.name}")
+        if path.parent.name == "2" * 32:
+            raise ValueError("injected second lock failure")
+        lock = FakeLock(path)
+        acquired.append(lock)
+        return lock
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", acquire)
+
+    with pytest.raises(ValueError, match="second lock failure"):
+        main([], environ=_environment(tmp_path, first_repo), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert events[:4] == [
+        "validate:hub",
+        *(f"validate:{spec.project_id}" for spec in specs),
+    ]
+    failed_at = next(index for index, spec in enumerate(specs) if spec.project_id == "2" * 32)
+    assert events[4:] == [
+        "lock:hub",
+        *(f"lock:{spec.project_id}" for spec in specs[:failed_at + 1]),
+        *(f"release:{spec.project_id}" for spec in reversed(specs[:failed_at])),
+        "release:hub",
+    ]
+    assert all(lock.released for lock in acquired)
+    assert not list(state_root.rglob("*.sqlite3"))
+
+
+def test_main_closes_constructed_runtime_and_every_lock_when_later_assembly_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _repo(tmp_path)
+    second_repo = tmp_path / "second-repo"
+    second_repo.mkdir()
+    (second_repo / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    state_root = tmp_path / "state" / "agent-bridge"
+    specs = tuple(sorted((
+        _project_spec(first_repo, "first", state_root / "projects" / project_id_for_root(first_repo)),
+        ProjectSpec("1" * 32, "second", second_repo, "main", state_root / "projects" / ("1" * 32)),
+    ), key=lambda spec: spec.project_id))
+    settings = launcher.Settings(
+        projects=specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    events: list[str] = []
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def release(self) -> None:
+            events.append(f"release:{self.path.parent.name}")
+
+    class FakeHubStore:
+        def __init__(self, path: Path, *, clock) -> None:
+            events.append("hub-store")
+
+        def close(self) -> None:
+            events.append("hub-close")
+
+        def usage_credits_acknowledged(self) -> bool:
+            return False
+
+    class FakeRuntime:
+        def __init__(self, spec: ProjectSpec, lock: FakeLock) -> None:
+            self.spec = spec
+            self.lock = lock
+
+        def close(self) -> None:
+            events.append(f"runtime-close:{self.spec.project_id}")
+            self.lock.release()
+
+    def prepare(candidate_settings: launcher.Settings, *, candidate: Path) -> Path:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def assemble(spec: ProjectSpec, **kwargs: object) -> FakeRuntime:
+        events.append(f"assemble:{spec.project_id}")
+        if spec.project_id == specs[1].project_id:
+            raise RuntimeError("injected runtime two failure")
+        return FakeRuntime(spec, kwargs["lock"])
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", lambda path: FakeLock(path))
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", FakeHubStore)
+    monkeypatch.setattr(launcher, "assemble_project_runtime", assemble)
+
+    with pytest.raises(RuntimeError, match="runtime two failure"):
+        main([], environ=_environment(tmp_path, first_repo), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert events == [
+        "hub-store",
+        f"assemble:{specs[0].project_id}",
+        f"assemble:{specs[1].project_id}",
+        f"runtime-close:{specs[0].project_id}",
+        f"release:{specs[0].project_id}",
+        "hub-close",
+        f"release:{specs[1].project_id}",
+        "release:hub",
+    ]
+
+
+@pytest.mark.parametrize("argument_kind", ("repo", "project"))
+def test_legacy_state_is_audited_and_adopted_in_place(
+    tmp_path: Path,
+    argument_kind: str,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    legacy_state = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    args = _args(repo, tools) if argument_kind == "repo" else [
+        "--project", f"chosen={repo}",
+        "--claude-executable", str(tools["claude"]),
+        "--codex-executable", str(tools["codex"]),
+        "--git-executable", str(tools["git"]),
+        "--bash-executable", str(tools["bash"]),
+        "--sh-executable", str(tools["sh"]),
+    ]
+
+    assert main(args, environ=environment, stdout=io.StringIO(), uvicorn_run=lambda *args, **kwargs: None) == 0
+
+    assert legacy_state.is_dir()
+    assert database.is_file()
+    assert not (tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)).exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE sessions SET repo_root = '/other' WHERE session_id = 'session-1'"
+            ),
+            id="mixed-root",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at) VALUES ('missing', NULL, 'user', 'message', '{}', '2026-08-11T00:00:00Z')"
+            ),
+            id="orphan",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE settings SET value_json = '\"missing\"' WHERE key = 'agent_bridge.active_session_id'"
+            ),
+            id="invalid-active-session",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO settings (key, value_json) VALUES ('agent_bridge.baseline.', 'not-json')"
+            ),
+            id="corrupt-baseline",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO tasks (task_id, revision, session_id, state, correction_count) VALUES ('orphan', 1, 'missing', 'fable_planning', 0)"
+            ),
+            id="failed-foreign-key",
+        ),
+    ),
+)
+def test_invalid_legacy_state_aborts_before_recovery(
+    tmp_path: Path,
+    corrupt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    legacy_state = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    corrupt(connection)
+    connection.commit()
+    connection.close()
+    recoveries: list[Path] = []
+    original_recover = SQLiteStore.recover_active_tasks
+
+    def recover(self: SQLiteStore):
+        recoveries.append(database)
+        return original_recover(self)
+
+    monkeypatch.setattr(SQLiteStore, "recover_active_tasks", recover)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        main(_args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert recoveries == []
+
+
+def test_legacy_and_digest_state_for_one_root_is_rejected_as_ambiguous(tmp_path: Path) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    (state_root / "repo").mkdir(parents=True)
+    (state_root / "projects" / project_id_for_root(repo)).mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        parse_settings(_args(repo, tools), environ=_environment(tmp_path, repo))
+
+
+def test_two_roots_cannot_claim_one_existing_legacy_state_directory(tmp_path: Path) -> None:
+    tools = _fake_tools(tmp_path)
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = first_parent / "repo"
+    second = second_parent / "repo"
+    first.mkdir()
+    second.mkdir()
+    (first / "AGENTS.md").write_text("# first\n", encoding="utf-8")
+    (second / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    legacy = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy.mkdir(parents=True)
+    arguments = [
+        "--project", f"first={first}",
+        "--project", f"second={second}",
+        "--claude-executable", str(tools["claude"]),
+        "--codex-executable", str(tools["codex"]),
+        "--git-executable", str(tools["git"]),
+        "--bash-executable", str(tools["bash"]),
+        "--sh-executable", str(tools["sh"]),
+    ]
+
+    with pytest.raises(ValueError, match="legacy"):
+        parse_settings(arguments, environ=_environment(tmp_path, first))

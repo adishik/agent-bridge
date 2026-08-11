@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import fcntl
 import ipaddress
 import json
@@ -18,7 +19,18 @@ import socket
 import stat
 import subprocess
 import sys
-from typing import Protocol, TextIO
+from typing import TYPE_CHECKING, Protocol, TextIO
+
+from agent_bridge.projects import (
+    ProjectSpec,
+    build_project_specs,
+    parse_project_argument,
+    project_id_for_root,
+)
+
+if TYPE_CHECKING:
+    from agent_bridge.coordinator import IdFactory
+    from agent_bridge.hub import InstanceLock, OwnedProjectRuntime
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
@@ -61,13 +73,12 @@ class UvicornRun(Protocol):
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Settings:
-    repo_root: Path
-    branch: str
+    projects: tuple[ProjectSpec, ...]
+    hub_state_dir: Path
     host: str
     port: int
-    state_dir: Path
     claude_executable: Path
     codex_executable: Path
     git_executable: Path
@@ -97,8 +108,22 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the local Agent Bridge.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--repo", required=True, help="Repository authority for this run.",
+    projects = parser.add_mutually_exclusive_group(required=True)
+    projects.add_argument(
+        "--repo",
+        help=(
+            "Single repository authority for this run; it becomes a "
+            "restart-required immutable allowlist entry."
+        ),
+    )
+    projects.add_argument(
+        "--project",
+        action="append",
+        metavar="LABEL=/ABSOLUTE/REPOSITORY",
+        help=(
+            "Repeatable restart-required immutable allowlist entry. "
+            "Labels are display-only."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -304,13 +329,6 @@ def parse_settings(
         raise ValueError("host must be a loopback address")
     if arguments.port < 0 or arguments.port > 65535:
         raise ValueError("port must be between 0 and 65535")
-    try:
-        repo_root = Path(arguments.repo).resolve(strict=True)
-    except OSError as error:
-        raise ValueError("repository must be an existing directory") from error
-    if not repo_root.is_dir():
-        raise ValueError("repository must be an existing directory")
-
     claude = _resolve_executable(
         arguments.claude_executable, command="claude", label="Claude",
     )
@@ -326,21 +344,6 @@ def parse_settings(
     sh = _resolve_executable(
         arguments.sh_executable, command="sh", label="sh",
     )
-    top_level_text = _run_git(
-        git, repo_root, ("rev-parse", "--show-toplevel"),
-    )
-    try:
-        top_level = Path(top_level_text).resolve(strict=True)
-    except OSError as error:
-        raise ValueError("Git top level is not an existing directory") from error
-    if top_level != repo_root:
-        raise ValueError("repository must equal its Git top level")
-    branch = _run_git(
-        git, repo_root, ("branch", "--show-current"),
-    )
-    if not branch:
-        branch = "detached"
-
     xdg_text = environment.get("XDG_STATE_HOME")
     if xdg_text:
         state_home = Path(xdg_text)
@@ -348,13 +351,40 @@ def parse_settings(
             raise ValueError("XDG_STATE_HOME must be an absolute path")
     else:
         state_home = Path.home() / ".local" / "state"
-    state_dir = Path(os.path.abspath(state_home / "agent-bridge" / _repository_slug(repo_root)))
+    state_root = Path(os.path.abspath(state_home / "agent-bridge"))
+    entries = _project_entries(arguments)
+    legacy_paths = _resolve_legacy_paths(entries, state_root)
+    try:
+        specs = build_project_specs(
+            entries,
+            state_root=state_root,
+            git_executable=git,
+        )
+    except ValueError as error:
+        if str(error) == "Git top-level probe failed":
+            raise ValueError("repository must be a readable Git repository") from error
+        if str(error) == "Git top-level does not match the canonical project root":
+            raise ValueError("repository must equal its Git top level") from error
+        raise
+    selected: list[ProjectSpec] = []
+    for spec in specs:
+        legacy_path = legacy_paths.get(spec.project_id)
+        if legacy_path is None:
+            selected.append(spec)
+            continue
+        # ``build_project_specs`` creates an empty digest directory as part of
+        # validation.  A selected legacy state must remain in place, so remove
+        # only that freshly-created, empty directory before using the old root.
+        try:
+            spec.state_dir.rmdir()
+        except OSError as error:
+            raise ValueError("legacy state selection is ambiguous") from error
+        selected.append(replace(spec, state_dir=legacy_path))
     return Settings(
-        repo_root=repo_root,
-        branch=branch,
+        projects=tuple(selected),
+        hub_state_dir=state_root / "hub",
         host="127.0.0.1",
         port=arguments.port,
-        state_dir=state_dir,
         claude_executable=claude,
         codex_executable=codex,
         git_executable=git,
@@ -363,26 +393,74 @@ def parse_settings(
     )
 
 
-def prepare_state_dir(settings: Settings) -> Path:
+def _project_entries(arguments: argparse.Namespace) -> tuple[tuple[str, Path], ...]:
+    if arguments.repo is not None:
+        raw_root = Path(arguments.repo)
+        if not raw_root.is_absolute():
+            raw_root = Path(os.path.abspath(raw_root))
+        return ((_repository_slug(raw_root), raw_root),)
+    values = tuple(arguments.project or ())
+    try:
+        return tuple(parse_project_argument(value) for value in values)
+    except ValueError:
+        raise
+
+
+def _resolve_legacy_paths(
+    entries: Sequence[tuple[str, Path]], state_root: Path,
+) -> dict[str, Path]:
+    """Select auditable basename state without opening a database."""
+    candidates: dict[Path, list[Path]] = {}
+    selected: dict[str, Path] = {}
+    for _, root in entries:
+        try:
+            canonical_root = root.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("repository must be an existing directory") from error
+        if not canonical_root.is_dir():
+            raise ValueError("repository must be an existing directory")
+        project_id = project_id_for_root(canonical_root)
+        legacy_path = state_root / _repository_slug(canonical_root)
+        digest_path = state_root / "projects" / project_id
+        legacy_exists = legacy_path.exists()
+        digest_exists = digest_path.exists()
+        if legacy_exists and digest_exists:
+            raise ValueError("legacy and digest project state are ambiguous")
+        if legacy_exists:
+            candidates.setdefault(legacy_path, []).append(canonical_root)
+            selected[project_id] = legacy_path
+    for roots in candidates.values():
+        if len(roots) > 1:
+            raise ValueError("multiple configured roots claim one legacy state directory")
+    return selected
+
+
+def prepare_state_dir(settings: Settings, *, candidate: Path | None = None) -> Path:
     """Create one external, non-symlinked, owner-only runtime directory."""
     if not isinstance(settings, Settings):
         raise ValueError("settings must be Settings")
-    candidate = settings.state_dir
-    resolved_candidate = candidate.resolve(strict=False)
-    if resolved_candidate.is_relative_to(settings.repo_root):
+    state_dir = settings.hub_state_dir if candidate is None else candidate
+    if not isinstance(state_dir, Path) or not state_dir.is_absolute():
+        raise ValueError("state directory must be an absolute path")
+    roots = tuple(spec.repo_root for spec in settings.projects)
+    if not roots:
+        raise ValueError("settings must contain at least one project")
+    resolved_candidate = state_dir.resolve(strict=False)
+    if any(resolved_candidate.is_relative_to(root) for root in roots):
         raise ValueError("state directory must remain outside repository")
     try:
-        candidate.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if candidate.is_symlink() or not candidate.is_dir():
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if state_dir.is_symlink() or not state_dir.is_dir():
             raise ValueError("state directory must be a safe directory")
-        if candidate.resolve(strict=True).is_relative_to(settings.repo_root):
+        resolved = state_dir.resolve(strict=True)
+        if any(resolved.is_relative_to(root) for root in roots):
             raise ValueError("state directory must remain outside repository")
-        candidate.chmod(0o700)
+        state_dir.chmod(0o700)
     except ValueError:
         raise
     except OSError as error:
         raise ValueError("state directory must be a safe writable directory") from error
-    return candidate
+    return state_dir
 
 
 def select_port(
@@ -451,9 +529,12 @@ def _secure_regular_file(path: Path) -> None:
         raise ValueError("database must be a safe owner-only file") from error
 
 
-def acquire_instance_lock(state_dir: Path) -> int:
-    """Acquire the repository state's nonblocking process-lifetime lock."""
-    path = state_dir / "agent-bridge.lock"
+def acquire_instance_lock(path: Path) -> InstanceLock:
+    """Acquire one nonblocking process-lifetime lock at its explicit path."""
+    from agent_bridge.hub import InstanceLock
+
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError("instance lock path must be absolute")
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -474,7 +555,7 @@ def acquire_instance_lock(state_dir: Path) -> int:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("agent bridge is already running for this repository") from error
-        return descriptor
+        return InstanceLock(path=path, descriptor=descriptor)
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
@@ -521,6 +602,7 @@ async def _run_preflights(
     runner: object,
     fable: object,
     settings: Settings,
+    spec: ProjectSpec,
     claude_source_environment: Mapping[str, str],
     codex_child_environment: Mapping[str, str],
 ) -> _PreflightStatus:
@@ -536,7 +618,7 @@ async def _run_preflights(
                 runner=runner,
                 run_id="startup-claude-version",
                 executable=settings.claude_executable,
-                cwd=settings.repo_root,
+                cwd=spec.repo_root,
                 environment=claude_environment,
             ),
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -557,7 +639,7 @@ async def _run_preflights(
                 runner=runner,
                 run_id="startup-codex-version",
                 executable=settings.codex_executable,
-                cwd=settings.repo_root,
+                cwd=spec.repo_root,
                 environment=codex_child_environment,
             ),
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -576,6 +658,48 @@ async def _run_preflights(
     )
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _store_clock(clock: Callable[[], datetime]) -> Callable[[], str]:
+    def timestamp() -> str:
+        value = clock()
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        return value.isoformat()
+    return timestamp
+
+
+async def _fresh_fable_probe(fable: object) -> tuple[bool, str]:
+    from agent_bridge.adapters.claude_cli import SubscriptionAuthError
+
+    try:
+        await asyncio.wait_for(fable.preflight(), timeout=PREFLIGHT_TIMEOUT_SECONDS)
+    except (OSError, RuntimeError, SubscriptionAuthError, TimeoutError):
+        return False, "subscription_unavailable"
+    return True, "subscription_ready"
+
+
+async def _fresh_sol_probe(
+    *, runner: object, settings: Settings, spec: ProjectSpec, environment: Mapping[str, str],
+) -> str:
+    try:
+        version = await asyncio.wait_for(
+            _version(
+                runner=runner,
+                run_id=f"readiness-codex-version-{spec.project_id}",
+                executable=settings.codex_executable,
+                cwd=spec.repo_root,
+                environment=environment,
+            ),
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except (OSError, RuntimeError, TimeoutError):
+        return "unavailable"
+    return "ready" if version is not None else "unavailable"
+
+
 def _active_session(store: object, repo_root: Path) -> str:
     configured = store.get_setting(_ACTIVE_SESSION_SETTING)
     if isinstance(configured, str):
@@ -591,6 +715,144 @@ def _active_session(store: object, repo_root: Path) -> str:
     return session_id
 
 
+def _is_legacy_state(spec: ProjectSpec, settings: Settings) -> bool:
+    return spec.state_dir == (
+        settings.hub_state_dir.parent / _repository_slug(spec.repo_root)
+    )
+
+
+def assemble_project_runtime(
+    spec: ProjectSpec,
+    *,
+    lock: InstanceLock,
+    settings: Settings,
+    environment: Mapping[str, str],
+    ids: IdFactory,
+    clock: Callable[[], datetime],
+) -> OwnedProjectRuntime:
+    """Build one fully isolated project runtime after every lock is held."""
+    from agent_bridge.adapters.claude_cli import ClaudeCLI
+    from agent_bridge.adapters.codex_cli import CodexCLI
+    from agent_bridge.app import InMemoryEventBroadcaster
+    from agent_bridge.coordinator import Coordinator
+    from agent_bridge.hub import OwnedProjectRuntime, RuntimeReadiness, RuntimeStatus
+    from agent_bridge.process import ProcessRunner
+    from agent_bridge.repository import RepositoryTracker
+    from agent_bridge.store import SQLiteStore
+
+    if not isinstance(spec, ProjectSpec):
+        raise ValueError("spec must be a ProjectSpec")
+    if not isinstance(settings, Settings):
+        raise ValueError("settings must be Settings")
+    database_path = spec.state_dir / "bridge.sqlite3"
+    store = None
+    tracker = None
+    try:
+        _secure_regular_file(database_path)
+        artifacts = _prepare_private_directory(spec.state_dir / "artifacts")
+        schemas = _prepare_private_directory(spec.state_dir / "schemas")
+        store = SQLiteStore(
+            database_path,
+            clock=_store_clock(clock),
+            check_same_thread=False,
+        )
+        if _is_legacy_state(spec, settings):
+            store.audit_legacy_project_ownership(str(spec.repo_root))
+        store.recover_active_tasks()
+        runner = ProcessRunner()
+        codex_child_environment = codex_environment(environment)
+        fable = ClaudeCLI(
+            settings.claude_executable,
+            runner,
+            env=environment,
+            cwd=spec.repo_root,
+        )
+        sol = CodexCLI(
+            settings.codex_executable,
+            runner,
+            repo_root=spec.repo_root,
+            schema_dir=schemas,
+            env=codex_child_environment,
+        )
+        preflight = asyncio.run(_run_preflights(
+            runner=runner,
+            fable=fable,
+            settings=settings,
+            spec=spec,
+            claude_source_environment=environment,
+            codex_child_environment=codex_child_environment,
+        ))
+        readiness = RuntimeReadiness(
+            initial=RuntimeStatus(
+                preflight.fable_ready,
+                preflight.fable_status,
+                preflight.sol_status,
+            ),
+            fable_probe=lambda: _fresh_fable_probe(fable),
+            sol_probe=lambda: _fresh_sol_probe(
+                runner=runner,
+                settings=settings,
+                spec=spec,
+                environment=codex_child_environment,
+            ),
+            timeout_seconds=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+        # The bootstrap screen displays this one bounded startup snapshot;
+        # model starts always use the fresh readiness probes above.
+        readiness._startup_preflight = preflight  # type: ignore[attr-defined]
+        tracker = RepositoryTracker(
+            spec.repo_root,
+            artifacts,
+            git_executable=settings.git_executable,
+        )
+        coordinator = Coordinator(
+            store=store,
+            repository=tracker,
+            runner=runner,
+            fable=fable,
+            sol=sol,
+            ids=ids,
+            repo_root=spec.repo_root,
+            repo_context=read_repository_context(spec.repo_root),
+            trusted_shells={
+                "bash": settings.bash_executable,
+                "sh": settings.sh_executable,
+            },
+        )
+        return OwnedProjectRuntime(
+            spec=spec,
+            store=store,
+            tracker=tracker,
+            runner=runner,
+            fable=fable,
+            sol=sol,
+            coordinator=coordinator,
+            broadcaster=InMemoryEventBroadcaster(),
+            readiness=readiness,
+            lock=lock,
+        )
+    except BaseException:
+        if tracker is not None:
+            try:
+                tracker.close()
+            except BaseException:
+                pass
+        if store is not None:
+            try:
+                store.close()
+            except BaseException:
+                pass
+        raise
+
+
+def _release_locks(locks: Sequence[object]) -> None:
+    for lock in reversed(tuple(locks)):
+        try:
+            lock.release()
+        except BaseException:
+            continue
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -602,88 +864,74 @@ def main(
     environment = dict(os.environ if environ is None else environ)
     output = sys.stdout if stdout is None else stdout
     settings = parse_settings(argv, environ=environment)
-    state_dir = prepare_state_dir(settings)
-    instance_lock = acquire_instance_lock(state_dir)
+    ordered_specs = tuple(sorted(settings.projects, key=lambda spec: spec.project_id))
+    for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in ordered_specs)):
+        prepare_state_dir(settings, candidate=state_dir)
+    locks: list[object] = []
     try:
-        database_path = state_dir / "bridge.sqlite3"
-        _secure_regular_file(database_path)
-        artifacts = _prepare_private_directory(state_dir / "artifacts")
-        schemas = _prepare_private_directory(state_dir / "schemas")
-
-        # Optional web and agent dependencies stay outside module import time.
-        from agent_bridge.adapters.claude_cli import ClaudeCLI
-        from agent_bridge.adapters.codex_cli import CodexCLI
-        from agent_bridge.app import BootstrapStatus, create_app
-        from agent_bridge.coordinator import Coordinator
-        from agent_bridge.process import ProcessRunner
-        from agent_bridge.repository import RepositoryTracker
-        from agent_bridge.store import SQLiteStore
-
-        store = SQLiteStore(database_path, check_same_thread=False)
+        hub_lock = acquire_instance_lock(settings.hub_state_dir / "agent-bridge.lock")
+        locks.append(hub_lock)
+        project_locks: dict[str, object] = {}
+        for spec in ordered_specs:
+            lock = acquire_instance_lock(spec.state_dir / "agent-bridge.lock")
+            locks.append(lock)
+            project_locks[spec.project_id] = lock
     except BaseException:
-        os.close(instance_lock)
+        _release_locks(locks)
         raise
-    repository = None
+
+    hub_store = None
+    runtimes: list[object] = []
+    registry = None
+    owned_project_ids: set[str] = set()
     try:
-        store.recover_active_tasks()
-        session_id = _active_session(store, settings.repo_root)
-        runner = ProcessRunner()
-        codex_child_environment = codex_environment(environment)
-        fable = ClaudeCLI(
-            settings.claude_executable,
-            runner,
-            env=environment,
-            cwd=settings.repo_root,
+        from agent_bridge.app import BootstrapStatus, create_app
+        from agent_bridge.hub import ActiveAgentLease, HubWorkflowOrchestrator, ProjectRegistry
+        from agent_bridge.hub_store import HubStore
+
+        hub_database = settings.hub_state_dir / "hub.sqlite3"
+        _secure_regular_file(hub_database)
+        hub_store = HubStore(hub_database, clock=_now)
+        for spec in ordered_specs:
+            runtime = assemble_project_runtime(
+                spec,
+                lock=project_locks[spec.project_id],
+                settings=settings,
+                environment=environment,
+                ids=_Ids(),
+                clock=_now,
+            )
+            runtimes.append(runtime)
+            owned_project_ids.add(spec.project_id)
+        registry = ProjectRegistry(runtimes)
+        # This binds the durable account acknowledgement to the hub rather
+        # than copying the former project-local setting into any project DB.
+        HubWorkflowOrchestrator(
+            registry=registry,
+            lease=ActiveAgentLease(),
+            usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
         )
-        sol = CodexCLI(
-            settings.codex_executable,
-            runner,
-            repo_root=settings.repo_root,
-            schema_dir=schemas,
-            env=codex_child_environment,
-        )
-        preflight = asyncio.run(_run_preflights(
-            runner=runner,
-            fable=fable,
-            settings=settings,
-            claude_source_environment=environment,
-            codex_child_environment=codex_child_environment,
-        ))
-        repository = RepositoryTracker(
-            settings.repo_root,
-            artifacts,
-            git_executable=settings.git_executable,
-        )
-        coordinator = Coordinator(
-            store=store,
-            repository=repository,
-            runner=runner,
-            fable=fable,
-            sol=sol,
-            ids=_Ids(),
-            repo_root=settings.repo_root,
-            repo_context=read_repository_context(settings.repo_root),
-            trusted_shells={
-                "bash": settings.bash_executable,
-                "sh": settings.sh_executable,
-            },
-        )
+        primary = runtimes[0]
+        session_id = _active_session(primary.store, primary.spec.repo_root)
+        status_snapshot = primary.readiness.snapshot()
+        preflight = primary.readiness._startup_preflight
         status = BootstrapStatus(
             session_id=session_id,
-            fable_ready=preflight.fable_ready,
-            fable_status=preflight.fable_status,
-            sol_status=preflight.sol_status,
-            repository=str(settings.repo_root),
-            branch=settings.branch,
+            fable_ready=status_snapshot.fable_ready,
+            fable_status=status_snapshot.fable_status,
+            sol_status=status_snapshot.sol_status,
+            repository=str(primary.spec.repo_root),
+            branch=primary.spec.branch,
         )
         session_key = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
         app = create_app(
-            coordinator=coordinator,
-            store=store,
+            coordinator=primary.coordinator,
+            store=primary.store,
             static_dir=Path(__file__).resolve().parent / "static",
             session_key=session_key,
             csrf_token=csrf_token,
+            broadcaster=primary.broadcaster,
             bootstrap_status=lambda: status,
         )
         port = select_port(settings.host, settings.port)
@@ -706,8 +954,8 @@ def main(
             "sol_status": preflight.sol_status,
             "sol_version": preflight.sol_version,
             "ssh_command": ssh_command,
-            "repository": str(settings.repo_root),
-            "branch": settings.branch,
+            "repository": str(primary.spec.repo_root),
+            "branch": primary.spec.branch,
         }
         output.write(json.dumps(startup, separators=(",", ":"), sort_keys=True) + "\n")
         output.flush()
@@ -720,14 +968,30 @@ def main(
         run_server(app, host=settings.host, port=port, reload=False)
         return 0
     finally:
-        try:
-            if repository is not None:
-                repository.close()
-        finally:
+        if registry is not None:
             try:
-                store.close()
-            finally:
-                os.close(instance_lock)
+                registry.close()
+            except BaseException:
+                pass
+        else:
+            for runtime in reversed(runtimes):
+                try:
+                    runtime.close()
+                except BaseException:
+                    pass
+        if hub_store is not None:
+            try:
+                hub_store.close()
+            except BaseException:
+                pass
+        _release_locks((
+            hub_lock,
+            *(
+                project_locks[spec.project_id]
+                for spec in ordered_specs
+                if spec.project_id not in owned_project_ids
+            ),
+        ))
 
 
 if __name__ == "__main__":
