@@ -1289,6 +1289,12 @@ def test_legacy_project_ownership_audit_is_one_read_transaction(tmp_path) -> Non
 @pytest.mark.parametrize(
     "corrupt",
     (
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO sessions (session_id, repo_root, created_at) VALUES ('other-session', '/other', '2026-08-10T10:00:00Z')"
+            ),
+            id="mixed_session_roots",
+        ),
         lambda connection: connection.execute(
             "UPDATE sessions SET repo_root = '/other' WHERE session_id = 'session-1'"
         ),
@@ -1304,6 +1310,12 @@ def test_legacy_project_ownership_audit_is_one_read_transaction(tmp_path) -> Non
         lambda connection: connection.execute(
             "INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at) VALUES ('missing-session', NULL, 'user', 'message', '{}', '2026-08-10T10:03:00Z')"
         ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at) VALUES ('session-1', 'missing-task', 'user', 'message', '{}', '2026-08-10T10:03:00Z')"
+            ),
+            id="valid_session_event_with_missing_task",
+        ),
         lambda connection: connection.execute(
             "INSERT INTO agent_runs (run_id, task_id, revision, agent, started_at, status) VALUES ('orphan-run', 'missing-task', 1, 'sol', '2026-08-10T10:03:00Z', 'running')"
         ),
@@ -1312,6 +1324,24 @@ def test_legacy_project_ownership_audit_is_one_read_transaction(tmp_path) -> Non
         ),
         lambda connection: connection.execute(
             "INSERT INTO settings (key, value_json) VALUES ('agent_bridge.baseline.', '{}')"
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE settings SET value_json = 'not-json' WHERE key = 'agent_bridge.baseline.task-1.1'"
+            ),
+            id="malformed_baseline_json",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE settings SET value_json = '[]' WHERE key = 'agent_bridge.baseline.task-1.1'"
+            ),
+            id="nonobject_baseline_payload",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE settings SET value_json = '{\"task_id\":\"other-task\",\"revision\":1,\"baseline_id\":\"baseline-1\",\"manifest\":{\"baseline_id\":\"baseline-1\",\"repo_root\":\"/repo\"}}' WHERE key = 'agent_bridge.baseline.task-1.1'"
+            ),
+            id="baseline_task_mismatch",
         ),
         lambda connection: connection.execute(
             "UPDATE settings SET value_json = '{\"task_id\":\"task-1\",\"revision\":2,\"baseline_id\":\"baseline-1\",\"manifest\":{\"baseline_id\":\"baseline-1\",\"repo_root\":\"/repo\"}}' WHERE key = 'agent_bridge.baseline.task-1.1'"
@@ -1340,6 +1370,28 @@ def test_legacy_project_ownership_audit_fails_closed_for_corrupt_relationships(
     assert "/repo" not in message
     assert "session-1" not in message
     assert "task-1" not in message
+
+
+def test_legacy_project_ownership_audit_rejects_a_task_whose_first_revision_is_two(
+    tmp_path,
+) -> None:
+    path = tmp_path / "late-revision.sqlite3"
+    _seed_auditable_legacy_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        INSERT INTO tasks (task_id, revision, session_id, state, correction_count)
+        VALUES ('late-task', 2, 'session-1', 'awaiting_user_approval', 0)
+        """
+    )
+    connection.commit()
+    connection.close()
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed") as error:
+        store.audit_legacy_project_ownership("/repo")
+
+    assert "task_revision_integrity" in str(error.value)
 
 
 def test_legacy_project_ownership_audit_aggregates_generic_reasons_without_mutation(

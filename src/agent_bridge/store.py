@@ -1801,7 +1801,10 @@ class SQLiteStore:
             task_revisions.setdefault(task_id, []).append(revision)
         for revisions in task_revisions.values():
             ordered = sorted(revisions)
-            if ordered != list(range(ordered[0], ordered[-1] + 1)):
+            if (
+                ordered[0] not in {0, 1}
+                or ordered != list(range(ordered[0], ordered[-1] + 1))
+            ):
                 reasons.add("task_revision_integrity")
 
         for row in self._connection.execute("SELECT session_id, task_id FROM events"):
