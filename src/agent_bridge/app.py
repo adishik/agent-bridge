@@ -637,6 +637,11 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="approval must name the latest exact revision",
             )
+        if task.brief is None or task.brief.open_questions:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="resolve the TaskBrief open questions before approval",
+            )
         require_model_start_ready(task.session_id)
         schedule(
             coordinator.approve_task(task_id, body.revision),
