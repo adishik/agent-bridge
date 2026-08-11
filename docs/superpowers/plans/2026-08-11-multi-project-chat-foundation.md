@@ -206,6 +206,8 @@ git commit -m "feat: persist hub account settings"
 **Files:**
 - Create: `src/agent_bridge/hub.py`
 - Create: `tests/agent_bridge/test_hub.py`
+- Modify: `src/agent_bridge/coordinator.py`
+- Modify: `tests/agent_bridge/test_coordinator.py`
 
 **Interfaces:**
 
@@ -332,6 +334,7 @@ Use threads and barriers to prove only one of two acquisitions succeeds. Assert 
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_hub.py
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_user_request or run_prepared_request or abort_prepared_action"
 ```
 
 Use an in-process lock plus monotonically increasing generation. `HubWorkflowOrchestrator` is the sole lease owner. Each awaited preparation validates route identity and hub acknowledgment without starting a child, then acquires the generation-safe lease (`acquire_new` creates a task ID inside that critical section), and only while holding it calls the route-selected `RuntimeReadiness.require_model_start_ready`. Fresh Claude/Sol probes therefore count inside the one-process boundary. Probe/gate failure releases the token and performs no coordinator/store preparation. After a green gate, `prepare_new_request` calls `Coordinator.prepare_user_request(session_id, text, task_id)` synchronously while holding the lease, releases on preparation failure, and returns `PreparedWorkflow`; `run` calls `Coordinator.run_prepared_request(task_id)` and releases in `finally`. Coordinators and HTTP handlers never reacquire independently. `abort_prepared` is the only preparation-to-scheduler failure path: it calls `Coordinator.abort_prepared_action` with the exact task/revision/action and fixed reason `scheduler_unavailable`, persists an interrupted/resumable pending action, and then releases the exact token. Raw scheduling exceptions never enter persistence. Do not persist a lease as proof of a live process; startup recovery remains per-project and explicit Resume remains required.
@@ -340,7 +343,8 @@ Use an in-process lock plus monotonically increasing generation. `HubWorkflowOrc
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_projects.py tests/agent_bridge/test_hub.py
-git add src/agent_bridge/hub.py tests/agent_bridge/test_hub.py
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_user_request or run_prepared_request or abort_prepared_action"
+git add src/agent_bridge/hub.py tests/agent_bridge/test_hub.py src/agent_bridge/coordinator.py tests/agent_bridge/test_coordinator.py
 git diff --cached --check
 git commit -m "feat: isolate project runtimes behind a hub lease"
 ```
