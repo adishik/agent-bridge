@@ -17,7 +17,7 @@ from agent_bridge.coordinator import Coordinator, IdFactory
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.repository import RepositoryTracker
-from agent_bridge.store import SQLiteStore
+from agent_bridge.store import PreparedActionRecord, SQLiteStore
 
 
 _FABLE_STATUSES = frozenset({
@@ -82,9 +82,13 @@ class RuntimeReadiness:
         if usage_credits_acknowledged is not True:
             raise PermissionError("usage credits must be acknowledged")
         async with self._refresh_lock:
+            probes = (
+                asyncio.create_task(self._fable_probe()),
+                asyncio.create_task(self._sol_probe()),
+            )
             try:
                 fable_result, sol_status = await asyncio.wait_for(
-                    asyncio.gather(self._fable_probe(), self._sol_probe()),
+                    asyncio.gather(*probes),
                     timeout=self._timeout_seconds,
                 )
                 if (
@@ -97,6 +101,10 @@ class RuntimeReadiness:
                     raise ValueError("provider probes returned an invalid status")
                 status = RuntimeStatus(fable_result[0], fable_result[1], sol_status)
             except BaseException as error:
+                for probe in probes:
+                    if not probe.done():
+                        probe.cancel()
+                await asyncio.gather(*probes, return_exceptions=True)
                 self._status = RuntimeStatus(
                     False, "subscription_unavailable", "unavailable"
                 )
@@ -316,12 +324,8 @@ class ProjectRegistry:
 
 @dataclass(frozen=True, slots=True)
 class PreparedWorkflow:
+    preparation_id: str
     token: LeaseToken
-    project_id: str
-    session_id: str
-    task_id: str
-    revision: int
-    action: str
 
 
 class HubWorkflowOrchestrator:
@@ -364,23 +368,14 @@ class HubWorkflowOrchestrator:
             await runtime.readiness.require_model_start_ready(
                 usage_credits_acknowledged=True
             )
-            task = runtime.coordinator.prepare_user_request(
-                session_id, text, token.task_id
-            )
-            if (
-                task.task_id != token.task_id
-                or task.session_id != session_id
-                or task.revision != 0
-            ):
-                raise RuntimeError("prepared task does not match the active lease")
-            return PreparedWorkflow(
-                token=token,
-                project_id=project_id,
+            record = runtime.coordinator.prepare_new_request(
                 session_id=session_id,
                 task_id=token.task_id,
-                revision=task.revision,
-                action="new_request",
+                text=text,
+                generation=token.generation,
             )
+            record = self._bound_record(runtime, record.preparation_id, token)
+            return PreparedWorkflow(preparation_id=record.preparation_id, token=token)
         except BaseException:
             self._lease.release(token)
             raise
@@ -396,41 +391,76 @@ class HubWorkflowOrchestrator:
     ) -> PreparedWorkflow:
         self._require_non_empty(task_id, "task_id")
         self._require_non_negative_integer(revision, "revision")
-        self._require_non_empty(action, "action")
-        runtime = self._runtime_for_session(project_id, session_id)
-        task = runtime.store.get_task(task_id, revision)
-        if task.session_id != session_id:
-            raise LookupError("task not found")
-        self._require_acknowledgement()
-        token = self._lease.acquire(
+        if action == "approval":
+            return await self.prepare_approval(
+                project_id=project_id, session_id=session_id,
+                task_id=task_id, revision=revision,
+            )
+        if action == "resume":
+            return await self.prepare_resume(
+                project_id=project_id, session_id=session_id,
+                task_id=task_id, revision=revision,
+            )
+        if action == "answer":
+            return await self.prepare_answer(
+                project_id=project_id, session_id=session_id,
+                task_id=task_id, revision=revision, answer="Continue.",
+            )
+        raise ValueError("action is invalid")
+
+    async def prepare_approval(
+        self, *, project_id: str, session_id: str, task_id: str, revision: int,
+    ) -> PreparedWorkflow:
+        return await self._prepare_existing(
             project_id=project_id, session_id=session_id, task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator.prepare_approval(
+                session_id=session_id, task_id=task_id, revision=revision,
+                generation=token.generation,
+            ),
         )
-        try:
-            await runtime.readiness.require_model_start_ready(
-                usage_credits_acknowledged=True
-            )
-            return PreparedWorkflow(
-                token=token,
-                project_id=project_id,
-                session_id=session_id,
-                task_id=task_id,
-                revision=revision,
-                action=action,
-            )
-        except BaseException:
-            self._lease.release(token)
-            raise
+
+    async def prepare_answer(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        answer: str,
+    ) -> PreparedWorkflow:
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("answer must be non-empty")
+        return await self._prepare_existing(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator.prepare_answer(
+                session_id=session_id, task_id=task_id, revision=revision,
+                answer=answer, generation=token.generation,
+            ),
+        )
+
+    async def prepare_resume(
+        self, *, project_id: str, session_id: str, task_id: str, revision: int,
+    ) -> PreparedWorkflow:
+        return await self._prepare_existing(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator.prepare_resume(
+                session_id=session_id, task_id=task_id, revision=revision,
+                generation=token.generation,
+            ),
+        )
 
     async def run(self, prepared: PreparedWorkflow) -> None:
         if not isinstance(prepared, PreparedWorkflow):
             raise ValueError("prepared must be a PreparedWorkflow")
         if self._lease.snapshot() != prepared.token:
             raise RuntimeError("prepared workflow no longer owns the active lease")
+        runtime = self._registry.runtime(prepared.token.project_id)
+        self._bound_record(runtime, prepared.preparation_id, prepared.token)
         try:
-            runtime = self._runtime_for_session(
-                prepared.project_id, prepared.session_id
-            )
-            await runtime.coordinator.run_prepared_request(prepared.task_id)
+            await runtime.coordinator.run_prepared_action(prepared.preparation_id)
         finally:
             self._lease.release(prepared.token)
 
@@ -440,21 +470,16 @@ class HubWorkflowOrchestrator:
         if prepared.token in self._aborted_tokens:
             return
         if self._lease.snapshot() != prepared.token:
-            self._aborted_tokens.add(prepared.token)
-            return
-        try:
-            runtime = self._runtime_for_session(
-                prepared.project_id, prepared.session_id
-            )
-            runtime.coordinator.abort_prepared_action(
-                prepared.task_id,
-                prepared.revision,
-                prepared.action,
-                _SCHEDULER_UNAVAILABLE,
-            )
-        finally:
-            self._aborted_tokens.add(prepared.token)
-            self._lease.release(prepared.token)
+            raise RuntimeError("prepared workflow no longer owns the active lease")
+        runtime = self._registry.runtime(prepared.token.project_id)
+        self._bound_record(runtime, prepared.preparation_id, prepared.token)
+        runtime.coordinator.abort_prepared_action(
+            prepared.preparation_id,
+            generation=prepared.token.generation,
+            reason=_SCHEDULER_UNAVAILABLE,
+        )
+        self._aborted_tokens.add(prepared.token)
+        self._lease.release(prepared.token)
 
     async def stop(
         self, *, project_id: str, session_id: str, task_id: str,
@@ -469,7 +494,81 @@ class HubWorkflowOrchestrator:
             or token.task_id != task_id
         ):
             raise RuntimeError("stop requires the exact active workflow")
-        await runtime.coordinator.stop_task(task_id)
+        stopping = asyncio.create_task(runtime.coordinator.stop_task(task_id))
+        try:
+            # ``stop_task`` persists the interrupted task before it waits for
+            # the child.  Let it reach that durable boundary, then record the
+            # exact claim as stopped before the child completion can look like
+            # a normal prepared-action completion.
+            await asyncio.sleep(0)
+            latest = runtime.store.latest_task(task_id)
+            if latest is not None:
+                record = runtime.store.latest_prepared_action_for_task(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=latest.revision,
+                )
+                if (
+                    record is not None
+                    and record.status == "CLAIMED"
+                    and record.generation == token.generation
+                ):
+                    runtime.coordinator.interrupt_claimed_prepared_action(
+                        record.preparation_id, generation=token.generation, reason="stop",
+                    )
+            await stopping
+        except BaseException:
+            if not stopping.done():
+                stopping.cancel()
+                await asyncio.gather(stopping, return_exceptions=True)
+            raise
+
+    async def _prepare_existing(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        prepare: Callable[[AppProjectRuntime, LeaseToken], PreparedActionRecord],
+    ) -> PreparedWorkflow:
+        self._require_non_empty(task_id, "task_id")
+        self._require_non_negative_integer(revision, "revision")
+        runtime = self._runtime_for_session(project_id, session_id)
+        task = runtime.store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise LookupError("task not found")
+        self._require_acknowledgement()
+        token = self._lease.acquire(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
+        try:
+            await runtime.readiness.require_model_start_ready(
+                usage_credits_acknowledged=True
+            )
+            record = prepare(runtime, token)
+            record = self._bound_record(runtime, record.preparation_id, token)
+            return PreparedWorkflow(preparation_id=record.preparation_id, token=token)
+        except BaseException:
+            self._lease.release(token)
+            raise
+
+    @staticmethod
+    def _bound_record(
+        runtime: AppProjectRuntime, preparation_id: str, token: LeaseToken,
+    ) -> PreparedActionRecord:
+        record = runtime.store.prepared_action(preparation_id)
+        if record is None:
+            raise RuntimeError("prepared action not found")
+        if (
+            record.project_id != token.project_id
+            or record.session_id != token.session_id
+            or record.task_id != token.task_id
+            or record.generation != token.generation
+        ):
+            raise RuntimeError("prepared action does not match the active lease")
+        return record
 
     def _runtime_for_session(
         self, project_id: str, session_id: str,

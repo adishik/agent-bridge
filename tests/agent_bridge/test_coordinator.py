@@ -25,7 +25,7 @@ from agent_bridge.coordinator import Coordinator
 from agent_bridge.process import ProcessRunner
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import SQLiteStore
+from agent_bridge.store import NewRequestPayload, SQLiteStore
 
 
 THREAD_ID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
@@ -2467,9 +2467,99 @@ def test_abort_prepared_action_persists_the_exact_resumable_scheduler_failure(
 
     assert interrupted.state is TaskState.INTERRUPTED
     assert interrupted.continuation_state is TaskState.FABLE_PLANNING
+    prepared = harness.store.latest_prepared_action_for_task(
+        project_id=harness.coordinator.project_id,
+        session_id="session-1",
+        task_id="prepared-task",
+        revision=0,
+    )
+    assert prepared is not None
+    assert prepared.status == "ABORTED"
     assert dict(interrupted.pending or {}) == {
-        "action": "new_request",
-        "reason": "scheduler_unavailable",
+        "prepared_action": {
+            "preparation_id": prepared.preparation_id,
+            "action": "new_request",
+            "reason": "scheduler_unavailable",
+            "context": None,
+        },
     }
     assert repeated == interrupted
     assert harness.fable.plan_calls == []
+
+
+def test_prepare_new_request_creates_a_durable_action_with_derived_project_identity(
+    harness,
+) -> None:
+    prepared = harness.coordinator.prepare_new_request(
+        session_id="session-1",
+        task_id="prepared-task",
+        text="Build the bridge",
+        generation=1,
+    )
+
+    assert prepared.payload == NewRequestPayload(text="Build the bridge")
+    assert prepared.project_id == harness.coordinator.project_id
+    assert harness.fable.plan_calls == []
+
+
+def test_run_prepared_action_persists_only_a_fixed_failure_category(
+    harness, monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        prepared = harness.coordinator.prepare_new_request(
+            session_id="session-1",
+            task_id="prepared-task",
+            text="Build the bridge",
+            generation=9,
+        )
+        secret = "raw-provider-output:/private/command --token never-persist-this"
+
+        async def fail_after_claim(*args: object, **kwargs: object) -> None:
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(harness.coordinator, "_run_planning", fail_after_claim)
+        outcome = await harness.coordinator.run_prepared_action(prepared.preparation_id)
+
+        persisted = harness.store.prepared_action(prepared.preparation_id)
+        assert outcome.category == "nonresumable_failure"
+        assert persisted is not None
+        assert persisted.status == "FAILED"
+        assert persisted.reason == "nonresumable_failure"
+        assert secret not in repr(persisted)
+        assert secret not in repr(harness.store.events_after("session-1", 0))
+        assert secret not in repr(harness.store.get_task("prepared-task", 0).pending)
+
+    asyncio.run(scenario())
+
+
+def test_interrupt_claimed_prepared_action_never_completes_an_interrupted_child(harness) -> None:
+    async def scenario() -> None:
+        release = asyncio.Event()
+        harness.fable.hold_plan = release
+        harness.runner.release_on_stop = release
+        prepared = harness.coordinator.prepare_new_request(
+            session_id="session-1",
+            task_id="prepared-task",
+            text="Build the bridge",
+            generation=10,
+        )
+        running = asyncio.create_task(
+            harness.coordinator.run_prepared_action(prepared.preparation_id)
+        )
+        while harness.store.active_run_for_task("prepared-task", 0) is None:
+            await asyncio.sleep(0)
+
+        await harness.coordinator.stop_task("prepared-task")
+        outcome = await running
+        terminal = harness.store.prepared_action(prepared.preparation_id)
+
+        assert outcome.category == "adapter_interrupted"
+        assert terminal is not None
+        assert terminal.status == "INTERRUPTED"
+        assert terminal.reason == "adapter_interrupted"
+        interrupted = harness.store.get_task("prepared-task", 0)
+        assert interrupted.state is TaskState.INTERRUPTED
+        assert interrupted.pending is not None
+        assert interrupted.pending["prepared_action"]["preparation_id"] == prepared.preparation_id
+
+    asyncio.run(scenario())

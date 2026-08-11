@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import threading
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 from agent_bridge.contracts import JsonValue, StreamEvent, TaskBrief, freeze_json
+from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState, require_transition
 
 
@@ -42,6 +44,19 @@ _NEW_CHAT_TITLE = "New chat"
 _ACTIVE_SESSION_SETTING = "agent_bridge.active_session_id"
 _BASELINE_SETTING_PREFIX = "agent_bridge.baseline."
 _MAX_LEGACY_AUDIT_REASONS = 8
+_MAX_PREPARED_TEXT_LENGTH = 16 * 1024
+_MAX_RESUME_DRIFT_SUMMARY_LENGTH = 1024
+_MAX_PREPARATION_ID_ATTEMPTS = 8
+_PREPARED_ACTION_KINDS = frozenset({"new_request", "approval", "answer", "resume"})
+_PREPARED_ACTION_STATUSES = frozenset({
+    "PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
+})
+_SAFE_PREPARED_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+PreparedActionKind: TypeAlias = Literal["new_request", "approval", "answer", "resume"]
+PreparedActionFailureReason: TypeAlias = Literal["nonresumable_failure"]
+PreparedActionInterruptionReason: TypeAlias = Literal["stop", "adapter_interrupted"]
+COMPATIBILITY_PREPARATION_GENERATION = 0
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,505 @@ class TaskRecord:
     correction_count: int
     continuation_state: TaskState | None
     pending: Mapping[str, JsonValue] | None
+
+
+def _prepared_text(value: object, name: str) -> str:
+    text = _require_string(value, name)
+    if len(text) > _MAX_PREPARED_TEXT_LENGTH:
+        raise ValueError(f"{name} is too long")
+    return text
+
+
+def _prepared_identifier(value: object, name: str) -> str:
+    identifier = _require_string(value, name)
+    if _SAFE_PREPARED_IDENTIFIER.fullmatch(identifier) is None:
+        raise ValueError(f"{name} must be a safe identifier")
+    return identifier
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedActionOutcome:
+    category: Literal["completed", "stop", "adapter_interrupted", "nonresumable_failure"]
+
+    def __post_init__(self) -> None:
+        if self.category not in {
+            "completed", "stop", "adapter_interrupted", "nonresumable_failure",
+        }:
+            raise ValueError("prepared action outcome category is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class NewRequestPayload:
+    text: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", _prepared_text(self.text, "text"))
+
+
+@dataclass(frozen=True, slots=True)
+class SolResumeContext:
+    sol_thread_id: str
+    sol_run_id: str
+    prompt: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sol_thread_id", _prepared_identifier(self.sol_thread_id, "sol_thread_id"))
+        object.__setattr__(self, "sol_run_id", _prepared_identifier(self.sol_run_id, "sol_run_id"))
+        object.__setattr__(self, "prompt", _prepared_text(self.prompt, "prompt"))
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeApprovalContext:
+    baseline_id: str
+    approved_revision: int
+    underlying_continuation: SolResumeContext | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "baseline_id", _prepared_identifier(self.baseline_id, "baseline_id"))
+        revision = _require_integer(self.approved_revision, "approved_revision")
+        if revision < 1:
+            raise ValueError("approved_revision must be positive")
+        object.__setattr__(self, "approved_revision", revision)
+        if self.underlying_continuation is not None and not isinstance(
+            self.underlying_continuation, SolResumeContext
+        ):
+            raise ValueError("scope underlying continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineSetting:
+    key: str
+    value_json: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key", _prepared_identifier(self.key, "key"))
+        value_json = _prepared_text(self.value_json, "value_json")
+        try:
+            decoded = json.loads(value_json)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("value_json must be canonical JSON") from error
+        if not isinstance(decoded, Mapping):
+            raise ValueError("value_json must encode an object")
+        canonical = json.dumps(decoded, separators=(",", ":"), sort_keys=True)
+        if canonical != value_json:
+            raise ValueError("value_json must be canonical JSON")
+        object.__setattr__(self, "value_json", value_json)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewContext:
+    fable_session_id: str
+    review_prompt: str
+    completion_allowed: bool
+    underlying_continuation: ScopeApprovalContext | SolResumeContext
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fable_session_id", _prepared_identifier(self.fable_session_id, "fable_session_id"))
+        object.__setattr__(self, "review_prompt", _prepared_text(self.review_prompt, "review_prompt"))
+        if not isinstance(self.completion_allowed, bool):
+            raise ValueError("completion_allowed must be a bool")
+        if not isinstance(self.underlying_continuation, (ScopeApprovalContext, SolResumeContext)):
+            raise ValueError("review underlying continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ClarificationContext:
+    fable_session_id: str
+    clarification_prompt: str
+    underlying_continuation: ScopeApprovalContext | SolResumeContext
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fable_session_id", _prepared_identifier(self.fable_session_id, "fable_session_id"))
+        object.__setattr__(self, "clarification_prompt", _prepared_text(self.clarification_prompt, "clarification_prompt"))
+        if not isinstance(self.underlying_continuation, (ScopeApprovalContext, SolResumeContext)):
+            raise ValueError("clarification underlying continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerContext:
+    answer: str
+    underlying_continuation: "PreparedContinuationContext"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "answer", _prepared_text(self.answer, "answer"))
+        if self.underlying_continuation is not None and not isinstance(
+            self.underlying_continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext),
+        ):
+            raise ValueError("answer underlying continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeDriftProjection:
+    status: Literal["unchanged", "drifted"]
+    summary: str
+    evidence_hashes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.status not in {"unchanged", "drifted"}:
+            raise ValueError("resume drift status is invalid")
+        summary = _prepared_text(self.summary, "summary")
+        if (
+            len(summary) > _MAX_RESUME_DRIFT_SUMMARY_LENGTH
+            or "/" in summary
+            or "\\" in summary
+            or any(ord(character) < 32 for character in summary)
+        ):
+            raise ValueError("resume drift summary is not safe")
+        object.__setattr__(self, "summary", summary)
+        hashes = tuple(self.evidence_hashes)
+        if len(hashes) > 64 or not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in hashes
+        ):
+            raise ValueError("resume drift evidence hashes are invalid")
+        object.__setattr__(self, "evidence_hashes", hashes)
+
+
+PreparedContinuationContext: TypeAlias = (
+    ScopeApprovalContext
+    | ReviewContext
+    | ClarificationContext
+    | SolResumeContext
+    | AnswerContext
+    | None
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalPayload:
+    baseline_id: str
+    baseline_setting: BaselineSetting | None
+    scope: ScopeApprovalContext | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "baseline_id", _prepared_identifier(self.baseline_id, "baseline_id"))
+        if self.baseline_setting is not None and not isinstance(self.baseline_setting, BaselineSetting):
+            raise ValueError("baseline_setting is invalid")
+        if self.scope is not None and not isinstance(self.scope, ScopeApprovalContext):
+            raise ValueError("scope is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerPayload:
+    answer: str
+    continuation: PreparedContinuationContext
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "answer", _prepared_text(self.answer, "answer"))
+        if self.continuation is not None and not isinstance(
+            self.continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext, AnswerContext),
+        ):
+            raise ValueError("answer continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ResumePayload:
+    continuation: PreparedContinuationContext
+    drift_event: ResumeDriftProjection
+
+    def __post_init__(self) -> None:
+        if self.continuation is not None and not isinstance(
+            self.continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext, AnswerContext),
+        ):
+            raise ValueError("resume continuation is invalid")
+        if not isinstance(self.drift_event, ResumeDriftProjection):
+            raise ValueError("drift_event is invalid")
+
+
+PreparedActionPayload: TypeAlias = NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedActionRecord:
+    preparation_id: str
+    project_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    action: PreparedActionKind
+    payload: PreparedActionPayload
+    source_state: TaskState
+    active_state: TaskState
+    continuation_state: TaskState | None
+    pending_context: PreparedContinuationContext
+    previous_preparation_id: str | None
+    status: Literal["PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED"]
+    reason: str | None
+    generation: int
+
+    def __post_init__(self) -> None:
+        for name in ("preparation_id", "project_id", "session_id", "task_id"):
+            object.__setattr__(self, name, _prepared_identifier(getattr(self, name), name))
+        revision = _require_integer(self.revision, "revision")
+        generation = _require_integer(self.generation, "generation")
+        if revision < 0 or generation < 0:
+            raise ValueError("revision and generation must be non-negative")
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "generation", generation)
+        if self.action not in _PREPARED_ACTION_KINDS:
+            raise ValueError("prepared action kind is invalid")
+        payload_types = {
+            "new_request": NewRequestPayload,
+            "approval": ApprovalPayload,
+            "answer": AnswerPayload,
+            "resume": ResumePayload,
+        }
+        if not isinstance(self.payload, payload_types[self.action]):
+            raise ValueError("prepared action payload does not match action")
+        if not isinstance(self.source_state, TaskState) or not isinstance(self.active_state, TaskState):
+            raise ValueError("prepared action states are invalid")
+        if self.continuation_state is not None and not isinstance(self.continuation_state, TaskState):
+            raise ValueError("prepared continuation state is invalid")
+        if self.pending_context is not None and not isinstance(
+            self.pending_context,
+            (
+                ScopeApprovalContext,
+                ReviewContext,
+                ClarificationContext,
+                SolResumeContext,
+                AnswerContext,
+            ),
+        ):
+            raise ValueError("prepared pending context is invalid")
+        if self.action == "new_request":
+            expected_context = None
+        elif self.action == "approval":
+            expected_context = self.payload.scope
+        else:
+            expected_context = self.payload.continuation
+        if self.pending_context != expected_context:
+            raise ValueError("prepared action context does not match its payload")
+        if self.previous_preparation_id is not None:
+            object.__setattr__(self, "previous_preparation_id", _prepared_identifier(self.previous_preparation_id, "previous_preparation_id"))
+        if self.status not in _PREPARED_ACTION_STATUSES:
+            raise ValueError("prepared action status is invalid")
+        if self.reason is not None:
+            object.__setattr__(self, "reason", _prepared_text(self.reason, "reason"))
+        if self.status in {"PREPARED", "CLAIMED", "COMPLETED", "RECOVERED"}:
+            if self.reason is not None:
+                raise ValueError("prepared action status must not have a reason")
+        elif self.status == "FAILED" and self.reason != "nonresumable_failure":
+            raise ValueError("failed prepared action reason is invalid")
+        elif self.status == "INTERRUPTED" and self.reason not in {
+            "stop", "adapter_interrupted",
+        }:
+            raise ValueError("interrupted prepared action reason is invalid")
+        elif self.status == "ABORTED" and self.reason is None:
+            raise ValueError("aborted prepared action reason is required")
+
+
+def _context_to_data(
+    context: PreparedContinuationContext, *, depth: int = 0,
+) -> dict[str, object] | None:
+    if depth > 8:
+        raise ValueError("prepared continuation nesting is too deep")
+    if context is None:
+        return None
+    if isinstance(context, SolResumeContext):
+        return {
+            "kind": "sol_resume",
+            "sol_thread_id": context.sol_thread_id,
+            "sol_run_id": context.sol_run_id,
+            "prompt": context.prompt,
+        }
+    if isinstance(context, ScopeApprovalContext):
+        return {
+            "kind": "scope_approval",
+            "baseline_id": context.baseline_id,
+            "approved_revision": context.approved_revision,
+            "underlying_continuation": _context_to_data(
+                context.underlying_continuation, depth=depth + 1
+            ),
+        }
+    if isinstance(context, ReviewContext):
+        return {
+            "kind": "review",
+            "fable_session_id": context.fable_session_id,
+            "review_prompt": context.review_prompt,
+            "completion_allowed": context.completion_allowed,
+            "underlying_continuation": _context_to_data(
+                context.underlying_continuation, depth=depth + 1
+            ),
+        }
+    if isinstance(context, ClarificationContext):
+        return {
+            "kind": "clarification",
+            "fable_session_id": context.fable_session_id,
+            "clarification_prompt": context.clarification_prompt,
+            "underlying_continuation": _context_to_data(
+                context.underlying_continuation, depth=depth + 1
+            ),
+        }
+    if isinstance(context, AnswerContext):
+        return {
+            "kind": "answer",
+            "answer": context.answer,
+            "underlying_continuation": _context_to_data(
+                context.underlying_continuation, depth=depth + 1
+            ),
+        }
+    raise ValueError("prepared continuation is invalid")
+
+
+def _context_from_data(
+    value: object, *, depth: int = 0,
+) -> PreparedContinuationContext:
+    if depth > 8:
+        raise RuntimeError("persisted prepared continuation is too deep")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise RuntimeError("persisted prepared continuation is invalid")
+    kind = value.get("kind")
+    try:
+        if kind == "sol_resume" and set(value) == {
+            "kind", "sol_thread_id", "sol_run_id", "prompt",
+        }:
+            return SolResumeContext(
+                sol_thread_id=value["sol_thread_id"],
+                sol_run_id=value["sol_run_id"],
+                prompt=value["prompt"],
+            )
+        if kind == "scope_approval" and set(value) == {
+            "kind", "baseline_id", "approved_revision", "underlying_continuation",
+        }:
+            underlying = _context_from_data(
+                value["underlying_continuation"], depth=depth + 1
+            )
+            if underlying is not None and not isinstance(underlying, SolResumeContext):
+                raise ValueError("scope continuation is invalid")
+            return ScopeApprovalContext(
+                baseline_id=value["baseline_id"],
+                approved_revision=value["approved_revision"],
+                underlying_continuation=underlying,
+            )
+        if kind == "review" and set(value) == {
+            "kind", "fable_session_id", "review_prompt", "completion_allowed", "underlying_continuation",
+        }:
+            underlying = _context_from_data(
+                value["underlying_continuation"], depth=depth + 1
+            )
+            if not isinstance(underlying, (ScopeApprovalContext, SolResumeContext)):
+                raise ValueError("review continuation is invalid")
+            return ReviewContext(
+                fable_session_id=value["fable_session_id"],
+                review_prompt=value["review_prompt"],
+                completion_allowed=value["completion_allowed"],
+                underlying_continuation=underlying,
+            )
+        if kind == "clarification" and set(value) == {
+            "kind", "fable_session_id", "clarification_prompt", "underlying_continuation",
+        }:
+            underlying = _context_from_data(
+                value["underlying_continuation"], depth=depth + 1
+            )
+            if not isinstance(underlying, (ScopeApprovalContext, SolResumeContext)):
+                raise ValueError("clarification continuation is invalid")
+            return ClarificationContext(
+                fable_session_id=value["fable_session_id"],
+                clarification_prompt=value["clarification_prompt"],
+                underlying_continuation=underlying,
+            )
+        if kind == "answer" and set(value) == {
+            "kind", "answer", "underlying_continuation",
+        }:
+            return AnswerContext(
+                answer=value["answer"],
+                underlying_continuation=_context_from_data(
+                    value["underlying_continuation"], depth=depth + 1
+                ),
+            )
+    except ValueError as error:
+        raise RuntimeError("persisted prepared continuation is invalid") from error
+    raise RuntimeError("persisted prepared continuation is invalid")
+
+
+def _payload_to_data(payload: PreparedActionPayload) -> dict[str, object]:
+    if isinstance(payload, NewRequestPayload):
+        return {"kind": "new_request", "text": payload.text}
+    if isinstance(payload, ApprovalPayload):
+        return {
+            "kind": "approval",
+            "baseline_id": payload.baseline_id,
+            "baseline_setting": None if payload.baseline_setting is None else {
+                "key": payload.baseline_setting.key,
+                "value_json": payload.baseline_setting.value_json,
+            },
+            "scope": _context_to_data(payload.scope),
+        }
+    if isinstance(payload, AnswerPayload):
+        return {
+            "kind": "answer",
+            "answer": payload.answer,
+            "continuation": _context_to_data(payload.continuation),
+        }
+    if isinstance(payload, ResumePayload):
+        return {
+            "kind": "resume",
+            "continuation": _context_to_data(payload.continuation),
+            "drift_event": {
+                "status": payload.drift_event.status,
+                "summary": payload.drift_event.summary,
+                "evidence_hashes": list(payload.drift_event.evidence_hashes),
+            },
+        }
+    raise ValueError("prepared action payload is invalid")
+
+
+def _payload_from_data(value: object) -> PreparedActionPayload:
+    if not isinstance(value, Mapping):
+        raise RuntimeError("persisted prepared payload is invalid")
+    kind = value.get("kind")
+    try:
+        if kind == "new_request" and set(value) == {"kind", "text"}:
+            return NewRequestPayload(text=value["text"])
+        if kind == "approval" and set(value) == {
+            "kind", "baseline_id", "baseline_setting", "scope",
+        }:
+            raw_setting = value["baseline_setting"]
+            if raw_setting is None:
+                setting = None
+            elif isinstance(raw_setting, Mapping) and set(raw_setting) == {"key", "value_json"}:
+                setting = BaselineSetting(
+                    key=raw_setting["key"], value_json=raw_setting["value_json"]
+                )
+            else:
+                raise ValueError("baseline setting is invalid")
+            scope = _context_from_data(value["scope"])
+            if scope is not None and not isinstance(scope, ScopeApprovalContext):
+                raise ValueError("scope context is invalid")
+            return ApprovalPayload(
+                baseline_id=value["baseline_id"], baseline_setting=setting, scope=scope,
+            )
+        if kind == "answer" and set(value) == {"kind", "answer", "continuation"}:
+            return AnswerPayload(
+                answer=value["answer"],
+                continuation=_context_from_data(value["continuation"]),
+            )
+        if kind == "resume" and set(value) == {
+            "kind", "continuation", "drift_event",
+        }:
+            drift = value["drift_event"]
+            if not isinstance(drift, Mapping) or set(drift) != {
+                "status", "summary", "evidence_hashes",
+            }:
+                raise ValueError("resume drift event is invalid")
+            hashes = drift["evidence_hashes"]
+            if not isinstance(hashes, (list, tuple)):
+                raise ValueError("resume drift evidence hashes are invalid")
+            return ResumePayload(
+                continuation=_context_from_data(value["continuation"]),
+                drift_event=ResumeDriftProjection(
+                    status=drift["status"], summary=drift["summary"],
+                    evidence_hashes=tuple(hashes),
+                ),
+            )
+    except ValueError as error:
+        raise RuntimeError("persisted prepared payload is invalid") from error
+    raise RuntimeError("persisted prepared payload is invalid")
 
 
 @dataclass(frozen=True)
@@ -247,6 +761,26 @@ _MIGRATION_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS prepared_actions (
+        preparation_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        source_state TEXT NOT NULL,
+        active_state TEXT NOT NULL,
+        continuation_state TEXT,
+        pending_context_json TEXT,
+        previous_preparation_id TEXT,
+        status TEXT NOT NULL,
+        reason TEXT,
+        generation INTEGER NOT NULL,
+        FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+    )
+    """,
+    """
     CREATE UNIQUE INDEX IF NOT EXISTS one_running_agent_run_per_task_revision
     ON agent_runs (task_id, revision)
     WHERE status = 'running'
@@ -266,6 +800,10 @@ _MIGRATION_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS events_session_sequence_desc
     ON events (session_id, sequence DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS prepared_actions_identity
+    ON prepared_actions (project_id, session_id, task_id, revision, status)
     """,
 )
 
@@ -565,6 +1103,708 @@ class SQLiteStore:
         if row is None:
             raise RuntimeError("task record not found")
         return self._task_from_row(row)
+
+    def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM prepared_actions WHERE preparation_id = ?",
+            (_prepared_identifier(preparation_id, "preparation_id"),),
+        ).fetchone()
+        return None if row is None else self._prepared_action_from_row(row)
+
+    def latest_prepared_action_for_task(
+        self, *, project_id: str, session_id: str, task_id: str, revision: int,
+    ) -> PreparedActionRecord | None:
+        project_id, session_id, task_id, revision, _ = self._prepared_identity(
+            project_id, session_id, task_id, revision, 0
+        )
+        row = self._connection.execute(
+            """
+            SELECT * FROM prepared_actions
+            WHERE project_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (project_id, session_id, task_id, revision),
+        ).fetchone()
+        return None if row is None else self._prepared_action_from_row(row)
+
+    def prepare_new_request_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        generation: int,
+        payload: NewRequestPayload,
+    ) -> PreparedActionRecord:
+        project_id, session_id, task_id, _, generation = self._prepared_identity(
+            project_id, session_id, task_id, 0, generation
+        )
+        if generation < 0 or not isinstance(payload, NewRequestPayload):
+            raise ValueError("new request preparation is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                if not self.session_exists(session_id):
+                    raise RuntimeError("prepared action session not found")
+                self._verify_prepared_project_identity(project_id, session_id)
+                self._connection.execute(
+                    """
+                    INSERT INTO tasks (task_id, revision, session_id, state, brief_json)
+                    VALUES (?, 0, ?, ?, NULL)
+                    """,
+                    (task_id, session_id, TaskState.FABLE_PLANNING.value),
+                )
+                emitted.append(self._insert_event_in_transaction(
+                    session_id, task_id, "user", "message", {"text": payload.text}
+                ))
+                record = self._insert_prepared_action(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=0,
+                    action="new_request",
+                    payload=payload,
+                    source_state=TaskState.FABLE_PLANNING,
+                    active_state=TaskState.FABLE_PLANNING,
+                    continuation_state=None,
+                    pending_context=None,
+                    previous_preparation_id=None,
+                    generation=generation,
+                )
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_approval_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: ApprovalPayload,
+    ) -> PreparedActionRecord:
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation
+        )
+        if not isinstance(payload, ApprovalPayload):
+            raise ValueError("approval preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                if task.state not in {
+                    TaskState.AWAITING_USER_APPROVAL,
+                    TaskState.AWAITING_SCOPE_APPROVAL,
+                } or task.brief is None or task.brief.open_questions:
+                    raise RuntimeError("task is not eligible for prepared approval")
+                if task.state is TaskState.AWAITING_SCOPE_APPROVAL:
+                    if payload.scope is None or task.continuation_state is None:
+                        raise RuntimeError("prepared scope approval has no continuation")
+                    active = task.continuation_state
+                else:
+                    if payload.scope is not None or task.continuation_state is not None:
+                        raise RuntimeError("prepared approval has unexpected continuation")
+                    active = TaskState.SOL_RUNNING
+                require_transition(task.state, active)
+                if payload.baseline_setting is not None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO settings (key, value_json) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+                        """,
+                        (payload.baseline_setting.key, payload.baseline_setting.value_json),
+                    )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET approved_at = ?, baseline_id = ?, state = ?,
+                        continuation_state = NULL, pending_json = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM tasks AS newer
+                        WHERE newer.task_id = ? AND newer.revision > ?
+                      )
+                    """,
+                    (
+                        self._timestamp(), payload.baseline_id, active.value,
+                        task_id, revision, session_id, task.state.value, task_id, revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("prepared approval changed concurrently")
+                emitted.append(self._insert_event_in_transaction(
+                    session_id, task_id, "coordinator", "task_state",
+                    {"state": active.value, "revision": revision},
+                ))
+                record = self._insert_prepared_action(
+                    project_id=project_id, session_id=session_id, task_id=task_id,
+                    revision=revision, action="approval", payload=payload,
+                    source_state=task.state, active_state=active,
+                    continuation_state=task.continuation_state, pending_context=payload.scope,
+                    previous_preparation_id=None, generation=generation,
+                )
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_answer_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: AnswerPayload,
+    ) -> PreparedActionRecord:
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation
+        )
+        if not isinstance(payload, AnswerPayload):
+            raise ValueError("answer preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                if task.state is not TaskState.AWAITING_USER_INPUT:
+                    raise RuntimeError("task is not eligible for prepared answer")
+                if task.continuation_state is None:
+                    raise RuntimeError("prepared answer has no continuation")
+                active = task.continuation_state
+                require_transition(task.state, active)
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = NULL, pending_json = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                    """,
+                    (active.value, task_id, revision, session_id, task.state.value),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("prepared answer changed concurrently")
+                emitted.append(self._insert_event_in_transaction(
+                    session_id, task_id, "user", "message", {"text": payload.answer}
+                ))
+                record = self._insert_prepared_action(
+                    project_id=project_id, session_id=session_id, task_id=task_id,
+                    revision=revision, action="answer", payload=payload,
+                    source_state=task.state, active_state=active,
+                    continuation_state=task.continuation_state,
+                    pending_context=payload.continuation,
+                    previous_preparation_id=None, generation=generation,
+                )
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_resume_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: ResumePayload,
+        previous_preparation_id: str | None,
+    ) -> PreparedActionRecord:
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation
+        )
+        if not isinstance(payload, ResumePayload):
+            raise ValueError("resume preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                if task.state is not TaskState.INTERRUPTED:
+                    raise RuntimeError("task is not eligible for prepared resume")
+                if task.continuation_state is None:
+                    raise RuntimeError("prepared resume has no continuation")
+                active = task.continuation_state
+                require_transition(task.state, active)
+                self._validate_predecessor(
+                    project_id, session_id, task_id, revision, generation,
+                    previous_preparation_id,
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = NULL, pending_json = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                    """,
+                    (active.value, task_id, revision, session_id, TaskState.INTERRUPTED.value),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("prepared resume changed concurrently")
+                emitted.append(self._insert_event_in_transaction(
+                    session_id, task_id, "coordinator", "resume_drift",
+                    {
+                        "status": payload.drift_event.status,
+                        "summary": payload.drift_event.summary,
+                        "evidence_hashes": list(payload.drift_event.evidence_hashes),
+                    },
+                ))
+                record = self._insert_prepared_action(
+                    project_id=project_id, session_id=session_id, task_id=task_id,
+                    revision=revision, action="resume", payload=payload,
+                    source_state=TaskState.INTERRUPTED, active_state=active,
+                    continuation_state=task.continuation_state,
+                    pending_context=payload.continuation,
+                    previous_preparation_id=previous_preparation_id, generation=generation,
+                )
+            self._publish_committed_events(emitted)
+        return record
+
+    def claim_prepared_action(
+        self, preparation_id: str, *, generation: int,
+    ) -> PreparedActionRecord:
+        return self._transition_prepared_action(
+            preparation_id, generation=generation, expected="PREPARED", target="CLAIMED", reason=None,
+        )
+
+    def complete_prepared_action(
+        self, preparation_id: str, *, generation: int,
+    ) -> PreparedActionRecord:
+        return self._transition_prepared_action(
+            preparation_id, generation=generation, expected="CLAIMED", target="COMPLETED", reason=None,
+        )
+
+    def fail_prepared_action(
+        self, preparation_id: str, *, generation: int,
+        reason: PreparedActionFailureReason,
+    ) -> PreparedActionRecord:
+        if reason != "nonresumable_failure":
+            raise ValueError("prepared action failure reason is invalid")
+        return self._transition_prepared_action(
+            preparation_id, generation=generation, expected="CLAIMED", target="FAILED", reason=reason,
+        )
+
+    def interrupt_claimed_prepared_action(
+        self, preparation_id: str, *, generation: int,
+        reason: PreparedActionInterruptionReason,
+    ) -> PreparedActionRecord:
+        if reason not in {"stop", "adapter_interrupted"}:
+            raise ValueError("prepared action interruption reason is invalid")
+        with self._immediate_transaction():
+            record = self._prepared_required(preparation_id)
+            self._require_record_generation(record, generation)
+            if record.status == "INTERRUPTED" and record.reason == reason:
+                return record
+            if record.status != "CLAIMED":
+                raise RuntimeError("prepared action is not claimed")
+            task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+            if task.state is not TaskState.INTERRUPTED:
+                raise RuntimeError("claimed prepared task is not interrupted")
+            pending = self._prepared_pending_projection(record, reason=reason)
+            task_cursor = self._connection.execute(
+                """
+                UPDATE tasks SET continuation_state = ?, pending_json = ?
+                WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                """,
+                (
+                    record.active_state.value,
+                    _encode_json(pending),
+                    record.task_id,
+                    record.revision,
+                    record.session_id,
+                    TaskState.INTERRUPTED.value,
+                ),
+            )
+            if task_cursor.rowcount != 1:
+                raise RuntimeError("claimed prepared task changed concurrently")
+            cursor = self._connection.execute(
+                """
+                UPDATE prepared_actions SET status = ?, reason = ?
+                WHERE preparation_id = ? AND generation = ? AND status = 'CLAIMED'
+                """,
+                ("INTERRUPTED", reason, record.preparation_id, generation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("prepared action changed concurrently")
+        return self._prepared_required(preparation_id)
+
+    def abort_prepared_action(
+        self, preparation_id: str, *, generation: int, reason: str,
+    ) -> PreparedActionRecord:
+        reason = _prepared_text(reason, "reason")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                record = self._prepared_required(preparation_id)
+                self._require_record_generation(record, generation)
+                if record.status == "ABORTED":
+                    if record.reason == reason:
+                        return record
+                    raise RuntimeError("prepared action was aborted differently")
+                if record.status != "PREPARED":
+                    raise RuntimeError("prepared action is not abortable")
+                require_transition(record.active_state, TaskState.INTERRUPTED)
+                task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+                if task.state is not record.active_state:
+                    raise RuntimeError("prepared action task changed concurrently")
+                pending = self._prepared_pending_projection(record, reason=reason)
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value, record.active_state.value, _encode_json(pending),
+                        record.task_id, record.revision, record.session_id, record.active_state.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("prepared abort changed concurrently")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE prepared_actions SET status = 'ABORTED', reason = ?
+                    WHERE preparation_id = ? AND generation = ? AND status = 'PREPARED'
+                    """,
+                    (reason, record.preparation_id, generation),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("prepared abort changed concurrently")
+                emitted.append(self._insert_event_in_transaction(
+                    record.session_id, record.task_id, "coordinator", "task_state",
+                    {"state": TaskState.INTERRUPTED.value, "revision": record.revision},
+                ))
+            self._publish_committed_events(emitted)
+        return self._prepared_required(preparation_id)
+
+    def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]:
+        recovered_ids: list[str] = []
+        with self._immediate_transaction():
+            rows = tuple(self._connection.execute(
+                "SELECT * FROM prepared_actions WHERE status IN ('PREPARED', 'CLAIMED') ORDER BY preparation_id"
+            ))
+            for row in rows:
+                record = self._prepared_action_from_row(row)
+                task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+                pending = self._prepared_pending_projection(record, reason="recovery")
+                if task.state is record.active_state:
+                    require_transition(record.active_state, TaskState.INTERRUPTED)
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE tasks
+                        SET state = ?, continuation_state = ?, pending_json = ?
+                        WHERE task_id = ? AND revision = ? AND state = ?
+                        """,
+                        (
+                            TaskState.INTERRUPTED.value,
+                            record.active_state.value,
+                            _encode_json(pending),
+                            record.task_id,
+                            record.revision,
+                            record.active_state.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("unfinished prepared action task changed")
+                elif task.state is not TaskState.INTERRUPTED:
+                    raise RuntimeError("unfinished prepared action task changed")
+                else:
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE tasks SET continuation_state = ?, pending_json = ?
+                        WHERE task_id = ? AND revision = ? AND state = ?
+                        """,
+                        (
+                            record.active_state.value,
+                            _encode_json(pending),
+                            record.task_id,
+                            record.revision,
+                            TaskState.INTERRUPTED.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("unfinished prepared action task changed")
+                self._connection.execute(
+                    "UPDATE prepared_actions SET status = 'RECOVERED', reason = NULL WHERE preparation_id = ?",
+                    (record.preparation_id,),
+                )
+                recovered_ids.append(record.preparation_id)
+        return tuple(self._prepared_required(identifier) for identifier in recovered_ids)
+
+    def _prepared_identity(
+        self,
+        project_id: object,
+        session_id: object,
+        task_id: object,
+        revision: object,
+        generation: object,
+    ) -> tuple[str, str, str, int, int]:
+        normalized_project = _prepared_identifier(project_id, "project_id")
+        normalized_session = _prepared_identifier(session_id, "session_id")
+        normalized_task = _prepared_identifier(task_id, "task_id")
+        normalized_revision = _require_integer(revision, "revision")
+        normalized_generation = _require_integer(generation, "generation")
+        if normalized_revision < 0 or normalized_generation < 0:
+            raise ValueError("revision and generation must be non-negative")
+        return (
+            normalized_project,
+            normalized_session,
+            normalized_task,
+            normalized_revision,
+            normalized_generation,
+        )
+
+    def _prepared_task_exact(
+        self, session_id: str, task_id: str, revision: int,
+    ) -> TaskRecord:
+        row = self._connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE task_id = ? AND revision = ? AND session_id = ?
+            """,
+            (task_id, revision, session_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("prepared action task not found")
+        latest = self._connection.execute(
+            "SELECT MAX(revision) AS revision FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if latest is None or latest["revision"] != revision:
+            raise RuntimeError("prepared action task is not the latest revision")
+        return self._task_from_row(row)
+
+    def _verify_prepared_project_identity(self, project_id: str, session_id: str) -> None:
+        """Bind a prepared row to the canonical session root when available.
+
+        Some low-level store tests and legacy data use synthetic, non-existent
+        repository strings.  They cannot be canonicalized, so the coordinator
+        remains the trust boundary there.  Runtime-backed sessions always have
+        an existing canonical root and therefore reject substituted browser
+        project identifiers before any mutation.
+        """
+        root = self.session_repo_root(session_id)
+        if root is None:
+            raise RuntimeError("prepared action session not found")
+        candidate = Path(root)
+        if not candidate.exists():
+            return
+        try:
+            expected = project_id_for_root(candidate.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise RuntimeError("prepared action project identity is invalid") from error
+        if project_id != expected:
+            raise RuntimeError("prepared action project identity does not match the session")
+
+    def _new_preparation_id(self) -> str:
+        for _ in range(_MAX_PREPARATION_ID_ATTEMPTS):
+            candidate = secrets.token_hex(24)
+            row = self._connection.execute(
+                "SELECT 1 FROM prepared_actions WHERE preparation_id = ?", (candidate,)
+            ).fetchone()
+            if row is None:
+                return candidate
+        raise RuntimeError("could not allocate prepared action identifier")
+
+    def _insert_prepared_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        action: PreparedActionKind,
+        payload: PreparedActionPayload,
+        source_state: TaskState,
+        active_state: TaskState,
+        continuation_state: TaskState | None,
+        pending_context: PreparedContinuationContext,
+        previous_preparation_id: str | None,
+        generation: int,
+    ) -> PreparedActionRecord:
+        preparation_id = self._new_preparation_id()
+        record = PreparedActionRecord(
+            preparation_id=preparation_id,
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            action=action,
+            payload=payload,
+            source_state=source_state,
+            active_state=active_state,
+            continuation_state=continuation_state,
+            pending_context=pending_context,
+            previous_preparation_id=previous_preparation_id,
+            status="PREPARED",
+            reason=None,
+            generation=generation,
+        )
+        self._connection.execute(
+            """
+            INSERT INTO prepared_actions (
+                preparation_id, project_id, session_id, task_id, revision, action,
+                payload_json, source_state, active_state, continuation_state,
+                pending_context_json, previous_preparation_id, status, reason, generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.preparation_id, record.project_id, record.session_id,
+                record.task_id, record.revision, record.action,
+                _encode_json(_payload_to_data(record.payload)), record.source_state.value,
+                record.active_state.value,
+                None if record.continuation_state is None else record.continuation_state.value,
+                None if record.pending_context is None else _encode_json(
+                    _context_to_data(record.pending_context)
+                ),
+                record.previous_preparation_id, record.status, record.reason,
+                record.generation,
+            ),
+        )
+        return record
+
+    def _prepared_required(self, preparation_id: str) -> PreparedActionRecord:
+        record = self.prepared_action(preparation_id)
+        if record is None:
+            raise RuntimeError("prepared action not found")
+        return record
+
+    @staticmethod
+    def _require_record_generation(record: PreparedActionRecord, generation: int) -> None:
+        generation = _require_integer(generation, "generation")
+        if record.generation != generation:
+            raise RuntimeError("prepared action generation changed")
+
+    @staticmethod
+    def _active_state_for_context(context: PreparedContinuationContext) -> TaskState:
+        if isinstance(context, ReviewContext):
+            return TaskState.FABLE_REVIEWING
+        if isinstance(context, ClarificationContext):
+            return TaskState.FABLE_CLARIFYING
+        if isinstance(context, (ScopeApprovalContext, SolResumeContext, AnswerContext)):
+            return TaskState.SOL_RUNNING
+        return TaskState.FABLE_PLANNING
+
+    @staticmethod
+    def _prepared_pending_projection(
+        record: PreparedActionRecord, *, reason: str,
+    ) -> dict[str, object]:
+        """Return the bounded resumable task projection for one durable row."""
+        return {
+            "prepared_action": {
+                "preparation_id": record.preparation_id,
+                "action": record.action,
+                "reason": reason,
+                "context": _context_to_data(record.pending_context),
+            },
+        }
+
+    def _validate_predecessor(
+        self,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        previous_preparation_id: str | None,
+    ) -> None:
+        existing = tuple(self._connection.execute(
+            """
+            SELECT preparation_id FROM prepared_actions
+            WHERE project_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+            """,
+            (project_id, session_id, task_id, revision),
+        ))
+        if previous_preparation_id is None:
+            if existing and generation != COMPATIBILITY_PREPARATION_GENERATION:
+                raise RuntimeError("prepared resume requires a previous preparation")
+            return
+        previous = self._prepared_required(previous_preparation_id)
+        if (
+            previous.project_id != project_id
+            or previous.session_id != session_id
+            or previous.task_id != task_id
+            or previous.revision != revision
+            or previous.status not in {"ABORTED", "RECOVERED", "INTERRUPTED"}
+        ):
+            raise RuntimeError("prepared resume predecessor is invalid")
+
+    def _transition_prepared_action(
+        self,
+        preparation_id: str,
+        *,
+        generation: int,
+        expected: str,
+        target: str,
+        reason: str | None,
+    ) -> PreparedActionRecord:
+        with self._immediate_transaction():
+            record = self._prepared_required(preparation_id)
+            self._require_record_generation(record, generation)
+            if record.status != expected:
+                raise RuntimeError("prepared action state changed")
+            if expected == "PREPARED":
+                task = self._prepared_task_exact(
+                    record.session_id, record.task_id, record.revision,
+                )
+                if task.state is not record.active_state:
+                    raise RuntimeError("prepared action task changed concurrently")
+            cursor = self._connection.execute(
+                """
+                UPDATE prepared_actions SET status = ?, reason = ?
+                WHERE preparation_id = ? AND generation = ? AND status = ?
+                """,
+                (target, reason, record.preparation_id, generation, expected),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("prepared action state changed")
+        return self._prepared_required(preparation_id)
+
+    def _insert_event_in_transaction(
+        self,
+        session_id: str,
+        task_id: str | None,
+        actor: str,
+        kind: str,
+        payload: Mapping[str, object],
+    ) -> StreamEvent:
+        frozen_payload = freeze_json(payload)
+        if not isinstance(frozen_payload, Mapping):
+            raise ValueError("payload must be an object")
+        created_at = self._timestamp()
+        cursor = self._connection.execute(
+            """
+            INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, task_id, actor, kind, _encode_json(frozen_payload), created_at),
+        )
+        row = self._connection.execute(
+            "SELECT * FROM events WHERE sequence = ?", (cursor.lastrowid,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("inserted event could not be read")
+        event = self._event_from_row(row)
+        title = self._first_user_message_title(
+            session_id=session_id,
+            sequence=event.sequence,
+            actor=actor,
+            kind=kind,
+            payload=frozen_payload,
+        )
+        if title is None:
+            self._connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (created_at, session_id),
+            )
+        else:
+            self._connection.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
+                (title, created_at, session_id),
+            )
+        return event
+
+    def _publish_committed_events(self, events: list[StreamEvent]) -> None:
+        self._pending_listener_events.extend(events)
+        if self._dispatching_listener_events:
+            return
+        self._dispatching_listener_events = True
+        self._drain_event_listeners()
 
     def task(self, task_id: str, revision: int) -> TaskRecord:
         """Compatibility-friendly spelling for retrieving one exact revision."""
@@ -1921,6 +3161,38 @@ class SQLiteStore:
             continuation_state=None if raw_continuation is None else TaskState(raw_continuation),
             pending=pending,
         )
+
+    def _prepared_action_from_row(self, row: sqlite3.Row) -> PreparedActionRecord:
+        try:
+            payload = _payload_from_data(
+                _decode_mapping(row["payload_json"], "prepared payload")
+            )
+            raw_context = row["pending_context_json"]
+            context = None if raw_context is None else _context_from_data(
+                _decode_mapping(raw_context, "prepared context")
+            )
+            raw_continuation = row["continuation_state"]
+            return PreparedActionRecord(
+                preparation_id=row["preparation_id"],
+                project_id=row["project_id"],
+                session_id=row["session_id"],
+                task_id=row["task_id"],
+                revision=int(row["revision"]),
+                action=row["action"],
+                payload=payload,
+                source_state=TaskState(row["source_state"]),
+                active_state=TaskState(row["active_state"]),
+                continuation_state=(
+                    None if raw_continuation is None else TaskState(raw_continuation)
+                ),
+                pending_context=context,
+                previous_preparation_id=row["previous_preparation_id"],
+                status=row["status"],
+                reason=row["reason"],
+                generation=int(row["generation"]),
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise RuntimeError("persisted prepared action is invalid") from error
 
     def _event_from_row(self, row: sqlite3.Row) -> StreamEvent:
         return StreamEvent(

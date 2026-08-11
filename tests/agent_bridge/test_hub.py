@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -16,8 +16,11 @@ from agent_bridge.hub import (
     ProjectRegistry,
     RuntimeReadiness,
     RuntimeStatus,
+    PreparedWorkflow,
 )
 from agent_bridge.projects import ProjectSpec
+from agent_bridge.state_machine import TaskState
+from agent_bridge.store import NewRequestPayload, PreparedActionOutcome, PreparedActionRecord
 
 
 @dataclass
@@ -39,6 +42,7 @@ class _RuntimeStore:
     listener_tokens: list[int] | None = None
     removed_listener_tokens: list[int] | None = None
     closed: bool = False
+    prepared_rows: dict[str, PreparedActionRecord] | None = None
 
     def __post_init__(self) -> None:
         if self.task_rows is None:
@@ -47,12 +51,38 @@ class _RuntimeStore:
             self.listener_tokens = []
         if self.removed_listener_tokens is None:
             self.removed_listener_tokens = []
+        if self.prepared_rows is None:
+            self.prepared_rows = {}
 
     def session_exists(self, session_id: str) -> bool:
         return session_id in self.sessions
 
     def get_task(self, task_id: str, revision: int) -> object:
         return self.task_rows[(task_id, revision)]
+
+    def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None:
+        return self.prepared_rows.get(preparation_id)
+
+    def latest_prepared_action_for_task(
+        self, *, project_id: str, session_id: str, task_id: str, revision: int,
+    ) -> PreparedActionRecord | None:
+        records = [
+            record for record in self.prepared_rows.values()
+            if (
+                record.project_id == project_id
+                and record.session_id == session_id
+                and record.task_id == task_id
+                and record.revision == revision
+            )
+        ]
+        return None if not records else records[-1]
+
+    def latest_task(self, task_id: str) -> object | None:
+        rows = [
+            value for (candidate, _), value in self.task_rows.items()
+            if candidate == task_id
+        ]
+        return None if not rows else rows[-1]
 
     def add_event_listener(self, listener: object) -> int:
         token = len(self.listener_tokens) + 1
@@ -72,6 +102,46 @@ class _RuntimeCoordinator:
     run_task_ids: list[str]
     aborts: list[tuple[str, int, str, str]]
     stops: list[str]
+    store: _RuntimeStore
+    project_id: str
+
+    def _record(
+        self, *, session_id: str, task_id: str, revision: int, action: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        preparation_id = f"prepared-{task_id}-{generation}"
+        payload = NewRequestPayload(text="Build it")
+        record = PreparedActionRecord(
+            preparation_id=preparation_id,
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            action=action,  # type: ignore[arg-type]
+            payload=payload if action == "new_request" else payload,  # type: ignore[arg-type]
+            source_state=TaskState.FABLE_PLANNING,
+            active_state=TaskState.FABLE_PLANNING,
+            continuation_state=None,
+            pending_context=None,
+            previous_preparation_id=None,
+            status="PREPARED",
+            reason=None,
+            generation=generation,
+        )
+        self.store.prepared_rows[preparation_id] = record
+        self.store.task_rows[(task_id, revision)] = SimpleNamespace(
+            session_id=session_id, revision=revision,
+        )
+        return record
+
+    def prepare_new_request(
+        self, *, session_id: str, task_id: str, text: str, generation: int,
+    ) -> PreparedActionRecord:
+        self.prepared.append((session_id, text, task_id))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=0,
+            action="new_request", generation=generation,
+        )
 
     def prepare_user_request(self, session_id: str, text: str, task_id: str) -> object:
         self.prepared.append((session_id, text, task_id))
@@ -80,11 +150,30 @@ class _RuntimeCoordinator:
     async def run_prepared_request(self, task_id: str) -> None:
         self.run_task_ids.append(task_id)
 
+    async def run_prepared_action(self, preparation_id: str) -> PreparedActionOutcome:
+        record = self.store.prepared_action(preparation_id)
+        assert record is not None
+        self.run_task_ids.append(record.task_id)
+        self.store.prepared_rows[preparation_id] = replace(record, status="COMPLETED")
+        return PreparedActionOutcome("completed")
+
     def abort_prepared_action(
-        self, task_id: str, revision: int, action: str, reason: str,
+        self, preparation_id: str, *, generation: int, reason: str,
     ) -> object:
-        self.aborts.append((task_id, revision, action, reason))
-        return SimpleNamespace(task_id=task_id, revision=revision)
+        record = self.store.prepared_action(preparation_id)
+        assert record is not None
+        self.aborts.append((record.task_id, record.revision, record.action, reason))
+        self.store.prepared_rows[preparation_id] = replace(
+            record, status="ABORTED", reason=reason,
+        )
+        return self.store.prepared_rows[preparation_id]
+
+    def interrupt_claimed_prepared_action(
+        self, preparation_id: str, *, generation: int, reason: str,
+    ) -> object:
+        return self.abort_prepared_action(
+            preparation_id, generation=generation, reason=reason,
+        )
 
     async def stop_task(self, task_id: str) -> None:
         self.stops.append(task_id)
@@ -124,13 +213,14 @@ def _readiness(
 
 
 def _runtime(project_id: str, *, sessions: set[str] | None = None) -> _Runtime:
+    store = _RuntimeStore(sessions or {"chat-1"})
     return _Runtime(
         project_id=project_id,
         label=project_id,
         repository=f"/repositories/{project_id}",
         branch="main",
-        store=_RuntimeStore(sessions or {"chat-1"}),
-        coordinator=_RuntimeCoordinator([], [], [], []),
+        store=store,
+        coordinator=_RuntimeCoordinator([], [], [], [], store, project_id),
         readiness=_readiness(),
     )
 
@@ -198,6 +288,33 @@ def test_runtime_readiness_rejects_unacknowledged_start_without_provider_probe()
 
         assert fable_calls == []
         assert sol_calls == []
+
+    asyncio.run(exercise())
+
+
+def test_runtime_readiness_cancels_and_awaits_a_hanging_sibling_when_a_probe_fails() -> None:
+    async def exercise() -> None:
+        sibling_cancelled = asyncio.Event()
+
+        async def fails() -> tuple[bool, str]:
+            raise RuntimeError("controlled failure")
+
+        async def hangs() -> str:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_cancelled.set()
+
+        readiness = RuntimeReadiness(
+            initial=RuntimeStatus(False, "checking", "checking"),
+            fable_probe=fails,
+            sol_probe=hangs,
+        )
+
+        with pytest.raises(RuntimeError, match="not ready"):
+            await readiness.require_model_start_ready(usage_credits_acknowledged=True)
+
+        assert sibling_cancelled.is_set()
 
     asyncio.run(exercise())
 
@@ -546,6 +663,64 @@ def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() 
         assert runtime.coordinator.aborts == [
             ("task-1", 0, "new_request", "scheduler_unavailable"),
         ]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_abort_persistence_failure_keeps_the_exact_lease_retryable() -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        original_abort = runtime.coordinator.abort_prepared_action
+
+        def fail_abort(*args: object, **kwargs: object) -> object:
+            raise RuntimeError("injected persistence failure")
+
+        runtime.coordinator.abort_prepared_action = fail_abort  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="persistence failure"):
+            workflows.abort_prepared(prepared, reason="scheduler rejected")
+        assert lease.snapshot() == prepared.token
+
+        runtime.coordinator.abort_prepared_action = original_abort  # type: ignore[method-assign]
+        workflows.abort_prepared(prepared, reason="scheduler rejected")
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_forged_preparation_identifier_cannot_claim_abort_or_release_the_real_lease() -> None:
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        forged = PreparedWorkflow(
+            preparation_id="forged-preparation", token=prepared.token,
+        )
+
+        with pytest.raises(RuntimeError, match="not found"):
+            await workflows.run(forged)
+        assert lease.snapshot() == prepared.token
+        with pytest.raises(RuntimeError, match="not found"):
+            workflows.abort_prepared(forged, reason="scheduler rejected")
+        assert lease.snapshot() == prepared.token
+
+        workflows.abort_prepared(prepared, reason="scheduler rejected")
         assert lease.snapshot() is None
 
     asyncio.run(exercise())

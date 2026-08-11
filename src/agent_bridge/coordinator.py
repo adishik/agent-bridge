@@ -23,6 +23,7 @@ from agent_bridge.contracts import (
     TaskBrief,
 )
 from agent_bridge.process import ProcessRunner
+from agent_bridge.projects import project_id_for_root
 from agent_bridge.repository import (
     RepositoryTracker,
     WorkspaceBaseline,
@@ -30,7 +31,24 @@ from agent_bridge.repository import (
     validate_allowed_path,
 )
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import SQLiteStore, TaskRecord
+from agent_bridge.store import (
+    AnswerPayload,
+    BaselineSetting,
+    ClarificationContext,
+    COMPATIBILITY_PREPARATION_GENERATION,
+    NewRequestPayload,
+    PreparedActionInterruptionReason,
+    PreparedActionOutcome,
+    PreparedActionRecord,
+    ReviewContext,
+    ResumeDriftProjection,
+    ResumePayload,
+    ScopeApprovalContext,
+    SolResumeContext,
+    SQLiteStore,
+    TaskRecord,
+    ApprovalPayload,
+)
 
 
 class IdFactory(Protocol):
@@ -110,10 +128,18 @@ class Coordinator:
         self._trusted_shells = resolved_shells
         self._writing_lock = asyncio.Lock()
         self._run_completions: dict[str, asyncio.Event] = {}
+        # A prepared row is never proof that a child is still alive after a
+        # process restart.  Recover before this coordinator can be admitted to
+        # a runtime registry or start another workflow.
+        self.recover_unfinished_prepared_actions()
 
     def close(self) -> None:
         """Release coordinator-local tracking; the runtime owns its store."""
         self._run_completions.clear()
+
+    @property
+    def project_id(self) -> str:
+        return project_id_for_root(self._repo_root)
 
     async def handle_user_request(self, session_id: str, text: str) -> str:
         if not isinstance(text, str) or not text.strip():
@@ -128,55 +154,348 @@ class Coordinator:
         )
         return task_id
 
+    def prepare_new_request(
+        self, *, session_id: str, task_id: str, text: str, generation: int,
+    ) -> PreparedActionRecord:
+        return self._store.prepare_new_request_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            generation=generation,
+            payload=NewRequestPayload(text=text),
+        )
+
     def prepare_user_request(
         self, session_id: str, text: str, task_id: str,
     ) -> TaskRecord:
-        """Persist a new planning task without creating an agent child."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("text must be non-empty")
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("task_id must be non-empty")
-        task = self._store.create_planning_task(session_id, task_id)
-        self._store.append_event(
-            session_id, task_id, "user", "message", {"text": text}
+        """Compatibility wrapper for the pre-hub synchronous preparation seam."""
+        prepared = self.prepare_new_request(
+            session_id=session_id,
+            task_id=task_id,
+            text=text,
+            generation=COMPATIBILITY_PREPARATION_GENERATION,
         )
-        return task
+        return self._store.get_task(prepared.task_id, prepared.revision)
+
+    def prepare_approval(
+        self, *, session_id: str, task_id: str, revision: int, generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise RuntimeError("task record not found")
+        if task.state not in {
+            TaskState.AWAITING_USER_APPROVAL,
+            TaskState.AWAITING_SCOPE_APPROVAL,
+        } or task.brief is None or task.brief.open_questions:
+            raise ValueError("task is not awaiting revision approval")
+        captured: WorkspaceBaseline | None = None
+        if task.baseline_id is None:
+            captured = self._repository.capture(task.brief)
+            baseline_id = captured.baseline_id
+            setting = BaselineSetting(
+                key=self._baseline_key(task.task_id, task.revision),
+                value_json=json.dumps(
+                    self._baseline_setting_value(task.task_id, task.revision, captured),
+                    separators=(",", ":"), sort_keys=True,
+                ),
+            )
+        else:
+            baseline = self._load_baseline(task)
+            if baseline.allowed_paths != task.brief.allowed_paths:
+                raise RuntimeError("approved baseline scope does not match the task revision")
+            baseline_id = baseline.baseline_id
+            setting = None
+        scope = None
+        if task.state is TaskState.AWAITING_SCOPE_APPROVAL:
+            answer = (task.pending or {}).get("answer")
+            if task.continuation_state not in _SOL_STATES or not isinstance(answer, str):
+                raise RuntimeError("scope approval is missing its exact continuation")
+            scope = ScopeApprovalContext(
+                baseline_id=baseline_id,
+                approved_revision=task.revision,
+                underlying_continuation=self._sol_context(task, self._scope_resume_prompt(
+                    task, answer
+                )),
+            )
+        try:
+            return self._store.prepare_approval_action(
+                project_id=self.project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                generation=generation,
+                payload=ApprovalPayload(
+                    baseline_id=baseline_id, baseline_setting=setting, scope=scope,
+                ),
+            )
+        except BaseException:
+            if captured is not None:
+                self._repository.discard_baseline(captured)
+            raise
+
+    def prepare_answer(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        answer: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id or task.state is not TaskState.AWAITING_USER_INPUT:
+            raise ValueError("task is not awaiting user input")
+        if task.continuation_state is None or task.pending is None:
+            raise RuntimeError("awaiting-user task has no persisted continuation")
+        return self._store.prepare_answer_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            generation=generation,
+            payload=AnswerPayload(answer=answer, continuation=self._context_from_task(task)),
+        )
+
+    def prepare_resume(
+        self, *, session_id: str, task_id: str, revision: int, generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id or task.state is not TaskState.INTERRUPTED:
+            raise ValueError("only an interrupted task may be resumed")
+        if task.continuation_state is None:
+            raise RuntimeError("interrupted task has no persisted continuation")
+        predecessor = self._store.latest_prepared_action_for_task(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+        )
+        context = (
+            self._context_from_task(task)
+            if predecessor is None
+            else predecessor.pending_context
+        )
+        drift = ResumeDriftProjection(
+            status="unchanged", summary="Repository drift was checked.", evidence_hashes=(),
+        )
+        if task.continuation_state is not TaskState.FABLE_PLANNING:
+            baseline = self._load_baseline(task)
+            delta = self._repository.compare(baseline)
+            if delta.unexpected_paths or delta.protected_changed_paths:
+                drift = ResumeDriftProjection(
+                    status="drifted", summary="Repository drift prevented automatic resume.", evidence_hashes=(),
+                )
+        return self._store.prepare_resume_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            generation=generation,
+            payload=ResumePayload(continuation=context, drift_event=drift),
+            previous_preparation_id=None if predecessor is None else predecessor.preparation_id,
+        )
+
+    async def run_prepared_action(self, preparation_id: str) -> PreparedActionOutcome:
+        record = self._store.prepared_action(preparation_id)
+        if record is None:
+            raise RuntimeError("prepared action not found")
+        if record.project_id != self.project_id:
+            raise RuntimeError("prepared action belongs to a different project")
+        claimed = self._store.claim_prepared_action(
+            record.preparation_id, generation=record.generation,
+        )
+        task = self._store.get_task(claimed.task_id, claimed.revision)
+        try:
+            if isinstance(claimed.payload, NewRequestPayload):
+                await self._run_planning(task, claimed.payload.text, resume_session_id=None)
+            elif isinstance(claimed.payload, ApprovalPayload):
+                if claimed.payload.scope is None:
+                    await self._start_sol(task)
+                else:
+                    await self._resume_sol(
+                        task, claimed.payload.scope.underlying_continuation.prompt
+                        if claimed.payload.scope.underlying_continuation is not None
+                        else "Continue the approved scoped task.",
+                    )
+            elif isinstance(claimed.payload, AnswerPayload):
+                await self._run_context(task, claimed.payload.continuation, claimed.payload.answer)
+            elif isinstance(claimed.payload, ResumePayload):
+                await self._run_context(task, claimed.payload.continuation, None)
+            else:
+                raise RuntimeError("prepared action payload is invalid")
+        except BaseException:
+            current = self._store.get_task(claimed.task_id, claimed.revision)
+            if current.state is TaskState.INTERRUPTED:
+                terminal = self._store.prepared_action(claimed.preparation_id)
+                if terminal is not None and terminal.status == "INTERRUPTED":
+                    if terminal.reason == "stop":
+                        return PreparedActionOutcome("stop")
+                    return PreparedActionOutcome("adapter_interrupted")
+                self._store.interrupt_claimed_prepared_action(
+                    claimed.preparation_id,
+                    generation=claimed.generation,
+                    reason="adapter_interrupted",
+                )
+                return PreparedActionOutcome("adapter_interrupted")
+            self._store.fail_prepared_action(
+                claimed.preparation_id,
+                generation=claimed.generation,
+                reason="nonresumable_failure",
+            )
+            return PreparedActionOutcome("nonresumable_failure")
+        current = self._store.get_task(claimed.task_id, claimed.revision)
+        if current.state is TaskState.INTERRUPTED:
+            terminal = self._store.prepared_action(claimed.preparation_id)
+            if terminal is not None and terminal.status == "INTERRUPTED":
+                if terminal.reason == "stop":
+                    return PreparedActionOutcome("stop")
+                return PreparedActionOutcome("adapter_interrupted")
+            self._store.interrupt_claimed_prepared_action(
+                claimed.preparation_id,
+                generation=claimed.generation,
+                reason="adapter_interrupted",
+            )
+            return PreparedActionOutcome("adapter_interrupted")
+        self._store.complete_prepared_action(
+            claimed.preparation_id, generation=claimed.generation,
+        )
+        return PreparedActionOutcome("completed")
 
     async def run_prepared_request(self, task_id: str) -> None:
-        """Start exactly one previously persisted initial planning request."""
+        """Compatibility wrapper that runs the local generation-zero record."""
         task = self._latest_required(task_id)
-        if task.state is not TaskState.FABLE_PLANNING or task.revision != 0:
+        record = self._store.latest_prepared_action_for_task(
+            project_id=self.project_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+        )
+        if record is None or record.generation != COMPATIBILITY_PREPARATION_GENERATION:
             raise ValueError("task is not a prepared initial request")
-        prompt = self._original_user_message(task.session_id, task.task_id)
-        await self._run_planning(task, prompt, resume_session_id=None)
+        await self.run_prepared_action(record.preparation_id)
+
+    def interrupt_claimed_prepared_action(
+        self, preparation_id: str, *, generation: int,
+        reason: PreparedActionInterruptionReason,
+    ) -> PreparedActionRecord:
+        return self._store.interrupt_claimed_prepared_action(
+            preparation_id, generation=generation, reason=reason,
+        )
 
     def abort_prepared_action(
-        self, task_id: str, revision: int, action: str, reason: str,
-    ) -> TaskRecord:
-        """Persist a scheduler-rejected preparation as an explicit continuation."""
-        if not isinstance(action, str) or not action:
-            raise ValueError("action must be non-empty")
-        if not isinstance(reason, str) or not reason:
-            raise ValueError("reason must be non-empty")
-        task = self._store.get_task(task_id, revision)
-        pending = {"action": action, "reason": reason}
-        if task.state is TaskState.INTERRUPTED:
+        self,
+        preparation_id: str,
+        *legacy: object,
+        generation: int | None = None,
+        reason: str | None = None,
+    ) -> PreparedActionRecord | TaskRecord:
+        if legacy:
+            if len(legacy) != 3:
+                raise TypeError("legacy abort requires revision, action, and reason")
+            revision, action, legacy_reason = legacy
+            if not isinstance(revision, int) or not isinstance(action, str) or not isinstance(legacy_reason, str):
+                raise ValueError("legacy abort arguments are invalid")
+            task = self._store.get_task(preparation_id, revision)
+            record = self._store.latest_prepared_action_for_task(
+                project_id=self.project_id,
+                session_id=task.session_id,
+                task_id=task.task_id,
+                revision=task.revision,
+            )
             if (
-                task.continuation_state is TaskState.FABLE_PLANNING
-                and dict(task.pending or {}) == pending
+                record is None
+                or record.generation != COMPATIBILITY_PREPARATION_GENERATION
+                or record.action != action
             ):
-                return task
-            raise RuntimeError("prepared action is already interrupted differently")
-        interrupted = self._store.pause_for_continuation(
-            task.task_id,
-            task.revision,
-            expected=task.state,
-            target=TaskState.INTERRUPTED,
-            continuation_state=task.state,
-            pending=pending,
+                raise RuntimeError("task is not a compatible prepared action")
+            self._store.abort_prepared_action(
+                record.preparation_id,
+                generation=COMPATIBILITY_PREPARATION_GENERATION,
+                reason=legacy_reason,
+            )
+            return self._store.get_task(task.task_id, task.revision)
+        if generation is None or reason is None:
+            raise TypeError("prepared abort requires generation and reason")
+        return self._store.abort_prepared_action(
+            preparation_id, generation=generation, reason=reason,
         )
-        self._emit_state(interrupted)
-        return interrupted
+
+    def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]:
+        return self._store.recover_unfinished_prepared_actions()
+
+    def _sol_context(self, task: TaskRecord, prompt: str) -> SolResumeContext:
+        thread_id = task.sol_thread_id or f"sol-thread-{task.task_id}-{task.revision}"
+        return SolResumeContext(
+            sol_thread_id=thread_id,
+            sol_run_id=f"sol-run-{task.task_id}-{task.revision}",
+            prompt=prompt,
+        )
+
+    def _context_from_task(self, task: TaskRecord):
+        continuation = task.continuation_state
+        pending = task.pending or {}
+        if continuation is TaskState.FABLE_PLANNING:
+            return None
+        if continuation is TaskState.FABLE_REVIEWING:
+            session_id = task.fable_session_id or f"fable-session-{task.task_id}-{task.revision}"
+            prompt = pending.get("review_prompt")
+            return ReviewContext(
+                fable_session_id=session_id,
+                review_prompt=prompt if isinstance(prompt, str) else "Continue review.",
+                completion_allowed=bool(pending.get("completion_allowed", False)),
+                underlying_continuation=self._sol_context(task, "Continue review context."),
+            )
+        if continuation is TaskState.FABLE_CLARIFYING:
+            session_id = task.fable_session_id or f"fable-session-{task.task_id}-{task.revision}"
+            prompt = pending.get("clarification_prompt")
+            return ClarificationContext(
+                fable_session_id=session_id,
+                clarification_prompt=prompt if isinstance(prompt, str) else "Continue clarification.",
+                underlying_continuation=self._sol_context(task, "Continue clarification context."),
+            )
+        prompt = pending.get("prompt")
+        return self._sol_context(
+            task, prompt if isinstance(prompt, str) else "Resume the prepared task.",
+        )
+
+    async def _run_context(self, task: TaskRecord, context: object, answer: str | None) -> None:
+        if isinstance(context, AnswerContext):
+            await self._run_context(task, context.underlying_continuation, context.answer)
+            return
+        if isinstance(context, SolResumeContext):
+            await self._resume_sol(task, answer if answer is not None else context.prompt)
+            return
+        if isinstance(context, ScopeApprovalContext):
+            if context.underlying_continuation is None:
+                await self._start_sol(task)
+            else:
+                await self._resume_sol(
+                    task,
+                    answer if answer is not None else context.underlying_continuation.prompt,
+                )
+            return
+        if isinstance(context, ReviewContext):
+            prompt = context.review_prompt
+            if answer is not None:
+                prompt = f"{prompt}\nUser answer: {answer}"
+            await self._call_fable_review(
+                task, prompt, completion_allowed=context.completion_allowed,
+            )
+            return
+        if isinstance(context, ClarificationContext):
+            prompt = context.clarification_prompt
+            if answer is not None:
+                prompt = f"{prompt}\nUser answer: {answer}"
+            await self._call_fable_clarification(task, prompt)
+            return
+        if context is None:
+            await self._run_planning(
+                task,
+                self._original_user_message(task.session_id, task.task_id),
+                resume_session_id=task.fable_session_id,
+            )
+            return
+        raise RuntimeError("prepared continuation is invalid")
 
     async def approve_task(self, task_id: str, revision: int) -> None:
         task = self._latest_required(task_id)
