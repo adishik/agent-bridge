@@ -1,1 +1,13 @@
 .worktrees/
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+*.sqlite3
+*.sqlite3-*
+*.lock
