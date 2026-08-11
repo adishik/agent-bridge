@@ -536,6 +536,7 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
 
   const brief = taskBrief(task);
   const approvalState = APPROVAL_STATES.has(String(task?.state ?? ""));
+  const hasOpenQuestions = brief !== null && brief.open_questions.length > 0;
   const hasUnusableBrief = brief === null && (
     approvalState || (task?.brief !== null && task?.brief !== undefined)
   );
@@ -574,6 +575,14 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
     );
   } else {
     appendTextSection(documentRoot, card, "Planning", "Fable is preparing the task contract.");
+  }
+  if (approvalState && hasOpenQuestions) {
+    appendTextSection(
+      documentRoot,
+      card,
+      "Approval blocked",
+      "Resolve or remove the open questions in Edit before approval.",
+    );
   }
 
   if (task?.outcome) {
@@ -712,7 +721,7 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
   const actions = element(documentRoot, "div", undefined, "task-actions");
   const hiddenControl = control(false, false);
   const definitions = [
-    ["Approve & run", "approve", hasUnusableBrief ? hiddenControl : controls.approve, "button-primary"],
+    ["Approve & run", "approve", hasUnusableBrief ? hiddenControl : (hasOpenQuestions ? control(true, false) : controls.approve), "button-primary"],
     ["Edit", "edit", hasUnusableBrief ? hiddenControl : controls.edit, ""],
     ["Reject", "reject", controls.reject, "button-danger"],
     ["Stop", "stop", controls.stop, "button-danger"],

@@ -235,6 +235,27 @@ def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
         .filter((node) => node.tag === "button")
         .map((node) => node.textContent);
       if (!runningButtons.includes("Stop") || runningButtons.includes("Approve & run") || runningButtons.includes("Edit")) process.exit(10);
+      const unresolvedStart = created.length;
+      bridge.renderTaskInspector(documentRoot, {{
+        task_id: "unresolved-task", revision: 1, state: "awaiting_user_approval",
+        brief: {{
+          ...brief,
+          task_id: "unresolved-task",
+          revision: 1,
+          open_questions: ["Which path is authoritative?"],
+        }},
+      }}, {{gate: {{ready: true}}, onAction: () => {{}}}});
+      const buttons = created.slice(unresolvedStart).filter((node) => node.tag === "button");
+      const approve = buttons.find((node) => node.textContent === "Approve & run");
+      const edit = buttons.find((node) => node.textContent === "Edit");
+      const reject = buttons.find((node) => node.textContent === "Reject");
+      if (!approve || !approve.disabled) process.exit(30);
+      if (!edit || edit.disabled) process.exit(31);
+      if (!reject || reject.disabled) process.exit(32);
+      const unresolvedText = created.slice(unresolvedStart).map((node) => node.textContent).join("\\n");
+      if (!unresolvedText.includes("Resolve or remove the open questions in Edit before approval.")) {{
+        process.exit(33);
+      }}
     """
     _run_module_harness(harness)
 

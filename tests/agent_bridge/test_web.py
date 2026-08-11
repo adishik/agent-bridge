@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import subprocess
@@ -872,6 +872,34 @@ def test_approval_requires_the_latest_exact_revision_before_scheduling(
             json={"revision": True},
             headers={"X-CSRF-Token": CSRF_TOKEN},
         ).status_code == 422
+    assert not any(call[0] == "approve" for call in web_harness.coordinator.calls)
+
+
+def test_approval_rejects_unresolved_open_questions_before_scheduling(
+    web_harness: WebHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    unresolved = replace(
+        valid_brief,
+        revision=2,
+        open_questions=("Which path is authoritative?",),
+    )
+    web_harness.store.save_task(
+        SESSION_ID,
+        unresolved,
+        TaskState.AWAITING_USER_APPROVAL,
+    )
+    with _authenticated_client(web_harness) as client:
+        csrf = _acknowledge_model_usage(client)
+        response = client.post(
+            "/api/tasks/task-1/approve",
+            json={"revision": 2},
+            headers={"X-CSRF-Token": csrf},
+        )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "resolve the TaskBrief open questions before approval"
+    }
     assert not any(call[0] == "approve" for call in web_harness.coordinator.calls)
 
 
