@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -73,12 +74,16 @@ def build_project_specs(
         return ()
     if len(normalized_entries) > MAX_PROJECTS:
         raise ValueError(f"too many projects; maximum is {MAX_PROJECTS}")
-    if (
-        not isinstance(probe_timeout_seconds, (int, float))
-        or isinstance(probe_timeout_seconds, bool)
-        or probe_timeout_seconds <= 0
+    if not isinstance(probe_timeout_seconds, (int, float)) or isinstance(
+        probe_timeout_seconds, bool
     ):
-        raise ValueError("probe_timeout_seconds must be positive")
+        raise ValueError("probe_timeout_seconds must be a finite positive number")
+    normalized_probe_timeout_seconds = float(probe_timeout_seconds)
+    if (
+        not math.isfinite(normalized_probe_timeout_seconds)
+        or normalized_probe_timeout_seconds <= 0
+    ):
+        raise ValueError("probe_timeout_seconds must be a finite positive number")
 
     validated_git = _validate_git_executable(git_executable)
     validated_state_root = _validate_state_root(state_root)
@@ -103,7 +108,7 @@ def build_project_specs(
             validated_git,
             canonical_root,
             ("rev-parse", "--show-toplevel"),
-            timeout_seconds=float(probe_timeout_seconds),
+            timeout_seconds=normalized_probe_timeout_seconds,
             label="Git top-level probe",
         )
         if top_level != str(canonical_root):
@@ -112,7 +117,7 @@ def build_project_specs(
             validated_git,
             canonical_root,
             ("symbolic-ref", "--quiet", "--short", "HEAD"),
-            timeout_seconds=float(probe_timeout_seconds),
+            timeout_seconds=normalized_probe_timeout_seconds,
             label="Git branch probe",
         )
         if not branch:

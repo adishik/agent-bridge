@@ -135,6 +135,26 @@ def test_build_limits_the_registry_to_max_projects(tmp_path: Path) -> None:
         _projects(entries, tmp_path)
 
 
+@pytest.mark.parametrize("timeout", (float("inf"), float("nan")))
+def test_build_rejects_non_finite_git_probe_timeouts(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    # This catches removing a finite deadline before subprocess setup can begin.
+    repo = _repository(tmp_path, "repo")
+    state_root = tmp_path / "state"
+
+    with pytest.raises(ValueError, match="finite"):
+        build_project_specs(
+            [("repo", repo)],
+            state_root=state_root,
+            git_executable=GIT_EXECUTABLE,
+            probe_timeout_seconds=timeout,
+        )
+
+    assert not state_root.exists()
+
+
 def test_build_rejects_non_git_root_without_creating_state(tmp_path: Path) -> None:
     root = tmp_path / "not-a-repository"
     root.mkdir()
