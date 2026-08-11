@@ -111,6 +111,10 @@ class Coordinator:
         self._writing_lock = asyncio.Lock()
         self._run_completions: dict[str, asyncio.Event] = {}
 
+    def close(self) -> None:
+        """Release coordinator-local tracking; the runtime owns its store."""
+        self._run_completions.clear()
+
     async def handle_user_request(self, session_id: str, text: str) -> str:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be non-empty")
@@ -123,6 +127,56 @@ class Coordinator:
             self._store.get_task(task_id, 0), text, resume_session_id=None
         )
         return task_id
+
+    def prepare_user_request(
+        self, session_id: str, text: str, task_id: str,
+    ) -> TaskRecord:
+        """Persist a new planning task without creating an agent child."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be non-empty")
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be non-empty")
+        task = self._store.create_planning_task(session_id, task_id)
+        self._store.append_event(
+            session_id, task_id, "user", "message", {"text": text}
+        )
+        return task
+
+    async def run_prepared_request(self, task_id: str) -> None:
+        """Start exactly one previously persisted initial planning request."""
+        task = self._latest_required(task_id)
+        if task.state is not TaskState.FABLE_PLANNING or task.revision != 0:
+            raise ValueError("task is not a prepared initial request")
+        prompt = self._original_user_message(task.session_id, task.task_id)
+        await self._run_planning(task, prompt, resume_session_id=None)
+
+    def abort_prepared_action(
+        self, task_id: str, revision: int, action: str, reason: str,
+    ) -> TaskRecord:
+        """Persist a scheduler-rejected preparation as an explicit continuation."""
+        if not isinstance(action, str) or not action:
+            raise ValueError("action must be non-empty")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be non-empty")
+        task = self._store.get_task(task_id, revision)
+        pending = {"action": action, "reason": reason}
+        if task.state is TaskState.INTERRUPTED:
+            if (
+                task.continuation_state is TaskState.FABLE_PLANNING
+                and dict(task.pending or {}) == pending
+            ):
+                return task
+            raise RuntimeError("prepared action is already interrupted differently")
+        interrupted = self._store.pause_for_continuation(
+            task.task_id,
+            task.revision,
+            expected=task.state,
+            target=TaskState.INTERRUPTED,
+            continuation_state=task.state,
+            pending=pending,
+        )
+        self._emit_state(interrupted)
+        return interrupted
 
     async def approve_task(self, task_id: str, revision: int) -> None:
         task = self._latest_required(task_id)

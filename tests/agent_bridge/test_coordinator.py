@@ -2411,3 +2411,65 @@ def test_adapter_contract_error_persists_safe_result_evidence_and_actual_exit(
         )
 
     asyncio.run(fable_scenario() if actor == "fable" else sol_scenario())
+
+
+def test_prepare_user_request_persists_a_planning_task_without_starting_a_child(
+    harness,
+) -> None:
+    task = harness.coordinator.prepare_user_request(
+        "session-1", "Build the bridge", "prepared-task",
+    )
+
+    assert task.task_id == "prepared-task"
+    assert task.session_id == "session-1"
+    assert task.revision == 0
+    assert task.state is TaskState.FABLE_PLANNING
+    assert harness.fable.plan_calls == []
+    assert [
+        event.payload for event in harness.store.events_after("session-1", 0)
+        if event.task_id == "prepared-task" and event.kind == "message"
+    ] == [{"text": "Build the bridge"}]
+
+
+def test_run_prepared_request_starts_only_the_task_that_was_already_prepared(
+    harness,
+) -> None:
+    async def scenario() -> None:
+        harness.fable.brief = replace(harness.fable.brief, task_id="prepared-task")
+        harness.coordinator.prepare_user_request(
+            "session-1", "Build the bridge", "prepared-task",
+        )
+
+        await harness.coordinator.run_prepared_request("prepared-task")
+
+        assert [task_id for task_id, _, _ in harness.fable.plan_calls] == [
+            "prepared-task"
+        ]
+        task = harness.store.get_task("prepared-task", 1)
+        assert task.state is TaskState.AWAITING_USER_APPROVAL
+
+    asyncio.run(scenario())
+
+
+def test_abort_prepared_action_persists_the_exact_resumable_scheduler_failure(
+    harness,
+) -> None:
+    harness.coordinator.prepare_user_request(
+        "session-1", "Build the bridge", "prepared-task",
+    )
+
+    interrupted = harness.coordinator.abort_prepared_action(
+        "prepared-task", 0, "new_request", "scheduler_unavailable",
+    )
+    repeated = harness.coordinator.abort_prepared_action(
+        "prepared-task", 0, "new_request", "scheduler_unavailable",
+    )
+
+    assert interrupted.state is TaskState.INTERRUPTED
+    assert interrupted.continuation_state is TaskState.FABLE_PLANNING
+    assert dict(interrupted.pending or {}) == {
+        "action": "new_request",
+        "reason": "scheduler_unavailable",
+    }
+    assert repeated == interrupted
+    assert harness.fable.plan_calls == []

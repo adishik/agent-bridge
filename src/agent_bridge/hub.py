@@ -1,0 +1,496 @@
+"""Project-owned runtimes and the single in-process model-start lease."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
+import fcntl
+import os
+from pathlib import Path
+import threading
+from typing import Protocol
+
+from agent_bridge.adapters.base import FableAdapter, SolAdapter
+from agent_bridge.app import EventBroadcaster
+from agent_bridge.coordinator import Coordinator, IdFactory
+from agent_bridge.process import ProcessRunner
+from agent_bridge.projects import ProjectSpec
+from agent_bridge.repository import RepositoryTracker
+from agent_bridge.store import SQLiteStore
+
+
+_FABLE_STATUSES = frozenset({
+    "checking", "subscription_ready", "subscription_unavailable",
+})
+_SOL_STATUSES = frozenset({"checking", "ready", "running", "blocked", "unavailable"})
+_SCHEDULER_UNAVAILABLE = "scheduler_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStatus:
+    """The current bounded, non-secret provider availability projection."""
+
+    fable_ready: bool
+    fable_status: str
+    sol_status: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fable_ready, bool):
+            raise ValueError("fable_ready must be a bool")
+        if self.fable_status not in _FABLE_STATUSES:
+            raise ValueError("fable_status is invalid")
+        if self.fable_ready != (self.fable_status == "subscription_ready"):
+            raise ValueError("fable_ready must match fable_status")
+        if self.sol_status not in _SOL_STATUSES:
+            raise ValueError("sol_status is invalid")
+
+
+class RuntimeReadiness:
+    """Refresh both provider states immediately before a model may start."""
+
+    def __init__(
+        self,
+        *,
+        initial: RuntimeStatus,
+        fable_probe: Callable[[], Awaitable[tuple[bool, str]]],
+        sol_probe: Callable[[], Awaitable[str]],
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        if not isinstance(initial, RuntimeStatus):
+            raise ValueError("initial must be a RuntimeStatus")
+        if not callable(fable_probe) or not callable(sol_probe):
+            raise ValueError("provider probes must be callable")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive number")
+        self._status = initial
+        self._fable_probe = fable_probe
+        self._sol_probe = sol_probe
+        self._timeout_seconds = float(timeout_seconds)
+        self._refresh_lock = asyncio.Lock()
+
+    def snapshot(self) -> RuntimeStatus:
+        return self._status
+
+    async def require_model_start_ready(
+        self, *, usage_credits_acknowledged: bool,
+    ) -> RuntimeStatus:
+        if usage_credits_acknowledged is not True:
+            raise PermissionError("usage credits must be acknowledged")
+        async with self._refresh_lock:
+            try:
+                fable_result, sol_status = await asyncio.wait_for(
+                    asyncio.gather(self._fable_probe(), self._sol_probe()),
+                    timeout=self._timeout_seconds,
+                )
+                if (
+                    not isinstance(fable_result, tuple)
+                    or len(fable_result) != 2
+                    or not isinstance(fable_result[0], bool)
+                    or not isinstance(fable_result[1], str)
+                    or not isinstance(sol_status, str)
+                ):
+                    raise ValueError("provider probes returned an invalid status")
+                status = RuntimeStatus(fable_result[0], fable_result[1], sol_status)
+            except BaseException as error:
+                self._status = RuntimeStatus(
+                    False, "subscription_unavailable", "unavailable"
+                )
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                raise RuntimeError("model runtime is not ready") from error
+            self._status = status
+            if not status.fable_ready or status.sol_status != "ready":
+                raise RuntimeError("model runtime is not ready")
+            return status
+
+    def invalidate_fable_subscription(self) -> None:
+        self._status = RuntimeStatus(
+            False, "subscription_unavailable", self._status.sol_status
+        )
+
+
+@dataclass(slots=True)
+class InstanceLock:
+    """One lock descriptor acquired by launcher startup and owned by a runtime."""
+
+    path: Path
+    descriptor: int
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(self.descriptor)
+            self.released = True
+
+
+class AppProjectRuntime(Protocol):
+    project_id: str
+    label: str
+    repository: str
+    branch: str
+    store: SQLiteStore
+    coordinator: Coordinator
+    broadcaster: EventBroadcaster
+    readiness: RuntimeReadiness
+
+
+@dataclass(slots=True)
+class OwnedProjectRuntime:
+    """A runtime whose listeners and local resources are owned by this hub."""
+
+    spec: ProjectSpec
+    store: SQLiteStore
+    tracker: RepositoryTracker
+    runner: ProcessRunner
+    fable: FableAdapter
+    sol: SolAdapter
+    coordinator: Coordinator
+    broadcaster: EventBroadcaster
+    readiness: RuntimeReadiness
+    lock: InstanceLock
+    _event_listener_token: int | None = field(init=False, default=None, repr=False)
+    _closed: bool = field(init=False, default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_listener_token = self.store.add_event_listener(
+            self.broadcaster.publish
+        )
+
+    @property
+    def project_id(self) -> str:
+        return self.spec.project_id
+
+    @property
+    def label(self) -> str:
+        return self.spec.label
+
+    @property
+    def repository(self) -> str:
+        return str(self.spec.repo_root)
+
+    @property
+    def branch(self) -> str:
+        return self.spec.branch
+
+    def close(self) -> None:
+        """Release owned resources once, continuing cleanup after a close error."""
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+
+        def release(call: Callable[[], None]) -> None:
+            try:
+                call()
+            except BaseException as error:
+                errors.append(error)
+
+        if self._event_listener_token is not None:
+            release(lambda: self.store.remove_event_listener(self._event_listener_token))
+            self._event_listener_token = None
+        release(self.coordinator.close)
+        release(self.tracker.close)
+        release(self.store.close)
+        release(self.lock.release)
+        if errors:
+            raise errors[0]
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseToken:
+    generation: int
+    project_id: str
+    session_id: str
+    task_id: str
+
+
+class ActiveAgentLease:
+    """One process-wide lease whose generation prevents stale release races."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._active: LeaseToken | None = None
+
+    def acquire_new(
+        self, *, project_id: str, session_id: str, ids: IdFactory,
+    ) -> LeaseToken:
+        self._require_id(project_id, "project_id")
+        self._require_id(session_id, "session_id")
+        if not callable(getattr(ids, "new_task_id", None)):
+            raise ValueError("ids must create task identifiers")
+        with self._lock:
+            self._require_available()
+            task_id = ids.new_task_id()
+            self._require_id(task_id, "task_id")
+            return self._activate(project_id, session_id, task_id)
+
+    def acquire(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> LeaseToken:
+        self._require_id(project_id, "project_id")
+        self._require_id(session_id, "session_id")
+        self._require_id(task_id, "task_id")
+        with self._lock:
+            self._require_available()
+            return self._activate(project_id, session_id, task_id)
+
+    def release(self, token: LeaseToken) -> None:
+        if not isinstance(token, LeaseToken):
+            raise ValueError("token must be a LeaseToken")
+        with self._lock:
+            if self._active == token:
+                self._active = None
+
+    def snapshot(self) -> LeaseToken | None:
+        with self._lock:
+            return self._active
+
+    def _activate(self, project_id: str, session_id: str, task_id: str) -> LeaseToken:
+        self._generation += 1
+        token = LeaseToken(self._generation, project_id, session_id, task_id)
+        self._active = token
+        return token
+
+    def _require_available(self) -> None:
+        if self._active is not None:
+            raise RuntimeError("another workflow already owns the active agent lease")
+
+    @staticmethod
+    def _require_id(value: object, name: str) -> None:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+
+
+class ProjectRegistry:
+    """Stable project lookup without cross-project persistence access."""
+
+    def __init__(self, runtimes: Iterable[AppProjectRuntime]) -> None:
+        provided = tuple(runtimes)
+        by_id: dict[str, AppProjectRuntime] = {}
+        for runtime in provided:
+            project_id = getattr(runtime, "project_id", None)
+            if not isinstance(project_id, str) or not project_id:
+                raise ValueError("runtime project_id must be a non-empty string")
+            if project_id in by_id:
+                raise ValueError("duplicate project id")
+            by_id[project_id] = runtime
+        self._runtimes = tuple(by_id[key] for key in sorted(by_id))
+        self._by_id = by_id
+        self._closed = False
+
+    def runtime(self, project_id: str) -> AppProjectRuntime:
+        try:
+            return self._by_id[project_id]
+        except (KeyError, TypeError) as error:
+            raise LookupError("project not found") from error
+
+    def projects(self) -> tuple[AppProjectRuntime, ...]:
+        return self._runtimes
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+        for runtime in reversed(self._runtimes):
+            close = getattr(runtime, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWorkflow:
+    token: LeaseToken
+    project_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    action: str
+
+
+class HubWorkflowOrchestrator:
+    """The sole owner of leases across preparation and model execution."""
+
+    def __init__(
+        self,
+        *,
+        registry: ProjectRegistry,
+        lease: ActiveAgentLease,
+        usage_credits_acknowledged: Callable[[], bool],
+    ) -> None:
+        if not isinstance(registry, ProjectRegistry):
+            raise ValueError("registry must be a ProjectRegistry")
+        if not isinstance(lease, ActiveAgentLease):
+            raise ValueError("lease must be an ActiveAgentLease")
+        if not callable(usage_credits_acknowledged):
+            raise ValueError("usage_credits_acknowledged must be callable")
+        self._registry = registry
+        self._lease = lease
+        self._usage_credits_acknowledged = usage_credits_acknowledged
+        self._aborted_tokens: set[LeaseToken] = set()
+
+    async def prepare_new_request(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        text: str,
+        ids: IdFactory,
+    ) -> PreparedWorkflow:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be non-empty")
+        runtime = self._runtime_for_session(project_id, session_id)
+        self._require_acknowledgement()
+        token = self._lease.acquire_new(
+            project_id=project_id, session_id=session_id, ids=ids,
+        )
+        try:
+            await runtime.readiness.require_model_start_ready(
+                usage_credits_acknowledged=True
+            )
+            task = runtime.coordinator.prepare_user_request(
+                session_id, text, token.task_id
+            )
+            if (
+                task.task_id != token.task_id
+                or task.session_id != session_id
+                or task.revision != 0
+            ):
+                raise RuntimeError("prepared task does not match the active lease")
+            return PreparedWorkflow(
+                token=token,
+                project_id=project_id,
+                session_id=session_id,
+                task_id=token.task_id,
+                revision=task.revision,
+                action="new_request",
+            )
+        except BaseException:
+            self._lease.release(token)
+            raise
+
+    async def prepare_existing_task(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        action: str,
+    ) -> PreparedWorkflow:
+        self._require_non_empty(task_id, "task_id")
+        self._require_non_negative_integer(revision, "revision")
+        self._require_non_empty(action, "action")
+        runtime = self._runtime_for_session(project_id, session_id)
+        task = runtime.store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise LookupError("task not found")
+        self._require_acknowledgement()
+        token = self._lease.acquire(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
+        try:
+            await runtime.readiness.require_model_start_ready(
+                usage_credits_acknowledged=True
+            )
+            return PreparedWorkflow(
+                token=token,
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                action=action,
+            )
+        except BaseException:
+            self._lease.release(token)
+            raise
+
+    async def run(self, prepared: PreparedWorkflow) -> None:
+        if not isinstance(prepared, PreparedWorkflow):
+            raise ValueError("prepared must be a PreparedWorkflow")
+        if self._lease.snapshot() != prepared.token:
+            raise RuntimeError("prepared workflow no longer owns the active lease")
+        try:
+            runtime = self._runtime_for_session(
+                prepared.project_id, prepared.session_id
+            )
+            await runtime.coordinator.run_prepared_request(prepared.task_id)
+        finally:
+            self._lease.release(prepared.token)
+
+    def abort_prepared(self, prepared: PreparedWorkflow, *, reason: str) -> None:
+        if not isinstance(prepared, PreparedWorkflow):
+            raise ValueError("prepared must be a PreparedWorkflow")
+        if prepared.token in self._aborted_tokens:
+            return
+        if self._lease.snapshot() != prepared.token:
+            self._aborted_tokens.add(prepared.token)
+            return
+        try:
+            runtime = self._runtime_for_session(
+                prepared.project_id, prepared.session_id
+            )
+            runtime.coordinator.abort_prepared_action(
+                prepared.task_id,
+                prepared.revision,
+                prepared.action,
+                _SCHEDULER_UNAVAILABLE,
+            )
+        finally:
+            self._aborted_tokens.add(prepared.token)
+            self._lease.release(prepared.token)
+
+    async def stop(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> None:
+        self._require_non_empty(task_id, "task_id")
+        runtime = self._runtime_for_session(project_id, session_id)
+        token = self._lease.snapshot()
+        if (
+            token is None
+            or token.project_id != project_id
+            or token.session_id != session_id
+            or token.task_id != task_id
+        ):
+            raise RuntimeError("stop requires the exact active workflow")
+        await runtime.coordinator.stop_task(task_id)
+
+    def _runtime_for_session(
+        self, project_id: str, session_id: str,
+    ) -> AppProjectRuntime:
+        self._require_non_empty(project_id, "project_id")
+        self._require_non_empty(session_id, "session_id")
+        runtime = self._registry.runtime(project_id)
+        if not runtime.store.session_exists(session_id):
+            raise LookupError("chat not found")
+        return runtime
+
+    def _require_acknowledgement(self) -> None:
+        if self._usage_credits_acknowledged() is not True:
+            raise PermissionError("usage credits must be acknowledged")
+
+    @staticmethod
+    def _require_non_empty(value: object, name: str) -> None:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+
+    @staticmethod
+    def _require_non_negative_integer(value: object, name: str) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
