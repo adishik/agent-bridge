@@ -256,6 +256,20 @@ def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
       if (!unresolvedText.includes("Resolve or remove the open questions in Edit before approval.")) {{
         process.exit(33);
       }}
+      const failedStart = created.length;
+      bridge.renderTaskInspector(documentRoot, {{
+        task_id: "failed-task", revision: 1, state: "failed",
+        brief: {{
+          ...brief,
+          task_id: "failed-task",
+          revision: 1,
+          open_questions: ["Which path is authoritative?"],
+        }},
+      }}, {{gate: {{ready: true}}, onAction: () => {{}}}});
+      const failedButtons = created.slice(failedStart).filter((node) => node.tag === "button");
+      if (failedButtons.some((node) => node.textContent === "Approve & run")) {{
+        process.exit(34);
+      }}
     """
     _run_module_harness(harness)
 
