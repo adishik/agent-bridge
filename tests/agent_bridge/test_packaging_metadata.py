@@ -43,3 +43,12 @@ def test_readme_is_generic_and_copy_pasteable() -> None:
     assert "Claude Code subscription" in readme
     assert "usage credits" in readme.lower()
     assert "Codex CLI" in readme
+
+
+def test_static_browser_assets_are_declared_as_package_data() -> None:
+    package_data = _metadata()["tool"]["setuptools"]["package-data"]
+    assert package_data["agent_bridge"] == [
+        "static/*.html",
+        "static/*.css",
+        "static/*.js",
+    ]

@@ -32,6 +32,13 @@ build-backend = "setuptools.build_meta"
 package-dir = { "" = "src" }
 include-package-data = true
 
+[tool.setuptools.package-data]
+agent_bridge = [
+  "static/*.html",
+  "static/*.css",
+  "static/*.js",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = false
