@@ -208,6 +208,8 @@ git commit -m "feat: persist hub account settings"
 - Create: `tests/agent_bridge/test_hub.py`
 - Modify: `src/agent_bridge/coordinator.py`
 - Modify: `tests/agent_bridge/test_coordinator.py`
+- Modify: `src/agent_bridge/store.py`
+- Modify: `tests/agent_bridge/test_store.py`
 
 **Interfaces:**
 
@@ -287,6 +289,63 @@ class ActiveAgentLease:
     def release(self, token: LeaseToken) -> None: ...
     def snapshot(self) -> LeaseToken | None: ...
 
+PreparedActionKind = Literal["new_request", "approval", "answer", "resume"]
+
+@dataclass(frozen=True, slots=True)
+class NewRequestPayload:
+    text: str
+
+@dataclass(frozen=True, slots=True)
+class ApprovalPayload:
+    pass
+
+@dataclass(frozen=True, slots=True)
+class AnswerPayload:
+    answer: str
+
+@dataclass(frozen=True, slots=True)
+class ResumePayload:
+    pass
+
+PreparedActionPayload = (
+    NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
+)
+
+@dataclass(frozen=True, slots=True)
+class PreparedActionRecord:
+    preparation_id: str
+    project_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    action: PreparedActionKind
+    payload: PreparedActionPayload
+    source_state: TaskState
+    active_state: TaskState
+    status: Literal["prepared", "claimed", "aborted", "completed"]
+    generation: int
+
+def prepare_action(
+    self,
+    *,
+    preparation_id: str,
+    project_id: str,
+    session_id: str,
+    task_id: str,
+    revision: int,
+    action: PreparedActionKind,
+    payload: PreparedActionPayload,
+    source_state: TaskState,
+    active_state: TaskState,
+    generation: int,
+) -> PreparedActionRecord: ...
+def claim_prepared_action(
+    self, preparation_id: str, *, generation: int,
+) -> PreparedActionRecord: ...
+def abort_prepared_action(
+    self, preparation_id: str, *, generation: int, reason: str,
+) -> PreparedActionRecord: ...
+
 class ProjectRegistry:
     def runtime(self, project_id: str) -> AppProjectRuntime: ...
     def projects(self) -> tuple[AppProjectRuntime, ...]: ...
@@ -294,12 +353,13 @@ class ProjectRegistry:
 
 @dataclass(frozen=True, slots=True)
 class PreparedWorkflow:
+    preparation_id: str
     token: LeaseToken
     project_id: str
     session_id: str
     task_id: str
     revision: int
-    action: str
+    action: PreparedActionKind
 
 class HubWorkflowOrchestrator:
     async def prepare_new_request(
@@ -308,43 +368,124 @@ class HubWorkflowOrchestrator:
     ) -> PreparedWorkflow: ...
     async def prepare_existing_task(
         self, *, project_id: str, session_id: str,
-        task_id: str, revision: int, action: str,
+        task_id: str, revision: int, action: PreparedActionKind,
     ) -> PreparedWorkflow: ...
     async def run(self, prepared: PreparedWorkflow) -> None: ...
     def abort_prepared(self, prepared: PreparedWorkflow, *, reason: str) -> None: ...
     async def stop(self, *, project_id: str, session_id: str, task_id: str) -> None: ...
 
 # Coordinator preparation methods called only by HubWorkflowOrchestrator.
-def prepare_user_request(self, session_id: str, text: str, task_id: str) -> TaskRecord: ...
-async def run_prepared_request(self, task_id: str) -> None: ...
+def prepare_new_request(
+    self, *, preparation_id: str, session_id: str, task_id: str, text: str,
+    generation: int,
+) -> PreparedActionRecord: ...
+def prepare_approval(
+    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    generation: int,
+) -> PreparedActionRecord: ...
+def prepare_answer(
+    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    answer: str, generation: int,
+) -> PreparedActionRecord: ...
+def prepare_resume(
+    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    generation: int,
+) -> PreparedActionRecord: ...
+async def run_prepared_action(self, preparation_id: str) -> None: ...
 def abort_prepared_action(
-    self, task_id: str, revision: int, action: str, reason: str,
-) -> TaskRecord: ...
+    self, preparation_id: str, *, generation: int, reason: str,
+) -> PreparedActionRecord: ...
 ```
+
+`SQLiteStore` owns a dedicated additive `prepared_actions` table; prepared
+work must never be encoded in `TaskRecord.pending`. Every row has an opaque
+unpredictable `preparation_id`, exact project/session/task/revision/action
+identity, a bounded discriminator-matched immutable payload (text/answer
+limits use the existing request limits and approval/resume carry no payload),
+the exact source and already-existing active pre-child states, and a
+generation/status compare-and-swap guard. `prepare_action` atomically validates
+the exact source record, inserts the row, and CAS-transitions the task into its
+existing active pre-child state. No state-machine edge is added: preparation
+uses the source-to-active transitions already represented in the state graph.
+
+`claim_prepared_action` may transition one exact `(preparation_id, generation)`
+row from `prepared` to `claimed` once; stale, different, forged, or already
+claimed identities reject before any child starts. `abort_prepared_action`
+atomically writes the task's existing `INTERRUPTED` state with its exact
+continuation and a bounded durable pending projection
+`{action, reason, preparation_id}`, marks the preparation aborted, and returns
+the same record for an identical abort retry. A stale generation or any
+different action/identity/reason rejects. An abort persistence failure leaves
+the preparation and lease retryable rather than releasing the token.
+
+The coordinator exposes route-specific synchronous preparation methods for
+new requests, approval, answer, and resume; each delegates the durable
+transition to the store. `run_prepared_action(preparation_id)` first claims the
+exact durable record and dispatches only its matched route. Existing public
+compatibility wrappers remain, but delegate through the corresponding
+prepare-then-run path rather than bypassing durable preparation.
 
 - [ ] **Step 1: Add registry isolation RED tests**
 
 Construct two app-facing runtimes with deliberately equal session/task IDs. Assert `runtime(project_a)` never queries project B, unknown IDs raise one generic lookup error, project order is stable, and duplicate IDs are rejected. Build owned runtimes separately and verify idempotent close unregisters listeners, closes coordinators/stores, and releases locks in reverse acquisition order even if one close raises. A non-owning compatibility runtime must never close resources supplied by the caller.
 
-- [ ] **Step 2: Add lease race RED tests**
+- [ ] **Step 2: Add prepared-action, readiness, and lease race RED tests**
 
 Use threads and barriers to prove only one of two acquisitions succeeds. Assert `acquire_new` creates the task ID inside the lease critical section, stale tokens cannot release a newer generation, double release is harmless, and the active snapshot contains opaque IDs only. Assert a held lease rejects project switch, chat switch, New Chat, approval, Resume, and an answer that would resume a model; Stop bypasses acquisition only for the exact lease-owning task. Force scheduler installation rejection after preparation and assert `abort_prepared` atomically places the exact task/action into `INTERRUPTED` with a resumable pending action, releases only its token, and is idempotent.
+
+In `test_store.py`, add durable transaction tests for each of approval, answer,
+and resume covering prepare, exact-once claim/run, scheduler abort,
+restart/reopen recovery, and idempotent same-identity retry. Assert preparation
+uses the exact active state selected by the existing state graph, does not add a
+graph edge, and never writes `TaskRecord.pending`. Cover malformed/oversized
+typed payloads, a stale/different preparation identity or generation, a forged
+workflow identity, duplicate claim, and an injected abort-persistence failure.
+In `test_hub.py`, make one readiness probe hang while its sibling fails or the
+caller is cancelled; assert `RuntimeReadiness` cancels and awaits every probe
+task before the orchestrator releases the lease. Assert hub `run` and
+`abort_prepared` load the record and compare its exact persisted
+project/session/task/revision/action/generation identity against the
+`LeaseToken` and `PreparedWorkflow` before dispatch or abort. An abort may
+release only after the durable store abort succeeds; an abort failure retains
+the exact retryable token.
 
 - [ ] **Step 3: Run RED and implement**
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_user_request or run_prepared_request or abort_prepared_action"
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action"
+python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action"
 ```
 
-Use an in-process lock plus monotonically increasing generation. `HubWorkflowOrchestrator` is the sole lease owner. Each awaited preparation validates route identity and hub acknowledgment without starting a child, then acquires the generation-safe lease (`acquire_new` creates a task ID inside that critical section), and only while holding it calls the route-selected `RuntimeReadiness.require_model_start_ready`. Fresh Claude/Sol probes therefore count inside the one-process boundary. Probe/gate failure releases the token and performs no coordinator/store preparation. After a green gate, `prepare_new_request` calls `Coordinator.prepare_user_request(session_id, text, task_id)` synchronously while holding the lease, releases on preparation failure, and returns `PreparedWorkflow`; `run` calls `Coordinator.run_prepared_request(task_id)` and releases in `finally`. Coordinators and HTTP handlers never reacquire independently. `abort_prepared` is the only preparation-to-scheduler failure path: it calls `Coordinator.abort_prepared_action` with the exact task/revision/action and fixed reason `scheduler_unavailable`, persists an interrupted/resumable pending action, and then releases the exact token. Raw scheduling exceptions never enter persistence. Do not persist a lease as proof of a live process; startup recovery remains per-project and explicit Resume remains required.
+Use an in-process lock plus monotonically increasing generation. `HubWorkflowOrchestrator` is the sole lease owner. Each awaited preparation validates route identity and hub acknowledgment without starting a child, then acquires the generation-safe lease (`acquire_new` creates a task ID inside that critical section), and only while holding it calls the route-selected `RuntimeReadiness.require_model_start_ready`. Fresh Claude/Sol probes therefore count inside the one-process boundary. `RuntimeReadiness` creates tracked probe tasks and, on any probe error, timeout, or caller cancellation, cancels and awaits all still-running siblings before returning control; only then may the orchestrator release the token. Probe/gate failure releases the token and performs no coordinator/store preparation.
+
+After a green gate, route-specific coordinator preparation synchronously writes
+one `PreparedActionRecord` while holding the lease and returns a
+`PreparedWorkflow` containing its `preparation_id`; `run` reloads that record,
+validates its persisted identity against the exact token/workflow, calls
+`Coordinator.run_prepared_action(preparation_id)`, and releases in `finally`.
+Coordinators and HTTP handlers never reacquire independently. `abort_prepared`
+is the only preparation-to-scheduler failure path: after reloading and
+validating the exact durable identity, it calls the coordinator abort with the
+fixed reason `scheduler_unavailable`, and releases the exact token only after
+the durable interrupted/resumable pending action succeeds. Raw scheduling
+exceptions never enter persistence. Do not persist a lease as proof of a live
+process; startup recovery remains per-project and explicit Resume remains
+required.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_projects.py tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_user_request or run_prepared_request or abort_prepared_action"
-git add src/agent_bridge/hub.py tests/agent_bridge/test_hub.py src/agent_bridge/coordinator.py tests/agent_bridge/test_coordinator.py
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action"
+python -m pytest -q tests/agent_bridge/test_store.py
+git add \
+  src/agent_bridge/hub.py \
+  tests/agent_bridge/test_hub.py \
+  src/agent_bridge/coordinator.py \
+  tests/agent_bridge/test_coordinator.py \
+  src/agent_bridge/store.py \
+  tests/agent_bridge/test_store.py
 git diff --cached --check
 git commit -m "feat: isolate project runtimes behind a hub lease"
 ```
