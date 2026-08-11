@@ -291,6 +291,12 @@ class ActiveAgentLease:
 
 PreparedActionKind = Literal["new_request", "approval", "answer", "resume"]
 COMPATIBILITY_PREPARATION_GENERATION = 0
+PreparedActionFailureReason = Literal["nonresumable_failure"]
+PreparedActionInterruptionReason = Literal["stop", "adapter_interrupted"]
+
+@dataclass(frozen=True, slots=True)
+class PreparedActionOutcome:
+    category: Literal["completed", "stop", "adapter_interrupted", "nonresumable_failure"]
 
 @dataclass(frozen=True, slots=True)
 class NewRequestPayload:
@@ -413,10 +419,10 @@ def complete_prepared_action(
     self, preparation_id: str, *, generation: int,
 ) -> PreparedActionRecord: ...
 def fail_prepared_action(
-    self, preparation_id: str, *, generation: int, reason: str,
+    self, preparation_id: str, *, generation: int, reason: PreparedActionFailureReason,
 ) -> PreparedActionRecord: ...
 def interrupt_claimed_prepared_action(
-    self, preparation_id: str, *, generation: int, reason: str,
+    self, preparation_id: str, *, generation: int, reason: PreparedActionInterruptionReason,
 ) -> PreparedActionRecord: ...
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
@@ -474,9 +480,9 @@ def prepare_resume(
     generation: int,
 ) -> PreparedActionRecord: ...
 def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
-async def run_prepared_action(self, preparation_id: str) -> None: ...
+async def run_prepared_action(self, preparation_id: str) -> PreparedActionOutcome: ...
 def interrupt_claimed_prepared_action(
-    self, preparation_id: str, *, generation: int, reason: str,
+    self, preparation_id: str, *, generation: int, reason: PreparedActionInterruptionReason,
 ) -> PreparedActionRecord: ...
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
@@ -583,11 +589,17 @@ new request, approval, answer, and resume; each performs its repository,
 baseline, exact-revision, continuation, and drift validation before invoking
 the matching store transaction. `run_prepared_action(preparation_id)` reloads
 and claims the exact durable record, invokes only the operation reconstructible
-from its persisted context, and classifies the exact post-coordinator outcome:
-normal completed action becomes `COMPLETED`; an exact matching Stop or
-adapter-interruption with the task revision in `TaskState.INTERRUPTED` becomes
-`INTERRUPTED`; and only a non-resumable classified failure becomes `FAILED`.
-It never classifies from raw exception text. Existing public compatibility
+from its persisted context, and returns only a `PreparedActionOutcome` fixed
+category. The hub reloads the exact task revision after every return or caught
+exception: `completed` becomes `COMPLETED` only for a normal completed action;
+`stop` or `adapter_interrupted` becomes `INTERRUPTED` only when that exact task
+revision is `TaskState.INTERRUPTED`; and `nonresumable_failure` becomes
+`FAILED`. On an unexpected exception, the hub ignores its text, reloads the
+exact task revision, uses fixed `adapter_interrupted` if it is interrupted, or
+fixed `nonresumable_failure` otherwise, then re-raises only a bounded safe
+error. The `PreparedActionOutcome` category—not an exception message—is the
+only persisted terminal reason; raw exception text never enters prepared
+records, task events, or pending projections. Existing public compatibility
 wrappers remain, but delegate through corresponding prepare-then-run paths
 rather than bypassing durable preparation.
 
@@ -634,6 +646,11 @@ that terminal record without invoking a child. Assert Resume accepts only a
 same-identity `ABORTED`, `RECOVERED`, or `INTERRUPTED` predecessor, rejects a
 wrong-project/session/task/revision or stale predecessor, rejects
 `CLAIMED`/`COMPLETED`/`FAILED`, and cannot cause a duplicate invocation.
+Inject a sentinel exception containing a secret-like/raw message after claim;
+assert the hub reloads the exact task, persists only the applicable fixed
+`adapter_interrupted` or `nonresumable_failure` category, emits no raw message
+in prepared records/events/pending data, and surfaces only a bounded safe
+error.
 
 In `test_hub.py`, make one readiness probe hang while its sibling fails or the
 caller is cancelled; assert `RuntimeReadiness` cancels and awaits every probe
