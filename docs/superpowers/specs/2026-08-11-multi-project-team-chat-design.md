@@ -133,7 +133,15 @@ boundary:
 - process runner;
 - Fable and Sol adapters bound to that repository;
 - coordinator; and
-- preflight/readiness projection.
+- a readiness service with a safe projection plus bounded fresh provider
+  validation before each model-starting action.
+
+Startup preflight seeds the displayed status but is not lifetime authority.
+Every model-starting preparation performs a fresh bounded Claude subscription
+check and the complete existing Sol-readiness and usage-credit gate. A
+structured expired-login result invalidates that project's Fable status
+immediately; after the operator logs in, Resume performs a new check rather
+than trusting the startup snapshot or requiring a server restart.
 
 New project state lives below:
 
@@ -145,8 +153,9 @@ The directory identity depends only on the exact canonical root. The display
 label is stored as metadata and may be renamed without selecting a different
 database. The digest prevents same-basename repositories from colliding. Two
 labels for the same root are rejected.
-Project locks are acquired in stable project-ID order before any database
-recovery. Failure to validate or lock any configured project aborts startup and
+Every selected state path is validated first. The hub and project locks are
+then acquired in stable project-ID order before any database is opened,
+migrated, audited, or recovered. Failure to validate or lock any configured project aborts startup and
 releases every acquired resource; the server never starts with a silently
 partial authority set.
 
@@ -320,7 +329,17 @@ The server then:
 Every recovery path can therefore expose the committed intervention as pending
 Resume, including a crash before or during process termination. Repeating the
 request with the same intervention ID cannot duplicate the message, signal, or
-resume.
+resume-attempt scheduling record.
+
+Before invoking a resumed provider session or thread, the bridge persists an
+exact resume-attempt ID and run ID. Claude Code and Codex CLI do not expose a
+transactional provider idempotency key, so a process crash after the provider
+accepts a resume prompt but before the bridge records the result has an
+unknowable outcome. Recovery marks that attempt `resume_outcome_unknown` and
+never replays it automatically. The browser explains that the prior attempt
+may have executed and requires the user to authorize a new attempt explicitly.
+This fail-closed boundary prevents the bridge from claiming impossible
+exactly-once provider execution or silently duplicating Sol mutations.
 
 Stop wins all post-run routing races. A late adapter result may be retained as
 sanitized evidence but cannot move an interrupted task to completion, review,
@@ -413,6 +432,9 @@ insertion, and bounded rendered collections.
   provider output, tokens, account identity, and stderr remain excluded.
 - Unexpected adapter, process, repository, or persistence errors emit bounded
   system conversation messages and retain safe details in Activity/Audit.
+- A crash during a persisted provider resume attempt marks its outcome unknown,
+  never auto-replays it, and requires explicit user acknowledgment that the
+  prior attempt may already have executed before a new attempt is created.
 - Restart recovery interrupts only the latest active revision in each project,
   retires every stale running run, and never sends a signal to persisted PIDs.
 - Explicit Resume is required after recovery.
@@ -524,7 +546,8 @@ Required coverage includes:
 - intervention-record commit before signaling, idempotent retry, Stop and
   Intervene ordering, exact process ownership, partial events, crash recovery,
   early Fable interruption without a session ID, visible new-session fallback,
-  stale completion, nested continuations, and baseline preservation;
+  unknown resume-outcome acknowledgment, stale completion, nested
+  continuations, and baseline preservation;
 - expired-auth fixed guidance without raw error leakage;
 - project-aware CSRF, keyed session, stale/cross-project ID, replay pagination,
   reconnect, and bounded bootstrap behavior;
