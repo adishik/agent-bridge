@@ -77,7 +77,13 @@ def test_usage_credits_acknowledgement_is_durable_and_uses_injected_clock(tmp_pa
 
 def test_usage_credits_acknowledgement_is_idempotent(tmp_path) -> None:
     path = tmp_path / "hub.sqlite3"
-    store = HubStore(path, clock=_clock)
+    timestamps = iter(
+        (
+            datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 11, 13, 0, tzinfo=timezone.utc),
+        )
+    )
+    store = HubStore(path, clock=lambda: next(timestamps))
 
     store.acknowledge_usage_credits()
     store.acknowledge_usage_credits()
@@ -111,7 +117,30 @@ def test_failed_acknowledgement_transaction_rolls_back(tmp_path) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="forced acknowledgement failure"):
         store.acknowledge_usage_credits()
 
+    assert store._connection.in_transaction is False
     assert store.usage_credits_acknowledged() is False
+    store._connection.execute("DROP TRIGGER reject_usage_acknowledgement")
+    store.acknowledge_usage_credits()
+    assert store.usage_credits_acknowledged() is True
+    store.close()
+
+
+def test_naive_clock_value_rolls_back_and_connection_remains_usable(tmp_path) -> None:
+    timestamps = iter(
+        (
+            datetime(2026, 8, 11, 12, 0),
+            datetime(2026, 8, 11, 13, 0, tzinfo=timezone.utc),
+        )
+    )
+    store = HubStore(tmp_path / "hub.sqlite3", clock=lambda: next(timestamps))
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.acknowledge_usage_credits()
+
+    assert store._connection.in_transaction is False
+    assert store.usage_credits_acknowledged() is False
+    store.acknowledge_usage_credits()
+    assert store.usage_credits_acknowledged() is True
     store.close()
 
 

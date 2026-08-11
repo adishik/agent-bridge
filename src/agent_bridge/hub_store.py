@@ -71,6 +71,8 @@ class HubStore:
             acknowledged_at = self._clock()
             if not isinstance(acknowledged_at, datetime):
                 raise ValueError("clock must return a datetime")
+            if acknowledged_at.utcoffset() is None:
+                raise ValueError("clock must return a timezone-aware datetime")
             self._connection.execute(
                 "INSERT INTO account_settings (key, value) VALUES (?, ?)",
                 (_USAGE_CREDITS_ACKNOWLEDGED_AT, acknowledged_at.isoformat()),
