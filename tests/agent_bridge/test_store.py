@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 import sqlite3
 import threading
@@ -889,3 +890,480 @@ def test_usage_credit_acknowledgement_setting_persists_across_connections(tmp_pa
 
     reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
     assert reopened.get_setting("usage_credits_acknowledged") is True
+
+
+def _create_current_schema(path) -> sqlite3.Connection:
+    """Create the schema released before chats became persistent records."""
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            repo_root TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            brief_json TEXT,
+            approved_at TEXT,
+            fable_session_id TEXT,
+            sol_thread_id TEXT,
+            baseline_id TEXT,
+            correction_count INTEGER NOT NULL DEFAULT 0,
+            continuation_state TEXT,
+            pending_json TEXT,
+            PRIMARY KEY (task_id, revision),
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        );
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            actor TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        );
+        CREATE TABLE agent_runs (
+            run_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            agent TEXT NOT NULL,
+            pid INTEGER,
+            process_group_id INTEGER,
+            cli_session_id TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            exit_code INTEGER,
+            status TEXT NOT NULL,
+            FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+        );
+        CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL
+        );
+        """
+    )
+    return connection
+
+
+def _legacy_table_rows(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
+    def rows(query: str) -> tuple[tuple, ...]:
+        return tuple(tuple(row) for row in connection.execute(query))
+
+    return {
+        "sessions": rows(
+            "SELECT session_id, repo_root, created_at FROM sessions ORDER BY session_id"
+        ),
+        "tasks": rows("SELECT * FROM tasks ORDER BY task_id, revision"),
+        "events": rows("SELECT * FROM events ORDER BY sequence"),
+        "agent_runs": rows("SELECT * FROM agent_runs ORDER BY run_id"),
+        "settings": rows("SELECT * FROM settings ORDER BY key"),
+    }
+
+
+def _seed_legacy_database(path) -> dict[str, tuple[tuple, ...]]:
+    connection = _create_current_schema(path)
+    connection.executemany(
+        "INSERT INTO sessions (session_id, repo_root, created_at) VALUES (?, ?, ?)",
+        (
+            ("active-session", "/repo", "2026-08-10T10:00:00Z"),
+            ("other-session", "/repo", "2026-08-10T10:01:00Z"),
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            task_id, revision, session_id, state, brief_json, approved_at,
+            fable_session_id, sol_thread_id, baseline_id, correction_count,
+            continuation_state, pending_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task.legacy",
+            1,
+            "active-session",
+            "awaiting_user_approval",
+            '{"raw":"brief bytes"}',
+            None,
+            None,
+            None,
+            "baseline-legacy",
+            0,
+            None,
+            '{"raw":"pending bytes"}',
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "other-session",
+            None,
+            "user",
+            "message",
+            '{"text":"preserved event bytes"}',
+            "2026-08-10T10:02:00Z",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_runs (
+            run_id, task_id, revision, agent, pid, process_group_id,
+            cli_session_id, started_at, ended_at, exit_code, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "run-legacy",
+            "task.legacy",
+            1,
+            "sol",
+            123,
+            123,
+            "thread-legacy",
+            "2026-08-10T10:03:00Z",
+            None,
+            None,
+            "running",
+        ),
+    )
+    baseline = {
+        "task_id": "task.legacy",
+        "revision": 1,
+        "baseline_id": "baseline-legacy",
+        "manifest": {"baseline_id": "baseline-legacy", "repo_root": "/repo"},
+    }
+    connection.executemany(
+        "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+        (
+            ("agent_bridge.active_session_id", '"active-session"'),
+            (
+                "agent_bridge.baseline.task.legacy.1",
+                json.dumps(baseline, separators=(",", ":"), sort_keys=True),
+            ),
+        ),
+    )
+    connection.commit()
+    rows = _legacy_table_rows(connection)
+    connection.close()
+    return rows
+
+
+def test_migration_preserves_legacy_bytes_and_backfills_bounded_chat_metadata(
+    tmp_path,
+) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    before = _seed_legacy_database(path)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    assert _legacy_table_rows(migrated._connection) == before
+    active = migrated.chat("active-session")
+    other = migrated.chat("other-session")
+    assert active is not None
+    assert active.title == "New chat"
+    assert active.updated_at == "2026-08-10T10:00:00Z"
+    assert active.latest_sequence == 0
+    assert other is not None
+    assert other.title == "New chat"
+    assert other.updated_at == "2026-08-10T10:01:00Z"
+    assert other.latest_sequence == 1
+    selected = migrated.get_setting("agent_bridge.active_session_id")
+    assert selected == "active-session"
+    assert migrated.chat(selected) == active
+    migrated.close()
+
+    first_migration_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert _legacy_table_rows(reopened._connection) == before
+    reopened.close()
+    assert path.read_bytes() == first_migration_bytes
+
+
+def test_chat_migration_rolls_back_every_ddl_change_after_backfill_failure(tmp_path) -> None:
+    path = tmp_path / "rollback.sqlite3"
+    connection = _create_current_schema(path)
+    connection.execute(
+        "INSERT INTO sessions (session_id, repo_root, created_at) VALUES (?, ?, ?)",
+        ("session-1", "/repo", "2026-08-10T10:00:00Z"),
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER fail_chat_backfill
+        BEFORE UPDATE OF updated_at ON sessions
+        BEGIN
+            SELECT RAISE(ABORT, 'injected chat migration failure');
+        END
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected chat migration failure"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    columns = tuple(row[1] for row in inspected.execute("PRAGMA table_info(sessions)"))
+    assert columns == ("session_id", "repo_root", "created_at")
+    assert inspected.execute("SELECT * FROM sessions").fetchall() == [
+        ("session-1", "/repo", "2026-08-10T10:00:00Z")
+    ]
+    inspected.close()
+
+
+def test_create_chat_uses_unique_cryptographic_ids_and_preserves_session_wrapper(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+
+    first = store.create_chat("/repo/one")
+    second = store.create_chat("/repo/two")
+    legacy_return = store.create_session("legacy-session", "/repo/legacy")
+
+    assert first.session_id != second.session_id
+    assert len(first.session_id) == 32
+    assert set(first.session_id) <= set("0123456789abcdef")
+    assert first.repo_root == "/repo/one"
+    assert second.repo_root == "/repo/two"
+    assert first.title == second.title == "New chat"
+    assert first.latest_sequence == second.latest_sequence == 0
+    assert legacy_return is None
+    assert store.chat("legacy-session") is not None
+    assert store.chat("legacy-session").repo_root == "/repo/legacy"  # type: ignore[union-attr]
+
+
+def test_first_user_message_derives_the_only_bounded_unicode_chat_title(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create_chat("/repo", session_id="chat-1")
+    first_text = "  café\t" + ("文" * 100)
+
+    store.append_event("chat-1", None, "fable", "message", {"text": "ignore me"})
+    store.append_event("chat-1", None, "system", "message", {"text": "ignore me too"})
+    store.append_event("chat-1", None, "user", "message", {"text": first_text})
+    titled = store.chat("chat-1")
+    store.append_event(
+        "chat-1", None, "user", "message", {"text": "later user text cannot rename"}
+    )
+
+    assert titled is not None
+    assert titled.title == "café " + ("文" * 75)
+    assert len(titled.title) == 80
+    assert store.chat("chat-1").title == titled.title  # type: ignore[union-attr]
+
+
+def test_chat_lists_use_event_sequence_recency_and_stable_cursor_pagination(tmp_path) -> None:
+    store = _store(tmp_path)
+    for session_id in ("active-a", "active-b", *(f"empty-{index:03d}" for index in range(103))):
+        store.create_chat("/repo", session_id=session_id)
+    older = store.append_event("active-a", None, "user", "message", {"text": "older"})
+    newer = store.append_event("active-b", None, "user", "message", {"text": "newer"})
+
+    all_records = store.list_chats(limit=50)
+    assert [record.session_id for record in all_records[:2]] == ["active-b", "active-a"]
+    assert [record.latest_sequence for record in all_records[:2]] == [
+        newer.sequence,
+        older.sequence,
+    ]
+    assert [record.session_id for record in all_records[2:]] == [
+        f"empty-{index:03d}" for index in range(48)
+    ]
+
+    seen = []
+    before = None
+    while True:
+        page = store.list_chats(before=before, limit=50)
+        seen.extend(record.session_id for record in page)
+        if len(page) < 50:
+            break
+        last = page[-1]
+        before = store_module.ChatCursor(last.latest_sequence, last.session_id)
+
+    assert seen == ["active-b", "active-a", *(f"empty-{index:03d}" for index in range(103))]
+    assert len(seen) == len(set(seen))
+
+
+def test_chat_page_inputs_reject_invalid_or_partial_cursors_before_sql(tmp_path) -> None:
+    store = _store(tmp_path)
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)
+
+    with pytest.raises(ValueError, match="limit"):
+        store.list_chats(limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        store.list_chats(limit=51)
+    with pytest.raises(ValueError, match="latest_sequence"):
+        store_module.ChatCursor(-1, "chat-1")
+    with pytest.raises(ValueError, match="session_id"):
+        store_module.ChatCursor(1, "")
+    with pytest.raises(ValueError, match="before"):
+        store.list_chats(before=object())
+
+    assert statements == []
+
+
+def _seed_auditable_legacy_database(path) -> None:
+    connection = _create_current_schema(path)
+    connection.execute(
+        "INSERT INTO sessions (session_id, repo_root, created_at) VALUES (?, ?, ?)",
+        ("session-1", "/repo", "2026-08-10T10:00:00Z"),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            task_id, revision, session_id, state, brief_json, approved_at,
+            fable_session_id, sol_thread_id, baseline_id, correction_count,
+            continuation_state, pending_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task-1",
+            1,
+            "session-1",
+            "awaiting_user_approval",
+            "{}",
+            None,
+            None,
+            None,
+            "baseline-1",
+            0,
+            None,
+            None,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("session-1", "task-1", "user", "message", '{"text":"hello"}', "2026-08-10T10:01:00Z"),
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_runs (
+            run_id, task_id, revision, agent, pid, process_group_id,
+            cli_session_id, started_at, ended_at, exit_code, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("run-1", "task-1", 1, "sol", None, None, None, "2026-08-10T10:02:00Z", None, None, "running"),
+    )
+    baseline = {
+        "task_id": "task-1",
+        "revision": 1,
+        "baseline_id": "baseline-1",
+        "manifest": {"baseline_id": "baseline-1", "repo_root": "/repo"},
+    }
+    connection.executemany(
+        "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+        (
+            ("agent_bridge.active_session_id", '"session-1"'),
+            (
+                "agent_bridge.baseline.task-1.1",
+                json.dumps(baseline, separators=(",", ":"), sort_keys=True),
+            ),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_legacy_project_ownership_audit_is_one_read_transaction(tmp_path) -> None:
+    path = tmp_path / "audit.sqlite3"
+    _seed_auditable_legacy_database(path)
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)
+
+    assert store.audit_legacy_project_ownership("/repo") is None
+
+    assert statements[0] == "BEGIN"
+    assert statements[-1] == "ROLLBACK"
+    assert not any(statement.split(maxsplit=1)[0] in {"INSERT", "UPDATE", "DELETE"} for statement in statements)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        lambda connection: connection.execute(
+            "UPDATE sessions SET repo_root = '/other' WHERE session_id = 'session-1'"
+        ),
+        lambda connection: connection.execute(
+            "UPDATE sessions SET repo_root = '' WHERE session_id = 'session-1'"
+        ),
+        lambda connection: connection.execute(
+            "UPDATE settings SET value_json = '\"missing-session\"' WHERE key = 'agent_bridge.active_session_id'"
+        ),
+        lambda connection: connection.execute(
+            "INSERT INTO tasks (task_id, revision, session_id, state, correction_count) VALUES ('orphan-task', 1, 'missing-session', 'fable_planning', 0)"
+        ),
+        lambda connection: connection.execute(
+            "INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at) VALUES ('missing-session', NULL, 'user', 'message', '{}', '2026-08-10T10:03:00Z')"
+        ),
+        lambda connection: connection.execute(
+            "INSERT INTO agent_runs (run_id, task_id, revision, agent, started_at, status) VALUES ('orphan-run', 'missing-task', 1, 'sol', '2026-08-10T10:03:00Z', 'running')"
+        ),
+        lambda connection: connection.execute(
+            "INSERT INTO agent_runs (run_id, task_id, revision, agent, started_at, status) VALUES ('wrong-revision', 'task-1', 2, 'sol', '2026-08-10T10:03:00Z', 'running')"
+        ),
+        lambda connection: connection.execute(
+            "INSERT INTO settings (key, value_json) VALUES ('agent_bridge.baseline.', '{}')"
+        ),
+        lambda connection: connection.execute(
+            "UPDATE settings SET value_json = '{\"task_id\":\"task-1\",\"revision\":2,\"baseline_id\":\"baseline-1\",\"manifest\":{\"baseline_id\":\"baseline-1\",\"repo_root\":\"/repo\"}}' WHERE key = 'agent_bridge.baseline.task-1.1'"
+        ),
+        lambda connection: connection.execute(
+            "UPDATE settings SET value_json = '{\"task_id\":\"task-1\",\"revision\":1,\"baseline_id\":\"baseline-1\",\"manifest\":{\"baseline_id\":\"baseline-1\",\"repo_root\":\"/other\"}}' WHERE key = 'agent_bridge.baseline.task-1.1'"
+        ),
+    ),
+)
+def test_legacy_project_ownership_audit_fails_closed_for_corrupt_relationships(
+    tmp_path, corrupt,
+) -> None:
+    path = tmp_path / "corrupt.sqlite3"
+    _seed_auditable_legacy_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    corrupt(connection)
+    connection.commit()
+    connection.close()
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed") as error:
+        store.audit_legacy_project_ownership("/repo")
+
+    message = str(error.value)
+    assert "/repo" not in message
+    assert "session-1" not in message
+    assert "task-1" not in message
+
+
+def test_legacy_project_ownership_audit_aggregates_generic_reasons_without_mutation(
+    tmp_path,
+) -> None:
+    path = tmp_path / "aggregate.sqlite3"
+    _seed_auditable_legacy_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("UPDATE sessions SET repo_root = '/outside'")
+    connection.execute(
+        "UPDATE settings SET value_json = '\"missing-session\"' WHERE key = 'agent_bridge.active_session_id'"
+    )
+    connection.execute(
+        "INSERT INTO agent_runs (run_id, task_id, revision, agent, started_at, status) VALUES ('orphan-run', 'missing-task', 1, 'sol', '2026-08-10T10:03:00Z', 'running')"
+    )
+    connection.commit()
+    connection.close()
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed") as error:
+        store.audit_legacy_project_ownership("/repo")
+
+    assert str(error.value).count(",") <= 7
+    assert "/outside" not in str(error.value)
+    assert _legacy_table_rows(store._connection) == before

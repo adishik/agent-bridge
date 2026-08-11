@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import secrets
 import sqlite3
 import threading
 from typing import TypeAlias
@@ -35,6 +36,12 @@ _ACTIVE_TASK_STATES = (
 MAX_TASK_OVERVIEWS = 200
 EVENT_REPLAY_PAGE_SIZE = 100
 MAX_INITIAL_REPLAY_EVENTS = 300
+MAX_CHAT_TITLE_LENGTH = 80
+MAX_CHAT_PAGE_SIZE = 50
+_NEW_CHAT_TITLE = "New chat"
+_ACTIVE_SESSION_SETTING = "agent_bridge.active_session_id"
+_BASELINE_SETTING_PREFIX = "agent_bridge.baseline."
+_MAX_LEGACY_AUDIT_REASONS = 8
 
 
 @dataclass(frozen=True)
@@ -85,6 +92,47 @@ class TaskOverview:
     review: Mapping[str, JsonValue] | None
     clarification: Mapping[str, JsonValue] | None
     activity: Mapping[str, JsonValue] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatRecord:
+    """One persisted chat projected from its session and event history."""
+
+    session_id: str
+    repo_root: str
+    title: str
+    created_at: str
+    updated_at: str
+    latest_sequence: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "session_id", _require_string(self.session_id, "session_id"))
+        object.__setattr__(self, "repo_root", _require_string(self.repo_root, "repo_root"))
+        title = _require_string(self.title, "title")
+        if len(title) > MAX_CHAT_TITLE_LENGTH:
+            raise ValueError(f"title must be at most {MAX_CHAT_TITLE_LENGTH} characters")
+        object.__setattr__(self, "title", title)
+        object.__setattr__(self, "created_at", _require_string(self.created_at, "created_at"))
+        object.__setattr__(self, "updated_at", _require_string(self.updated_at, "updated_at"))
+        latest_sequence = _require_integer(self.latest_sequence, "latest_sequence")
+        if latest_sequence < 0:
+            raise ValueError("latest_sequence must be non-negative")
+        object.__setattr__(self, "latest_sequence", latest_sequence)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatCursor:
+    """An exclusive cursor in the deterministic chat-recency ordering."""
+
+    latest_sequence: int
+    session_id: str
+
+    def __post_init__(self) -> None:
+        latest_sequence = _require_integer(self.latest_sequence, "latest_sequence")
+        if latest_sequence < 0:
+            raise ValueError("latest_sequence must be non-negative")
+        object.__setattr__(self, "latest_sequence", latest_sequence)
+        object.__setattr__(self, "session_id", _require_string(self.session_id, "session_id"))
 
 
 def _utc_now() -> str:
@@ -141,7 +189,9 @@ _MIGRATION_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
         repo_root TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT 'New chat',
+        updated_at TEXT
     )
     """,
     """
@@ -212,6 +262,10 @@ _MIGRATION_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS events_session_task_kind_sequence
     ON events (session_id, task_id, kind, sequence DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_session_sequence_desc
+    ON events (session_id, sequence DESC)
     """,
 )
 
@@ -304,11 +358,28 @@ class SQLiteStore:
         try:
             for statement in _MIGRATION_STATEMENTS:
                 self._connection.execute(statement)
+            self._migrate_session_chat_metadata()
         except BaseException:
             self._connection.rollback()
             raise
         else:
             self._connection.commit()
+
+    def _migrate_session_chat_metadata(self) -> None:
+        """Add the chat projection fields without rewriting legacy records."""
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "title" not in columns:
+            self._connection.execute(
+                "ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New chat'"
+            )
+        if "updated_at" not in columns:
+            self._connection.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
+        self._connection.execute(
+            "UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL"
+        )
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[None]:
@@ -325,10 +396,115 @@ class SQLiteStore:
         return _require_string(self._clock(), "clock result")
 
     def create_session(self, session_id: str, repo_root: str) -> None:
+        """Create one session using the legacy call signature."""
+        self.create_chat(repo_root, session_id=session_id)
+
+    def create_chat(
+        self, repo_root: str, *, session_id: str | None = None,
+    ) -> ChatRecord:
+        """Persist an empty chat bound to exactly one repository root."""
+        repo_root = _require_string(repo_root, "repo_root")
+        if session_id is not None:
+            return self._insert_chat(_require_string(session_id, "session_id"), repo_root)
+        while True:
+            generated_session_id = secrets.token_hex(16)
+            try:
+                return self._insert_chat(generated_session_id, repo_root)
+            except sqlite3.IntegrityError as error:
+                if "sessions.session_id" not in str(error):
+                    raise
+
+    def _insert_chat(self, session_id: str, repo_root: str) -> ChatRecord:
+        timestamp = self._timestamp()
         self._connection.execute(
-            "INSERT INTO sessions (session_id, repo_root, created_at) VALUES (?, ?, ?)",
-            (_require_string(session_id, "session_id"), _require_string(repo_root, "repo_root"), self._timestamp()),
+            """
+            INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, repo_root, timestamp, _NEW_CHAT_TITLE, timestamp),
         )
+        chat = self.chat(session_id)
+        if chat is None:
+            raise RuntimeError("inserted chat could not be read")
+        return chat
+
+    def chat(self, session_id: str) -> ChatRecord | None:
+        """Return one chat projection, or ``None`` when its session is absent."""
+        row = self._connection.execute(
+            """
+            SELECT
+                sessions.session_id,
+                sessions.repo_root,
+                sessions.title,
+                sessions.created_at,
+                sessions.updated_at,
+                COALESCE((
+                    SELECT events.sequence
+                    FROM events
+                    WHERE events.session_id = sessions.session_id
+                    ORDER BY events.sequence DESC
+                    LIMIT 1
+                ), 0) AS latest_sequence
+            FROM sessions
+            WHERE sessions.session_id = ?
+            """,
+            (_require_string(session_id, "session_id"),),
+        ).fetchone()
+        return None if row is None else self._chat_from_row(row)
+
+    def list_chats(
+        self,
+        *,
+        before: ChatCursor | None = None,
+        limit: int = MAX_CHAT_PAGE_SIZE,
+    ) -> tuple[ChatRecord, ...]:
+        """List a bounded, cursor-paged projection ordered by event sequence."""
+        limit = _require_integer(limit, "limit")
+        if not 1 <= limit <= MAX_CHAT_PAGE_SIZE:
+            raise ValueError(f"limit must be between 1 and {MAX_CHAT_PAGE_SIZE}")
+        if before is not None and not isinstance(before, ChatCursor):
+            raise ValueError("before must be a ChatCursor or None")
+        if before is not None:
+            latest_sequence = _require_integer(before.latest_sequence, "latest_sequence")
+            if latest_sequence < 0:
+                raise ValueError("latest_sequence must be non-negative")
+            session_id = _require_string(before.session_id, "session_id")
+            where = "WHERE latest_sequence < ? OR (latest_sequence = ? AND session_id > ?)"
+            parameters: tuple[object, ...] = (
+                latest_sequence,
+                latest_sequence,
+                session_id,
+                limit,
+            )
+        else:
+            where = ""
+            parameters = (limit,)
+        rows = self._connection.execute(
+            f"""
+            WITH chat_rows AS (
+                SELECT
+                    sessions.session_id,
+                    sessions.repo_root,
+                    sessions.title,
+                    sessions.created_at,
+                    sessions.updated_at,
+                    COALESCE((
+                        SELECT events.sequence
+                        FROM events
+                        WHERE events.session_id = sessions.session_id
+                        ORDER BY events.sequence DESC
+                        LIMIT 1
+                    ), 0) AS latest_sequence
+                FROM sessions
+            )
+            SELECT * FROM chat_rows
+            {where}
+            ORDER BY latest_sequence DESC, session_id
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return tuple(self._chat_from_row(row) for row in rows)
 
     def session_exists(self, session_id: str) -> bool:
         row = self._connection.execute(
@@ -1230,35 +1406,92 @@ class SQLiteStore:
         frozen_payload = freeze_json(payload)
         if not isinstance(frozen_payload, Mapping):
             raise ValueError("payload must be an object")
+        session_id = _require_string(session_id, "session_id")
+        task_id = None if task_id is None else _require_string(task_id, "task_id")
+        actor = _require_string(actor, "actor")
+        kind = _require_string(kind, "kind")
+        created_at = self._timestamp()
         values = (
-            _require_string(session_id, "session_id"),
-            None if task_id is None else _require_string(task_id, "task_id"),
-            _require_string(actor, "actor"),
-            _require_string(kind, "kind"),
+            session_id,
+            task_id,
+            actor,
+            kind,
             _encode_json(frozen_payload),
-            self._timestamp(),
+            created_at,
         )
         with self._event_listener_lock:
-            cursor = self._connection.execute(
-                """
-                INSERT INTO events (
-                    session_id, task_id, actor, kind, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                values,
-            )
-            row = self._connection.execute(
-                "SELECT * FROM events WHERE sequence = ?", (cursor.lastrowid,)
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("inserted event could not be read")
-            event = self._event_from_row(row)
+            with self._immediate_transaction():
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO events (
+                        session_id, task_id, actor, kind, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                row = self._connection.execute(
+                    "SELECT * FROM events WHERE sequence = ?", (cursor.lastrowid,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("inserted event could not be read")
+                event = self._event_from_row(row)
+                title = self._first_user_message_title(
+                    session_id=session_id,
+                    sequence=event.sequence,
+                    actor=actor,
+                    kind=kind,
+                    payload=frozen_payload,
+                )
+                if title is None:
+                    self._connection.execute(
+                        "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                        (created_at, session_id),
+                    )
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE sessions
+                        SET title = ?, updated_at = ?
+                        WHERE session_id = ?
+                        """,
+                        (title, created_at, session_id),
+                    )
             self._pending_listener_events.append(event)
             if self._dispatching_listener_events:
                 return event
             self._dispatching_listener_events = True
         self._drain_event_listeners()
         return event
+
+    def _first_user_message_title(
+        self,
+        *,
+        session_id: str,
+        sequence: int,
+        actor: str,
+        kind: str,
+        payload: Mapping[str, JsonValue],
+    ) -> str | None:
+        if actor != "user" or kind != "message":
+            return None
+        earlier = self._connection.execute(
+            """
+            SELECT 1 FROM events
+            WHERE session_id = ?
+              AND actor = 'user'
+              AND kind = 'message'
+              AND sequence < ?
+            LIMIT 1
+            """,
+            (session_id, sequence),
+        ).fetchone()
+        if earlier is not None:
+            return None
+        raw_text = payload.get("text")
+        if not isinstance(raw_text, str):
+            return _NEW_CHAT_TITLE
+        title = " ".join(raw_text.split())
+        return _NEW_CHAT_TITLE if not title else title[:MAX_CHAT_TITLE_LENGTH]
 
     def events_after(
         self,
@@ -1472,6 +1705,185 @@ class SQLiteStore:
             return json.loads(row["value_json"])
         except json.JSONDecodeError as error:
             raise RuntimeError("persisted setting is invalid JSON") from error
+
+    def audit_legacy_project_ownership(self, canonical_repo_root: str) -> None:
+        """Fail closed unless a legacy database belongs to one exact project root."""
+        canonical_repo_root = _require_string(canonical_repo_root, "canonical_repo_root")
+        self._connection.execute("BEGIN")
+        try:
+            reasons = self._legacy_project_ownership_reasons(canonical_repo_root)
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.rollback()
+        if reasons:
+            summary = ", ".join(sorted(reasons)[:_MAX_LEGACY_AUDIT_REASONS])
+            raise RuntimeError(f"legacy project ownership audit failed: {summary}")
+
+    def _legacy_project_ownership_reasons(
+        self, canonical_repo_root: str,
+    ) -> set[str]:
+        """Collect generic integrity categories without exposing persisted values."""
+        reasons: set[str] = set()
+        foreign_key_rows = tuple(self._connection.execute("PRAGMA foreign_key_check"))
+        if foreign_key_rows:
+            reasons.add("foreign_key_integrity")
+
+        session_rows = tuple(
+            self._connection.execute("SELECT session_id, repo_root FROM sessions")
+        )
+        session_ids: set[str] = set()
+        for row in session_rows:
+            session_id = row["session_id"]
+            repo_root = row["repo_root"]
+            if (
+                not isinstance(session_id, str)
+                or not session_id.strip()
+                or not isinstance(repo_root, str)
+                or not repo_root.strip()
+                or repo_root != canonical_repo_root
+            ):
+                reasons.add("session_ownership")
+                continue
+            session_ids.add(session_id)
+
+        active_row = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ?",
+            (_ACTIVE_SESSION_SETTING,),
+        ).fetchone()
+        if active_row is None:
+            reasons.add("active_session")
+        else:
+            try:
+                active_session = json.loads(active_row["value_json"])
+            except (TypeError, json.JSONDecodeError):
+                reasons.add("active_session")
+            else:
+                if (
+                    not isinstance(active_session, str)
+                    or not active_session.strip()
+                    or active_session not in session_ids
+                ):
+                    reasons.add("active_session")
+
+        task_rows = tuple(
+            self._connection.execute(
+                "SELECT task_id, revision, session_id, baseline_id FROM tasks"
+            )
+        )
+        task_keys: set[tuple[str, int]] = set()
+        task_baselines: dict[tuple[str, int], str | None] = {}
+        task_sessions: dict[str, str] = {}
+        task_revisions: dict[str, list[int]] = {}
+        for row in task_rows:
+            task_id = row["task_id"]
+            revision = row["revision"]
+            session_id = row["session_id"]
+            baseline_id = row["baseline_id"]
+            if (
+                not isinstance(task_id, str)
+                or not task_id.strip()
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+                or not isinstance(session_id, str)
+                or session_id not in session_ids
+                or (baseline_id is not None and (not isinstance(baseline_id, str) or not baseline_id))
+            ):
+                reasons.add("task_integrity")
+                continue
+            if task_id in task_sessions and task_sessions[task_id] != session_id:
+                reasons.add("task_ownership")
+            task_sessions[task_id] = session_id
+            task_keys.add((task_id, revision))
+            task_baselines[(task_id, revision)] = baseline_id
+            task_revisions.setdefault(task_id, []).append(revision)
+        for revisions in task_revisions.values():
+            ordered = sorted(revisions)
+            if ordered != list(range(ordered[0], ordered[-1] + 1)):
+                reasons.add("task_revision_integrity")
+
+        for row in self._connection.execute("SELECT session_id, task_id FROM events"):
+            session_id = row["session_id"]
+            task_id = row["task_id"]
+            if not isinstance(session_id, str) or session_id not in session_ids:
+                reasons.add("event_ownership")
+                continue
+            if task_id is not None:
+                if not isinstance(task_id, str) or task_sessions.get(task_id) != session_id:
+                    reasons.add("event_task_integrity")
+
+        for row in self._connection.execute("SELECT task_id, revision FROM agent_runs"):
+            task_id = row["task_id"]
+            revision = row["revision"]
+            if (
+                not isinstance(task_id, str)
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or (task_id, revision) not in task_keys
+            ):
+                reasons.add("run_task_integrity")
+
+        baseline_settings: dict[tuple[str, int], str] = {}
+        for row in self._connection.execute("SELECT key, value_json FROM settings"):
+            key = row["key"]
+            if not isinstance(key, str):
+                continue
+            if key != _BASELINE_SETTING_PREFIX.removesuffix(".") and not key.startswith(
+                _BASELINE_SETTING_PREFIX
+            ):
+                continue
+            try:
+                persisted = json.loads(row["value_json"])
+            except (TypeError, json.JSONDecodeError):
+                reasons.add("baseline_integrity")
+                continue
+            if not isinstance(persisted, dict):
+                reasons.add("baseline_integrity")
+                continue
+            task_id = persisted.get("task_id")
+            revision = persisted.get("revision")
+            baseline_id = persisted.get("baseline_id")
+            manifest = persisted.get("manifest")
+            if (
+                not isinstance(task_id, str)
+                or not task_id.strip()
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+                or not isinstance(baseline_id, str)
+                or not baseline_id
+                or not isinstance(manifest, dict)
+                or key != f"{_BASELINE_SETTING_PREFIX}{task_id}.{revision}"
+                or manifest.get("baseline_id") != baseline_id
+                or manifest.get("repo_root") != canonical_repo_root
+                or task_baselines.get((task_id, revision)) != baseline_id
+            ):
+                reasons.add("baseline_integrity")
+                continue
+            baseline_settings[(task_id, revision)] = baseline_id
+        for task_key, baseline_id in task_baselines.items():
+            if baseline_id is not None and baseline_settings.get(task_key) != baseline_id:
+                reasons.add("baseline_integrity")
+
+        return reasons
+
+    def _chat_from_row(self, row: sqlite3.Row) -> ChatRecord:
+        updated_at = row["updated_at"]
+        if updated_at is None:
+            raise RuntimeError("persisted chat is missing its updated timestamp")
+        try:
+            return ChatRecord(
+                session_id=row["session_id"],
+                repo_root=row["repo_root"],
+                title=row["title"],
+                created_at=row["created_at"],
+                updated_at=updated_at,
+                latest_sequence=row["latest_sequence"],
+            )
+        except ValueError as error:
+            raise RuntimeError("persisted chat is invalid") from error
 
     def _task_from_row(self, row: sqlite3.Row) -> TaskRecord:
         revision = int(row["revision"])
