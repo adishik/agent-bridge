@@ -311,7 +311,7 @@ class ScopeApprovalContext:
 @dataclass(frozen=True, slots=True)
 class BaselineSetting:
     key: str
-    value: str
+    value_json: str
 
 @dataclass(frozen=True, slots=True)
 class ReviewContext:
@@ -503,12 +503,18 @@ and answer continuations. It never stores raw command text, provider output,
 or arbitrary mappings. No state-machine edge is added: preparation uses only
 the source-to-active transitions already represented in the state graph.
 
+`BaselineSetting.value_json` is a bounded, validated canonical JSON object for
+the existing baseline-setting manifest schema. The coordinator captures that
+canonical value after baseline construction; `prepare_approval_action` inserts
+it verbatim as the setting value rather than JSON-encoding it again, so the
+existing baseline loader reconstructs the same mapping after restart.
+
 Define route-specific transactional store operations rather than a generic
 prepare call. `prepare_new_request_action` atomically creates the generated
 task, persists its user message event, transitions to the existing planning
 active state, and inserts the prepared row. `prepare_approval_action`
 atomically commits the exact revision approval, coordinator-captured
-`baseline_id`, optional baseline setting key/value, existing active-state
+`baseline_id`, optional baseline setting key/value_json, existing active-state
 transition, and prepared row while preserving scope-approval pending context.
 The coordinator discards any captured baseline artifact if this transaction
 fails. `prepare_answer_action` atomically validates and resumes the exact
