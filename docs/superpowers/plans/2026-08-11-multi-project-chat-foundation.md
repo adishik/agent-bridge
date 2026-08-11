@@ -296,20 +296,52 @@ class NewRequestPayload:
     text: str
 
 @dataclass(frozen=True, slots=True)
+class ScopeApprovalContext:
+    baseline_id: str
+    approved_revision: int
+
+@dataclass(frozen=True, slots=True)
+class ReviewContext:
+    sol_thread_id: str
+    review_run_id: str
+
+@dataclass(frozen=True, slots=True)
+class ClarificationContext:
+    sol_thread_id: str
+    clarification_run_id: str
+
+@dataclass(frozen=True, slots=True)
+class SolResumeContext:
+    sol_thread_id: str
+    sol_run_id: str
+
+@dataclass(frozen=True, slots=True)
+class AnswerContext:
+    answer: str
+
+PreparedContinuationContext = (
+    ScopeApprovalContext
+    | ReviewContext
+    | ClarificationContext
+    | SolResumeContext
+    | AnswerContext
+    | None
+)
+
+@dataclass(frozen=True, slots=True)
 class ApprovalPayload:
-    pass
+    scope: ScopeApprovalContext | None
 
 @dataclass(frozen=True, slots=True)
 class AnswerPayload:
     answer: str
+    continuation: PreparedContinuationContext
 
 @dataclass(frozen=True, slots=True)
 class ResumePayload:
-    pass
+    continuation: PreparedContinuationContext
 
-PreparedActionPayload = (
-    NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
-)
+PreparedActionPayload = NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
 
 @dataclass(frozen=True, slots=True)
 class PreparedActionRecord:
@@ -322,25 +354,42 @@ class PreparedActionRecord:
     payload: PreparedActionPayload
     source_state: TaskState
     active_state: TaskState
-    status: Literal["prepared", "claimed", "aborted", "completed"]
+    continuation_state: TaskState | None
+    pending_context: PreparedContinuationContext
+    previous_preparation_id: str | None
+    status: Literal["PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "RECOVERED"]
+    reason: str | None
     generation: int
 
-def prepare_action(
+def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None: ...
+def prepare_new_request_action(
     self,
     *,
-    preparation_id: str,
-    project_id: str,
     session_id: str,
     task_id: str,
-    revision: int,
-    action: PreparedActionKind,
-    payload: PreparedActionPayload,
-    source_state: TaskState,
-    active_state: TaskState,
     generation: int,
+    payload: NewRequestPayload,
+) -> PreparedActionRecord: ...
+def prepare_approval_action(
+    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    payload: ApprovalPayload,
+) -> PreparedActionRecord: ...
+def prepare_answer_action(
+    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    payload: AnswerPayload,
+) -> PreparedActionRecord: ...
+def prepare_resume_action(
+    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    payload: ResumePayload, previous_preparation_id: str,
 ) -> PreparedActionRecord: ...
 def claim_prepared_action(
     self, preparation_id: str, *, generation: int,
+) -> PreparedActionRecord: ...
+def complete_prepared_action(
+    self, preparation_id: str, *, generation: int,
+) -> PreparedActionRecord: ...
+def fail_prepared_action(
+    self, preparation_id: str, *, generation: int, reason: str,
 ) -> PreparedActionRecord: ...
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
@@ -355,20 +404,23 @@ class ProjectRegistry:
 class PreparedWorkflow:
     preparation_id: str
     token: LeaseToken
-    project_id: str
-    session_id: str
-    task_id: str
-    revision: int
-    action: PreparedActionKind
 
 class HubWorkflowOrchestrator:
     async def prepare_new_request(
         self, *, project_id: str, session_id: str,
         text: str, ids: IdFactory,
     ) -> PreparedWorkflow: ...
-    async def prepare_existing_task(
+    async def prepare_approval(
         self, *, project_id: str, session_id: str,
-        task_id: str, revision: int, action: PreparedActionKind,
+        task_id: str, revision: int,
+    ) -> PreparedWorkflow: ...
+    async def prepare_answer(
+        self, *, project_id: str, session_id: str,
+        task_id: str, revision: int, answer: str,
+    ) -> PreparedWorkflow: ...
+    async def prepare_resume(
+        self, *, project_id: str, session_id: str,
+        task_id: str, revision: int,
     ) -> PreparedWorkflow: ...
     async def run(self, prepared: PreparedWorkflow) -> None: ...
     def abort_prepared(self, prepared: PreparedWorkflow, *, reason: str) -> None: ...
@@ -376,19 +428,19 @@ class HubWorkflowOrchestrator:
 
 # Coordinator preparation methods called only by HubWorkflowOrchestrator.
 def prepare_new_request(
-    self, *, preparation_id: str, session_id: str, task_id: str, text: str,
+    self, *, session_id: str, task_id: str, text: str,
     generation: int,
 ) -> PreparedActionRecord: ...
 def prepare_approval(
-    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    self, *, session_id: str, task_id: str, revision: int,
     generation: int,
 ) -> PreparedActionRecord: ...
 def prepare_answer(
-    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    self, *, session_id: str, task_id: str, revision: int,
     answer: str, generation: int,
 ) -> PreparedActionRecord: ...
 def prepare_resume(
-    self, *, preparation_id: str, session_id: str, task_id: str, revision: int,
+    self, *, session_id: str, task_id: str, revision: int,
     generation: int,
 ) -> PreparedActionRecord: ...
 async def run_prepared_action(self, preparation_id: str) -> None: ...
@@ -398,32 +450,67 @@ def abort_prepared_action(
 ```
 
 `SQLiteStore` owns a dedicated additive `prepared_actions` table; prepared
-work must never be encoded in `TaskRecord.pending`. Every row has an opaque
-unpredictable `preparation_id`, exact project/session/task/revision/action
-identity, a bounded discriminator-matched immutable payload (text/answer
-limits use the existing request limits and approval/resume carry no payload),
-the exact source and already-existing active pre-child states, and a
-generation/status compare-and-swap guard. `prepare_action` atomically validates
-the exact source record, inserts the row, and CAS-transitions the task into its
-existing active pre-child state. No state-machine edge is added: preparation
-uses the source-to-active transitions already represented in the state graph.
+work must never be encoded in `TaskRecord.pending`. The store, not a hub,
+coordinator, or browser caller, generates each cryptographically opaque
+`preparation_id` with collision retry. `prepared_action(preparation_id)` is the
+only lookup used to reconstruct a workflow. Every row persists the project ID
+that the coordinator derives from its canonical configured `repo_root` through
+the existing project-ID function; browser-provided project identity is never
+stored or trusted. Rows preserve exact session/task/revision/action identity,
+source and existing active pre-child states, source continuation state, frozen
+typed pending context, previous preparation reference, status, and generation.
 
-`claim_prepared_action` may transition one exact `(preparation_id, generation)`
-row from `prepared` to `claimed` once; stale, different, forged, or already
-claimed identities reject before any child starts. `abort_prepared_action`
-atomically writes the task's existing `INTERRUPTED` state with its exact
-continuation and a bounded durable pending projection
-`{action, reason, preparation_id}`, marks the preparation aborted, and returns
-the same record for an identical abort retry. A stale generation or any
-different action/identity/reason rejects. An abort persistence failure leaves
-the preparation and lease retryable rather than releasing the token.
+Payload and continuation validation is structural and bounded before a
+transaction: it permits only the discriminator-matched immutable variants,
+bounded user text/answer, validated opaque run/thread/baseline IDs, and the
+typed contexts necessary to reconstruct scope approval, review, clarification,
+Sol resume, and answer continuations. It never stores raw command text,
+provider output, or arbitrary mappings. No state-machine edge is added:
+preparation uses only the source-to-active transitions already represented in
+the state graph.
 
-The coordinator exposes route-specific synchronous preparation methods for
-new requests, approval, answer, and resume; each delegates the durable
-transition to the store. `run_prepared_action(preparation_id)` first claims the
-exact durable record and dispatches only its matched route. Existing public
-compatibility wrappers remain, but delegate through the corresponding
-prepare-then-run path rather than bypassing durable preparation.
+Define route-specific transactional store operations rather than a generic
+prepare call. `prepare_new_request_action` atomically creates the generated
+task, persists its user message event, transitions to the existing planning
+active state, and inserts the prepared row. `prepare_approval_action`
+atomically performs the exact revision/baseline-setting CAS, preserves any
+scope-approval pending context, transitions to its existing active state, and
+inserts the row. `prepare_answer_action` atomically validates and resumes the
+exact continuation, writes the user answer event, transitions to the existing
+active state, and inserts the row. `prepare_resume_action` atomically consumes
+an already-validated drift outcome, carries forward the exact continuation and
+pending context, transitions to the existing active state, and inserts a new
+row referencing the prior aborted or recovered claimed preparation. Each route
+publishes its listener/event notification exactly once, after its transaction
+commits; no listener is called for a rollback.
+
+`claim_prepared_action` is an exact-once CAS from `PREPARED` to `CLAIMED` for
+the matching ID and generation. `complete_prepared_action` and
+`fail_prepared_action` transition that exact claimed row to `COMPLETED` or
+`FAILED`; stale, different, forged, duplicate, or terminal identities reject
+before a child starts. Startup recovery never silently reclaims a claim: it
+marks an uncompleted `CLAIMED` row as `RECOVERED` with an interrupted task and
+preserved continuation. Explicit Resume creates a new generation-safe
+`PREPARED` row referencing that `ABORTED` or `RECOVERED` row; it never reuses a
+claim.
+
+`abort_prepared_action` is a `PREPARED` to `ABORTED` CAS. It atomically writes
+the task's existing `INTERRUPTED` state with the active-state continuation and
+a bounded durable pending projection containing the fixed action, fixed reason,
+preparation ID, and the frozen typed source context. An identical abort retry
+returns the same record; stale generation or any different identity/action/
+reason rejects. An abort persistence failure leaves the preparation and lease
+retryable rather than releasing the token.
+
+The coordinator derives its project identity only from the canonical
+repository root and exposes route-specific synchronous preparation methods for
+new request, approval, answer, and resume; each performs its repository,
+baseline, exact-revision, continuation, and drift validation before invoking
+the matching store transaction. `run_prepared_action(preparation_id)` reloads
+and claims the exact durable record, invokes only the operation reconstructible
+from its persisted context, and completes or fails that record. Existing public
+compatibility wrappers remain, but delegate through corresponding prepare-then-
+run paths rather than bypassing durable preparation.
 
 - [ ] **Step 1: Add registry isolation RED tests**
 
@@ -433,21 +520,28 @@ Construct two app-facing runtimes with deliberately equal session/task IDs. Asse
 
 Use threads and barriers to prove only one of two acquisitions succeeds. Assert `acquire_new` creates the task ID inside the lease critical section, stale tokens cannot release a newer generation, double release is harmless, and the active snapshot contains opaque IDs only. Assert a held lease rejects project switch, chat switch, New Chat, approval, Resume, and an answer that would resume a model; Stop bypasses acquisition only for the exact lease-owning task. Force scheduler installation rejection after preparation and assert `abort_prepared` atomically places the exact task/action into `INTERRUPTED` with a resumable pending action, releases only its token, and is idempotent.
 
-In `test_store.py`, add durable transaction tests for each of approval, answer,
-and resume covering prepare, exact-once claim/run, scheduler abort,
-restart/reopen recovery, and idempotent same-identity retry. Assert preparation
-uses the exact active state selected by the existing state graph, does not add a
-graph edge, and never writes `TaskRecord.pending`. Cover malformed/oversized
-typed payloads, a stale/different preparation identity or generation, a forged
-workflow identity, duplicate claim, and an injected abort-persistence failure.
+In `test_store.py`, add durable transaction RED coverage for new request,
+approval, answer, and resume. Assert each route's exact task/event/baseline/
+continuation mutation and one post-commit listener publication; inject each
+transaction failure and assert no listener or partial row. Cover store-owned
+opaque ID collision retry and getter reconstruction; malformed/oversized typed
+payloads; scope/review/clarification/Sol-resume/answer context preservation;
+exact-once claim; `CLAIMED` complete/fail transitions; scheduler abort;
+restart/reopen recovery; explicit Resume's new record with previous reference;
+idempotent same-identity abort; stale/different ID, identity, action, reason,
+or generation rejection; and an injected abort-persistence failure. Assert
+preparation uses the exact existing active state selected by the state graph,
+does not add a graph edge, and never writes `TaskRecord.pending`.
+
 In `test_hub.py`, make one readiness probe hang while its sibling fails or the
 caller is cancelled; assert `RuntimeReadiness` cancels and awaits every probe
-task before the orchestrator releases the lease. Assert hub `run` and
-`abort_prepared` load the record and compare its exact persisted
-project/session/task/revision/action/generation identity against the
-`LeaseToken` and `PreparedWorkflow` before dispatch or abort. An abort may
-release only after the durable store abort succeeds; an abort failure retains
-the exact retryable token.
+task before the orchestrator releases the lease. Cover route-specific hub
+preparations and assert the hub reloads `prepared_action(preparation_id)` and
+matches only its persisted project/session/task/generation against the exact
+`LeaseToken` before claim/run/abort. Forge a workflow ID, substitute a token,
+or alter record action/revision/context and assert no claim, child, abort, or
+lease release occurs. An abort may release only after the durable store abort
+succeeds; an abort failure retains the exact retryable token.
 
 - [ ] **Step 3: Run RED and implement**
 
@@ -457,21 +551,35 @@ python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_p
 python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action"
 ```
 
-Use an in-process lock plus monotonically increasing generation. `HubWorkflowOrchestrator` is the sole lease owner. Each awaited preparation validates route identity and hub acknowledgment without starting a child, then acquires the generation-safe lease (`acquire_new` creates a task ID inside that critical section), and only while holding it calls the route-selected `RuntimeReadiness.require_model_start_ready`. Fresh Claude/Sol probes therefore count inside the one-process boundary. `RuntimeReadiness` creates tracked probe tasks and, on any probe error, timeout, or caller cancellation, cancels and awaits all still-running siblings before returning control; only then may the orchestrator release the token. Probe/gate failure releases the token and performs no coordinator/store preparation.
+Use an in-process lock plus monotonically increasing generation.
+`HubWorkflowOrchestrator` is the sole lease owner. It exposes only
+`prepare_new_request`, `prepare_approval`, `prepare_answer(answer)`, and
+`prepare_resume`; each selects one runtime, validates the exact route identity
+and hub acknowledgement without starting a child, acquires the exact
+generation-safe `LeaseToken` (`acquire_new` creates a task ID inside that
+critical section), and calls route-selected
+`RuntimeReadiness.require_model_start_ready` while holding it. Fresh Claude/
+Sol probes therefore count inside the one-process boundary. `RuntimeReadiness`
+creates tracked probe tasks and, on any probe error, timeout, or caller
+cancellation, cancels and awaits all still-running siblings before returning
+control; only then may the orchestrator release the token. Probe/gate failure
+releases the token and performs no coordinator/store preparation.
 
-After a green gate, route-specific coordinator preparation synchronously writes
-one `PreparedActionRecord` while holding the lease and returns a
-`PreparedWorkflow` containing its `preparation_id`; `run` reloads that record,
-validates its persisted identity against the exact token/workflow, calls
-`Coordinator.run_prepared_action(preparation_id)`, and releases in `finally`.
-Coordinators and HTTP handlers never reacquire independently. `abort_prepared`
-is the only preparation-to-scheduler failure path: after reloading and
-validating the exact durable identity, it calls the coordinator abort with the
-fixed reason `scheduler_unavailable`, and releases the exact token only after
-the durable interrupted/resumable pending action succeeds. Raw scheduling
-exceptions never enter persistence. Do not persist a lease as proof of a live
-process; startup recovery remains per-project and explicit Resume remains
-required.
+After a green gate, the matching coordinator preparation synchronously writes
+one store-owned `PreparedActionRecord` while holding the lease and returns only
+its `preparation_id` plus the token in `PreparedWorkflow`; duplicated workflow
+metadata is never an authority. Before run or abort, the hub reloads that row,
+requires `token.project_id/session_id/task_id/generation` to equal the
+persisted record, and lets record revision/action/context remain solely store
+authority. `run` then calls `Coordinator.run_prepared_action(preparation_id)`
+and releases in `finally`. Coordinators and HTTP handlers never reacquire
+independently. `abort_prepared` is the only preparation-to-scheduler failure
+path: after the same exact lookup/identity check, it calls the coordinator
+abort with fixed reason `scheduler_unavailable` and releases the exact token
+only after the durable interrupted/resumable pending action succeeds. Raw
+scheduling exceptions never enter persistence. Do not persist a lease as proof
+of a live process; startup recovery remains per-project and explicit Resume
+remains required.
 
 - [ ] **Step 4: Run GREEN and commit**
 
