@@ -32,6 +32,18 @@ export const MAX_CONVERSATION_MESSAGES = 300;
 export const MAX_TASK_HISTORY = 100;
 export const MAX_TASK_OVERVIEWS = 200;
 
+const MESSAGE_EVENT_KINDS = new Set([
+  "message",
+  "task_brief",
+  "clarification",
+  "outcome",
+  "review",
+  "task_rejected",
+  "action_error",
+  "stop_error",
+  "resume_drift",
+]);
+
 const APPROVAL_STATES = new Set([
   "awaiting_user_approval",
   "awaiting_scope_approval",
@@ -182,6 +194,26 @@ function element(documentRoot, tag, text, className = "") {
 }
 
 
+function appendConversationNode(documentRoot, conversation, node) {
+  const intro = documentRoot.querySelector("#conversation-empty");
+  if (intro && typeof intro.remove === "function") {
+    intro.remove();
+  }
+  conversation.append(node);
+  if (conversation.children.length > MAX_CONVERSATION_MESSAGES) {
+    conversation.removeChild(conversation.children[0]);
+  }
+  return node;
+}
+
+
+export function conversationPresentation(event) {
+  if (event?.kind === "task_state") return "status";
+  if (MESSAGE_EVENT_KINDS.has(event?.kind)) return "message";
+  return "hidden";
+}
+
+
 export function renderMessage(documentRoot, event, associatedRevision = null) {
   const conversation = documentRoot.querySelector("#conversation");
   if (!conversation) {
@@ -234,15 +266,39 @@ export function renderMessage(documentRoot, event, associatedRevision = null) {
     time.setAttribute("datetime", event.created_at);
     article.append(time);
   }
-  const intro = documentRoot.querySelector("#conversation-empty");
-  if (intro && typeof intro.remove === "function") {
-    intro.remove();
+  return appendConversationNode(documentRoot, conversation, article);
+}
+
+
+function renderConversationStatus(documentRoot, event, associatedRevision) {
+  const conversation = documentRoot.querySelector("#conversation");
+  if (!conversation) {
+    throw new Error("conversation region is missing");
   }
-  conversation.append(article);
-  if (conversation.children.length > MAX_CONVERSATION_MESSAGES) {
-    conversation.removeChild(conversation.children[0]);
+  const payload = asObject(event?.payload);
+  const revision = Number.isInteger(associatedRevision)
+    ? associatedRevision
+    : (Number.isInteger(payload.revision) ? payload.revision : null);
+  const sequence = Number.isSafeInteger(event?.sequence) ? `#${event.sequence}` : "#?";
+  const taskId = typeof event?.task_id === "string" ? event.task_id : "global";
+  const revisionText = revision === null ? "" : ` · r${revision}`;
+  const status = element(
+    documentRoot,
+    "p",
+    `${eventText(event)} · ${sequence} · ${taskId}${revisionText}`,
+    "conversation-status",
+  );
+  return appendConversationNode(documentRoot, conversation, status);
+}
+
+
+export function renderConversationEvent(documentRoot, event, associatedRevision = null) {
+  const presentation = conversationPresentation(event);
+  if (presentation === "hidden") return null;
+  if (presentation === "status") {
+    return renderConversationStatus(documentRoot, event, associatedRevision);
   }
-  return article;
+  return renderMessage(documentRoot, event, associatedRevision);
 }
 
 
@@ -1488,9 +1544,9 @@ export function startBrowserApp(documentRoot, windowRoot) {
       setStatus(solNode, `Sol · ${label}`, label === "Ready" ? "ready" : "checking");
     }
     if (repoNode) {
-      const repository = typeof state.repository === "string" ? state.repository : "Repository";
-      const branch = typeof state.branch === "string" ? ` · ${state.branch}` : "";
-      repoNode.textContent = `${repository}${branch}`;
+      const repository = typeof state.repository === "string" ? state.repository : "checking";
+      const branch = typeof state.branch === "string" ? state.branch : "checking";
+      repoNode.textContent = `Repository: ${repository} · Branch: ${branch}`;
     }
     messageInput.disabled = !state.gate.canCompose || state.sessionId === null;
     composerSubmit.disabled = messageInput.disabled;
@@ -1599,13 +1655,17 @@ export function startBrowserApp(documentRoot, windowRoot) {
     state.tasks = reduceTaskEvent(state.tasks, event);
     state.selectedTaskId = repairTaskSelection(state.tasks, state.selectedTaskId);
     const associatedTask = state.tasks.find((task) => taskIdentity(task) === event?.task_id);
-    renderMessage(documentRoot, event, associatedRevisionForEvent(event, associatedTask));
+    const rendered = renderConversationEvent(
+      documentRoot,
+      event,
+      associatedRevisionForEvent(event, associatedTask),
+    );
     if (state.tasks !== previousTasks || state.selectedTaskId !== previousSelection) {
       renderWorkspace();
       renderStatus();
     }
     const conversation = documentRoot.querySelector("#conversation");
-    if (conversation) {
+    if (rendered && conversation) {
       conversation.scrollTop = conversation.scrollHeight;
     }
   }

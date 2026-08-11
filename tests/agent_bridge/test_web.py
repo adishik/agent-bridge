@@ -756,7 +756,9 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
-      if (nodes["repository-status"].textContent !== "/repo · feat/agent-bridge") process.exit(9);
+      if (nodes["repository-status"].textContent !== "Repository: /repo · Branch: feat/agent-bridge") {{
+        process.exit(9);
+      }}
 
       const approve = nodes["task-inspector"].children[0].querySelector("button");
       await approve.emit("click");

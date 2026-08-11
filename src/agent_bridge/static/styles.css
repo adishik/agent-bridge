@@ -115,6 +115,15 @@ input:focus-visible,
   white-space: nowrap;
 }
 
+.brand-block .repository-authority-note {
+  max-width: 38ch;
+  overflow: visible;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .header-statuses {
   display: flex;
   flex: 1;
@@ -362,6 +371,19 @@ dialog h2 {
   background: var(--coordinator-soft);
   border-left-color: var(--coordinator);
   border-left-style: dashed;
+}
+
+.conversation-status {
+  max-width: min(46rem, 92%);
+  margin: 0 0 0.55rem;
+  padding: 0.4rem 0.6rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  background: rgb(238 241 239 / 72%);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 0.3rem;
 }
 
 .task-card,
