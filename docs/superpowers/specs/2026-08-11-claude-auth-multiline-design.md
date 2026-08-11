@@ -15,7 +15,7 @@ assumption about JSON line formatting is wrong.
 
 ## Decision
 
-`ClaudeCLI._parse_auth_status` will join the bounded stdout lines with newline
+`ClaudeCLI._parse_auth_status` will join the captured stdout lines with newline
 characters and decode the complete text as exactly one JSON document. It will
 continue to require all of the existing fields and values:
 
@@ -24,8 +24,8 @@ continue to require all of the existing fields and values:
 - `apiProvider` is exactly `firstParty`; and
 - `subscriptionType` is a non-empty string.
 
-Exit status, interrupted-run behavior, environment filtering, process bounds,
-and browser readiness gates do not change. Malformed JSON, empty output,
+Exit status, interrupted-run behavior, environment filtering, and browser
+readiness gates do not change. Malformed JSON, empty output,
 multiple JSON documents, non-object JSON, or any missing/inconsistent
 subscription field remains a `SubscriptionAuthError`.
 
@@ -43,18 +43,19 @@ subscription field remains a `SubscriptionAuthError`.
 
 The adapter tests will first reproduce the failure with a valid multiline auth
 object. The minimal implementation must make that test pass while preserving
-the existing compact response test. Additional focused cases will prove that
-malformed output and two concatenated JSON documents still fail closed. The
-focused Claude/launcher tests, complete Agent Bridge suite, and a bounded live
-startup preflight will then run before deployment is restarted.
+the existing compact response test. Additional focused fake-only cases will
+prove that malformed output, two concatenated JSON documents, top-level `[]`,
+top-level `null`, and truly empty captured stdout fail closed. The existing
+nonzero-exit coverage remains. The auth-shape parameterization will also
+explicitly reject `loggedIn=1` and non-string `subscriptionType` values.
 
-No live model prompt is part of the fix verification. The live check is limited
-to version and subscription-status preflights until the browser is ready.
+No live CLI, model prompt, network call, browser server, or deployment action
+is part of the implementation or its verification.
 
 ## Scope and rollout
 
-The production change is limited to the Claude authentication-status parser
-and its focused tests. Terra implements test-first in the isolated worktree;
-Sol reviews the exact diff. After review, the fix is integrated into `main`,
-pushed through the protected repository workflow, and the foreground server is
-restarted against `/home/adi/agent-bridge-demo`.
+The implementation change is limited to
+`src/agent_bridge/adapters/claude_cli.py` and
+`tests/agent_bridge/test_claude_cli.py`. Terra implements test-first in the
+isolated worktree; Sol reviews the exact diff. Any operator rollout is outside
+this implementation plan and remains governed by the repository policy.

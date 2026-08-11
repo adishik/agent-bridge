@@ -4,7 +4,7 @@
 
 **Goal:** Accept Claude Code's compact or pretty-printed subscription-status JSON without weakening Agent Bridge's fail-closed authentication boundary.
 
-**Architecture:** Keep the existing `ClaudeCLI.preflight()` process and field validation unchanged. Change only `_parse_auth_status` so the bounded stdout line tuple is reconstructed into one JSON document before decoding; malformed, concatenated, non-object, or non-subscription responses still raise `SubscriptionAuthError`.
+**Architecture:** Keep the existing `ClaudeCLI.preflight()` process and field validation unchanged. Change only `_parse_auth_status` so the captured stdout line tuple is reconstructed into one JSON document before decoding; malformed, concatenated, non-object, or non-subscription responses still raise `SubscriptionAuthError`.
 
 **Tech Stack:** Python 3.11+, pytest, existing fake Claude executable and `ProcessRunner`.
 
@@ -12,21 +12,21 @@
 
 - Preserve the exact `loggedIn is True`, `authMethod == "claude.ai"`, `apiProvider == "firstParty"`, and non-empty `subscriptionType` requirements.
 - Do not add a provider, API-key, `jq`, shell, or network fallback.
-- Do not change process bounds, environment filtering, browser readiness, interruption behavior, or model invocation arguments.
+- Do not add output bounding or change environment filtering, browser readiness, interruption behavior, or model invocation arguments.
 - Tests use only the existing fake Claude executable; do not invoke live Claude, Codex, authentication, network, browser servers, or paid services.
 - Modify only `src/agent_bridge/adapters/claude_cli.py` and `tests/agent_bridge/test_claude_cli.py` for the implementation commit.
 - Terra implements test-first; Sol reviews the exact implementation diff before integration.
 
 ---
 
-### Task 1: Decode the complete bounded Claude auth document
+### Task 1: Decode the complete captured Claude auth document
 
 **Files:**
 - Modify: `tests/agent_bridge/test_claude_cli.py`
 - Modify: `src/agent_bridge/adapters/claude_cli.py:182-206`
 
 **Interfaces:**
-- Consumes: `ProcessResult.stdout: tuple[str, ...]` from the existing bounded `ProcessRunner`.
+- Consumes: `ProcessResult.stdout: tuple[str, ...]`, the captured stdout lines returned by the existing `ProcessRunner`.
 - Produces: unchanged `ClaudeCLI._parse_auth_status(result: ProcessResult) -> ClaudeAuthStatus` behavior, extended to valid multiline JSON.
 
 - [ ] **Step 1: Add a failing multiline-success test**
@@ -60,10 +60,10 @@ def test_fable_accepts_pretty_printed_subscription_auth_status(
 
 - [ ] **Step 2: Run the new test and verify the honest RED**
 
-Run:
+After activating the repository development environment, run:
 
 ```bash
-PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+PYTHONPATH="$PWD/src" python -m pytest -q \
   tests/agent_bridge/test_claude_cli.py::test_fable_accepts_pretty_printed_subscription_auth_status
 ```
 
@@ -94,16 +94,72 @@ def test_fable_rejects_multiple_auth_json_documents(
     asyncio.run(scenario())
 ```
 
-Run:
+After activating the repository development environment, run:
 
 ```bash
-PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+PYTHONPATH="$PWD/src" python -m pytest -q \
   tests/agent_bridge/test_claude_cli.py::test_fable_rejects_multiple_auth_json_documents
 ```
 
 Expected: PASS under the current fail-closed parser. Retain it to prove the minimal fix does not accept two documents.
 
-- [ ] **Step 4: Implement complete-document decoding**
+- [ ] **Step 4: Add direct fail-closed tests for empty and non-object stdout**
+
+Import `ProcessResult` from `agent_bridge.process`. Add this focused
+parameterized test beside the auth preflight tests; it constructs the process
+result locally so `stdout=()` is truly empty without changing the fake fixture:
+
+```python
+@pytest.mark.parametrize("stdout", ((), ("[]",), ("null",)))
+def test_fable_rejects_empty_or_non_object_auth_document(
+    fake_claude: Path, tmp_path: Path, stdout: tuple[str, ...],
+) -> None:
+    result = ProcessResult(
+        run_id="auth-result",
+        pid=123,
+        process_group_id=123,
+        exit_code=0,
+        stdout=stdout,
+        stderr=(),
+        interrupted=False,
+    )
+
+    with pytest.raises(SubscriptionAuthError, match="could not be verified"):
+        _adapter(fake_claude, tmp_path)._parse_auth_status(result)
+```
+
+Run:
+
+```bash
+PYTHONPATH="$PWD/src" python -m pytest -q \
+  tests/agent_bridge/test_claude_cli.py::test_fable_rejects_empty_or_non_object_auth_document
+```
+
+Expected: PASS before and after the implementation because empty stdout and
+top-level arrays or `null` are never valid authentication objects.
+
+- [ ] **Step 5: Make strict-type cases explicit in the existing fake auth-shape test**
+
+Extend the `auth_status` parameter values in
+`test_fable_rejects_every_non_subscription_auth_shape_without_model_call`
+with these two exact objects, without modifying the fake Claude fixture:
+
+```python
+{"loggedIn": 1, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"},
+{"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": 1},
+```
+
+Run:
+
+```bash
+PYTHONPATH="$PWD/src" python -m pytest -q \
+  tests/agent_bridge/test_claude_cli.py::test_fable_rejects_every_non_subscription_auth_shape_without_model_call
+```
+
+Expected: PASS before and after the implementation, proving `loggedIn=1` is
+not accepted as `True` and `subscriptionType` remains string-only.
+
+- [ ] **Step 6: Implement complete-document decoding**
 
 In `ClaudeCLI._parse_auth_status`, replace the one-line condition and one-line decoder input with complete-document reconstruction:
 
@@ -123,38 +179,18 @@ except (json.JSONDecodeError, TypeError):
 
 Leave the existing `Mapping` check and exact subscription-field validation unchanged.
 
-- [ ] **Step 5: Verify focused GREEN and existing failure cases**
+- [ ] **Step 7: Verify focused GREEN and existing failure cases**
 
-Run:
+After activating the repository development environment, run:
 
 ```bash
-PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+PYTHONPATH="$PWD/src" python -m pytest -q \
   tests/agent_bridge/test_claude_cli.py
 ```
 
 Expected: all Claude adapter tests pass, including compact JSON, pretty-printed JSON, malformed JSON, concatenated documents, non-subscription shapes, and nonzero exit status.
 
-- [ ] **Step 6: Run launcher and complete bridge regression suites**
-
-Run:
-
-```bash
-PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
-  tests/agent_bridge/test_main.py
-```
-
-Expected: all launcher tests pass.
-
-Then run:
-
-```bash
-PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
-  tests/agent_bridge
-```
-
-Expected: all Agent Bridge tests pass; the known Starlette TestClient deprecation warning may remain.
-
-- [ ] **Step 7: Verify the exact diff and commit**
+- [ ] **Step 8: Verify the exact diff and commit**
 
 Run:
 
@@ -171,4 +207,5 @@ git add src/agent_bridge/adapters/claude_cli.py tests/agent_bridge/test_claude_c
 git commit -m "fix: accept multiline Claude auth status"
 ```
 
-Do not restart the live server or invoke a live model. The controller performs the bounded subscription preflight and deployment restart only after Sol approves this exact commit.
+The implementation plan ends with the staged implementation commit. Operator
+rollout is outside this plan and remains governed by repository policy.
