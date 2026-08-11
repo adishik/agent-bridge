@@ -296,28 +296,36 @@ class NewRequestPayload:
     text: str
 
 @dataclass(frozen=True, slots=True)
-class ScopeApprovalContext:
-    baseline_id: str
-    approved_revision: int
-
-@dataclass(frozen=True, slots=True)
-class ReviewContext:
-    sol_thread_id: str
-    review_run_id: str
-
-@dataclass(frozen=True, slots=True)
-class ClarificationContext:
-    sol_thread_id: str
-    clarification_run_id: str
-
-@dataclass(frozen=True, slots=True)
 class SolResumeContext:
     sol_thread_id: str
     sol_run_id: str
+    prompt: str
+
+@dataclass(frozen=True, slots=True)
+class ScopeApprovalContext:
+    baseline_id: str
+    approved_revision: int
+    underlying_continuation: SolResumeContext | None
+
+@dataclass(frozen=True, slots=True)
+class ReviewContext:
+    fable_session_id: str
+    review_prompt: str
+    completion_allowed: bool
+    underlying_continuation: ScopeApprovalContext | SolResumeContext
+
+@dataclass(frozen=True, slots=True)
+class ClarificationContext:
+    fable_session_id: str
+    clarification_prompt: str
+    underlying_continuation: ScopeApprovalContext | SolResumeContext
 
 @dataclass(frozen=True, slots=True)
 class AnswerContext:
     answer: str
+    underlying_continuation: (
+        ScopeApprovalContext | ReviewContext | ClarificationContext | SolResumeContext
+    )
 
 PreparedContinuationContext = (
     ScopeApprovalContext
@@ -365,21 +373,22 @@ def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None: .
 def prepare_new_request_action(
     self,
     *,
+    project_id: str,
     session_id: str,
     task_id: str,
     generation: int,
     payload: NewRequestPayload,
 ) -> PreparedActionRecord: ...
 def prepare_approval_action(
-    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    self, *, project_id: str, session_id: str, task_id: str, revision: int, generation: int,
     payload: ApprovalPayload,
 ) -> PreparedActionRecord: ...
 def prepare_answer_action(
-    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    self, *, project_id: str, session_id: str, task_id: str, revision: int, generation: int,
     payload: AnswerPayload,
 ) -> PreparedActionRecord: ...
 def prepare_resume_action(
-    self, *, session_id: str, task_id: str, revision: int, generation: int,
+    self, *, project_id: str, session_id: str, task_id: str, revision: int, generation: int,
     payload: ResumePayload, previous_preparation_id: str,
 ) -> PreparedActionRecord: ...
 def claim_prepared_action(
@@ -394,6 +403,7 @@ def fail_prepared_action(
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
 ) -> PreparedActionRecord: ...
+def recover_claimed_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
 
 class ProjectRegistry:
     def runtime(self, project_id: str) -> AppProjectRuntime: ...
@@ -427,6 +437,8 @@ class HubWorkflowOrchestrator:
     async def stop(self, *, project_id: str, session_id: str, task_id: str) -> None: ...
 
 # Coordinator preparation methods called only by HubWorkflowOrchestrator.
+@property
+def project_id(self) -> str: ...  # project_id_for_root(canonical_repo_root)
 def prepare_new_request(
     self, *, session_id: str, task_id: str, text: str,
     generation: int,
@@ -453,21 +465,23 @@ def abort_prepared_action(
 work must never be encoded in `TaskRecord.pending`. The store, not a hub,
 coordinator, or browser caller, generates each cryptographically opaque
 `preparation_id` with collision retry. `prepared_action(preparation_id)` is the
-only lookup used to reconstruct a workflow. Every row persists the project ID
-that the coordinator derives from its canonical configured `repo_root` through
-the existing project-ID function; browser-provided project identity is never
-stored or trusted. Rows preserve exact session/task/revision/action identity,
+only lookup used to reconstruct a workflow. Every route-specific store method
+requires the trusted `project_id` argument that its coordinator derives from
+its canonical configured `repo_root` through the existing project-ID function;
+the store verifies and persists that identity, while browser-provided project
+identity is never stored or trusted. Rows preserve exact session/task/revision/action identity,
 source and existing active pre-child states, source continuation state, frozen
 typed pending context, previous preparation reference, status, and generation.
 
 Payload and continuation validation is structural and bounded before a
 transaction: it permits only the discriminator-matched immutable variants,
-bounded user text/answer, validated opaque run/thread/baseline IDs, and the
-typed contexts necessary to reconstruct scope approval, review, clarification,
-Sol resume, and answer continuations. It never stores raw command text,
-provider output, or arbitrary mappings. No state-machine edge is added:
-preparation uses only the source-to-active transitions already represented in
-the state graph.
+bounded user text/answer/prompts, validated opaque run/thread/baseline/session
+IDs, and the typed contexts necessary to reconstruct exact scope approval,
+Fable review (`review_prompt` and `completion_allowed`), Fable clarification
+(`clarification_prompt` and `underlying_continuation`), Sol resume (`prompt`),
+and answer continuations. It never stores raw command text, provider output,
+or arbitrary mappings. No state-machine edge is added: preparation uses only
+the source-to-active transitions already represented in the state graph.
 
 Define route-specific transactional store operations rather than a generic
 prepare call. `prepare_new_request_action` atomically creates the generated
@@ -493,6 +507,15 @@ marks an uncompleted `CLAIMED` row as `RECOVERED` with an interrupted task and
 preserved continuation. Explicit Resume creates a new generation-safe
 `PREPARED` row referencing that `ABORTED` or `RECOVERED` row; it never reuses a
 claim.
+
+`recover_claimed_prepared_actions` is the named startup-recovery operation.
+Before the runtime is admitted to `ProjectRegistry` or accepts requests, its
+coordinator calls it once after store migration/recovery setup. In one
+transaction it finds every uncompleted claimed row, transitions it to
+`RECOVERED`, and writes the matching task's existing `INTERRUPTED` state with
+the preserved active continuation and frozen pending context. It is idempotent:
+completed, failed, aborted, and already recovered rows are unchanged; each
+recovered task still requires explicit Resume to create a new row.
 
 `abort_prepared_action` is a `PREPARED` to `ABORTED` CAS. It atomically writes
 the task's existing `INTERRUPTED` state with the active-state continuation and
@@ -525,9 +548,12 @@ approval, answer, and resume. Assert each route's exact task/event/baseline/
 continuation mutation and one post-commit listener publication; inject each
 transaction failure and assert no listener or partial row. Cover store-owned
 opaque ID collision retry and getter reconstruction; malformed/oversized typed
-payloads; scope/review/clarification/Sol-resume/answer context preservation;
-exact-once claim; `CLAIMED` complete/fail transitions; scheduler abort;
-restart/reopen recovery; explicit Resume's new record with previous reference;
+payloads; trusted coordinator-derived project identity (including browser-ID
+substitution rejection); scope/review prompt plus completion guard/
+clarification prompt plus underlying continuation/Sol-resume prompt/answer
+context preservation; exact-once claim; `CLAIMED` complete/fail transitions;
+scheduler abort; named startup recovery's atomic `CLAIMED → RECOVERED` task
+interruption; explicit Resume's new record with previous reference;
 idempotent same-identity abort; stale/different ID, identity, action, reason,
 or generation rejection; and an injected abort-persistence failure. Assert
 preparation uses the exact existing active state selected by the state graph,
