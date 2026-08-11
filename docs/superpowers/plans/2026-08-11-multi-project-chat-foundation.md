@@ -380,7 +380,7 @@ class PreparedActionRecord:
     continuation_state: TaskState | None
     pending_context: PreparedContinuationContext
     previous_preparation_id: str | None
-    status: Literal["PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "RECOVERED"]
+    status: Literal["PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED"]
     reason: str | None
     generation: int
 
@@ -413,6 +413,9 @@ def complete_prepared_action(
     self, preparation_id: str, *, generation: int,
 ) -> PreparedActionRecord: ...
 def fail_prepared_action(
+    self, preparation_id: str, *, generation: int, reason: str,
+) -> PreparedActionRecord: ...
+def interrupt_claimed_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
 ) -> PreparedActionRecord: ...
 def abort_prepared_action(
@@ -472,6 +475,9 @@ def prepare_resume(
 ) -> PreparedActionRecord: ...
 def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]: ...
 async def run_prepared_action(self, preparation_id: str) -> None: ...
+def interrupt_claimed_prepared_action(
+    self, preparation_id: str, *, generation: int, reason: str,
+) -> PreparedActionRecord: ...
 def abort_prepared_action(
     self, preparation_id: str, *, generation: int, reason: str,
 ) -> PreparedActionRecord: ...
@@ -530,12 +536,19 @@ listener is called for a rollback.
 `claim_prepared_action` is an exact-once CAS from `PREPARED` to `CLAIMED` for
 the matching ID and generation. `complete_prepared_action` and
 `fail_prepared_action` transition that exact claimed row to `COMPLETED` or
-`FAILED`; stale, different, forged, duplicate, or terminal identities reject
-before a child starts. Startup recovery never silently reclaims a claim: it
-marks every unfinished `PREPARED` or `CLAIMED` row as `RECOVERED` with an
-interrupted task and preserved continuation. Explicit Resume creates a new
-generation-safe `PREPARED` row referencing its valid `ABORTED` or `RECOVERED`
-predecessor when one exists; it never reuses a claim.
+`FAILED`; `FAILED` is non-resumable. `interrupt_claimed_prepared_action` is a
+separate exact `(preparation_id, generation)` CAS from `CLAIMED` to
+`INTERRUPTED`, used only when Coordinator/Stop or an adapter interruption has
+left that exact task revision in `TaskState.INTERRUPTED`. It atomically
+preserves the active continuation, frozen typed context, and safe pending
+projection. `INTERRUPTED` is durable and resumable, distinct from scheduler
+`ABORTED`, startup `RECOVERED`, normal `COMPLETED`, and non-resumable `FAILED`.
+Stale, different, forged, duplicate, or terminal identities reject before a
+child starts. Startup recovery never silently reclaims a claim: it marks every
+unfinished `PREPARED` or `CLAIMED` row as `RECOVERED` with an interrupted task
+and preserved continuation. Explicit Resume creates a new generation-safe
+`PREPARED` row referencing its valid `ABORTED`, `RECOVERED`, or `INTERRUPTED`
+predecessor when a modern prepared row exists; it never reuses a claim.
 
 `recover_unfinished_prepared_actions` is the named startup-recovery operation.
 Before the runtime is admitted to `ProjectRegistry` or accepts requests, its
@@ -556,11 +569,13 @@ preparation ID, and the frozen typed source context. An identical abort retry
 returns the same record; stale generation or any different identity/action/
 reason rejects. An abort persistence failure leaves the preparation and lease
 retryable rather than releasing the token. `previous_preparation_id` is optional
-only for exact legacy/normal Stop/adapter-interrupted tasks that have no prior
-prepared row. When non-null, the store requires the same project/session/task/
-revision identity and an `ABORTED` or `RECOVERED` terminal lineage before a new
-positive-generation Resume row may reference it; it never silently reuses a
-claim.
+only for an exact legacy task that has no prepared row. When non-null, the
+store requires the same project/session/task/
+revision identity and an `ABORTED`, `RECOVERED`, or `INTERRUPTED` terminal
+lineage before a new positive-generation Resume row may reference it. `None`
+is rejected whenever a modern same-identity prepared row exists. `CLAIMED`,
+`COMPLETED`, and `FAILED` predecessors reject; the store never silently reuses
+a claim.
 
 The coordinator derives its project identity only from the canonical
 repository root and exposes route-specific synchronous preparation methods for
@@ -568,9 +583,13 @@ new request, approval, answer, and resume; each performs its repository,
 baseline, exact-revision, continuation, and drift validation before invoking
 the matching store transaction. `run_prepared_action(preparation_id)` reloads
 and claims the exact durable record, invokes only the operation reconstructible
-from its persisted context, and completes or fails that record. Existing public
-compatibility wrappers remain, but delegate through corresponding prepare-then-
-run paths rather than bypassing durable preparation.
+from its persisted context, and classifies the exact post-coordinator outcome:
+normal completed action becomes `COMPLETED`; an exact matching Stop or
+adapter-interruption with the task revision in `TaskState.INTERRUPTED` becomes
+`INTERRUPTED`; and only a non-resumable classified failure becomes `FAILED`.
+It never classifies from raw exception text. Existing public compatibility
+wrappers remain, but delegate through corresponding prepare-then-run paths
+rather than bypassing durable preparation.
 
 Generation zero is reserved exclusively for immediate one-process compatibility
 wrappers: their prepare-then-run delegation is one local call path and is
@@ -607,6 +626,15 @@ or generation rejection; and an injected abort-persistence failure. Assert
 preparation uses the exact existing active state selected by the state graph,
 does not add a graph edge, and never writes `TaskRecord.pending`.
 
+Add focused Store/Coordinator/Hub cases where Stop arrives after an exact
+claim and where the adapter reports an interruption. Assert both persist
+`CLAIMED → INTERRUPTED` exactly once with the matching task revision,
+continuation, typed context, and safe pending projection; restart preserves
+that terminal record without invoking a child. Assert Resume accepts only a
+same-identity `ABORTED`, `RECOVERED`, or `INTERRUPTED` predecessor, rejects a
+wrong-project/session/task/revision or stale predecessor, rejects
+`CLAIMED`/`COMPLETED`/`FAILED`, and cannot cause a duplicate invocation.
+
 In `test_hub.py`, make one readiness probe hang while its sibling fails or the
 caller is cancelled; assert `RuntimeReadiness` cancels and awaits every probe
 task before the orchestrator releases the lease. Cover route-specific hub
@@ -621,8 +649,8 @@ succeeds; an abort failure retains the exact retryable token.
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or recover_unfinished_prepared_actions or compatibility"
-python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action or recovery or compatibility"
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or interrupt_claimed_prepared_action or recover_unfinished_prepared_actions or compatibility"
+python -m pytest -q tests/agent_bridge/test_store.py -k "prepared_action or pending_action or interruption or recovery or compatibility"
 ```
 
 Use an in-process lock plus monotonically increasing generation.
@@ -659,7 +687,7 @@ remains required.
 
 ```bash
 python -m pytest -q tests/agent_bridge/test_projects.py tests/agent_bridge/test_hub.py
-python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or recover_unfinished_prepared_actions or compatibility"
+python -m pytest -q tests/agent_bridge/test_coordinator.py -k "prepare_ or run_prepared_action or abort_prepared_action or interrupt_claimed_prepared_action or recover_unfinished_prepared_actions or compatibility"
 python -m pytest -q tests/agent_bridge/test_store.py
 git add \
   src/agent_bridge/hub.py \
