@@ -93,15 +93,41 @@ class _Ids:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local Agent Bridge")
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=56590)
-    parser.add_argument("--claude-executable")
-    parser.add_argument("--codex-executable")
-    parser.add_argument("--git-executable")
-    parser.add_argument("--bash-executable")
-    parser.add_argument("--sh-executable")
+    parser = argparse.ArgumentParser(
+        description="Run the local Agent Bridge.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--repo", required=True, help="Repository authority for this run.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Loopback-only host, normalized to 127.0.0.1.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=56590, help="Loopback listener port.",
+    )
+    parser.add_argument(
+        "--claude-executable",
+        help="Claude executable; must be an absolute executable path.",
+    )
+    parser.add_argument(
+        "--codex-executable",
+        help="Codex executable; must be an absolute executable path.",
+    )
+    parser.add_argument(
+        "--git-executable",
+        help="Git executable; must be an absolute executable path.",
+    )
+    parser.add_argument(
+        "--bash-executable",
+        help="Bash executable; must be an absolute executable path.",
+    )
+    parser.add_argument(
+        "--sh-executable",
+        help="sh executable; must be an absolute executable path.",
+    )
     return parser
 
 

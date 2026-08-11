@@ -32,11 +32,11 @@ the bridge.
 ## Subscription and usage safety
 
 Agent Bridge is designed for subscription-backed local use. Before starting a
-model action, it performs bounded startup checks and cleans provider-specific
-environment variables from child processes. Claude receives only the safe
-authentication projection needed for its saved subscription login; unrelated
-provider credentials, tokens, and connection settings are not forwarded.
-Codex receives a separately filtered local-tool environment.
+model action, it performs bounded startup checks. Claude's child environment
+uses a bounded denylist of known provider selectors and overrides; it is not a
+general secret scrubber. Start Agent Bridge from a clean launch shell and do
+not place unrelated credentials in that shell's environment. Codex receives a
+separately filtered minimal local-tool environment.
 
 The browser has a separate account-level acknowledgement: confirm that Claude
 account usage credits are disabled before sending or approving work. This

@@ -216,6 +216,31 @@ def test_importing_main_keeps_optional_web_stack_unloaded() -> None:
     )
     assert result.returncode == 0, result.stderr
 
+    help_result = subprocess.run(
+        [sys.executable, "-m", "agent_bridge", "--help"],
+        cwd=source_root.parent,
+        env={"PYTHONPATH": str(source_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    help_text = help_result.stdout.lower()
+    assert "repository authority" in help_text
+    assert "loopback-only" in help_text
+    assert "127.0.0.1" in help_result.stdout
+    assert "56590" in help_result.stdout
+    for option in (
+        "--claude-executable",
+        "--codex-executable",
+        "--git-executable",
+        "--bash-executable",
+        "--sh-executable",
+    ):
+        assert option in help_result.stdout
+    normalized_help = " ".join(help_text.split())
+    assert normalized_help.count("must be an absolute executable path") == 5
+
 
 def test_parse_settings_rejects_public_bind_missing_repo_and_non_git(tmp_path: Path) -> None:
     tools = _fake_tools(tmp_path)
