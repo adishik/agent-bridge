@@ -180,10 +180,11 @@ class ClaudeCLI:
         )
 
     def _parse_auth_status(self, result: ProcessResult) -> ClaudeAuthStatus:
-        if result.exit_code != 0 or len(result.stdout) != 1:
+        if result.exit_code != 0 or not result.stdout:
             raise SubscriptionAuthError("Claude subscription authentication could not be verified")
+        auth_document = "\n".join(result.stdout)
         try:
-            status = json.loads(result.stdout[0])
+            status = json.loads(auth_document)
         except (json.JSONDecodeError, TypeError):
             raise SubscriptionAuthError(
                 "Claude subscription authentication could not be verified"

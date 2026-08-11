@@ -13,7 +13,7 @@ from agent_bridge.adapters.claude_cli import (
     ClaudeRunError,
     SubscriptionAuthError,
 )
-from agent_bridge.process import ProcessRunner
+from agent_bridge.process import ProcessResult, ProcessRunner
 
 
 SAFE_ENV = {"AGENT_BRIDGE_TEST_FAKE": "1", "LANG": "C.UTF-8", "PATH": "/not-used"}
@@ -135,6 +135,68 @@ def test_fable_requires_subscription_and_sanitizes_environment(
     asyncio.run(scenario())
 
 
+def test_fable_accepts_pretty_printed_subscription_auth_status(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        auth_status = {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        }
+        status = await _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_AUTH_STATUS=json.dumps(auth_status, indent=2),
+        ).preflight()
+
+        assert status.logged_in is True
+        assert status.auth_method == "claude.ai"
+        assert status.api_provider == "firstParty"
+        assert status.subscription_type == "max"
+
+    asyncio.run(scenario())
+
+
+def test_fable_rejects_multiple_auth_json_documents(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        auth_status = json.dumps({
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        })
+        with pytest.raises(SubscriptionAuthError, match="could not be verified"):
+            await _adapter(
+                fake_claude,
+                tmp_path,
+                FAKE_CLAUDE_AUTH_STATUS=f"{auth_status}\n{auth_status}",
+            ).preflight()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stdout", ((), ("[]",), ("null",)))
+def test_fable_rejects_empty_or_non_object_auth_document(
+    fake_claude: Path, tmp_path: Path, stdout: tuple[str, ...],
+) -> None:
+    result = ProcessResult(
+        run_id="auth-result",
+        pid=123,
+        process_group_id=123,
+        exit_code=0,
+        stdout=stdout,
+        stderr=(),
+        interrupted=False,
+    )
+
+    with pytest.raises(SubscriptionAuthError, match="could not be verified"):
+        _adapter(fake_claude, tmp_path)._parse_auth_status(result)
+
+
 @pytest.mark.parametrize(
     "auth_status",
     [
@@ -145,6 +207,8 @@ def test_fable_requires_subscription_and_sanitizes_environment(
         {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "   "},
         {"loggedIn": False, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"},
         {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "gateway", "subscriptionType": "max"},
+        {"loggedIn": 1, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"},
+        {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": 1},
     ],
 )
 def test_fable_rejects_every_non_subscription_auth_shape_without_model_call(
