@@ -329,6 +329,7 @@ class ProjectRegistry:
 class PreparedWorkflow:
     preparation_id: str
     token: LeaseToken
+    revision: int = 0
 
 
 class HubWorkflowOrchestrator:
@@ -351,6 +352,45 @@ class HubWorkflowOrchestrator:
         self._lease = lease
         self._usage_credits_acknowledged = usage_credits_acknowledged
         self._aborted_tokens: set[LeaseToken] = set()
+
+    def active_lease_snapshot(self) -> LeaseToken | None:
+        """Return the current lease identity without exposing its owner."""
+        return self._lease.snapshot()
+
+    def require_no_active_lease(self) -> None:
+        """Fail before a navigation or mutation may disturb an active workflow."""
+        if self._lease.snapshot() is not None:
+            raise RuntimeError("another workflow already owns the active agent lease")
+
+    def require_navigation_allowed(
+        self, *, project_id: str, session_id: str,
+    ) -> LeaseToken | None:
+        """Allow an idle browser or the exact browser owning the active task."""
+        self._require_non_empty(project_id, "project_id")
+        self._require_non_empty(session_id, "session_id")
+        token = self._lease.snapshot()
+        if token is not None and (
+            token.project_id != project_id or token.session_id != session_id
+        ):
+            raise RuntimeError("active workflow belongs to another project or chat")
+        return token
+
+    def require_exact_stop_owner(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> LeaseToken:
+        """Validate Stop at the HTTP boundary before it can schedule work."""
+        self._require_non_empty(project_id, "project_id")
+        self._require_non_empty(session_id, "session_id")
+        self._require_non_empty(task_id, "task_id")
+        token = self._lease.snapshot()
+        if (
+            token is None
+            or token.project_id != project_id
+            or token.session_id != session_id
+            or token.task_id != task_id
+        ):
+            raise RuntimeError("stop requires the exact active workflow")
+        return token
 
     async def prepare_new_request(
         self,
@@ -378,7 +418,11 @@ class HubWorkflowOrchestrator:
                 generation=token.generation,
             )
             record = self._bound_record(runtime, record.preparation_id, token)
-            return PreparedWorkflow(preparation_id=record.preparation_id, token=token)
+            return PreparedWorkflow(
+                preparation_id=record.preparation_id,
+                token=token,
+                revision=record.revision,
+            )
         except BaseException:
             self._lease.release(token)
             raise
@@ -467,16 +511,10 @@ class HubWorkflowOrchestrator:
     async def stop(
         self, *, project_id: str, session_id: str, task_id: str,
     ) -> None:
-        self._require_non_empty(task_id, "task_id")
+        token = self.require_exact_stop_owner(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
         runtime = self._runtime_for_session(project_id, session_id)
-        token = self._lease.snapshot()
-        if (
-            token is None
-            or token.project_id != project_id
-            or token.session_id != session_id
-            or token.task_id != task_id
-        ):
-            raise RuntimeError("stop requires the exact active workflow")
         stopping = asyncio.create_task(runtime.coordinator.stop_task(task_id))
         try:
             # ``stop_task`` persists the interrupted task before it waits for
@@ -501,6 +539,7 @@ class HubWorkflowOrchestrator:
                         record.preparation_id, generation=token.generation, reason="stop",
                     )
             await stopping
+            self._lease.release(token)
         except BaseException:
             if not stopping.done():
                 stopping.cancel()
@@ -532,7 +571,11 @@ class HubWorkflowOrchestrator:
             )
             record = prepare(runtime, token)
             record = self._bound_record(runtime, record.preparation_id, token)
-            return PreparedWorkflow(preparation_id=record.preparation_id, token=token)
+            return PreparedWorkflow(
+                preparation_id=record.preparation_id,
+                token=token,
+                revision=record.revision,
+            )
         except BaseException:
             self._lease.release(token)
             raise

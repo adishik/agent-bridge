@@ -931,7 +931,7 @@ def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
         assert terminal.status == "INTERRUPTED"
         assert terminal.reason == "stop"
         assert runtime.coordinator.stops == ["task-1"]
-        assert lease.snapshot() == prepared.token
+        assert lease.snapshot() is None
 
     asyncio.run(exercise())
 
@@ -948,6 +948,16 @@ def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() 
         prepared = await workflows.prepare_new_request(
             project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
         )
+        workflows.abort_prepared(prepared, reason="first")
+        workflows.abort_prepared(prepared, reason="second")
+        assert runtime.coordinator.aborts == [
+            ("task-1", 0, "new_request", "scheduler_unavailable"),
+        ]
+        assert lease.snapshot() is None
+
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
 
         with pytest.raises(RuntimeError, match="exact active workflow"):
             await workflows.stop(
@@ -959,14 +969,76 @@ def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() 
             project_id="project-a", session_id="chat-1", task_id="task-1",
         )
         assert runtime.coordinator.stops == ["task-1"]
-        assert lease.snapshot() == prepared.token
-
-        workflows.abort_prepared(prepared, reason="first")
-        workflows.abort_prepared(prepared, reason="second")
-        assert runtime.coordinator.aborts == [
-            ("task-1", 0, "new_request", "scheduler_unavailable"),
-        ]
         assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_public_active_lease_guards_are_read_only_and_exact() -> None:
+    """Removing route-side lease guards would allow foreign navigation work."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a", sessions={"chat-1", "chat-2"})
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        assert workflows.active_lease_snapshot() is None
+        workflows.require_no_active_lease()
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        assert workflows.active_lease_snapshot() == prepared.token
+        with pytest.raises(RuntimeError, match="another workflow"):
+            workflows.require_no_active_lease()
+        assert workflows.require_navigation_allowed(
+            project_id="project-a", session_id="chat-1",
+        ) == prepared.token
+        with pytest.raises(RuntimeError, match="active workflow"):
+            workflows.require_navigation_allowed(
+                project_id="project-a", session_id="chat-2",
+            )
+        with pytest.raises(RuntimeError, match="active workflow"):
+            workflows.require_navigation_allowed(
+                project_id="project-b", session_id="chat-1",
+            )
+        assert workflows.require_exact_stop_owner(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+        ) == prepared.token
+        with pytest.raises(RuntimeError, match="exact active workflow"):
+            workflows.require_exact_stop_owner(
+                project_id="project-a", session_id="chat-1", task_id="other-task",
+            )
+
+        assert lease.snapshot() == prepared.token
+        assert runtime.coordinator.stops == []
+
+    asyncio.run(exercise())
+
+
+def test_stop_releases_the_exact_lease_after_successful_finalization() -> None:
+    """A successful Stop must not strand the global model-start lease."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        await workflows.stop(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+        )
+
+        assert runtime.coordinator.stops == ["task-1"]
+        assert workflows.active_lease_snapshot() is None
 
     asyncio.run(exercise())
 

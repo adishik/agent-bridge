@@ -23,7 +23,16 @@ from agent_bridge.app import (
     create_hub_app,
 )
 from agent_bridge.contracts import StreamEvent, TaskBrief
-from agent_bridge.hub import ProjectRegistry, RuntimeStatus
+from agent_bridge.coordinator import Coordinator
+from agent_bridge.hub import (
+    ActiveAgentLease,
+    HubWorkflowOrchestrator,
+    LeaseToken,
+    ProjectRegistry,
+    RuntimeReadiness,
+    RuntimeStatus,
+)
+from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import SQLiteStore
 
@@ -42,6 +51,19 @@ class _Clock:
     def __call__(self) -> str:
         self._tick += 1
         return f"2026-08-10T00:00:{self._tick:02d}Z"
+
+
+@dataclass
+class _RealIds:
+    task_number: int = 0
+
+    def new_task_id(self) -> str:
+        self.task_number += 1
+        return f"real-task-{self.task_number}"
+
+    def new_run_id(self) -> str:
+        self.task_number += 1
+        return f"real-run-{self.task_number}"
 
 
 class RecordingCoordinator:
@@ -1492,7 +1514,8 @@ class _Prepared:
     preparation_id: str
     project_id: str
     session_id: str
-    task_id: str | None
+    task_id: str
+    revision: int = 0
 
 
 class _HubWorkflows:
@@ -1506,6 +1529,39 @@ class _HubWorkflows:
         self.stops: list[tuple[str, str, str]] = []
         self.reject_preparation = False
         self.probe_calls = 0
+        self.active_lease: LeaseToken | None = None
+        self.run_failure = False
+        self.block_run = False
+
+    def active_lease_snapshot(self) -> LeaseToken | None:
+        return self.active_lease
+
+    def require_no_active_lease(self) -> None:
+        if self.active_lease is not None:
+            raise RuntimeError("another workflow already owns the active agent lease")
+
+    def require_navigation_allowed(
+        self, *, project_id: str, session_id: str,
+    ) -> LeaseToken | None:
+        token = self.active_lease
+        if token is not None and (
+            token.project_id != project_id or token.session_id != session_id
+        ):
+            raise RuntimeError("active workflow belongs to another project or chat")
+        return token
+
+    def require_exact_stop_owner(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> LeaseToken:
+        token = self.active_lease
+        if (
+            token is None
+            or token.project_id != project_id
+            or token.session_id != session_id
+            or token.task_id != task_id
+        ):
+            raise RuntimeError("stop requires the exact active workflow")
+        return token
 
     def _prepare(
         self,
@@ -1516,6 +1572,7 @@ class _HubWorkflows:
         task_id: str | None,
         text: str | None = None,
     ) -> _Prepared:
+        self.require_no_active_lease()
         if self.reject_preparation:
             raise RuntimeError("another workflow already owns the active agent lease")
         self.probe_calls += 1
@@ -1527,9 +1584,12 @@ class _HubWorkflows:
             preparation_id=f"{action}-{len(self.prepared) + 1}",
             project_id=project_id,
             session_id=session_id,
-            task_id=task_id,
+            task_id=(task_id or f"task-{len(self.prepared) + 1}"),
         )
         self.prepared.append(prepared)
+        self.active_lease = LeaseToken(
+            len(self.prepared), project_id, session_id, prepared.task_id,
+        )
         return prepared
 
     async def prepare_new_request(self, **kwargs: object) -> _Prepared:
@@ -1567,12 +1627,19 @@ class _HubWorkflows:
 
     async def run(self, prepared: _Prepared) -> None:
         self.runs.append(prepared.preparation_id)
+        if self.active_lease is not None and self.active_lease.task_id == prepared.task_id:
+            self.active_lease = None
+        if self.block_run:
+            await asyncio.Future()
+        if self.run_failure:
+            raise RuntimeError("deliberately unsafe prepared failure")
 
     def abort_prepared(self, prepared: _Prepared, *, reason: str) -> None:
         self.aborts.append((prepared.preparation_id, reason))
 
     async def stop(self, *, project_id: str, session_id: str, task_id: str) -> None:
         self.stops.append((project_id, session_id, task_id))
+        self.active_lease = None
 
 
 class _HubStoreFake:
@@ -1682,7 +1749,8 @@ def test_hub_routes_resolve_project_before_any_foreign_chat_or_task_lookup(
     with _authenticated_hub_client(hub_harness) as client:
         headers = {"X-CSRF-Token": CSRF_TOKEN}
         for path, body in mutations:
-            assert client.post(path, json=body, headers=headers).status_code == 404
+            expected = 409 if path.endswith("/stop") else 404
+            assert client.post(path, json=body, headers=headers).status_code == expected
         assert client.get(
             "/api/projects/project-a/chats/chat-b/bootstrap"
         ).status_code == 404
@@ -1737,9 +1805,24 @@ def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
         assert projects.status_code == 200
         assert projects.json() == {
             "projects": [
-                {"project_id": "project-a", "label": "PROJECT-A", "branch": "main"},
-                {"project_id": "project-b", "label": "PROJECT-B", "branch": "main"},
-            ]
+                {
+                    "project_id": "project-a", "label": "PROJECT-A", "branch": "main",
+                    "readiness": {
+                        "fable_ready": True,
+                        "fable_status": "subscription_ready",
+                        "sol_status": "ready",
+                    },
+                },
+                {
+                    "project_id": "project-b", "label": "PROJECT-B", "branch": "main",
+                    "readiness": {
+                        "fable_ready": True,
+                        "fable_status": "subscription_ready",
+                        "sol_status": "ready",
+                    },
+                },
+            ],
+            "active_lease": None,
         }
         created = client.post("/api/projects/project-a/chats", headers=headers)
         assert created.status_code == 201
@@ -1773,7 +1856,7 @@ def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
         ]
 
 
-def test_hub_model_preparation_rejects_foreign_lease_without_probe_and_stop_remains_available(
+def test_hub_model_preparation_rejects_foreign_lease_without_probe_and_stop_is_exact_owner_only(
     hub_harness: _HubHarness,
     valid_brief: TaskBrief,
 ) -> None:
@@ -1791,9 +1874,59 @@ def test_hub_model_preparation_rejects_foreign_lease_without_probe_and_stop_rema
         assert client.post(
             "/api/projects/project-a/chats/chat-a/tasks/task-1/stop",
             headers=headers,
+        ).status_code == 409
+    assert hub_harness.workflows.probe_calls == 0
+    assert hub_harness.workflows.stops == []
+
+
+def test_active_lease_synchronously_gates_navigation_model_mutations_and_exact_stop(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    hub_harness.hub_store.acknowledge_usage_credits()
+    hub_harness.workflows.active_lease = LeaseToken(
+        7, "project-b", "chat-b", "foreign-task",
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        projects = client.get("/api/projects").json()
+        assert projects["active_lease"] == {
+            "project_id": "project-b", "session_id": "chat-b", "task_id": "foreign-task",
+        }
+        assert client.post("/api/projects/project-a/chats", headers=headers).status_code == 409
+        assert client.get("/api/projects/project-a/chats/chat-a/bootstrap").status_code == 409
+        assert client.get("/api/projects/project-b/chats/chat-b/bootstrap").status_code == 200
+        for path, body in (
+            ("/api/projects/project-a/chats/chat-a/messages", {"text": "plan"}),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
+        ):
+            assert client.post(path, json=body, headers=headers).status_code == 409
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect(
+                "/ws?project_id=project-a&session_id=chat-a&after=0"
+            ):
+                pass
+        assert caught.value.code == 1008
+
+        hub_harness.workflows.active_lease = LeaseToken(
+            8, "project-a", "chat-a", "task-1",
+        )
+        assert client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/other-task/stop",
+            headers=headers,
+        ).status_code == 409
+        assert client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/stop",
+            headers=headers,
         ).status_code == 202
         _wait_until(lambda: hub_harness.workflows.stops == [("project-a", "chat-a", "task-1")])
     assert hub_harness.workflows.probe_calls == 0
+    assert hub_harness.workflows.prepared == []
 
 
 def test_hub_scheduler_rejection_aborts_the_exact_durable_preparation(
@@ -1817,6 +1950,182 @@ def test_hub_scheduler_rejection_aborts_the_exact_durable_preparation(
     assert hub_harness.workflows.aborts == [("new-1", "scheduler_unavailable")]
     assert hub_harness.workflows.runs == []
     assert hub_harness.app.state.active_coroutines == set()
+
+
+def test_prepared_task_failures_and_lifespan_cancellation_are_observed_without_raw_event_persistence(
+    hub_harness: _HubHarness,
+) -> None:
+    hub_harness.hub_store.acknowledge_usage_credits()
+    hub_harness.workflows.run_failure = True
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/messages",
+            json={"text": "fail locally"},
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+        assert response.status_code == 202
+        _wait_until(lambda: not hub_harness.app.state.active_coroutines)
+    assert hub_harness.app.state.coroutine_observation_failures == [
+        {"stage": "prepared", "error_type": "RuntimeError"},
+    ]
+    assert [event.kind for event in hub_harness.runtimes["project-a"].store.events_after("chat-a", 0)] == [
+        "message",
+    ]
+
+    hub_harness.workflows.run_failure = False
+    hub_harness.workflows.block_run = True
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/messages",
+            json={"text": "cancel locally"},
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+        assert response.status_code == 202
+        _wait_until(lambda: bool(hub_harness.app.state.active_coroutines))
+    assert hub_harness.app.state.active_coroutines == set()
+    assert hub_harness.app.state.coroutine_observation_failures == [
+        {"stage": "prepared", "error_type": "RuntimeError"},
+    ]
+
+
+def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_duplicate_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable retry is Resume, not a repeated user message."""
+    repo_root = tmp_path / "repository"
+    repo_root.mkdir()
+    project_id = project_id_for_root(repo_root)
+    store = SQLiteStore(
+        tmp_path / "project.sqlite3", clock=_Clock(), check_same_thread=False,
+    )
+    store.create_session("chat-real", str(repo_root))
+
+    async def fable_probe() -> tuple[bool, str]:
+        return True, "subscription_ready"
+
+    async def sol_probe() -> str:
+        return "ready"
+
+    coordinator = Coordinator(
+        store=store,
+        repository=object(),  # Preparation/abort needs no repository operation.
+        runner=object(),
+        fable=object(),
+        sol=object(),
+        ids=_RealIds(),
+        repo_root=repo_root,
+        repo_context="local test repository",
+        trusted_shells={"sh": "/bin/sh"},
+    )
+    runtime = _HubRuntime(
+        project_id=project_id,
+        label="REAL",
+        repository=str(repo_root),
+        branch="main",
+        store=store,
+        coordinator=coordinator,  # type: ignore[arg-type]
+        broadcaster=InMemoryEventBroadcaster(),
+        readiness=RuntimeReadiness(
+            initial=RuntimeStatus(True, "subscription_ready", "ready"),
+            fable_probe=fable_probe,
+            sol_probe=sol_probe,
+        ),
+    )
+    hub_store = _HubStoreFake()
+    hub_store.acknowledge_usage_credits()
+    workflows = HubWorkflowOrchestrator(
+        registry=ProjectRegistry((runtime,)),
+        lease=ActiveAgentLease(),
+        usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
+    )
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html><title>real hub</title>")
+    app = create_hub_app(
+        registry=ProjectRegistry((runtime,)),
+        hub_store=hub_store,
+        workflows=workflows,
+        static_dir=static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    try:
+        with TestClient(app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{project_id}/chats/chat-real/messages",
+                json={"text": "make exactly one durable plan"},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 503
+        recovery = response.json()["detail"]
+        assert recovery == {
+            "state": "recoverable",
+            "preparation_id": recovery["preparation_id"],
+            "project_id": project_id,
+            "session_id": "chat-real",
+            "task_id": recovery["task_id"],
+            "revision": 0,
+        }
+        original = store.prepared_action(recovery["preparation_id"])
+        assert original is not None
+        assert original.status == "ABORTED"
+        assert store.get_task(recovery["task_id"], 0).state is TaskState.INTERRUPTED
+        assert workflows.active_lease_snapshot() is None
+        assert app.state.active_coroutines == set()
+        assert [event.kind for event in store.events_after("chat-real", 0)] == [
+            "message", "task_state",
+        ]
+
+        with TestClient(app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            existing_rejection = client.post(
+                f"/api/projects/{project_id}/chats/chat-real/tasks/{recovery['task_id']}/resume",
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert existing_rejection.status_code == 503
+        existing_recovery = existing_rejection.json()["detail"]
+        assert existing_recovery["project_id"] == project_id
+        assert existing_recovery["session_id"] == "chat-real"
+        assert existing_recovery["task_id"] == recovery["task_id"]
+        assert existing_recovery["revision"] == 0
+        existing = store.prepared_action(existing_recovery["preparation_id"])
+        assert existing is not None
+        assert existing.action == "resume"
+        assert existing.status == "ABORTED"
+        assert existing.previous_preparation_id == original.preparation_id
+        assert workflows.active_lease_snapshot() is None
+        assert app.state.active_coroutines == set()
+        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+
+        monkeypatch.undo()
+        with TestClient(app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            resumed = client.post(
+                f"/api/projects/{project_id}/chats/chat-real/tasks/{recovery['task_id']}/resume",
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert resumed.status_code == 202
+            _wait_until(lambda: not app.state.active_coroutines)
+        retry = store.latest_prepared_action_for_task(
+            project_id=project_id,
+            session_id="chat-real",
+            task_id=recovery["task_id"],
+            revision=0,
+        )
+        assert retry is not None
+        assert retry.action == "resume"
+        assert retry.previous_preparation_id == existing.preparation_id
+        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+    finally:
+        coordinator.close()
+        store.close()
 
 
 def test_hub_websocket_replay_is_session_filtered_inside_the_selected_project(

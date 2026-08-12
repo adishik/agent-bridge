@@ -582,18 +582,42 @@ def create_hub_app(
                 )
             return False
         app.state.active_coroutines.add(task)
-        task.add_done_callback(
-            lambda completed: app.state.active_coroutines.discard(completed)
-        )
+        def observe_prepared(completed: asyncio.Task[object]) -> None:
+            app.state.active_coroutines.discard(completed)
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                if not app.state.shutting_down:
+                    app.state.coroutine_observation_failures.append(
+                        {"stage": "prepared", "outcome": "cancelled"}
+                    )
+                return
+            except BaseException as observation_error:
+                error = observation_error
+            if error is not None:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "prepared", "error_type": type(error).__name__}
+                )
+
+        task.add_done_callback(observe_prepared)
         return True
 
     def recoverable_preparation(prepared: object) -> HTTPException:
         preparation_id = getattr(prepared, "preparation_id", None)
+        token = getattr(prepared, "token", None)
+        project_id = getattr(token, "project_id", getattr(prepared, "project_id", None))
+        session_id = getattr(token, "session_id", getattr(prepared, "session_id", None))
+        task_id = getattr(token, "task_id", getattr(prepared, "task_id", None))
+        revision = getattr(prepared, "revision", None)
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "state": "recoverable",
                 "preparation_id": preparation_id if isinstance(preparation_id, str) else None,
+                "project_id": project_id if isinstance(project_id, str) else None,
+                "session_id": session_id if isinstance(session_id, str) else None,
+                "task_id": task_id if isinstance(task_id, str) else None,
+                "revision": revision if isinstance(revision, int) and revision >= 0 else None,
             },
         )
 
@@ -635,15 +659,30 @@ def create_hub_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="project query parameters are not accepted",
             )
+        active = workflows.active_lease_snapshot()
         return {
             "projects": [
                 {
                     "project_id": runtime.project_id,
                     "label": runtime.label,
                     "branch": runtime.branch,
+                    "readiness": {
+                        "fable_ready": runtime.readiness.snapshot().fable_ready,
+                        "fable_status": runtime.readiness.snapshot().fable_status,
+                        "sol_status": runtime.readiness.snapshot().sol_status,
+                    },
                 }
                 for runtime in registry.projects()
-            ]
+            ],
+            "active_lease": (
+                None
+                if active is None
+                else {
+                    "project_id": active.project_id,
+                    "session_id": active.session_id,
+                    "task_id": active.task_id,
+                }
+            ),
         }
 
     @app.get("/api/projects/{project_id}/chats", dependencies=[Depends(require_session)])
@@ -673,6 +712,10 @@ def create_hub_app(
     )
     async def create_chat(project_id: ProjectId) -> Mapping[str, object]:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
         return chat_snapshot(runtime.store.create_chat(runtime.repository))
 
     @app.get(
@@ -691,6 +734,12 @@ def create_hub_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="bootstrap query parameters are not accepted",
             )
+        try:
+            workflows.require_navigation_allowed(
+                project_id=project_id, session_id=session_id,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         response.headers["Cache-Control"] = "no-store"
         readiness = runtime.readiness.snapshot()
@@ -731,6 +780,10 @@ def create_hub_app(
         project_id: ProjectId, session_id: SessionId, body: MessageRequest,
     ) -> Response:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         try:
             prepared = await workflows.prepare_new_request(
@@ -761,6 +814,10 @@ def create_hub_app(
         body: ApprovalRequest,
     ) -> Response:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         task = selected_task(runtime, session_id, task_id)
         if body.revision != task.revision:
@@ -864,6 +921,10 @@ def create_hub_app(
         body: AnswerRequest,
     ) -> Response:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         task = selected_task(runtime, session_id, task_id)
         try:
@@ -893,6 +954,12 @@ def create_hub_app(
         project_id: ProjectId, session_id: SessionId, task_id: TaskId,
     ) -> Response:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_exact_stop_owner(
+                project_id=project_id, session_id=session_id, task_id=task_id,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         selected_task(runtime, session_id, task_id)
         if not install_action(
@@ -919,6 +986,10 @@ def create_hub_app(
         project_id: ProjectId, session_id: SessionId, task_id: TaskId,
     ) -> Response:
         runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
         selected_chat(runtime, session_id)
         task = selected_task(runtime, session_id, task_id)
         try:
@@ -970,8 +1041,11 @@ def create_hub_app(
             return
         try:
             runtime = selected_runtime(project_id)
+            workflows.require_navigation_allowed(
+                project_id=project_id, session_id=session_id,
+            )
             selected_chat(runtime, session_id)
-        except HTTPException:
+        except (HTTPException, RuntimeError):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await websocket.accept()
