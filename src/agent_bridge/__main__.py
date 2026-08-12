@@ -854,13 +854,13 @@ def assemble_project_runtime(
         raise ValueError("settings must be Settings")
     opened = _opened_state
     opened_here = opened is None
-    if opened is None:
-        opened = _open_project_state(spec, lock=lock, clock=clock)
-        _audit_project_state(opened, settings)
-    elif opened.spec != spec or opened.lock is not lock:
-        raise ValueError("opened project state does not match runtime inputs")
     tracker = None
     try:
+        if opened is None:
+            opened = _open_project_state(spec, lock=lock, clock=clock)
+            _audit_project_state(opened, settings)
+        elif opened.spec != spec or opened.lock is not lock:
+            raise ValueError("opened project state does not match runtime inputs")
         opened.store.recover_active_tasks()
         runner = ProcessRunner()
         codex_child_environment = codex_environment(environment)
@@ -952,7 +952,7 @@ def assemble_project_runtime(
                 tracker.close()
             except BaseException:
                 pass
-        if opened_here:
+        if opened_here and opened is not None:
             try:
                 opened.store.close()
             except BaseException:

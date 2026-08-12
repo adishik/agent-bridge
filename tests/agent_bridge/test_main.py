@@ -1315,6 +1315,150 @@ def test_legacy_audit_for_all_projects_precedes_every_project_recovery(
         lock.release()
 
 
+def test_direct_assembler_closes_its_store_when_legacy_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a direct-assembler audit escape that otherwise leaks SQLite state."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    legacy_state = state_root / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    seed = SQLiteStore(database)
+    seed.create_session("session-1", "/foreign-repository")
+    seed.set_setting("agent_bridge.active_session_id", "session-1")
+    seed.close()
+    spec = _project_spec(repo, "repo", legacy_state)
+    settings = launcher.Settings(
+        projects=(spec,),
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    stores: list[SQLiteStore] = []
+    recoveries: list[SQLiteStore] = []
+    closed: list[SQLiteStore] = []
+    children: list[str] = []
+
+    class TrackingStore(SQLiteStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            stores.append(self)
+
+        def recover_active_tasks(self):
+            recoveries.append(self)
+            return super().recover_active_tasks()
+
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class CallerOwnedLock:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    def unexpected_runner() -> None:
+        children.append("runner")
+        raise AssertionError("runtime child must not be constructed after audit failure")
+
+    lock = CallerOwnedLock()
+    monkeypatch.setattr("agent_bridge.store.SQLiteStore", TrackingStore)
+    monkeypatch.setattr("agent_bridge.process.ProcessRunner", unexpected_runner)
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy project ownership audit failed: active_session, session_ownership",
+    ):
+        launcher.assemble_project_runtime(
+            spec,
+            lock=lock,
+            settings=settings,
+            environment=_environment(tmp_path, repo),
+            ids=launcher._Ids(),
+            clock=launcher._now,
+        )
+
+    assert len(stores) == 1
+    assert closed == stores
+    assert recoveries == []
+    assert children == []
+    assert lock.release_count == 0
+
+
+def test_direct_assembler_leaves_caller_opened_state_owned_by_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An externally opened state remains with its caller when completion fails."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    spec = _project_spec(
+        repo,
+        "repo",
+        state_root / "projects" / project_id_for_root(repo),
+    )
+    spec.state_dir.mkdir(parents=True)
+    settings = launcher.Settings(
+        projects=(spec,),
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    closed: list[SQLiteStore] = []
+
+    class TrackingStore(SQLiteStore):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class CallerOwnedLock:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    def failed_recovery():
+        raise RuntimeError("injected recovery failure")
+
+    lock = CallerOwnedLock()
+    monkeypatch.setattr("agent_bridge.store.SQLiteStore", TrackingStore)
+    opened = launcher._open_project_state(spec, lock=lock, clock=launcher._now)
+    monkeypatch.setattr(opened.store, "recover_active_tasks", failed_recovery)
+
+    with pytest.raises(RuntimeError, match="injected recovery failure"):
+        launcher.assemble_project_runtime(
+            spec,
+            lock=lock,
+            settings=settings,
+            environment=_environment(tmp_path, repo),
+            ids=launcher._Ids(),
+            clock=launcher._now,
+            _opened_state=opened,
+        )
+
+    assert closed == []
+    assert lock.release_count == 0
+    opened.store.close()
+    assert closed == [opened.store]
+
+
 def test_successful_three_project_assembly_keeps_project_resources_independent(
     tmp_path: Path,
 ) -> None:
