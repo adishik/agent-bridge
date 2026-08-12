@@ -650,6 +650,12 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
     harness = f"""
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
+      const projectBootstrap = {{...bootstrap, project_id: "project-a"}};
+      const projects = {{projects: [{{
+        project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
+        readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+      }}], active_lease: null}};
+      const chats = {{chats: [{{session_id: "session-1", title: "New chat", latest_sequence: 0}}]}};
       const persistedEvent = {json.dumps(persisted_event)};
       const unsafe = {json.dumps(unsafe)};
       let interactionAllowed = () => true;
@@ -738,6 +744,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       }};
 
       const fetchCalls = [];
+      let projectFetchCount = 0;
       let bootstrapFetchCount = 0;
       let releaseReconnectBootstrap;
       const scheduled = [];
@@ -759,13 +766,20 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         matchMedia: () => media,
         fetch: async (url, options = {{}}) => {{
           fetchCalls.push({{url, options}});
-          if (url === "/api/bootstrap") {{
+          if (url === "/api/projects") {{
+            projectFetchCount += 1;
+            if (projectFetchCount === 1) return {{ok: false, status: 503, json: async () => ({{}})}};
+            return {{ok: true, status: 200, json: async () => projects}};
+          }}
+          if (url === "/api/projects/project-a/chats?limit=50") {{
+            return {{ok: true, status: 200, json: async () => chats}};
+          }}
+          if (url === "/api/projects/project-a/chats/session-1/bootstrap") {{
             bootstrapFetchCount += 1;
-            if (bootstrapFetchCount === 1) return {{ok: false, status: 503, json: async () => ({{}})}};
-            if (bootstrapFetchCount === 3) {{
+            if (bootstrapFetchCount === 2) {{
               return await new Promise((resolve) => {{ releaseReconnectBootstrap = resolve; }});
             }}
-            return {{ok: true, status: 200, json: async () => bootstrap}};
+            return {{ok: true, status: 200, json: async () => projectBootstrap}};
           }}
           return {{ok: true, status: 202, json: async () => ({{}})}};
         }},
@@ -780,26 +794,26 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (await controller.ready) process.exit(4);
       if (nodes["bootstrap-retry"].hidden || !nodes["message-input"].disabled) process.exit(5);
       if (!interactionAllowed(nodes["bootstrap-retry"])) process.exit(25);
-      if (!nodes["usage-error"].textContent.includes("Bootstrap failed")) process.exit(26);
+      if (!nodes["usage-error"].textContent.includes("Request failed")) process.exit(26);
 
       await nodes["bootstrap-retry"].emit("click");
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
-      if (nodes["repository-status"].textContent !== "Repository: /repo · Branch: feat/agent-bridge") {{
+      if (nodes["repository-status"].textContent !== "Project: PROJECT-A · Branch: feat/agent-bridge") {{
         process.exit(9);
       }}
 
       const approve = nodes["task-inspector"].children[0].querySelector("button");
       await approve.emit("click");
       await Promise.resolve();
-      const approval = fetchCalls.find((call) => call.url === "/api/tasks/task-1/approve");
+      const approval = fetchCalls.find((call) => call.url === "/api/projects/project-a/chats/session-1/tasks/task-1/approve");
       if (approval.options.body !== '{{"revision":1}}') process.exit(10);
       if (approval.options.headers["X-CSRF-Token"] !== {json.dumps(CSRF_TOKEN)}) process.exit(11);
 
       nodes["message-input"].value = unsafe;
       await nodes["composer"].emit("submit");
-      const message = fetchCalls.find((call) => call.url === "/api/sessions/session-1/messages");
+      const message = fetchCalls.find((call) => call.url === "/api/projects/project-a/chats/session-1/messages");
       if (JSON.parse(message.options.body).text !== unsafe) process.exit(12);
       if (message.url.includes(unsafe)) process.exit(13);
       const socket = FakeSocket.instances[0];
@@ -815,7 +829,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await Promise.resolve();
       if (!nodes["message-input"].disabled
           || !nodes["connection-status"].textContent.includes("refresh")) process.exit(27);
-      releaseReconnectBootstrap({{ok: true, status: 200, json: async () => bootstrap}});
+      releaseReconnectBootstrap({{ok: true, status: 200, json: async () => projectBootstrap}});
       await reconnecting;
       if (documentRoot.activeElement !== nodes["message-input"]) process.exit(24);
       if (nodes["message-input"].disabled) process.exit(28);
@@ -2304,6 +2318,46 @@ def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
                 "latest_sequence": 0,
             }
         ]
+
+
+def test_project_navigation_public_payloads_need_no_repository_path(
+    hub_harness: _HubHarness,
+) -> None:
+    """The static controller receives labels and opaque IDs, never a local path."""
+    with _authenticated_hub_client(hub_harness) as client:
+        projects = client.get("/api/projects")
+        assert projects.status_code == 200
+        payload = projects.json()
+        assert payload["active_lease"] is None
+        assert payload["projects"] == [
+            {
+                "project_id": "project-a", "label": "PROJECT-A", "branch": "main",
+                "readiness": {
+                    "fable_ready": True,
+                    "fable_status": "subscription_ready",
+                    "sol_status": "ready",
+                },
+            },
+            {
+                "project_id": "project-b", "label": "PROJECT-B", "branch": "main",
+                "readiness": {
+                    "fable_ready": True,
+                    "fable_status": "subscription_ready",
+                    "sol_status": "ready",
+                },
+            },
+        ]
+        assert "repository" not in str(payload)
+        chats = client.get("/api/projects/project-a/chats?limit=50")
+        assert chats.status_code == 200
+        assert chats.json()["chats"][0]["session_id"] == "chat-a"
+        bootstrap = client.get(
+            "/api/projects/project-a/chats/chat-a/bootstrap"
+        )
+        assert bootstrap.status_code == 200
+        assert bootstrap.json()["project_id"] == "project-a"
+        assert bootstrap.json()["session_id"] == "chat-a"
+        assert "repository" not in str(bootstrap.json())
 
 
 def test_hub_model_preparation_rejects_foreign_lease_without_probe_and_stop_is_exact_owner_only(

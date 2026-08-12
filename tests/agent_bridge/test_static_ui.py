@@ -992,3 +992,171 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
     assert ".message-fable" in styles
     assert ".message-sol" in styles
     assert ".message-coordinator" in styles
+
+
+def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert {
+        "project-navigation",
+        "project-list",
+        "chat-list",
+        "new-chat",
+        "selected-project-name",
+        "selected-chat-name",
+    } <= rendered.ids
+    assert rendered.element("nav", "project-navigation")["aria-label"] == "Projects and chats"
+    assert rendered.element("ul", "project-list")["aria-label"] == "Projects"
+    assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
+    assert rendered.element("button", "new-chat")["type"] == "button"
+    assert rendered.element("button", "new-chat")["disabled"] is None
+    assert rendered.element("section", "conversation")["id"] == "conversation"
+    assert rendered.element("aside", "task-inspector")["id"] == "task-inspector"
+    assert "Fable" in " ".join(rendered.text)
+    assert "Sol" in " ".join(rendered.text)
+    assert not any(
+        tag == "input" and "path" in " ".join(
+            value or "" for value in attrs.values()
+        ).lower()
+        for tag, attrs in rendered.elements
+    )
+
+
+def test_project_chat_controller_scopes_selection_routes_and_stream_lifecycle() -> None:
+    harness = r"""
+      const calls = [];
+      const replies = new Map([
+        ["GET /api/projects", [
+          {projects: [
+            {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "project-b", label: "Beta", branch: "release", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ], active_lease: null},
+          {projects: [
+            {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "project-b", label: "Beta", branch: "release", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ], active_lease: null},
+        ]],
+        ["GET /api/projects/project-a/chats?limit=50", [
+          {chats: [
+            {session_id: "shared-chat", title: "Shared Alpha", latest_sequence: 0},
+            {session_id: "old-chat", title: "Old Alpha", latest_sequence: 0},
+          ]},
+        ]],
+        ["GET /api/projects/project-a/chats/shared-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 2, tasks: []},
+        ]],
+        ["GET /api/projects/project-a/chats/old-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "old-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []},
+        ]],
+        ["POST /api/projects/project-a/chats", [
+          {session_id: "random-chat-99", title: "New chat", latest_sequence: 0},
+        ]],
+        ["GET /api/projects/project-a/chats/random-chat-99/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "random-chat-99", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []},
+        ]],
+        ["GET /api/projects/project-b/chats?limit=50", [
+          {chats: [{session_id: "shared-chat", title: "Shared Beta", latest_sequence: 0}]},
+        ]],
+        ["GET /api/projects/project-b/chats/shared-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-b", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "release", replay_after: 0, tasks: []},
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-b", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "release", replay_after: 7, tasks: []},
+        ]],
+      ]);
+      const fetchFunction = async (url, options = {}) => {
+        const key = `${options.method ?? "GET"} ${url}`;
+        calls.push({url, options});
+        const reply = replies.get(key)?.shift();
+        if (!reply) throw new Error(`unexpected ${key}`);
+        return {ok: true, status: options.method === "POST" ? 201 : 200, json: async () => reply};
+      };
+      const sockets = [];
+      class Socket {
+        constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        emit(kind, value = {}) { return this.listeners[kind]?.(value); }
+        close() { this.closed = true; }
+      }
+      const timers = [];
+      const cancelled = [];
+      const states = [];
+      const chatResets = [];
+      const controller = bridge.createProjectChatController({
+        fetchFunction,
+        WebSocketCtor: Socket,
+        schedule(callback, delay) { timers.push({callback, delay}); return timers.length; },
+        cancelSchedule(timer) { cancelled.push(timer); },
+        location: {protocol: "https:", host: "bridge.test"},
+        onState(state) { states.push(state); },
+        onEvent() {},
+        onStatus() {},
+        onChatReset() { chatResets.push("reset"); },
+      });
+
+      await controller.bootstrapInitial();
+      if (controller.state.projectId !== "project-a" || controller.state.sessionId !== "shared-chat") process.exit(2);
+      if (sockets.length !== 1 || !sockets[0].url.includes("project_id=project-a") || !sockets[0].url.includes("session_id=shared-chat") || !sockets[0].url.endsWith("after=2")) process.exit(3);
+
+      await controller.selectChat("project-a", "old-chat");
+      if (!sockets[0].closed || controller.state.sessionId !== "old-chat" || controller.state.lastSequence !== 0) process.exit(4);
+
+      await controller.createChat();
+      if (controller.state.sessionId !== "random-chat-99" || !calls.some((call) => call.url === "/api/projects/project-a/chats" && call.options.headers["X-CSRF-Token"] === "csrf")) process.exit(5);
+      if (sockets.filter((socket) => socket.closed).length !== 2) process.exit(6);
+
+      await controller.selectProject("project-b");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "shared-chat") process.exit(7);
+      if (!sockets[2].closed || !sockets[3].url.includes("project_id=project-b") || !sockets[3].url.includes("session_id=shared-chat")) process.exit(8);
+      if (chatResets.length !== 3) process.exit(20);
+
+      sockets[3].emit("message", {data: JSON.stringify({sequence: 7, task_id: null, payload: {text: "safe"}})});
+      sockets[3].emit("close");
+      if (timers.length !== 1 || timers[0].delay !== 500) process.exit(9);
+      timers[0].callback();
+      if (sockets.length !== 5 || !sockets[4].url.endsWith("after=7")) process.exit(10);
+      await sockets[4].emit("open");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "shared-chat" || controller.state.lastSequence !== 7) process.exit(11);
+      if (cancelled.length !== 0 || states.some((state) => state.projectId === "project-a" && state.sessionId === "shared-chat" && state.lastSequence === 7)) process.exit(12);
+
+      if (bridge.projectChatMessagePath("project:a", "chat.2") !== "/api/projects/project%3Aa/chats/chat.2/messages") process.exit(13);
+      if (bridge.projectTaskActionPath("project-a", "chat-a", "task-a", "approve") !== "/api/projects/project-a/chats/chat-a/tasks/task-a/approve") process.exit(14);
+      if (bridge.projectWebsocketPath("project-a", "chat-a", 9) !== "/ws?project_id=project-a&session_id=chat-a&after=9") process.exit(15);
+      let unsafeRejected = false;
+      try { bridge.projectChatBootstrapPath("project-a", "chat/escape"); } catch { unsafeRejected = true; }
+      if (!unsafeRejected) process.exit(16);
+
+      class Node {
+        constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.disabled = false; this._text = ""; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        replaceChildren(...children) { this.children = [...children]; this._text = ""; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener() {}
+      }
+      const projectList = new Node("ul");
+      const chatList = new Node("ul");
+      const newChat = new Node("button");
+      const selectedProject = new Node("strong");
+      const selectedChat = new Node("strong");
+      const roots = {
+        "#project-list": projectList, "#chat-list": chatList, "#new-chat": newChat,
+        "#selected-project-name": selectedProject, "#selected-chat-name": selectedChat,
+      };
+      const documentRoot = {
+        createElement(tag) { return new Node(tag); },
+        querySelector(selector) { return roots[selector] ?? null; },
+      };
+      bridge.renderProjectNavigation(documentRoot, {
+        projectId: "project-0", projectLabel: "<script>Alpha</script>", sessionId: "chat-0",
+        projects: Array.from({length: bridge.MAX_NAV_PROJECTS + 5}, (_, index) => ({projectId: `project-${index}`, label: index === 0 ? "<script>Alpha</script>" : `Project ${index}`})),
+        chats: Array.from({length: bridge.MAX_NAV_CHATS + 5}, (_, index) => ({sessionId: `chat-${index}`, title: index === 0 ? "<img>" : `Chat ${index}`})),
+        activeLease: {projectId: "project-0", sessionId: "chat-0", taskId: "task-0"},
+        csrfToken: "csrf",
+      }, {onProject() {}, onChat() {}, onNewChat() {}});
+      if (projectList.children.length !== bridge.MAX_NAV_PROJECTS || chatList.children.length !== bridge.MAX_NAV_CHATS) process.exit(17);
+      if (!newChat.disabled || projectList.children.some((item) => !item.children[0].disabled) || chatList.children.some((item) => !item.children[0].disabled)) process.exit(18);
+      if (selectedProject.textContent !== "<script>Alpha</script>" || selectedChat.textContent !== "<img>") process.exit(19);
+    """
+    _run_module_harness(harness)
