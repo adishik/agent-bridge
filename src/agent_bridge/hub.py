@@ -509,10 +509,15 @@ class HubWorkflowOrchestrator:
         self._lease.release(prepared.token)
 
     async def stop(
-        self, *, project_id: str, session_id: str, task_id: str,
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        token: LeaseToken,
     ) -> None:
-        token = self.require_exact_stop_owner(
-            project_id=project_id, session_id=session_id, task_id=task_id,
+        self._require_exact_stop_token(
+            project_id=project_id, session_id=session_id, task_id=task_id, token=token,
         )
         runtime = self._runtime_for_session(project_id, session_id)
         stopping = asyncio.create_task(runtime.coordinator.stop_task(task_id))
@@ -522,6 +527,9 @@ class HubWorkflowOrchestrator:
             # exact claim as stopped before the child completion can look like
             # a normal prepared-action completion.
             await asyncio.sleep(0)
+            self._require_exact_stop_token(
+                project_id=project_id, session_id=session_id, task_id=task_id, token=token,
+            )
             latest = runtime.store.latest_task(task_id)
             if latest is not None:
                 record = runtime.store.latest_prepared_action_for_task(
@@ -539,6 +547,9 @@ class HubWorkflowOrchestrator:
                         record.preparation_id, generation=token.generation, reason="stop",
                     )
             await stopping
+            self._require_exact_stop_token(
+                project_id=project_id, session_id=session_id, task_id=task_id, token=token,
+            )
             self._lease.release(token)
         except BaseException:
             if not stopping.done():
@@ -609,6 +620,24 @@ class HubWorkflowOrchestrator:
     def _require_acknowledgement(self) -> None:
         if self._usage_credits_acknowledged() is not True:
             raise PermissionError("usage credits must be acknowledged")
+
+    def _require_exact_stop_token(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        token: LeaseToken,
+    ) -> None:
+        if not isinstance(token, LeaseToken):
+            raise ValueError("stop token must be a LeaseToken")
+        if (
+            token.project_id != project_id
+            or token.session_id != session_id
+            or token.task_id != task_id
+            or self._lease.snapshot() != token
+        ):
+            raise RuntimeError("stop requires the exact active workflow")
 
     @staticmethod
     def _require_non_empty(value: object, name: str) -> None:

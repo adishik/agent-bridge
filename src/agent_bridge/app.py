@@ -955,7 +955,7 @@ def create_hub_app(
     ) -> Response:
         runtime = selected_runtime(project_id)
         try:
-            workflows.require_exact_stop_owner(
+            stop_token = workflows.require_exact_stop_owner(
                 project_id=project_id, session_id=session_id, task_id=task_id,
             )
         except BaseException as error:
@@ -968,7 +968,10 @@ def create_hub_app(
             task_id=task_id,
             action="stop",
             coroutine_factory=lambda: workflows.stop(
-                project_id=project_id, session_id=session_id, task_id=task_id
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                token=stop_token,
             ),
         ):
             raise HTTPException(

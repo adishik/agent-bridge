@@ -12,6 +12,7 @@ import pytest
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
+    LeaseToken,
     OwnedProjectRuntime,
     ProjectRegistry,
     RuntimeReadiness,
@@ -924,6 +925,7 @@ def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
 
         await workflows.stop(
             project_id="project-a", session_id="chat-1", task_id="task-1",
+            token=prepared.token,
         )
 
         terminal = runtime.store.prepared_action(prepared.preparation_id)
@@ -962,11 +964,13 @@ def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() 
         with pytest.raises(RuntimeError, match="exact active workflow"):
             await workflows.stop(
                 project_id="project-a", session_id="chat-1", task_id="other-task",
+                token=prepared.token,
             )
         assert runtime.coordinator.stops == []
 
         await workflows.stop(
             project_id="project-a", session_id="chat-1", task_id="task-1",
+            token=prepared.token,
         )
         assert runtime.coordinator.stops == ["task-1"]
         assert lease.snapshot() is None
@@ -1029,16 +1033,117 @@ def test_stop_releases_the_exact_lease_after_successful_finalization() -> None:
             lease=lease,
             usage_credits_acknowledged=lambda: True,
         )
-        await workflows.prepare_new_request(
+        prepared = await workflows.prepare_new_request(
             project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
         )
 
         await workflows.stop(
             project_id="project-a", session_id="chat-1", task_id="task-1",
+            token=prepared.token,
         )
 
         assert runtime.coordinator.stops == ["task-1"]
         assert workflows.active_lease_snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_stop_requires_the_route_validated_lease_token_across_a_same_identity_reacquire() -> None:
+    """Ignoring the route token would stop and release generation two by IDs alone."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        lease.release(prepared.token)
+        replacement = lease.acquire(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+        )
+        assert replacement.generation == prepared.token.generation + 1
+
+        with pytest.raises(RuntimeError, match="exact active workflow"):
+            await workflows.stop(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-1",
+                token=prepared.token,
+            )
+        assert runtime.coordinator.stops == []
+        assert lease.snapshot() == replacement
+
+        with pytest.raises(RuntimeError, match="exact active workflow"):
+            await workflows.stop(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-1",
+                token=LeaseToken(
+                    replacement.generation,
+                    "project-a",
+                    "chat-1",
+                    "other-task",
+                ),
+            )
+        assert runtime.coordinator.stops == []
+        assert lease.snapshot() == replacement
+
+        await workflows.stop(
+            project_id="project-a",
+            session_id="chat-1",
+            task_id="task-1",
+            token=replacement,
+        )
+        assert runtime.coordinator.stops == ["task-1"]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_stop_does_not_release_a_same_identity_token_reacquired_while_finalizing() -> None:
+    """Checking only before Stop waits would release a newer lease at completion."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_stop = runtime.coordinator.stop_task
+
+        async def pause_stop(task_id: str) -> None:
+            entered.set()
+            await release.wait()
+            await original_stop(task_id)
+
+        runtime.coordinator.stop_task = pause_stop  # type: ignore[method-assign]
+        stopping = asyncio.create_task(workflows.stop(
+            project_id="project-a",
+            session_id="chat-1",
+            task_id="task-1",
+            token=prepared.token,
+        ))
+        await entered.wait()
+        lease.release(prepared.token)
+        successor = lease.acquire(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+        )
+        release.set()
+        with pytest.raises(RuntimeError, match="exact active workflow"):
+            await stopping
+        assert runtime.coordinator.stops == ["task-1"]
+        assert lease.snapshot() == successor
 
     asyncio.run(exercise())
 

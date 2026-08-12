@@ -42,6 +42,7 @@ SESSION_KEY = "session-secret"
 CSRF_TOKEN = "csrf-secret"
 EXPECTED_EVENT_REPLAY_PAGE_SIZE = 100
 EXPECTED_MAX_INITIAL_REPLAY_EVENTS = 300
+_HANGING_PROBE = object()
 
 
 class _Clock:
@@ -1637,7 +1638,13 @@ class _HubWorkflows:
     def abort_prepared(self, prepared: _Prepared, *, reason: str) -> None:
         self.aborts.append((prepared.preparation_id, reason))
 
-    async def stop(self, *, project_id: str, session_id: str, task_id: str) -> None:
+    async def stop(
+        self, *, project_id: str, session_id: str, task_id: str, token: LeaseToken,
+    ) -> None:
+        if token != self.require_exact_stop_owner(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        ):
+            raise RuntimeError("stop requires the exact active workflow")
         self.stops.append((project_id, session_id, task_id))
         self.active_lease = None
 
@@ -1651,6 +1658,146 @@ class _HubStoreFake:
 
     def acknowledge_usage_credits(self) -> None:
         self.acknowledged = True
+
+
+@dataclass
+class _ProbePlan:
+    fable_results: list[object]
+    sol_results: list[object]
+    fable_calls: int = 0
+    sol_calls: int = 0
+
+    async def fable_probe(self) -> tuple[bool, str]:
+        self.fable_calls += 1
+        result = self.fable_results.pop(0)
+        if result is _HANGING_PROBE:
+            await asyncio.Future()
+        if isinstance(result, BaseException):
+            raise result
+        return result  # type: ignore[return-value]
+
+    async def sol_probe(self) -> str:
+        self.sol_calls += 1
+        result = self.sol_results.pop(0)
+        if result is _HANGING_PROBE:
+            await asyncio.Future()
+        if isinstance(result, BaseException):
+            raise result
+        return result  # type: ignore[return-value]
+
+
+@dataclass
+class _RealHubHarness:
+    app: Any
+    runtimes: dict[str, _HubRuntime]
+    workflows: HubWorkflowOrchestrator
+    lease: ActiveAgentLease
+    probes: dict[str, _ProbePlan]
+    hub_store: _HubStoreFake
+
+    def close(self) -> None:
+        for runtime in self.runtimes.values():
+            runtime.coordinator.close()
+            runtime.store.close()
+
+
+def _real_hub_harness(
+    tmp_path: Path,
+    *,
+    fable_results: tuple[object, ...] = ((True, "subscription_ready"),),
+    sol_results: tuple[object, ...] = ("ready",),
+    fable: object | None = None,
+) -> _RealHubHarness:
+    static_dir = tmp_path / "real-static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html><title>real hub</title>")
+    runtimes: dict[str, _HubRuntime] = {}
+    probes: dict[str, _ProbePlan] = {}
+    for label in ("a", "b"):
+        repo_root = tmp_path / f"repository-{label}"
+        repo_root.mkdir()
+        project_id = project_id_for_root(repo_root)
+        store = SQLiteStore(
+            tmp_path / f"real-{label}.sqlite3",
+            clock=_Clock(),
+            check_same_thread=False,
+        )
+        store.create_session("shared-chat", str(repo_root))
+        probe = _ProbePlan(list(fable_results), list(sol_results))
+        coordinator = Coordinator(
+            store=store,
+            repository=object(),  # Preparation/abort never reaches an adapter edge.
+            runner=object(),
+            fable=object() if fable is None else fable,
+            sol=object(),
+            ids=_RealIds(),
+            repo_root=repo_root,
+            repo_context="local test repository",
+            trusted_shells={"sh": "/bin/sh"},
+        )
+        runtime = _HubRuntime(
+            project_id=project_id,
+            label=f"REAL-{label.upper()}",
+            repository=str(repo_root),
+            branch="main",
+            store=store,
+            coordinator=coordinator,  # type: ignore[arg-type]
+            broadcaster=InMemoryEventBroadcaster(),
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(False, "checking", "checking"),
+                fable_probe=probe.fable_probe,
+                sol_probe=probe.sol_probe,
+                timeout_seconds=0.05,
+            ),
+        )
+        runtimes[label] = runtime
+        probes[label] = probe
+    hub_store = _HubStoreFake()
+    hub_store.acknowledge_usage_credits()
+    registry = ProjectRegistry(tuple(runtimes.values()))
+    lease = ActiveAgentLease()
+    workflows = HubWorkflowOrchestrator(
+        registry=registry,
+        lease=lease,
+        usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
+    )
+    app = create_hub_app(
+        registry=registry,
+        hub_store=hub_store,
+        workflows=workflows,
+        static_dir=static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+    return _RealHubHarness(app, runtimes, workflows, lease, probes, hub_store)
+
+
+class _DelayedStopWorkflow:
+    """Delay only the scheduled Stop body; all Hub logic stays real."""
+
+    def __init__(self, inner: HubWorkflowOrchestrator) -> None:
+        self._inner = inner
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def stop(self, **kwargs: object) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await self._inner.stop(**kwargs)  # type: ignore[arg-type]
+
+
+class _BlockingFable:
+    """Local provider edge fake used solely to hold a real prepared workflow."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def plan(self, **kwargs: object) -> object:
+        self.started.set()
+        await asyncio.Future()
 
 
 @dataclass(frozen=True)
@@ -1796,6 +1943,74 @@ def test_hub_duplicate_chat_and_task_ids_remain_bound_to_the_route_project(
     assert hub_harness.workflows.prepared[0].session_id == "shared-chat"
 
 
+def test_every_duplicate_identifier_route_stays_inside_project_a(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A global duplicate-ID lookup would query B or schedule B's coordinator."""
+    shared_brief = replace(valid_brief, task_id="shared-task")
+    for runtime in hub_harness.runtimes.values():
+        runtime.store.create_session("shared-chat", runtime.repository)
+        runtime.store.save_task(
+            "shared-chat", shared_brief, TaskState.AWAITING_USER_APPROVAL,
+        )
+    foreign = hub_harness.runtimes["project-b"]
+
+    def foreign_access(*args: object, **kwargs: object) -> object:
+        raise AssertionError("duplicate identifiers must not touch project B")
+
+    for name in (
+        "session_exists", "chat", "latest_task", "get_task", "append_event",
+        "events_after", "latest_task_overviews", "browser_replay_floor",
+    ):
+        monkeypatch.setattr(foreign.store, name, foreign_access)
+
+    hub_harness.hub_store.acknowledge_usage_credits()
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        assert client.get(
+            "/api/projects/project-a/chats/shared-chat/bootstrap"
+        ).status_code == 200
+        assert client.post(
+            "/api/projects/project-a/chats/shared-chat/messages",
+            json={"text": "plan in A"}, headers=headers,
+        ).status_code == 202
+        _wait_until(lambda: hub_harness.workflows.runs == ["new-1"])
+        for path, body in (
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/approve", {"revision": 1}),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/edit", _edited_brief(shared_brief)),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/reject", None),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/resume", None),
+        ):
+            assert client.post(path, json=body, headers=headers).status_code == 202
+        _wait_until(lambda: len(hub_harness.workflows.runs) == 4)
+        hub_harness.workflows.active_lease = LeaseToken(
+            9, "project-a", "shared-chat", "shared-task",
+        )
+        assert client.post(
+            "/api/projects/project-a/chats/shared-chat/tasks/shared-task/stop",
+            headers=headers,
+        ).status_code == 202
+        _wait_until(lambda: hub_harness.workflows.stops == [
+            ("project-a", "shared-chat", "shared-task"),
+        ])
+        own_event = hub_harness.runtimes["project-a"].store.append_event(
+            "shared-chat", None, "user", "message", {"text": "A only"},
+        )
+        with client.websocket_connect(
+            f"/ws?project_id=project-a&session_id=shared-chat&after={own_event.sequence - 1}"
+        ) as socket:
+            replay = socket.receive_json()
+    assert replay["sequence"] == own_event.sequence
+    assert foreign.coordinator.calls == []
+    assert all(
+        prepared.project_id == "project-a"
+        for prepared in hub_harness.workflows.prepared
+    )
+
+
 def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
     hub_harness: _HubHarness,
 ) -> None:
@@ -1927,6 +2142,283 @@ def test_active_lease_synchronously_gates_navigation_model_mutations_and_exact_s
         _wait_until(lambda: hub_harness.workflows.stops == [("project-a", "chat-a", "task-1")])
     assert hub_harness.workflows.probe_calls == 0
     assert hub_harness.workflows.prepared == []
+
+
+def test_stop_route_carries_generation_one_token_into_a_delayed_same_identity_reacquire(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """Passing only IDs here would let the delayed Stop terminate generation two."""
+    harness = _real_hub_harness(tmp_path)
+    runtime = harness.runtimes["a"]
+    runtime.store.save_task(
+        "shared-chat", valid_brief, TaskState.AWAITING_USER_APPROVAL,
+    )
+    token = harness.lease.acquire(
+        project_id=runtime.project_id,
+        session_id="shared-chat",
+        task_id=valid_brief.task_id,
+    )
+    delayed = _DelayedStopWorkflow(harness.workflows)
+    app = create_hub_app(
+        registry=ProjectRegistry(tuple(harness.runtimes.values())),
+        hub_store=harness.hub_store,
+        workflows=delayed,  # type: ignore[arg-type]
+        static_dir=tmp_path / "real-static",
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+    try:
+        with TestClient(app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/tasks/{valid_brief.task_id}/stop",
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 202
+            client.portal.call(delayed.entered.wait)
+            harness.lease.release(token)
+            successor = harness.lease.acquire(
+                project_id=runtime.project_id,
+                session_id="shared-chat",
+                task_id=valid_brief.task_id,
+            )
+            assert successor.generation == token.generation + 1
+            client.portal.call(delayed.release.set)
+            _wait_until(lambda: not app.state.active_coroutines)
+        task = runtime.store.get_task(valid_brief.task_id, valid_brief.revision)
+        assert task.state is TaskState.AWAITING_USER_APPROVAL
+        assert harness.lease.snapshot() == successor
+        assert [event.kind for event in runtime.store.events_after("shared-chat", 0)] == [
+            "action_error",
+        ]
+        assert app.state.coroutine_observation_failures == []
+    finally:
+        harness.close()
+
+
+def test_real_foreign_lease_rejects_navigation_and_model_preparation_before_store_work(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """Removing route guards would let foreign preparation create durable rows."""
+    harness = _real_hub_harness(tmp_path)
+    runtime_a = harness.runtimes["a"]
+    runtime_b = harness.runtimes["b"]
+    approval = replace(valid_brief, task_id="approval-task")
+    answer = replace(valid_brief, task_id="answer-task")
+    resume = replace(valid_brief, task_id="resume-task")
+    runtime_a.store.save_task("shared-chat", approval, TaskState.AWAITING_USER_APPROVAL)
+    runtime_a.store.save_task("shared-chat", answer, TaskState.AWAITING_USER_INPUT)
+    runtime_a.store.save_task("shared-chat", resume, TaskState.INTERRUPTED)
+    token = harness.lease.acquire(
+        project_id=runtime_b.project_id,
+        session_id="shared-chat",
+        task_id="foreign-task",
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            assert client.post(
+                f"/api/projects/{runtime_a.project_id}/chats", headers=headers,
+            ).status_code == 409
+            assert client.get(
+                f"/api/projects/{runtime_a.project_id}/chats/shared-chat/bootstrap"
+            ).status_code == 409
+            assert client.get(
+                f"/api/projects/{runtime_b.project_id}/chats/shared-chat/bootstrap"
+            ).status_code == 200
+            for path, body in (
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "plan"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/approval-task/approve", {"revision": 1}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/answer", {"answer": "yes"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/resume-task/resume", None),
+            ):
+                assert client.post(path, json=body, headers=headers).status_code == 409
+        assert harness.probes["a"].fable_calls == 0
+        assert harness.probes["a"].sol_calls == 0
+        assert harness.app.state.active_coroutines == set()
+        assert runtime_a.store.events_after("shared-chat", 0) == ()
+        assert runtime_a.store.latest_prepared_action_for_task(
+            project_id=runtime_a.project_id,
+            session_id="shared-chat",
+            task_id="approval-task",
+            revision=1,
+        ) is None
+        assert harness.lease.snapshot() == token
+    finally:
+        harness.close()
+
+
+def test_real_concurrent_project_preparations_probe_only_the_lease_winner(
+    tmp_path: Path,
+) -> None:
+    """Moving lease acquisition after readiness would make both real runtimes probe."""
+    harness = _real_hub_harness(tmp_path)
+
+    async def exercise() -> None:
+        barrier = asyncio.Barrier(2)
+
+        async def prepare(label: str) -> object:
+            runtime = harness.runtimes[label]
+            await barrier.wait()
+            return await harness.workflows.prepare_new_request(
+                project_id=runtime.project_id,
+                session_id="shared-chat",
+                text=f"plan for {label}",
+                ids=_RealIds(),
+            )
+
+        results = await asyncio.gather(
+            prepare("a"), prepare("b"), return_exceptions=True,
+        )
+        winners = [result for result in results if not isinstance(result, BaseException)]
+        losers = [result for result in results if isinstance(result, BaseException)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        assert isinstance(losers[0], RuntimeError)
+        assert sum(probe.fable_calls for probe in harness.probes.values()) == 1
+        assert sum(probe.sol_calls for probe in harness.probes.values()) == 1
+        stores_with_message = [
+            runtime.store
+            for runtime in harness.runtimes.values()
+            if runtime.store.events_after("shared-chat", 0)
+        ]
+        assert len(stores_with_message) == 1
+        winner = winners[0]
+        harness.workflows.abort_prepared(winner, reason="scheduler_unavailable")  # type: ignore[arg-type]
+        assert harness.lease.snapshot() is None
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        harness.close()
+
+
+def test_real_http_preparation_refreshes_fable_readiness_after_each_lease_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a ready snapshot would accept the second unavailable Fable result."""
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((True, "subscription_ready"), (False, "subscription_unavailable")),
+        sol_results=("ready", "ready"),
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    runtime = harness.runtimes["a"]
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            first = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "first plan"}, headers=headers,
+            )
+            assert first.status_code == 503
+            assert runtime.readiness.snapshot() == RuntimeStatus(
+                True, "subscription_ready", "ready",
+            )
+            second = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "second plan"}, headers=headers,
+            )
+            assert second.status_code == 409
+        assert harness.probes["a"].fable_calls == 2
+        assert harness.probes["a"].sol_calls == 2
+        assert runtime.readiness.snapshot() == RuntimeStatus(
+            False, "subscription_unavailable", "ready",
+        )
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+        assert [event.kind for event in runtime.store.events_after("shared-chat", 0)] == [
+            "message", "task_state",
+        ]
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("fable_result", "sol_result", "expected_status"),
+    (
+        (_HANGING_PROBE, "ready", RuntimeStatus(False, "subscription_unavailable", "unavailable")),
+        ("malformed-fable-result", "ready", RuntimeStatus(False, "subscription_unavailable", "unavailable")),
+        ((False, "subscription_unavailable"), "ready", RuntimeStatus(False, "subscription_unavailable", "ready")),
+        ((True, "subscription_ready"), "unavailable", RuntimeStatus(True, "subscription_ready", "unavailable")),
+    ),
+    ids=("timeout", "malformed", "fable-unavailable", "sol-unavailable"),
+)
+def test_real_http_readiness_failures_release_lease_without_durable_preparation(
+    tmp_path: Path,
+    fable_result: object,
+    sol_result: object,
+    expected_status: RuntimeStatus,
+) -> None:
+    """Any failed fresh gate must leave the real selected store untouched."""
+    harness = _real_hub_harness(
+        tmp_path, fable_results=(fable_result,), sol_results=(sol_result,),
+    )
+    runtime = harness.runtimes["a"]
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "must not persist"},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 409
+        assert runtime.readiness.snapshot() == expected_status
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+        assert runtime.store.events_after("shared-chat", 0) == ()
+        assert runtime.store.latest_task("real-task-1") is None
+    finally:
+        harness.close()
+
+
+def test_lifespan_cancellation_terminalizes_a_real_prepared_workflow_and_releases_its_lease(
+    tmp_path: Path,
+) -> None:
+    """Dropping tracked tasks at shutdown would leak the claimed row or global lease."""
+    blocking_fable = _BlockingFable()
+    harness = _real_hub_harness(tmp_path, fable=blocking_fable)
+    runtime = harness.runtimes["a"]
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "hold until shutdown"},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 202
+            client.portal.call(blocking_fable.started.wait)
+            event = runtime.store.events_after("shared-chat", 0)[0]
+            assert event.task_id is not None
+            prepared = runtime.store.latest_prepared_action_for_task(
+                project_id=runtime.project_id,
+                session_id="shared-chat",
+                task_id=event.task_id,
+                revision=0,
+            )
+            assert prepared is not None and prepared.status == "CLAIMED"
+            assert harness.lease.snapshot() is not None
+        terminal = runtime.store.prepared_action(prepared.preparation_id)
+        assert terminal is not None
+        assert terminal.status == "INTERRUPTED"
+        assert terminal.reason == "adapter_interrupted"
+        assert runtime.store.get_task(event.task_id, 0).state is TaskState.INTERRUPTED
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+        assert harness.app.state.coroutine_observation_failures == []
+    finally:
+        harness.close()
 
 
 def test_hub_scheduler_rejection_aborts_the_exact_durable_preparation(
