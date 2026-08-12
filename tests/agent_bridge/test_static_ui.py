@@ -1327,3 +1327,92 @@ def test_project_chat_controller_keeps_empty_chat_csrf_selection_refresh_and_foc
       if (!newChat.disabled || !projectList.children[0].children[0].disabled) process.exit(11);
     """
     _run_module_harness(harness)
+
+
+def test_project_chat_controller_replaces_invalidated_lease_refresh_before_unlocking() -> None:
+    harness = r"""
+      const released = {
+        csrf_token: "csrf-refresh",
+        usage_credits_acknowledged: true,
+        projects: [
+          {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "project-b", label: "Beta", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ],
+        active_lease: null,
+      };
+      const leased = {
+        ...released,
+        active_lease: {project_id: "project-b", session_id: "chat-b", task_id: "task-b"},
+      };
+      const projectRequests = [];
+      let projectFetches = 0;
+      const flush = async () => { for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); };
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") {
+          projectFetches += 1;
+          if (projectFetches === 1) return Promise.resolve({ok: true, status: 200, json: async () => released});
+          return new Promise((resolve) => projectRequests.push(resolve));
+        }
+        if (url === "/api/projects/project-a/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "Alpha chat", latest_sequence: 0}]})});
+        if (url === "/api/projects/project-b/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "Beta chat", latest_sequence: 0}]})});
+        if (url === "/api/projects/project-a/chats/chat-a/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-refresh", usage_credits_acknowledged: true, project_id: "project-a", session_id: "chat-a", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []})});
+        if (url === "/api/projects/project-b/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-refresh", usage_credits_acknowledged: true, project_id: "project-b", session_id: "chat-b", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []})});
+        throw new Error(`unexpected GET ${url}`);
+      };
+      const sockets = [];
+      class Socket {
+        constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket, schedule() { return 1; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      if (controller.state.projectId !== "project-a" || controller.state.sessionId !== "chat-a" || controller.state.navigationPending) process.exit(2);
+
+      const staleReleased = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(3);
+      await controller.selectProject("project-b");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "chat-b" || !controller.state.navigationPending) process.exit(4);
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await flush();
+      if (projectRequests.length !== 1 || controller.state.activeLease !== null || !controller.state.navigationPending) process.exit(5);
+      projectRequests.shift()({ok: true, status: 200, json: async () => leased});
+      await staleReleased;
+      if (controller.state.activeLease?.projectId !== "project-b" || controller.state.navigationPending || controller.state.navigationLocked) process.exit(6);
+
+      const staleFailure = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(7);
+      await controller.selectProject("project-a");
+      if (!controller.state.navigationPending) process.exit(8);
+      projectRequests.shift()({ok: true, status: 200, json: async () => leased});
+      await flush();
+      if (projectRequests.length !== 1 || !controller.state.navigationPending) process.exit(9);
+      projectRequests.shift()({ok: false, status: 503, json: async () => ({})});
+      await staleFailure;
+      if (!controller.state.navigationLocked || controller.state.navigationPending) process.exit(10);
+
+      const validRelease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await validRelease;
+      if (controller.state.navigationLocked || controller.state.activeLease !== null || controller.state.navigationPending) process.exit(11);
+
+      const staleMalformed = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(12);
+      await controller.selectProject("project-b");
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await flush();
+      if (projectRequests.length !== 1 || !controller.state.navigationPending) process.exit(13);
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({...released, active_lease: {project_id: "bad id"}})});
+      await staleMalformed;
+      if (!controller.state.navigationLocked || controller.state.navigationPending) process.exit(14);
+
+      const finalRelease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await finalRelease;
+      const activeSockets = sockets.filter((socket) => !socket.closed);
+      if (controller.state.navigationLocked || controller.state.activeLease !== null || controller.state.navigationPending || activeSockets.length !== 1 || !activeSockets[0].url.includes("project_id=project-b")) process.exit(15);
+    """
+    _run_module_harness(harness)

@@ -706,6 +706,7 @@ def create_hub_app(
         response.headers["Cache-Control"] = "no-store"
         return {
             "csrf_token": csrf_token,
+            "usage_credits_acknowledged": hub_store.usage_credits_acknowledged(),
             "projects": [
                 {
                     "project_id": runtime.project_id,

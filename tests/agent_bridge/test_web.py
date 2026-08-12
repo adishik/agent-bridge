@@ -651,7 +651,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
       const projectBootstrap = {{...bootstrap, project_id: "project-a"}};
-      let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, projects: [{{
+      let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, usage_credits_acknowledged: true, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
       }}], active_lease: null}};
@@ -889,6 +889,7 @@ def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stal
     harness = f"""
       import * as bridge from {json.dumps(module_uri)};
       let documentRoot;
+      let interactionAllowed = () => true;
       class ClassList {{
         constructor() {{ this.values = new Set(); }}
         add(value) {{ this.values.add(value); }}
@@ -913,6 +914,7 @@ def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stal
         removeAttribute(name) {{ delete this.attributes[name]; }}
         addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }}
         async emit(kind, event = {{}}) {{
+          if (!interactionAllowed(this)) return;
           event.preventDefault ??= () => {{}};
           for (const listener of this.listeners[kind] ?? []) await listener(event);
           await this.onclick?.(event);
@@ -938,14 +940,27 @@ def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stal
       nodes["usage-credits-confirm"].tag = "input";
       nodes["usage-modal"].append(nodes["usage-credits-form"]);
       nodes["usage-credits-form"].append(nodes["usage-credits-confirm"], nodes["usage-credits-acknowledge"], nodes["usage-error"], nodes["bootstrap-retry"]);
+      const isDescendantOf = (node, ancestor) => {{
+        for (let current = node; current; current = current.parent) {{
+          if (current === ancestor) return true;
+        }}
+        return false;
+      }};
+      interactionAllowed = (node) => !nodes["usage-modal"].open
+        || isDescendantOf(node, nodes["usage-modal"]);
+      const launcher = new Node("button", "launcher");
       documentRoot = {{
-        activeElement: new Node("button", "launcher"), listeners: {{}},
+        activeElement: launcher, listeners: {{}},
         createElement(tag) {{ return new Node(tag); }},
         querySelector(selector) {{ return selector.startsWith("#") ? nodes[selector.slice(1)] ?? null : null; }},
         addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }},
       }};
       const calls = [];
       const creates = [];
+      let acknowledgementFailures = 1;
+      let acknowledged = false;
+      let createCount = 0;
+      const scheduled = [];
       class Socket {{
         static instances = [];
         constructor(url) {{ this.url = url; this.listeners = {{}}; Socket.instances.push(this); }}
@@ -955,31 +970,54 @@ def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stal
       const windowRoot = {{
         location: {{protocol: "http:", host: "bridge.test"}}, WebSocket: Socket,
         matchMedia: () => ({{matches: false, addEventListener() {{}}}}),
-        setTimeout() {{ return 1; }}, clearTimeout() {{}}, addEventListener() {{}},
+        setTimeout(callback, delay) {{ scheduled.push({{callback, delay}}); return scheduled.length; }}, clearTimeout() {{}}, addEventListener() {{}},
         fetch(url, options = {{}}) {{
           calls.push({{url, options}});
           if (url === "/api/projects") return Promise.resolve({{ok: true, status: 200, json: async () => ({{
-            csrf_token: "csrf-empty", projects: [
+            csrf_token: "csrf-empty", usage_credits_acknowledged: acknowledged, projects: [
               {{project_id: "empty", label: "Empty", branch: "main", readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}}}},
               {{project_id: "other", label: "Other", branch: "next", readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}}}},
             ], active_lease: null,
           }})}});
+          if (url === "/api/settings/usage-credits-acknowledgement" && options.method === "POST") {{
+            if (acknowledgementFailures > 0) {{
+              acknowledgementFailures -= 1;
+              return Promise.resolve({{ok: false, status: 503, json: async () => ({{}})}});
+            }}
+            acknowledged = true;
+            return Promise.resolve({{ok: true, status: 202, json: async () => ({{}})}});
+          }}
           if (url === "/api/projects/empty/chats?limit=50") return Promise.resolve({{ok: true, status: 200, json: async () => ({{chats: []}})}});
           if (url === "/api/projects/other/chats?limit=50") return Promise.resolve({{ok: true, status: 200, json: async () => ({{chats: [{{session_id: "other-chat", title: "Other chat", latest_sequence: 0}}]}})}});
           if (url === "/api/projects/empty/chats/first-empty/bootstrap") return Promise.resolve({{ok: true, status: 200, json: async () => ({{csrf_token: "csrf-empty", usage_credits_acknowledged: true, project_id: "empty", session_id: "first-empty", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []}})}});
           if (url === "/api/projects/other/chats/other-chat/bootstrap") return Promise.resolve({{ok: true, status: 200, json: async () => ({{csrf_token: "csrf-empty", usage_credits_acknowledged: true, project_id: "other", session_id: "other-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []}})}});
-          if (url === "/api/projects/empty/chats" && options.method === "POST") return new Promise((resolve) => creates.push(resolve));
+          if (url === "/api/projects/empty/chats" && options.method === "POST") {{
+            createCount += 1;
+            if (createCount === 1) return Promise.resolve({{ok: true, status: 201, json: async () => ({{session_id: "first-empty", title: "First empty", latest_sequence: 0}})}});
+            return new Promise((resolve) => creates.push(resolve));
+          }}
           throw new Error(`unexpected ${{options.method ?? "GET"}} ${{url}}`);
         }},
       }};
       const app = bridge.startBrowserApp(documentRoot, windowRoot);
-      if (!(await app.ready) || app.state.projectId !== "empty" || app.state.sessionId !== null || nodes["new-chat"].disabled) process.exit(2);
+      if (!(await app.ready) || app.state.projectId !== "empty" || app.state.sessionId !== null || !nodes["usage-modal"].open) process.exit(2);
+      if (documentRoot.activeElement !== nodes["usage-credits-confirm"] || nodes["fable-status"].textContent !== "Fable · Subscription · ready" || nodes["sol-status"].textContent !== "Sol · Ready") process.exit(7);
       await nodes["new-chat"].emit("click");
       await Promise.resolve();
-      if (creates.length !== 1 || calls.at(-1).options.headers["X-CSRF-Token"] !== "csrf-empty") process.exit(3);
-      creates.shift()({{ok: true, status: 201, json: async () => ({{session_id: "first-empty", title: "First empty", latest_sequence: 0}})}});
+      if (createCount !== 0 || !nodes["usage-modal"].open) process.exit(3);
+      nodes["usage-credits-confirm"].checked = true;
+      await nodes["usage-credits-confirm"].emit("change");
+      await nodes["usage-credits-form"].emit("submit");
+      if (!nodes["usage-modal"].open || app.state.gate.acknowledged || !nodes["usage-error"].textContent.includes("503")) process.exit(8);
+      await nodes["usage-credits-form"].emit("submit");
       for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
-      if (app.state.projectId !== "empty" || app.state.sessionId !== "first-empty" || Socket.instances.length !== 1 || !Socket.instances[0].url.includes("session_id=first-empty")) process.exit(5);
+      const acknowledgements = calls.filter((call) => call.url === "/api/settings/usage-credits-acknowledgement");
+      if (nodes["usage-modal"].open || !app.state.gate.acknowledged || nodes["new-chat"].disabled || !interactionAllowed(nodes["new-chat"]) || documentRoot.activeElement !== launcher || acknowledgements.length !== 2 || acknowledgements.some((call) => call.options.headers["X-CSRF-Token"] !== "csrf-empty")) process.exit(9);
+
+      await nodes["new-chat"].emit("click");
+      for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
+      const firstCreate = calls.find((call) => call.url === "/api/projects/empty/chats" && call.options.method === "POST");
+      if (!firstCreate || firstCreate.options.headers["X-CSRF-Token"] !== "csrf-empty" || app.state.projectId !== "empty" || app.state.sessionId !== "first-empty" || Socket.instances.length !== 1 || !Socket.instances[0].url.includes("session_id=first-empty")) process.exit(5);
 
       await nodes["new-chat"].emit("click");
       await Promise.resolve();
@@ -989,7 +1027,7 @@ def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stal
       creates.shift()({{ok: true, status: 201, json: async () => ({{session_id: "late-empty", title: "Late", latest_sequence: 0}})}});
       for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
       const activeSockets = Socket.instances.filter((socket) => !socket.closed);
-      if (app.state.projectId !== "other" || app.state.sessionId !== "other-chat" || activeSockets.length !== 1 || !activeSockets[0].url.includes("project_id=other")) process.exit(4);
+      if (app.state.projectId !== "other" || app.state.sessionId !== "other-chat" || activeSockets.length !== 1 || scheduled.length !== 0 || documentRoot.activeElement !== launcher || !activeSockets[0].url.includes("project_id=other")) process.exit(4);
     """
     result = subprocess.run(
         ["node", "--experimental-default-type=module", "--input-type=module", "-e", harness],
@@ -2407,6 +2445,7 @@ def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
         assert projects.headers["cache-control"] == "no-store"
         assert projects.json() == {
             "csrf_token": CSRF_TOKEN,
+            "usage_credits_acknowledged": False,
             "projects": [
                 {
                     "project_id": "project-a", "label": "PROJECT-A", "branch": "main",
@@ -2469,6 +2508,7 @@ def test_project_navigation_public_payloads_need_no_repository_path(
         payload = projects.json()
         assert payload["csrf_token"] == CSRF_TOKEN
         assert projects.headers["cache-control"] == "no-store"
+        assert payload["usage_credits_acknowledged"] is False
         assert payload["active_lease"] is None
         assert payload["projects"] == [
             {

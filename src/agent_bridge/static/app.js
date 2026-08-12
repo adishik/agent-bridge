@@ -1348,22 +1348,42 @@ function boundedNavigationRecords(records, normalizer, maximum) {
 }
 
 
+function navigationProjectReadiness(projects, projectId) {
+  return asObject(projects.find((project) => project.projectId === projectId)?.readiness);
+}
+
+
+function navigationProjectGate(projects, projectId, acknowledged) {
+  const readiness = navigationProjectReadiness(projects, projectId);
+  return subscriptionGate({
+    fable_ready: readiness.fable_ready,
+    fable_status: readiness.fable_status,
+    sol_status: readiness.sol_status,
+    usage_credits_acknowledged: acknowledged === true,
+  });
+}
+
+
 function navigationState(previousState, payload) {
   const payloadObject = asObject(payload);
   const lease = navigationLeaseState(payloadObject);
   const csrfToken = navigationCsrfToken(payloadObject);
+  const projects = boundedNavigationRecords(
+    payloadObject.projects,
+    navigationProject,
+    MAX_NAV_PROJECTS,
+  );
+  const acknowledged = payloadObject.usage_credits_acknowledged === true;
   return {
     ...previousState,
     csrfToken: csrfToken ?? "",
-    projects: boundedNavigationRecords(
-      payloadObject.projects,
-      navigationProject,
-      MAX_NAV_PROJECTS,
-    ),
+    projects,
     activeLease: lease.navigationLocked
       ? (previousState.activeLease ?? null)
       : lease.activeLease,
     navigationLocked: lease.navigationLocked || csrfToken === null,
+    gate: navigationProjectGate(projects, previousState.projectId, acknowledged),
+    solStatus: navigationProjectReadiness(projects, previousState.projectId).sol_status ?? null,
   };
 }
 
@@ -1523,6 +1543,8 @@ export function createProjectChatController({
   let projectRefreshGeneration = 0;
   let projectRefreshInFlight = null;
   let projectRefreshPending = false;
+  let selectionPending = false;
+  let projectRefreshBlocksNavigation = false;
 
   function publish(nextState) {
     state = nextState;
@@ -1551,13 +1573,22 @@ export function createProjectChatController({
     stream = null;
   }
 
+  function navigationPending() {
+    return selectionPending || projectRefreshBlocksNavigation;
+  }
+
   function invalidateProjectRefresh() {
     projectRefreshGeneration += 1;
+    if (projectRefreshInFlight !== null) {
+      projectRefreshPending = true;
+      projectRefreshBlocksNavigation = true;
+    }
   }
 
   function beginChatSelection(projectId, sessionId) {
     stopStream();
     invalidateProjectRefresh();
+    selectionPending = true;
     if (state.sessionId !== null && state.sessionId !== sessionId) {
       onChatReset();
     }
@@ -1569,9 +1600,10 @@ export function createProjectChatController({
       sessionId,
       tasks: [],
       selectedTaskId: null,
-      gate: subscriptionGate({}),
+      gate: navigationProjectGate(state.projects, projectId, state.gate.acknowledged),
+      solStatus: navigationProjectReadiness(state.projects, projectId).sol_status ?? null,
       lastSequence: 0,
-      navigationPending: true,
+      navigationPending: navigationPending(),
     });
     return selectionGeneration;
   }
@@ -1630,10 +1662,11 @@ export function createProjectChatController({
     if (applied.projectId !== projectId || applied.sessionId !== sessionId) {
       throw new Error("bootstrap selection did not match the requested project chat");
     }
+    selectionPending = false;
     publish({
       ...applied,
       projectLabel: projectLabelFor(applied, projectId),
-      navigationPending: false,
+      navigationPending: navigationPending(),
     });
     startStream(projectId, sessionId);
     return true;
@@ -1663,6 +1696,7 @@ export function createProjectChatController({
     const currentSessionId = state.projectId === projectId ? state.sessionId : null;
     stopStream();
     invalidateProjectRefresh();
+    selectionPending = true;
     if (state.sessionId !== null) {
       onChatReset();
     }
@@ -1676,9 +1710,10 @@ export function createProjectChatController({
       chats: [],
       tasks: [],
       selectedTaskId: null,
-      gate: subscriptionGate({}),
+      gate: navigationProjectGate(state.projects, projectId, state.gate.acknowledged),
+      solStatus: navigationProjectReadiness(state.projects, projectId).sol_status ?? null,
       lastSequence: 0,
-      navigationPending: true,
+      navigationPending: navigationPending(),
     });
     const chatPayload = await getJson(projectChatsPath(projectId));
     if (generation !== selectionGeneration || state.projectId !== projectId) {
@@ -1695,7 +1730,8 @@ export function createProjectChatController({
         ? currentSessionId
         : withChats.chats[0]?.sessionId);
     if (typeof targetSessionId !== "string") {
-      publish({...withChats, navigationPending: false});
+      selectionPending = false;
+      publish({...withChats, navigationPending: navigationPending()});
       return true;
     }
     return selectChat(projectId, targetSessionId);
@@ -1707,16 +1743,18 @@ export function createProjectChatController({
     try {
       const payload = await getJson("/api/projects");
       if (ownGeneration === projectRefreshGeneration) {
+        projectRefreshBlocksNavigation = false;
         const nextState = navigationState(state, payload);
         const label = typeof nextState.projectId === "string"
           ? projectLabelFor(nextState, nextState.projectId)
           : null;
-        publish({...nextState, projectLabel: label});
+        publish({...nextState, projectLabel: label, navigationPending: navigationPending()});
         refreshed = true;
       }
     } catch (_error) {
       if (ownGeneration === projectRefreshGeneration) {
-        publish({...state, navigationLocked: true});
+        projectRefreshBlocksNavigation = false;
+        publish({...state, navigationLocked: true, navigationPending: navigationPending()});
       }
     }
     if (projectRefreshPending) {
@@ -2366,7 +2404,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
         {acknowledged: true},
         state.csrfToken,
       );
-      await controller.refreshSelectedBootstrap();
+      const refreshed = await controller.refreshProjects();
+      if (!refreshed || !state.gate.acknowledged) {
+        throw new Error("usage-credit acknowledgement could not be confirmed");
+      }
     } catch (error) {
       usageError.textContent = String(error.message ?? error);
       usageSubmit.disabled = false;
