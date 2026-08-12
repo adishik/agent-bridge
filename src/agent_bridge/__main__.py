@@ -95,6 +95,17 @@ class _PreflightStatus:
     sol_status: str
 
 
+@dataclass(slots=True)
+class _OpenedProjectState:
+    """One migrated project database held until every legacy audit completes."""
+
+    spec: ProjectSpec
+    lock: InstanceLock
+    store: object
+    artifacts: Path
+    schemas: Path
+
+
 class _Ids:
     def new_task_id(self) -> str:
         return f"task-{secrets.token_hex(16)}"
@@ -353,7 +364,31 @@ def parse_settings(
         state_home = Path.home() / ".local" / "state"
     state_root = Path(os.path.abspath(state_home / "agent-bridge"))
     entries = _project_entries(arguments)
-    legacy_paths = _resolve_legacy_paths(entries, state_root)
+    candidate_specs = _candidate_project_specs(entries, state_root)
+    legacy_paths = _resolve_legacy_paths(candidate_specs, state_root)
+    preliminary_settings = Settings(
+        projects=candidate_specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=arguments.port,
+        claude_executable=claude,
+        codex_executable=codex,
+        git_executable=git,
+        bash_executable=bash,
+        sh_executable=sh,
+    )
+    # ``build_project_specs`` creates digest directories.  Validate the state
+    # parent and every selected project target before permitting that write.
+    preliminary_candidates = (
+        preliminary_settings.hub_state_dir,
+        state_root / "projects",
+        *(
+            legacy_paths.get(spec.project_id, spec.state_dir)
+            for spec in candidate_specs
+        ),
+    )
+    for candidate in preliminary_candidates:
+        _validate_state_dir(preliminary_settings, candidate=candidate)
     try:
         specs = build_project_specs(
             entries,
@@ -406,13 +441,12 @@ def _project_entries(arguments: argparse.Namespace) -> tuple[tuple[str, Path], .
         raise
 
 
-def _resolve_legacy_paths(
+def _candidate_project_specs(
     entries: Sequence[tuple[str, Path]], state_root: Path,
-) -> dict[str, Path]:
-    """Select auditable basename state without opening a database."""
-    candidates: dict[Path, list[Path]] = {}
-    selected: dict[str, Path] = {}
-    for _, root in entries:
+) -> tuple[ProjectSpec, ...]:
+    """Resolve the immutable authorities needed for no-write state validation."""
+    candidates: list[ProjectSpec] = []
+    for label, root in entries:
         try:
             canonical_root = root.resolve(strict=True)
         except OSError as error:
@@ -420,34 +454,66 @@ def _resolve_legacy_paths(
         if not canonical_root.is_dir():
             raise ValueError("repository must be an existing directory")
         project_id = project_id_for_root(canonical_root)
-        legacy_path = state_root / _repository_slug(canonical_root)
-        digest_path = state_root / "projects" / project_id
+        candidates.append(ProjectSpec(
+            project_id=project_id,
+            label=label,
+            repo_root=canonical_root,
+            branch="pending",
+            state_dir=state_root / "projects" / project_id,
+        ))
+    return tuple(sorted(candidates, key=lambda spec: spec.project_id))
+
+
+def _resolve_legacy_paths(
+    specs: Sequence[ProjectSpec], state_root: Path,
+) -> dict[str, Path]:
+    """Select auditable basename state without opening a database."""
+    candidates: dict[Path, list[Path]] = {}
+    selected: dict[str, Path] = {}
+    for spec in specs:
+        legacy_path = state_root / _repository_slug(spec.repo_root)
+        digest_path = state_root / "projects" / spec.project_id
         legacy_exists = legacy_path.exists()
         digest_exists = digest_path.exists()
         if legacy_exists and digest_exists:
             raise ValueError("legacy and digest project state are ambiguous")
         if legacy_exists:
-            candidates.setdefault(legacy_path, []).append(canonical_root)
-            selected[project_id] = legacy_path
+            candidates.setdefault(legacy_path, []).append(spec.repo_root)
+            selected[spec.project_id] = legacy_path
     for roots in candidates.values():
         if len(roots) > 1:
             raise ValueError("multiple configured roots claim one legacy state directory")
     return selected
 
 
-def prepare_state_dir(settings: Settings, *, candidate: Path | None = None) -> Path:
-    """Create one external, non-symlinked, owner-only runtime directory."""
+def _validate_state_dir(settings: Settings, *, candidate: Path) -> Path:
+    """Check a state target without creating it or following symlinked parents."""
     if not isinstance(settings, Settings):
         raise ValueError("settings must be Settings")
-    state_dir = settings.hub_state_dir if candidate is None else candidate
+    state_dir = candidate
     if not isinstance(state_dir, Path) or not state_dir.is_absolute():
         raise ValueError("state directory must be an absolute path")
     roots = tuple(spec.repo_root for spec in settings.projects)
     if not roots:
         raise ValueError("settings must contain at least one project")
+    ancestor = state_dir
+    while True:
+        if ancestor.is_symlink():
+            raise ValueError("state directory must not have a symlinked ancestor")
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
     resolved_candidate = state_dir.resolve(strict=False)
     if any(resolved_candidate.is_relative_to(root) for root in roots):
         raise ValueError("state directory must remain outside repository")
+    return state_dir
+
+
+def prepare_state_dir(settings: Settings, *, candidate: Path | None = None) -> Path:
+    """Create one external, non-symlinked, owner-only runtime directory."""
+    state_dir = settings.hub_state_dir if candidate is None else candidate
+    _validate_state_dir(settings, candidate=state_dir)
+    roots = tuple(spec.repo_root for spec in settings.projects)
     try:
         state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if state_dir.is_symlink() or not state_dir.is_dir():
@@ -721,32 +787,17 @@ def _is_legacy_state(spec: ProjectSpec, settings: Settings) -> bool:
     )
 
 
-def assemble_project_runtime(
+def _open_project_state(
     spec: ProjectSpec,
     *,
     lock: InstanceLock,
-    settings: Settings,
-    environment: Mapping[str, str],
-    ids: IdFactory,
     clock: Callable[[], datetime],
-) -> OwnedProjectRuntime:
-    """Build one fully isolated project runtime after every lock is held."""
-    from agent_bridge.adapters.claude_cli import ClaudeCLI
-    from agent_bridge.adapters.codex_cli import CodexCLI
-    from agent_bridge.app import InMemoryEventBroadcaster
-    from agent_bridge.coordinator import Coordinator
-    from agent_bridge.hub import OwnedProjectRuntime, RuntimeReadiness, RuntimeStatus
-    from agent_bridge.process import ProcessRunner
-    from agent_bridge.repository import RepositoryTracker
+) -> _OpenedProjectState:
+    """Open and migrate one project database without recovering work."""
     from agent_bridge.store import SQLiteStore
 
-    if not isinstance(spec, ProjectSpec):
-        raise ValueError("spec must be a ProjectSpec")
-    if not isinstance(settings, Settings):
-        raise ValueError("settings must be Settings")
     database_path = spec.state_dir / "bridge.sqlite3"
     store = None
-    tracker = None
     try:
         _secure_regular_file(database_path)
         artifacts = _prepare_private_directory(spec.state_dir / "artifacts")
@@ -756,12 +807,75 @@ def assemble_project_runtime(
             clock=_store_clock(clock),
             check_same_thread=False,
         )
-        if _is_legacy_state(spec, settings):
-            store.audit_legacy_project_ownership(str(spec.repo_root))
-        store.recover_active_tasks()
+        return _OpenedProjectState(
+            spec=spec,
+            lock=lock,
+            store=store,
+            artifacts=artifacts,
+            schemas=schemas,
+        )
+    except BaseException:
+        if store is not None:
+            try:
+                store.close()
+            except BaseException:
+                pass
+        raise
+
+
+def _audit_project_state(opened: _OpenedProjectState, settings: Settings) -> None:
+    """Perform the exact legacy-root audit before any project may recover."""
+    if _is_legacy_state(opened.spec, settings):
+        opened.store.audit_legacy_project_ownership(str(opened.spec.repo_root))
+
+
+def assemble_project_runtime(
+    spec: ProjectSpec,
+    *,
+    lock: InstanceLock,
+    settings: Settings,
+    environment: Mapping[str, str],
+    ids: IdFactory,
+    clock: Callable[[], datetime],
+    _opened_state: _OpenedProjectState | None = None,
+) -> OwnedProjectRuntime:
+    """Build one fully isolated project runtime after the legacy audit phase."""
+    from agent_bridge.adapters.claude_cli import ClaudeCLI, SubscriptionAuthError
+    from agent_bridge.adapters.codex_cli import CodexCLI
+    from agent_bridge.app import InMemoryEventBroadcaster
+    from agent_bridge.coordinator import Coordinator
+    from agent_bridge.hub import OwnedProjectRuntime, RuntimeReadiness, RuntimeStatus
+    from agent_bridge.process import ProcessRunner
+    from agent_bridge.repository import RepositoryTracker
+
+    if not isinstance(spec, ProjectSpec):
+        raise ValueError("spec must be a ProjectSpec")
+    if not isinstance(settings, Settings):
+        raise ValueError("settings must be Settings")
+    opened = _opened_state
+    opened_here = opened is None
+    if opened is None:
+        opened = _open_project_state(spec, lock=lock, clock=clock)
+        _audit_project_state(opened, settings)
+    elif opened.spec != spec or opened.lock is not lock:
+        raise ValueError("opened project state does not match runtime inputs")
+    tracker = None
+    try:
+        opened.store.recover_active_tasks()
         runner = ProcessRunner()
         codex_child_environment = codex_environment(environment)
-        fable = ClaudeCLI(
+        readiness_holder: list[RuntimeReadiness] = []
+
+        class _ReadinessBoundClaudeCLI(ClaudeCLI):
+            async def _run_contract(self, **kwargs: object) -> object:
+                try:
+                    return await super()._run_contract(**kwargs)
+                except SubscriptionAuthError:
+                    if readiness_holder:
+                        readiness_holder[0].invalidate_fable_subscription()
+                    raise
+
+        fable = _ReadinessBoundClaudeCLI(
             settings.claude_executable,
             runner,
             env=environment,
@@ -771,7 +885,7 @@ def assemble_project_runtime(
             settings.codex_executable,
             runner,
             repo_root=spec.repo_root,
-            schema_dir=schemas,
+            schema_dir=opened.schemas,
             env=codex_child_environment,
         )
         preflight = asyncio.run(_run_preflights(
@@ -797,16 +911,17 @@ def assemble_project_runtime(
             ),
             timeout_seconds=PREFLIGHT_TIMEOUT_SECONDS,
         )
+        readiness_holder.append(readiness)
         # The bootstrap screen displays this one bounded startup snapshot;
         # model starts always use the fresh readiness probes above.
         readiness._startup_preflight = preflight  # type: ignore[attr-defined]
         tracker = RepositoryTracker(
             spec.repo_root,
-            artifacts,
+            opened.artifacts,
             git_executable=settings.git_executable,
         )
         coordinator = Coordinator(
-            store=store,
+            store=opened.store,
             repository=tracker,
             runner=runner,
             fable=fable,
@@ -821,7 +936,7 @@ def assemble_project_runtime(
         )
         return OwnedProjectRuntime(
             spec=spec,
-            store=store,
+            store=opened.store,
             tracker=tracker,
             runner=runner,
             fable=fable,
@@ -837,9 +952,9 @@ def assemble_project_runtime(
                 tracker.close()
             except BaseException:
                 pass
-        if store is not None:
+        if opened_here:
             try:
-                store.close()
+                opened.store.close()
             except BaseException:
                 pass
         raise
@@ -882,6 +997,7 @@ def main(
 
     hub_store = None
     runtimes: list[object] = []
+    opened_states: list[_OpenedProjectState] = []
     registry = None
     owned_project_ids: set[str] = set()
     try:
@@ -893,6 +1009,15 @@ def main(
         _secure_regular_file(hub_database)
         hub_store = HubStore(hub_database, clock=_now)
         for spec in ordered_specs:
+            opened_states.append(_open_project_state(
+                spec,
+                lock=project_locks[spec.project_id],
+                clock=_now,
+            ))
+        for opened in opened_states:
+            _audit_project_state(opened, settings)
+        for opened in opened_states:
+            spec = opened.spec
             runtime = assemble_project_runtime(
                 spec,
                 lock=project_locks[spec.project_id],
@@ -900,13 +1025,14 @@ def main(
                 environment=environment,
                 ids=_Ids(),
                 clock=_now,
+                _opened_state=opened,
             )
             runtimes.append(runtime)
             owned_project_ids.add(spec.project_id)
         registry = ProjectRegistry(runtimes)
         # This binds the durable account acknowledgement to the hub rather
         # than copying the former project-local setting into any project DB.
-        HubWorkflowOrchestrator(
+        orchestrator = HubWorkflowOrchestrator(
             registry=registry,
             lease=ActiveAgentLease(),
             usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
@@ -934,6 +1060,13 @@ def main(
             broadcaster=primary.broadcaster,
             bootstrap_status=lambda: status,
         )
+        # Task 6 owns project-aware request routing.  Retain the assembled hub
+        # foundations here so that routing can adopt them without reconstructing
+        # project state or changing the compatibility application yet.
+        app.state.launcher_settings = settings
+        app.state.project_registry = registry
+        app.state.hub_store = hub_store
+        app.state.hub_orchestrator = orchestrator
         port = select_port(settings.host, settings.port)
         public_host = "127.0.0.1"
         url = f"http://{public_host}:{port}/?key={session_key}"
@@ -979,6 +1112,13 @@ def main(
                     runtime.close()
                 except BaseException:
                     pass
+        for opened in reversed(opened_states):
+            if opened.spec.project_id in owned_project_ids:
+                continue
+            try:
+                opened.store.close()
+            except BaseException:
+                pass
         if hub_store is not None:
             try:
                 hub_store.close()
