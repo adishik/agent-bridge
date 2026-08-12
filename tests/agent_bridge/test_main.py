@@ -515,16 +515,15 @@ def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_c
             assert len(lines) == 1
             record = json.loads(lines[0])
             startup_records.append(record)
-            key = parse_qs(urlparse(str(record["url"])).query)["key"][0]
-            with TestClient(app) as client:
-                assert client.get(f"/?key={key}", follow_redirects=False).status_code == 303
-                bootstrap = client.get("/api/bootstrap").json()
-            assert bootstrap["fable_ready"] is True
-            assert bootstrap["fable_status"] == "subscription_ready"
-            assert bootstrap["sol_status"] == "ready"
-            assert bootstrap["repository"] == str(repo)
-            assert bootstrap["branch"] == "feat/test-launcher"
-            observed_sessions.append(bootstrap["session_id"])
+            runtime = app.state.project_registry.projects()[0]
+            readiness = runtime.readiness.snapshot()
+            assert readiness.fable_ready is True
+            assert readiness.fable_status == "subscription_ready"
+            assert readiness.sol_status == "ready"
+            assert runtime.branch == "feat/test-launcher"
+            chats = runtime.store.list_chats()
+            assert len(chats) == 1
+            observed_sessions.append(chats[0].session_id)
 
         assert main(
             _args(repo, tools), environ=environ, stdout=output,
@@ -706,11 +705,12 @@ def test_invalid_subscription_still_starts_with_server_gate_disabled(tmp_path: P
     observed: list[dict[str, object]] = []
 
     def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
-        record = json.loads(output.getvalue())
-        key = parse_qs(urlparse(str(record["url"])).query)["key"][0]
-        with TestClient(app) as client:
-            client.get(f"/?key={key}", follow_redirects=False)
-            observed.append(client.get("/api/bootstrap").json())
+        readiness = app.state.project_registry.projects()[0].readiness.snapshot()
+        observed.append({
+            "fable_ready": readiness.fable_ready,
+            "fable_status": readiness.fable_status,
+            "sol_status": readiness.sol_status,
+        })
 
     assert main(
         _args(repo, tools), environ=environ, stdout=output,
@@ -1498,6 +1498,184 @@ def test_successful_three_project_assembly_keeps_project_resources_independent(
     )
     assert captured["hub_store"] is not captured["runtimes"][0].store
     assert captured["orchestrator"]._registry is captured["registry"]
+
+
+def test_main_builds_the_actual_project_aware_boundary_from_assembled_hub_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing the hub app with the legacy wrapper would lose this boundary."""
+    import agent_bridge.app as web
+
+    tools = _fake_tools(tmp_path)
+    projects = [
+        ("first", _named_repo(tmp_path, "first")),
+        ("second", _named_repo(tmp_path, "second")),
+    ]
+    factory_calls: list[dict[str, object]] = []
+    created_hub_stores: list[object] = []
+    original_hub_factory = web.create_hub_app
+
+    class ThreadSafeHubStore:
+        def __init__(self, path: Path, *, clock: object) -> None:
+            self.acknowledged = False
+            self.close_calls = 0
+            created_hub_stores.append(self)
+
+        def usage_credits_acknowledged(self) -> bool:
+            return self.acknowledged
+
+        def acknowledge_usage_credits(self) -> None:
+            self.acknowledged = True
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def build_hub_app(**kwargs: object):
+        factory_calls.append(kwargs)
+        return original_hub_factory(**kwargs)  # type: ignore[arg-type]
+
+    def legacy_app_is_for_compatibility_only(**kwargs: object) -> object:
+        raise AssertionError("launcher must not create the legacy wrapper")
+
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", ThreadSafeHubStore)
+    monkeypatch.setattr(web, "create_hub_app", build_hub_app)
+    monkeypatch.setattr(web, "create_app", legacy_app_is_for_compatibility_only)
+    captured: dict[str, object] = {}
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        captured["app"] = app
+        runtimes = app.state.project_registry.projects()
+        primary = runtimes[0]
+        direct_calls: list[object] = []
+        prepared: list[object] = []
+        original_prepare = app.state.hub_orchestrator.prepare_new_request
+
+        async def direct_legacy_call(*args: object, **kwargs: object) -> object:
+            direct_calls.append((args, kwargs))
+            raise AssertionError("hub mutation must not call primary legacy entrypoint")
+
+        async def record_preparation(**kwargs: object) -> object:
+            prepared_action = await original_prepare(**kwargs)
+            prepared.append(prepared_action)
+            return prepared_action
+
+        async def abort_after_scheduling(prepared_action: object) -> None:
+            app.state.hub_orchestrator.abort_prepared(
+                prepared_action, reason="test scheduler"
+            )
+
+        primary.coordinator.handle_user_request = direct_legacy_call
+        app.state.hub_orchestrator.prepare_new_request = record_preparation
+        app.state.hub_orchestrator.run = abort_after_scheduling
+        with TestClient(app) as client:
+            assert client.get(f"/?key={factory_calls[0]['session_key']}", follow_redirects=False).status_code == 303
+            projects_response = client.get("/api/projects")
+            assert projects_response.status_code == 200
+            assert [item["project_id"] for item in projects_response.json()["projects"]] == [
+                runtime.project_id for runtime in runtimes
+            ]
+            assert client.post(
+                "/api/settings/usage-credits-acknowledgement",
+                json={"acknowledged": True},
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            ).status_code == 202
+            project_id = primary.project_id
+            created = client.post(
+                f"/api/projects/{project_id}/chats",
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            )
+            assert created.status_code == 201
+            session_id = created.json()["session_id"]
+            accepted = client.post(
+                f"/api/projects/{project_id}/chats/{session_id}/messages",
+                json={"text": "route through the hub"},
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            )
+            assert accepted.status_code == 202
+            deadline = time.monotonic() + 1
+            while not prepared and time.monotonic() < deadline:
+                time.sleep(0.005)
+        assert direct_calls == []
+        assert len(prepared) == 1
+        assert prepared[0].token.project_id == project_id
+        assert prepared[0].token.session_id == session_id
+
+    assert main(
+        _project_args(projects, tools),
+        environ=_environment(tmp_path, projects[0][1]),
+        stdout=io.StringIO(),
+        uvicorn_run=run_uvicorn,
+    ) == 0
+
+    assert len(factory_calls) == 1
+    arguments = factory_calls[0]
+    app = captured["app"]
+    assert arguments["registry"] is app.state.project_registry
+    assert arguments["hub_store"] is app.state.hub_store
+    assert arguments["workflows"] is app.state.hub_orchestrator
+    assert arguments["static_dir"] == Path(launcher.__file__).resolve().parent / "static"
+    assert len(created_hub_stores) == 1
+    assert created_hub_stores[0].close_calls == 1
+
+
+@pytest.mark.parametrize("foreground_failure", (False, True))
+def test_main_closes_hub_registry_and_store_once_after_foreground_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreground_failure: bool,
+) -> None:
+    """A factory cutover must not duplicate or skip existing ownership cleanup."""
+    import agent_bridge.hub as hub
+
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    stores: list[object] = []
+    closed_registries: list[object] = []
+    original_registry_close = hub.ProjectRegistry.close
+
+    class RecordingHubStore:
+        def __init__(self, path: Path, *, clock: object) -> None:
+            self.close_calls = 0
+            stores.append(self)
+
+        def usage_credits_acknowledged(self) -> bool:
+            return False
+
+        def acknowledge_usage_credits(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def close_registry(registry: object) -> None:
+        closed_registries.append(registry)
+        original_registry_close(registry)
+
+    def run_uvicorn(*args: object, **kwargs: object) -> None:
+        if foreground_failure:
+            raise RuntimeError("injected foreground failure")
+
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", RecordingHubStore)
+    monkeypatch.setattr(hub.ProjectRegistry, "close", close_registry)
+    if foreground_failure:
+        with pytest.raises(RuntimeError, match="foreground failure"):
+            main(
+                _args(repo, tools),
+                environ=_environment(tmp_path, repo),
+                stdout=io.StringIO(),
+                uvicorn_run=run_uvicorn,
+            )
+    else:
+        assert main(
+            _args(repo, tools),
+            environ=_environment(tmp_path, repo),
+            stdout=io.StringIO(),
+            uvicorn_run=run_uvicorn,
+        ) == 0
+    assert len(closed_registries) == 1
+    assert len(stores) == 1
+    assert stores[0].close_calls == 1
 
 
 def test_hub_acknowledgement_does_not_copy_the_legacy_project_acknowledgement(

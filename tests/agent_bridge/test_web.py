@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,8 +16,14 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from agent_bridge.app import BootstrapStatus, InMemoryEventBroadcaster, create_app
+from agent_bridge.app import (
+    BootstrapStatus,
+    InMemoryEventBroadcaster,
+    create_app,
+    create_hub_app,
+)
 from agent_bridge.contracts import StreamEvent, TaskBrief
+from agent_bridge.hub import ProjectRegistry, RuntimeStatus
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import SQLiteStore
 
@@ -1454,3 +1461,421 @@ def test_live_broadcaster_ignores_other_sessions_and_duplicate_sequences(
             received = socket.receive_json()
     assert received["sequence"] == live.sequence
     assert received["payload"] == {"text": "live"}
+
+
+@dataclass
+class _HubCoordinator:
+    store: SQLiteStore
+    calls: list[tuple[object, ...]]
+
+    async def edit_task(self, task_id: str, brief: TaskBrief) -> None:
+        self.calls.append(("edit", task_id, brief.revision))
+
+    async def reject_task(self, task_id: str) -> None:
+        self.calls.append(("reject", task_id))
+
+
+@dataclass
+class _HubRuntime:
+    project_id: str
+    label: str
+    repository: str
+    branch: str
+    store: SQLiteStore
+    coordinator: _HubCoordinator
+    broadcaster: InMemoryEventBroadcaster
+    readiness: object
+
+
+@dataclass
+class _Prepared:
+    preparation_id: str
+    project_id: str
+    session_id: str
+    task_id: str | None
+
+
+class _HubWorkflows:
+    """Route-level fake: persistence stays in the real selected SQLite store."""
+
+    def __init__(self, runtimes: dict[str, _HubRuntime]) -> None:
+        self.runtimes = runtimes
+        self.prepared: list[_Prepared] = []
+        self.runs: list[str] = []
+        self.aborts: list[tuple[str, str]] = []
+        self.stops: list[tuple[str, str, str]] = []
+        self.reject_preparation = False
+        self.probe_calls = 0
+
+    def _prepare(
+        self,
+        *,
+        action: str,
+        project_id: str,
+        session_id: str,
+        task_id: str | None,
+        text: str | None = None,
+    ) -> _Prepared:
+        if self.reject_preparation:
+            raise RuntimeError("another workflow already owns the active agent lease")
+        self.probe_calls += 1
+        if text is not None:
+            self.runtimes[project_id].store.append_event(
+                session_id, None, "user", "message", {"text": text}
+            )
+        prepared = _Prepared(
+            preparation_id=f"{action}-{len(self.prepared) + 1}",
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+        )
+        self.prepared.append(prepared)
+        return prepared
+
+    async def prepare_new_request(self, **kwargs: object) -> _Prepared:
+        return self._prepare(
+            action="new",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=None,
+            text=str(kwargs["text"]),
+        )
+
+    async def prepare_approval(self, **kwargs: object) -> _Prepared:
+        return self._prepare(
+            action="approval",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_answer(self, **kwargs: object) -> _Prepared:
+        return self._prepare(
+            action="answer",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_resume(self, **kwargs: object) -> _Prepared:
+        return self._prepare(
+            action="resume",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def run(self, prepared: _Prepared) -> None:
+        self.runs.append(prepared.preparation_id)
+
+    def abort_prepared(self, prepared: _Prepared, *, reason: str) -> None:
+        self.aborts.append((prepared.preparation_id, reason))
+
+    async def stop(self, *, project_id: str, session_id: str, task_id: str) -> None:
+        self.stops.append((project_id, session_id, task_id))
+
+
+class _HubStoreFake:
+    def __init__(self) -> None:
+        self.acknowledged = False
+
+    def usage_credits_acknowledged(self) -> bool:
+        return self.acknowledged
+
+    def acknowledge_usage_credits(self) -> None:
+        self.acknowledged = True
+
+
+@dataclass(frozen=True)
+class _HubHarness:
+    app: Any
+    runtimes: dict[str, _HubRuntime]
+    workflows: _HubWorkflows
+    hub_store: _HubStoreFake
+    static_dir: Path
+
+
+@pytest.fixture
+def hub_harness(tmp_path: Path, valid_brief: TaskBrief) -> _HubHarness:
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html><title>hub</title>")
+    runtimes: dict[str, _HubRuntime] = {}
+    for project_id in ("project-a", "project-b"):
+        store = SQLiteStore(
+            tmp_path / f"{project_id}.sqlite3",
+            clock=_Clock(),
+            check_same_thread=False,
+        )
+        session_id = "chat-a" if project_id == "project-a" else "chat-b"
+        store.create_session(session_id, f"/repositories/{project_id}")
+        if project_id == "project-b":
+            store.save_task(session_id, valid_brief, TaskState.AWAITING_USER_APPROVAL)
+        coordinator = _HubCoordinator(store, [])
+        runtimes[project_id] = _HubRuntime(
+            project_id=project_id,
+            label=project_id.upper(),
+            repository=f"/repositories/{project_id}",
+            branch="main",
+            store=store,
+            coordinator=coordinator,
+            broadcaster=InMemoryEventBroadcaster(),
+            readiness=SimpleNamespace(
+                snapshot=lambda: RuntimeStatus(True, "subscription_ready", "ready")
+            ),
+        )
+    workflows = _HubWorkflows(runtimes)
+    hub_store = _HubStoreFake()
+    app = create_hub_app(
+        registry=ProjectRegistry(tuple(runtimes.values())),
+        hub_store=hub_store,
+        workflows=workflows,  # type: ignore[arg-type]
+        static_dir=static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+    harness = _HubHarness(app, runtimes, workflows, hub_store, static_dir)
+    try:
+        yield harness
+    finally:
+        for runtime in runtimes.values():
+            runtime.store.close()
+
+
+def _authenticated_hub_client(harness: _HubHarness) -> TestClient:
+    client = TestClient(harness.app)
+    response = client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+    if response.status_code != 303:
+        raise RuntimeError("hub authentication failed")
+    return client
+
+
+def test_hub_routes_resolve_project_before_any_foreign_chat_or_task_lookup(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing route-selected lookup would query or mutate project B."""
+    foreign = hub_harness.runtimes["project-b"].store
+    foreign_calls: list[str] = []
+
+    def foreign_query(*args: object, **kwargs: object) -> object:
+        foreign_calls.append("foreign")
+        raise AssertionError("foreign store must not be queried")
+
+    for name in (
+        "session_exists", "chat", "latest_task", "get_task", "events_after",
+        "latest_task_overviews", "browser_replay_floor", "append_event",
+    ):
+        monkeypatch.setattr(foreign, name, foreign_query)
+
+    edited = _edited_brief(valid_brief)
+    mutations = (
+        ("/api/projects/project-a/chats/chat-b/messages", {"text": "plan"}),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/edit", edited),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/reject", None),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        for path, body in mutations:
+            assert client.post(path, json=body, headers=headers).status_code == 404
+        assert client.get(
+            "/api/projects/project-a/chats/chat-b/bootstrap"
+        ).status_code == 404
+        with pytest.raises(WebSocketDisconnect) as caught:
+            with client.websocket_connect(
+                "/ws?project_id=project-a&session_id=chat-b&after=0"
+            ):
+                pass
+    assert caught.value.code == 1008
+    assert foreign_calls == []
+    assert hub_harness.workflows.prepared == []
+
+
+def test_hub_duplicate_chat_and_task_ids_remain_bound_to_the_route_project(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A global task lookup would run B when both projects use the same IDs."""
+    shared_brief = replace(valid_brief, task_id="shared-task")
+    for runtime in hub_harness.runtimes.values():
+        runtime.store.create_session("shared-chat", runtime.repository)
+        runtime.store.save_task(
+            "shared-chat", shared_brief, TaskState.AWAITING_USER_APPROVAL
+        )
+    foreign = hub_harness.runtimes["project-b"].store
+
+    def foreign_query(*args: object, **kwargs: object) -> object:
+        raise AssertionError("duplicate identifiers must not select project B")
+
+    monkeypatch.setattr(foreign, "latest_task", foreign_query)
+    monkeypatch.setattr(foreign, "chat", foreign_query)
+    hub_harness.hub_store.acknowledge_usage_credits()
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/shared-chat/tasks/shared-task/approve",
+            json={"revision": 1},
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+        assert response.status_code == 202
+        _wait_until(lambda: bool(hub_harness.workflows.runs))
+    assert hub_harness.workflows.prepared[0].project_id == "project-a"
+    assert hub_harness.workflows.prepared[0].session_id == "shared-chat"
+
+
+def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
+    hub_harness: _HubHarness,
+) -> None:
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        projects = client.get("/api/projects")
+        assert projects.status_code == 200
+        assert projects.json() == {
+            "projects": [
+                {"project_id": "project-a", "label": "PROJECT-A", "branch": "main"},
+                {"project_id": "project-b", "label": "PROJECT-B", "branch": "main"},
+            ]
+        }
+        created = client.post("/api/projects/project-a/chats", headers=headers)
+        assert created.status_code == 201
+        chat = created.json()
+        assert chat["title"] == "New chat"
+        assert chat["session_id"] not in {"chat-a", "chat-b"}
+        message = client.post(
+            f"/api/projects/project-a/chats/{chat['session_id']}/messages",
+            json={"text": "  Build a concise status dashboard for the handoff.  "},
+            headers=headers,
+        )
+        assert message.status_code == 202
+        _wait_until(lambda: bool(hub_harness.workflows.runs))
+        page = client.get("/api/projects/project-a/chats?limit=2")
+        assert page.status_code == 200
+        assert page.json()["chats"][0]["session_id"] == chat["session_id"]
+        assert page.json()["chats"][0]["title"] == "Build a concise status dashboard for the handoff."
+        reopened = client.get(
+            f"/api/projects/project-a/chats/{chat['session_id']}/bootstrap"
+        )
+        assert reopened.status_code == 200
+        assert reopened.json()["session_id"] == chat["session_id"]
+        assert client.get("/api/projects/project-b/chats?limit=50").json()["chats"] == [
+            {
+                "session_id": "chat-b",
+                "title": "New chat",
+                "created_at": "2026-08-10T00:00:01Z",
+                "updated_at": "2026-08-10T00:00:01Z",
+                "latest_sequence": 0,
+            }
+        ]
+
+
+def test_hub_model_preparation_rejects_foreign_lease_without_probe_and_stop_remains_available(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    hub_harness.hub_store.acknowledge_usage_credits()
+    hub_harness.workflows.reject_preparation = True
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        denied = client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/approve",
+            json={"revision": 1}, headers=headers,
+        )
+        assert denied.status_code == 409
+        assert client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/stop",
+            headers=headers,
+        ).status_code == 202
+        _wait_until(lambda: hub_harness.workflows.stops == [("project-a", "chat-a", "task-1")])
+    assert hub_harness.workflows.probe_calls == 0
+
+
+def test_hub_scheduler_rejection_aborts_the_exact_durable_preparation(
+    hub_harness: _HubHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub_harness.hub_store.acknowledge_usage_credits()
+
+    def reject_task(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_task)
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/messages",
+            json={"text": "make a plan"},
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["state"] == "recoverable"
+    assert hub_harness.workflows.aborts == [("new-1", "scheduler_unavailable")]
+    assert hub_harness.workflows.runs == []
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+def test_hub_websocket_replay_is_session_filtered_inside_the_selected_project(
+    hub_harness: _HubHarness,
+) -> None:
+    first = hub_harness.runtimes["project-a"].store.append_event(
+        "chat-a", None, "user", "message", {"text": "only A"}
+    )
+    hub_harness.runtimes["project-b"].store.append_event(
+        "chat-b", None, "user", "message", {"text": "only B"}
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        with client.websocket_connect(
+            "/ws?project_id=project-a&session_id=chat-a&after=0"
+        ) as socket:
+            replay = socket.receive_json()
+    assert replay["sequence"] == first.sequence
+    assert replay["payload"] == {"text": "only A"}
+
+
+def test_compatibility_factory_is_one_non_owning_runtime(web_harness: WebHarness) -> None:
+    runtime = web_harness.app.state.compatibility_runtime
+    assert runtime.store is web_harness.store
+    assert runtime.coordinator is web_harness.coordinator
+    assert runtime.broadcaster is web_harness.broadcaster
+    assert web_harness.app.state.project_registry.projects() == (runtime,)
+    assert not hasattr(runtime, "close")
+
+
+def test_compatibility_model_starts_use_the_injected_fresh_readiness_check(
+    web_harness: WebHarness,
+) -> None:
+    async def fresh_readiness() -> BootstrapStatus:
+        return BootstrapStatus(
+            session_id=SESSION_ID,
+            fable_ready=False,
+            fable_status="subscription_unavailable",
+            sol_status="ready",
+            repository="/repo",
+            branch="main",
+        )
+
+    app = create_app(
+        coordinator=web_harness.coordinator,
+        store=web_harness.store,
+        static_dir=web_harness.static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+        broadcaster=web_harness.broadcaster,
+        bootstrap_status=web_harness.status_provider,
+        readiness_check=fresh_readiness,
+    )
+    with TestClient(app) as client:
+        assert client.get(f"/?key={SESSION_KEY}", follow_redirects=False).status_code == 303
+        csrf = _acknowledge_model_usage(client)
+        response = client.post(
+            f"/api/sessions/{SESSION_ID}/messages",
+            json={"text": "must use the fresh check"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    assert response.status_code == 409
+    assert web_harness.coordinator.calls == []

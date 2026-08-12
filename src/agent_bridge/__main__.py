@@ -1001,7 +1001,7 @@ def main(
     registry = None
     owned_project_ids: set[str] = set()
     try:
-        from agent_bridge.app import BootstrapStatus, create_app
+        from agent_bridge.app import create_hub_app
         from agent_bridge.hub import ActiveAgentLease, HubWorkflowOrchestrator, ProjectRegistry
         from agent_bridge.hub_store import HubStore
 
@@ -1038,35 +1038,19 @@ def main(
             usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
         )
         primary = runtimes[0]
-        session_id = _active_session(primary.store, primary.spec.repo_root)
-        status_snapshot = primary.readiness.snapshot()
+        _active_session(primary.store, primary.spec.repo_root)
         preflight = primary.readiness._startup_preflight
-        status = BootstrapStatus(
-            session_id=session_id,
-            fable_ready=status_snapshot.fable_ready,
-            fable_status=status_snapshot.fable_status,
-            sol_status=status_snapshot.sol_status,
-            repository=str(primary.spec.repo_root),
-            branch=primary.spec.branch,
-        )
         session_key = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
-        app = create_app(
-            coordinator=primary.coordinator,
-            store=primary.store,
+        app = create_hub_app(
+            registry=registry,
+            hub_store=hub_store,
+            workflows=orchestrator,
             static_dir=Path(__file__).resolve().parent / "static",
             session_key=session_key,
             csrf_token=csrf_token,
-            broadcaster=primary.broadcaster,
-            bootstrap_status=lambda: status,
         )
-        # Task 6 owns project-aware request routing.  Retain the assembled hub
-        # foundations here so that routing can adopt them without reconstructing
-        # project state or changing the compatibility application yet.
         app.state.launcher_settings = settings
-        app.state.project_registry = registry
-        app.state.hub_store = hub_store
-        app.state.hub_orchestrator = orchestrator
         port = select_port(settings.host, settings.port)
         public_host = "127.0.0.1"
         url = f"http://{public_host}:{port}/?key={session_key}"
