@@ -696,14 +696,16 @@ def create_hub_app(
         return response
 
     @app.get("/api/projects", dependencies=[Depends(require_session)])
-    async def projects(request: Request) -> Mapping[str, object]:
+    async def projects(request: Request, response: Response) -> Mapping[str, object]:
         if request.query_params:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="project query parameters are not accepted",
             )
         active = workflows.active_lease_snapshot()
+        response.headers["Cache-Control"] = "no-store"
         return {
+            "csrf_token": csrf_token,
             "projects": [
                 {
                     "project_id": runtime.project_id,

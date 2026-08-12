@@ -95,6 +95,7 @@ const FIELD_LABELS = Object.freeze({
 const RECONNECT_DELAYS = Object.freeze([500, 1000, 2000, 5000, 10000]);
 const BOOTSTRAP_REFRESH_DELAY = 500;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_CSRF_TOKEN = /^[\x21-\x7e]+$/;
 
 
 function requireSafeId(value, name) {
@@ -1315,6 +1316,27 @@ function navigationLease(value) {
 }
 
 
+function navigationLeaseState(payload) {
+  if (!Object.hasOwn(payload, "active_lease")) {
+    return {activeLease: null, navigationLocked: true};
+  }
+  if (payload.active_lease === null) {
+    return {activeLease: null, navigationLocked: false};
+  }
+  const activeLease = navigationLease(payload.active_lease);
+  return activeLease === null
+    ? {activeLease: null, navigationLocked: true}
+    : {activeLease, navigationLocked: false};
+}
+
+
+function navigationCsrfToken(payload) {
+  return typeof payload.csrf_token === "string" && SAFE_CSRF_TOKEN.test(payload.csrf_token)
+    ? payload.csrf_token
+    : null;
+}
+
+
 function boundedNavigationRecords(records, normalizer, maximum) {
   if (!Array.isArray(records)) {
     return [];
@@ -1328,14 +1350,20 @@ function boundedNavigationRecords(records, normalizer, maximum) {
 
 function navigationState(previousState, payload) {
   const payloadObject = asObject(payload);
+  const lease = navigationLeaseState(payloadObject);
+  const csrfToken = navigationCsrfToken(payloadObject);
   return {
     ...previousState,
+    csrfToken: csrfToken ?? "",
     projects: boundedNavigationRecords(
       payloadObject.projects,
       navigationProject,
       MAX_NAV_PROJECTS,
     ),
-    activeLease: navigationLease(payloadObject.active_lease),
+    activeLease: lease.navigationLocked
+      ? (previousState.activeLease ?? null)
+      : lease.activeLease,
+    navigationLocked: lease.navigationLocked || csrfToken === null,
   };
 }
 
@@ -1355,6 +1383,62 @@ function projectLabelFor(state, projectId) {
 }
 
 
+function navigationAttribute(node, name) {
+  if (typeof node?.getAttribute === "function") {
+    return node.getAttribute(name);
+  }
+  return node?.attributes?.[name] ?? null;
+}
+
+
+function navigationListMatches(container, records, selectedId, locked, idName, labelName) {
+  if (!container || container.children.length !== records.length) {
+    return false;
+  }
+  return records.every((record, index) => {
+    const button = container.children[index]?.children?.[0];
+    return button?.dataset?.[idName] === record[idName]
+      && button.textContent === record[labelName]
+      && button.disabled === locked
+      && navigationAttribute(button, "aria-current") === (
+        record[idName] === selectedId ? "true" : "false"
+      );
+  });
+}
+
+
+function renderNavigationList(
+  documentRoot,
+  container,
+  records,
+  selectedId,
+  locked,
+  idName,
+  labelName,
+  onSelect,
+) {
+  if (navigationListMatches(container, records, selectedId, locked, idName, labelName)) {
+    return;
+  }
+  const items = [];
+  for (const record of records) {
+    if (typeof record?.[idName] !== "string") {
+      continue;
+    }
+    const item = element(documentRoot, "li");
+    const button = element(documentRoot, "button", record[labelName], "project-navigation-button");
+    button.type = "button";
+    button.disabled = locked;
+    button.dataset[idName] = record[idName];
+    button.setAttribute("aria-current", record[idName] === selectedId ? "true" : "false");
+    button.addEventListener("click", () => onSelect(record[idName]));
+    item.append(button);
+    items.push(item);
+  }
+  container?.replaceChildren(...items);
+}
+
+
 export function renderProjectNavigation(documentRoot, currentState, handlers = {}) {
   const state = asObject(currentState);
   const projectList = documentRoot.querySelector("#project-list");
@@ -1369,6 +1453,7 @@ export function renderProjectNavigation(documentRoot, currentState, handlers = {
     ? state.chats.slice(0, MAX_NAV_CHATS)
     : [];
   const locked = state.activeLease !== null && state.activeLease !== undefined
+    || state.navigationLocked === true
     || state.navigationPending === true;
   const selectedProject = projects.find((project) => project?.projectId === state.projectId);
   const selectedChat = chats.find((chat) => chat?.sessionId === state.sessionId);
@@ -1383,40 +1468,16 @@ export function renderProjectNavigation(documentRoot, currentState, handlers = {
       : "No chat selected";
   }
   if (projectList) {
-    const items = [];
-    for (const project of projects) {
-      if (typeof project?.projectId !== "string") {
-        continue;
-      }
-      const item = element(documentRoot, "li");
-      const button = element(documentRoot, "button", project.label, "project-navigation-button");
-      button.type = "button";
-      button.disabled = locked;
-      button.dataset.projectId = project.projectId;
-      button.setAttribute("aria-current", project.projectId === state.projectId ? "true" : "false");
-      button.addEventListener("click", () => handlers.onProject?.(project.projectId));
-      item.append(button);
-      items.push(item);
-    }
-    projectList.replaceChildren(...items);
+    renderNavigationList(
+      documentRoot, projectList, projects, state.projectId, locked,
+      "projectId", "label", (projectId) => handlers.onProject?.(projectId),
+    );
   }
   if (chatList) {
-    const items = [];
-    for (const chat of chats) {
-      if (typeof chat?.sessionId !== "string") {
-        continue;
-      }
-      const item = element(documentRoot, "li");
-      const button = element(documentRoot, "button", chat.title, "project-navigation-button");
-      button.type = "button";
-      button.disabled = locked;
-      button.dataset.sessionId = chat.sessionId;
-      button.setAttribute("aria-current", chat.sessionId === state.sessionId ? "true" : "false");
-      button.addEventListener("click", () => handlers.onChat?.(chat.sessionId));
-      item.append(button);
-      items.push(item);
-    }
-    chatList.replaceChildren(...items);
+    renderNavigationList(
+      documentRoot, chatList, chats, state.sessionId, locked,
+      "sessionId", "title", (sessionId) => handlers.onChat?.(sessionId),
+    );
   }
   if (newChat) {
     newChat.disabled = locked
@@ -1450,6 +1511,7 @@ export function createProjectChatController({
     projects: [],
     chats: [],
     activeLease: null,
+    navigationLocked: true,
     navigationPending: false,
     tasks: [],
     selectedTaskId: null,
@@ -1458,6 +1520,9 @@ export function createProjectChatController({
   };
   let stream = null;
   let selectionGeneration = 0;
+  let projectRefreshGeneration = 0;
+  let projectRefreshInFlight = null;
+  let projectRefreshPending = false;
 
   function publish(nextState) {
     state = nextState;
@@ -1486,8 +1551,13 @@ export function createProjectChatController({
     stream = null;
   }
 
+  function invalidateProjectRefresh() {
+    projectRefreshGeneration += 1;
+  }
+
   function beginChatSelection(projectId, sessionId) {
     stopStream();
+    invalidateProjectRefresh();
     if (state.sessionId !== null && state.sessionId !== sessionId) {
       onChatReset();
     }
@@ -1592,6 +1662,7 @@ export function createProjectChatController({
     }
     const currentSessionId = state.projectId === projectId ? state.sessionId : null;
     stopStream();
+    invalidateProjectRefresh();
     if (state.sessionId !== null) {
       onChatReset();
     }
@@ -1630,14 +1701,45 @@ export function createProjectChatController({
     return selectChat(projectId, targetSessionId);
   }
 
-  async function refreshProjects() {
-    const payload = await getJson("/api/projects");
-    const refreshed = navigationState(state, payload);
-    const label = typeof refreshed.projectId === "string"
-      ? projectLabelFor(refreshed, refreshed.projectId)
-      : null;
-    publish({...refreshed, projectLabel: label});
-    return true;
+  async function performProjectRefresh() {
+    const ownGeneration = projectRefreshGeneration;
+    let refreshed = false;
+    try {
+      const payload = await getJson("/api/projects");
+      if (ownGeneration === projectRefreshGeneration) {
+        const nextState = navigationState(state, payload);
+        const label = typeof nextState.projectId === "string"
+          ? projectLabelFor(nextState, nextState.projectId)
+          : null;
+        publish({...nextState, projectLabel: label});
+        refreshed = true;
+      }
+    } catch (_error) {
+      if (ownGeneration === projectRefreshGeneration) {
+        publish({...state, navigationLocked: true});
+      }
+    }
+    if (projectRefreshPending) {
+      projectRefreshPending = false;
+      return performProjectRefresh();
+    }
+    return refreshed;
+  }
+
+  function refreshProjects() {
+    projectRefreshGeneration += 1;
+    if (projectRefreshInFlight !== null) {
+      projectRefreshPending = true;
+      return projectRefreshInFlight;
+    }
+    const refresh = performProjectRefresh();
+    projectRefreshInFlight = refresh;
+    void refresh.finally(() => {
+      if (projectRefreshInFlight === refresh) {
+        projectRefreshInFlight = null;
+      }
+    });
+    return refresh;
   }
 
   async function bootstrapInitial() {
@@ -1663,6 +1765,7 @@ export function createProjectChatController({
   async function createChat() {
     if (
       state.activeLease !== null
+      || state.navigationLocked
       || state.navigationPending
       || typeof state.projectId !== "string"
       || typeof state.csrfToken !== "string"
@@ -1671,6 +1774,8 @@ export function createProjectChatController({
       throw new Error("new chat is unavailable while navigation is locked");
     }
     const projectId = state.projectId;
+    const sessionId = state.sessionId;
+    const generation = selectionGeneration;
     const response = await postJson(
       fetchFunction,
       projectNewChatPath(projectId),
@@ -1678,8 +1783,15 @@ export function createProjectChatController({
       state.csrfToken,
     );
     const created = navigationChat(await response.json());
-    if (created === null || state.projectId !== projectId) {
+    if (created === null) {
       throw new Error("new chat response was invalid");
+    }
+    if (
+      generation !== selectionGeneration
+      || state.projectId !== projectId
+      || state.sessionId !== sessionId
+    ) {
+      return false;
     }
     publish({
       ...state,

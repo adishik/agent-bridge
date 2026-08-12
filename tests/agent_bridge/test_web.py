@@ -651,7 +651,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
       const projectBootstrap = {{...bootstrap, project_id: "project-a"}};
-      const projects = {{projects: [{{
+      let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
       }}], active_lease: null}};
@@ -659,6 +659,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const persistedEvent = {json.dumps(persisted_event)};
       const unsafe = {json.dumps(unsafe)};
       let interactionAllowed = () => true;
+      const flush = async () => {{ for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); }};
 
       class ClassList {{
         constructor(node) {{ this.node = node; this.values = new Set(); }}
@@ -684,10 +685,11 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         setAttribute(name, value) {{ this.attributes[name] = String(value); }}
         removeAttribute(name) {{ delete this.attributes[name]; if (name === "open") this.open = false; }}
         addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }}
-        async emit(kind, event = {{}}) {{
-          if (!interactionAllowed(this)) return;
-          event.preventDefault ??= () => {{}};
-          for (const listener of this.listeners[kind] ?? []) await listener(event);
+            async emit(kind, event = {{}}) {{
+              if (!interactionAllowed(this)) return;
+              event.preventDefault ??= () => {{}};
+              for (const listener of this.listeners[kind] ?? []) await listener(event);
+              await this.onclick?.(event);
         }}
         focus() {{ documentRoot.activeElement = this; this.focusCount = (this.focusCount ?? 0) + 1; }}
         showModal() {{ this.open = true; this.showModalCount = (this.showModalCount ?? 0) + 1; }}
@@ -710,10 +712,11 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         "usage-credits-confirm", "usage-credits-acknowledge", "usage-error",
         "toast-region", "fable-status", "sol-status", "repository-status",
         "connection-status", "task-drawer-toggle", "inspector-drawer-toggle",
-        "bootstrap-retry",
+        "bootstrap-retry", "project-list", "chat-list", "new-chat",
+        "selected-project-name", "selected-chat-name",
       ];
       const nodes = Object.fromEntries(ids.map((id) => [id, new Node(
-        id === "usage-modal" ? "dialog" : id.includes("toggle") || id.includes("submit") || id === "bootstrap-retry" ? "button" : id === "composer" || id === "usage-credits-form" ? "form" : "div",
+        id === "usage-modal" ? "dialog" : id.includes("toggle") || id.includes("submit") || id === "bootstrap-retry" || id === "new-chat" ? "button" : id === "composer" || id === "usage-credits-form" ? "form" : "div",
         id,
       )]));
       nodes["message-input"].tag = "textarea";
@@ -769,7 +772,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
           if (url === "/api/projects") {{
             projectFetchCount += 1;
             if (projectFetchCount === 1) return {{ok: false, status: 503, json: async () => ({{}})}};
-            return {{ok: true, status: 200, json: async () => projects}};
+            return {{ok: true, status: 200, json: async () => projectPayload}};
           }}
           if (url === "/api/projects/project-a/chats?limit=50") {{
             return {{ok: true, status: 200, json: async () => chats}};
@@ -794,7 +797,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (await controller.ready) process.exit(4);
       if (nodes["bootstrap-retry"].hidden || !nodes["message-input"].disabled) process.exit(5);
       if (!interactionAllowed(nodes["bootstrap-retry"])) process.exit(25);
-      if (!nodes["usage-error"].textContent.includes("Request failed")) process.exit(26);
+      if (!nodes["usage-error"].textContent.includes("No project chats")) process.exit(26);
 
       await nodes["bootstrap-retry"].emit("click");
       if (!(await controller.ready)) process.exit(6);
@@ -822,7 +825,24 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (controller.state.tasks[0].state !== "sol_running") process.exit(21);
       if (controller.state.tasks[0].history.length !== 1) process.exit(22);
       if (nodes["sol-status"].textContent !== "Sol · Running") process.exit(23);
-      nodes["message-input"].focus();
+          const projectButton = nodes["project-list"].children[0].children[0];
+          const chatButton = nodes["chat-list"].children[0].children[0];
+          await projectButton.emit("click");
+          await chatButton.emit("click");
+          projectButton.focus();
+          socket.listeners.message({{data: JSON.stringify({{...persistedEvent, sequence: persistedEvent.sequence + 1}})}});
+          await flush();
+      if (documentRoot.activeElement !== projectButton) process.exit(29);
+      projectPayload = {{...projectPayload, active_lease: {{project_id: "project-a", session_id: "session-1", task_id: "task-1"}}}};
+          socket.listeners.message({{data: JSON.stringify({{...persistedEvent, sequence: persistedEvent.sequence + 2}})}});
+          await flush();
+      if (!nodes["new-chat"].disabled || !nodes["project-list"].children[0].children[0].disabled) process.exit(30);
+      projectPayload = {{...projectPayload, active_lease: null}};
+          socket.listeners.message({{data: JSON.stringify({{...persistedEvent, sequence: persistedEvent.sequence + 3}})}});
+          await flush();
+      if (nodes["new-chat"].disabled || nodes["project-list"].children[0].children[0].disabled) process.exit(31);
+      const reconnectFocus = nodes["chat-list"].children[0].children[0];
+      reconnectFocus.focus();
       socket.listeners.close();
       scheduled[0].callback();
       const reconnecting = FakeSocket.instances[1].listeners.open();
@@ -831,7 +851,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
           || !nodes["connection-status"].textContent.includes("refresh")) process.exit(27);
       releaseReconnectBootstrap({{ok: true, status: 200, json: async () => projectBootstrap}});
       await reconnecting;
-      if (documentRoot.activeElement !== nodes["message-input"]) process.exit(24);
+      if (documentRoot.activeElement !== reconnectFocus) process.exit(24);
       if (nodes["message-input"].disabled) process.exit(28);
 
       await nodes["task-drawer-toggle"].emit("click");
@@ -859,6 +879,121 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         text=True,
         capture_output=True,
         check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_browser_startup_creates_first_chat_without_a_bootstrap_and_ignores_stale_new_chat(
+) -> None:
+    module_uri = Path("src/agent_bridge/static/app.js").resolve().as_uri()
+    harness = f"""
+      import * as bridge from {json.dumps(module_uri)};
+      let documentRoot;
+      class ClassList {{
+        constructor() {{ this.values = new Set(); }}
+        add(value) {{ this.values.add(value); }}
+        remove(value) {{ this.values.delete(value); }}
+        contains(value) {{ return this.values.has(value); }}
+        toggle(value, force) {{ force ? this.add(value) : this.remove(value); }}
+      }}
+      class Node {{
+        constructor(tag, id = "") {{
+          this.tag = tag; this.id = id; this.children = []; this.attributes = {{}};
+          this.dataset = {{}}; this.classList = new ClassList(); this.listeners = {{}};
+          this._text = ""; this.disabled = false; this.hidden = false; this.open = false;
+          this.value = ""; this.checked = false; this.inert = false;
+        }}
+        set textContent(value) {{ this._text = String(value); this.children = []; }}
+        get textContent() {{ return this._text; }}
+        append(...children) {{ for (const child of children) {{ child.parent = this; this.children.push(child); }} }}
+        replaceChildren(...children) {{ this.children = []; this.append(...children); this._text = ""; }}
+        removeChild(child) {{ this.children.splice(this.children.indexOf(child), 1); }}
+        remove() {{ this.parent?.removeChild(this); }}
+        setAttribute(name, value) {{ this.attributes[name] = String(value); }}
+        removeAttribute(name) {{ delete this.attributes[name]; }}
+        addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }}
+        async emit(kind, event = {{}}) {{
+          event.preventDefault ??= () => {{}};
+          for (const listener of this.listeners[kind] ?? []) await listener(event);
+          await this.onclick?.(event);
+        }}
+        focus() {{ documentRoot.activeElement = this; }}
+        showModal() {{ this.open = true; }}
+        close() {{ this.open = false; }}
+        querySelector() {{ return this.children.find((child) => child.tag === "button") ?? null; }}
+      }}
+      const ids = [
+        "task-list", "conversation", "task-inspector", "composer", "message-input",
+        "composer-submit", "composer-guidance", "usage-modal", "usage-credits-form",
+        "usage-credits-confirm", "usage-credits-acknowledge", "usage-error", "toast-region",
+        "fable-status", "sol-status", "repository-status", "connection-status",
+        "task-drawer-toggle", "inspector-drawer-toggle", "bootstrap-retry", "project-list",
+        "chat-list", "new-chat", "selected-project-name", "selected-chat-name",
+      ];
+      const nodes = Object.fromEntries(ids.map((id) => [id, new Node(
+        id === "usage-modal" ? "dialog" : id === "composer" || id === "usage-credits-form" ? "form" : id.includes("button") || id.includes("toggle") || id.includes("submit") || id === "new-chat" || id === "bootstrap-retry" ? "button" : "div",
+        id,
+      )]));
+      nodes["message-input"].tag = "textarea";
+      nodes["usage-credits-confirm"].tag = "input";
+      nodes["usage-modal"].append(nodes["usage-credits-form"]);
+      nodes["usage-credits-form"].append(nodes["usage-credits-confirm"], nodes["usage-credits-acknowledge"], nodes["usage-error"], nodes["bootstrap-retry"]);
+      documentRoot = {{
+        activeElement: new Node("button", "launcher"), listeners: {{}},
+        createElement(tag) {{ return new Node(tag); }},
+        querySelector(selector) {{ return selector.startsWith("#") ? nodes[selector.slice(1)] ?? null : null; }},
+        addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }},
+      }};
+      const calls = [];
+      const creates = [];
+      class Socket {{
+        static instances = [];
+        constructor(url) {{ this.url = url; this.listeners = {{}}; Socket.instances.push(this); }}
+        addEventListener(kind, listener) {{ this.listeners[kind] = listener; }}
+        close() {{ this.closed = true; }}
+      }}
+      const windowRoot = {{
+        location: {{protocol: "http:", host: "bridge.test"}}, WebSocket: Socket,
+        matchMedia: () => ({{matches: false, addEventListener() {{}}}}),
+        setTimeout() {{ return 1; }}, clearTimeout() {{}}, addEventListener() {{}},
+        fetch(url, options = {{}}) {{
+          calls.push({{url, options}});
+          if (url === "/api/projects") return Promise.resolve({{ok: true, status: 200, json: async () => ({{
+            csrf_token: "csrf-empty", projects: [
+              {{project_id: "empty", label: "Empty", branch: "main", readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}}}},
+              {{project_id: "other", label: "Other", branch: "next", readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}}}},
+            ], active_lease: null,
+          }})}});
+          if (url === "/api/projects/empty/chats?limit=50") return Promise.resolve({{ok: true, status: 200, json: async () => ({{chats: []}})}});
+          if (url === "/api/projects/other/chats?limit=50") return Promise.resolve({{ok: true, status: 200, json: async () => ({{chats: [{{session_id: "other-chat", title: "Other chat", latest_sequence: 0}}]}})}});
+          if (url === "/api/projects/empty/chats/first-empty/bootstrap") return Promise.resolve({{ok: true, status: 200, json: async () => ({{csrf_token: "csrf-empty", usage_credits_acknowledged: true, project_id: "empty", session_id: "first-empty", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []}})}});
+          if (url === "/api/projects/other/chats/other-chat/bootstrap") return Promise.resolve({{ok: true, status: 200, json: async () => ({{csrf_token: "csrf-empty", usage_credits_acknowledged: true, project_id: "other", session_id: "other-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []}})}});
+          if (url === "/api/projects/empty/chats" && options.method === "POST") return new Promise((resolve) => creates.push(resolve));
+          throw new Error(`unexpected ${{options.method ?? "GET"}} ${{url}}`);
+        }},
+      }};
+      const app = bridge.startBrowserApp(documentRoot, windowRoot);
+      if (!(await app.ready) || app.state.projectId !== "empty" || app.state.sessionId !== null || nodes["new-chat"].disabled) process.exit(2);
+      await nodes["new-chat"].emit("click");
+      await Promise.resolve();
+      if (creates.length !== 1 || calls.at(-1).options.headers["X-CSRF-Token"] !== "csrf-empty") process.exit(3);
+      creates.shift()({{ok: true, status: 201, json: async () => ({{session_id: "first-empty", title: "First empty", latest_sequence: 0}})}});
+      for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
+      if (app.state.projectId !== "empty" || app.state.sessionId !== "first-empty" || Socket.instances.length !== 1 || !Socket.instances[0].url.includes("session_id=first-empty")) process.exit(5);
+
+      await nodes["new-chat"].emit("click");
+      await Promise.resolve();
+      if (creates.length !== 1) process.exit(6);
+      await nodes["project-list"].children[1].children[0].emit("click");
+      for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
+      creates.shift()({{ok: true, status: 201, json: async () => ({{session_id: "late-empty", title: "Late", latest_sequence: 0}})}});
+      for (let tick = 0; tick < 12; tick += 1) await Promise.resolve();
+      const activeSockets = Socket.instances.filter((socket) => !socket.closed);
+      if (app.state.projectId !== "other" || app.state.sessionId !== "other-chat" || activeSockets.length !== 1 || !activeSockets[0].url.includes("project_id=other")) process.exit(4);
+    """
+    result = subprocess.run(
+        ["node", "--experimental-default-type=module", "--input-type=module", "-e", harness],
+        text=True, capture_output=True, check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
 
@@ -2263,11 +2398,15 @@ def test_real_b_only_identifiers_cannot_change_selected_project_or_foreign_store
 def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
     hub_harness: _HubHarness,
 ) -> None:
+    with TestClient(hub_harness.app) as anonymous:
+        assert anonymous.get("/api/projects").status_code == 403
     with _authenticated_hub_client(hub_harness) as client:
         headers = {"X-CSRF-Token": CSRF_TOKEN}
         projects = client.get("/api/projects")
         assert projects.status_code == 200
+        assert projects.headers["cache-control"] == "no-store"
         assert projects.json() == {
+            "csrf_token": CSRF_TOKEN,
             "projects": [
                 {
                     "project_id": "project-a", "label": "PROJECT-A", "branch": "main",
@@ -2328,6 +2467,8 @@ def test_project_navigation_public_payloads_need_no_repository_path(
         projects = client.get("/api/projects")
         assert projects.status_code == 200
         payload = projects.json()
+        assert payload["csrf_token"] == CSRF_TOKEN
+        assert projects.headers["cache-control"] == "no-store"
         assert payload["active_lease"] is None
         assert payload["projects"] == [
             {
