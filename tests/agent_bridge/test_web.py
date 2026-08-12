@@ -1551,7 +1551,7 @@ class _HubWorkflows:
             raise RuntimeError("active workflow belongs to another project or chat")
         return token
 
-    def require_exact_stop_owner(
+    def reserve_stop(
         self, *, project_id: str, session_id: str, task_id: str,
     ) -> LeaseToken:
         token = self.active_lease
@@ -1563,6 +1563,10 @@ class _HubWorkflows:
         ):
             raise RuntimeError("stop requires the exact active workflow")
         return token
+
+    def cancel_stop_reservation(self, reservation: LeaseToken) -> None:
+        if self.active_lease != reservation:
+            raise RuntimeError("stop requires the exact active workflow")
 
     def _prepare(
         self,
@@ -1638,14 +1642,12 @@ class _HubWorkflows:
     def abort_prepared(self, prepared: _Prepared, *, reason: str) -> None:
         self.aborts.append((prepared.preparation_id, reason))
 
-    async def stop(
-        self, *, project_id: str, session_id: str, task_id: str, token: LeaseToken,
-    ) -> None:
-        if token != self.require_exact_stop_owner(
-            project_id=project_id, session_id=session_id, task_id=task_id,
-        ):
+    async def stop(self, *, reservation: LeaseToken) -> None:
+        if self.active_lease != reservation:
             raise RuntimeError("stop requires the exact active workflow")
-        self.stops.append((project_id, session_id, task_id))
+        self.stops.append((
+            reservation.project_id, reservation.session_id, reservation.task_id,
+        ))
         self.active_lease = None
 
 
@@ -1707,6 +1709,7 @@ def _real_hub_harness(
     fable_results: tuple[object, ...] = ((True, "subscription_ready"),),
     sol_results: tuple[object, ...] = ("ready",),
     fable: object | None = None,
+    repository: object | None = None,
 ) -> _RealHubHarness:
     static_dir = tmp_path / "real-static"
     static_dir.mkdir()
@@ -1726,7 +1729,7 @@ def _real_hub_harness(
         probe = _ProbePlan(list(fable_results), list(sol_results))
         coordinator = Coordinator(
             store=store,
-            repository=object(),  # Preparation/abort never reaches an adapter edge.
+            repository=object() if repository is None else repository,
             runner=object(),
             fable=object() if fable is None else fable,
             sol=object(),
@@ -1798,6 +1801,25 @@ class _BlockingFable:
     async def plan(self, **kwargs: object) -> object:
         self.started.set()
         await asyncio.Future()
+
+
+@dataclass(frozen=True)
+class _LocalBaseline:
+    baseline_id: str
+    allowed_paths: tuple[str, ...]
+
+
+class _LocalRepository:
+    """The narrow local repository edge required by real approval preparation."""
+
+    def capture(self, brief: TaskBrief) -> _LocalBaseline:
+        return _LocalBaseline("local-baseline", brief.allowed_paths)
+
+    def baseline_manifest(self, baseline: _LocalBaseline) -> dict[str, object]:
+        return {"baseline_id": baseline.baseline_id}
+
+    def discard_baseline(self, baseline: _LocalBaseline) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -2011,6 +2033,219 @@ def test_every_duplicate_identifier_route_stays_inside_project_a(
     )
 
 
+def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing lookup to a global task/session source would mutate B's rows too."""
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((True, "subscription_ready"),) * 4,
+        sol_results=("ready",) * 4,
+        repository=_LocalRepository(),
+    )
+    runtime_a = harness.runtimes["a"]
+    runtime_b = harness.runtimes["b"]
+    task_ids = {
+        "approval": "same-approval",
+        "edit": "same-edit",
+        "reject": "same-reject",
+        "answer": "same-answer",
+        "resume": "same-resume",
+        "stop": "same-stop",
+    }
+
+    def seed(runtime: _HubRuntime) -> None:
+        store = runtime.store
+        approval = replace(valid_brief, task_id=task_ids["approval"])
+        edit = replace(valid_brief, task_id=task_ids["edit"])
+        reject = replace(valid_brief, task_id=task_ids["reject"])
+        answer = replace(valid_brief, task_id=task_ids["answer"])
+        resume = replace(valid_brief, task_id=task_ids["resume"])
+        stop = replace(valid_brief, task_id=task_ids["stop"])
+        store.save_task("shared-chat", approval, TaskState.AWAITING_USER_APPROVAL)
+        store.save_task("shared-chat", edit, TaskState.AWAITING_USER_APPROVAL)
+        store.set_fable_session(edit.task_id, edit.revision, "fable-edit-session")
+        store.save_task("shared-chat", reject, TaskState.AWAITING_USER_APPROVAL)
+        store.save_task("shared-chat", answer, TaskState.SOL_RUNNING)
+        store.set_sol_thread(answer.task_id, answer.revision, "sol-answer-thread")
+        store.pause_for_continuation(
+            answer.task_id,
+            answer.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=TaskState.AWAITING_USER_INPUT,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending={"prompt": "Answer exactly.", "sol_run_id": "sol-answer-run"},
+        )
+        store.save_task("shared-chat", resume, TaskState.FABLE_PLANNING)
+        store.mark_interrupted(
+            resume.task_id, resume.revision, continuation=TaskState.FABLE_PLANNING,
+        )
+        store.save_task("shared-chat", stop, TaskState.FABLE_PLANNING)
+
+    def snapshot(runtime: _HubRuntime) -> tuple[object, ...]:
+        rows = tuple(
+            (
+                task_id,
+                runtime.store.latest_task(task_id).state.value,  # type: ignore[union-attr]
+                runtime.store.latest_task(task_id).revision,  # type: ignore[union-attr]
+                None if runtime.store.latest_task(task_id).continuation_state is None  # type: ignore[union-attr]
+                else runtime.store.latest_task(task_id).continuation_state.value,  # type: ignore[union-attr]
+            )
+            for task_id in task_ids.values()
+        )
+        records = tuple(
+            (
+                task_id,
+                None
+                if (record := runtime.store.latest_prepared_action_for_task(
+                    project_id=runtime.project_id,
+                    session_id="shared-chat",
+                    task_id=task_id,
+                    revision=1,
+                )) is None
+                else (record.action, record.status, record.generation),
+            )
+            for task_id in task_ids.values()
+        )
+        return rows, records, tuple(event.to_dict() for event in runtime.store.events_after("shared-chat", 0))
+
+    seed(runtime_a)
+    seed(runtime_b)
+    before_b = snapshot(runtime_b)
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            edited = _edited_brief(replace(valid_brief, task_id=task_ids["edit"]))
+            assert client.post(
+                f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['edit']}/edit",
+                json=edited, headers=headers,
+            ).status_code == 202
+            _wait_until(lambda: runtime_a.store.latest_task(task_ids["edit"]).revision == 2)  # type: ignore[union-attr]
+            assert client.post(
+                f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['reject']}/reject",
+                headers=headers,
+            ).status_code == 202
+            _wait_until(lambda: runtime_a.store.latest_task(task_ids["reject"]).state is TaskState.FAILED)  # type: ignore[union-attr]
+
+            monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+            for path, body in (
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "only A message"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['approval']}/approve", {"revision": 1}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['answer']}/answer", {"answer": "only A answer"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['resume']}/resume", None),
+            ):
+                assert client.post(path, json=body, headers=headers).status_code == 503
+            monkeypatch.undo()
+
+            harness.lease.acquire(
+                project_id=runtime_a.project_id,
+                session_id="shared-chat",
+                task_id=task_ids["stop"],
+            )
+            active_stop = harness.lease.snapshot()
+            assert active_stop is not None
+            assert (
+                active_stop.project_id,
+                active_stop.session_id,
+                active_stop.task_id,
+            ) == (runtime_a.project_id, "shared-chat", task_ids["stop"])
+            assert client.post(
+                f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['stop']}/stop",
+                headers=headers,
+            ).status_code == 202
+            _wait_until(lambda: harness.lease.snapshot() is None)
+
+            selected_event = runtime_a.store.append_event(
+                "shared-chat", None, "user", "message", {"text": "selected A only"},
+            )
+            assert client.get(
+                f"/api/projects/{runtime_a.project_id}/chats/shared-chat/bootstrap"
+            ).status_code == 200
+            with client.websocket_connect(
+                f"/ws?project_id={runtime_a.project_id}&session_id=shared-chat&after={selected_event.sequence - 1}"
+            ) as socket:
+                assert socket.receive_json()["sequence"] == selected_event.sequence
+
+        assert snapshot(runtime_b) == before_b
+        a_rows, _, a_events = snapshot(runtime_a)
+        assert {task_id: values for task_id, *values in a_rows} == {
+            task_ids["approval"]: ["interrupted", 1, "sol_running"],
+            task_ids["edit"]: ["awaiting_user_approval", 2, None],
+            task_ids["reject"]: ["failed", 1, None],
+            task_ids["answer"]: ["interrupted", 1, "sol_running"],
+            task_ids["resume"]: ["interrupted", 1, "fable_planning"],
+            task_ids["stop"]: ["interrupted", 1, "fable_planning"],
+        }
+        assert set(task_ids.values()).issubset({event["task_id"] for event in a_events})
+        for route in ("approval", "answer", "resume"):
+            record = runtime_a.store.latest_prepared_action_for_task(
+                project_id=runtime_a.project_id,
+                session_id="shared-chat",
+                task_id=task_ids[route],
+                revision=1,
+            )
+            assert record is not None and record.status == "ABORTED"
+        assert harness.lease.snapshot() is None
+    finally:
+        harness.close()
+
+
+def test_real_b_only_identifiers_cannot_change_selected_project_or_foreign_store(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """Resolving B before the route project would make these B-only IDs observable."""
+    harness = _real_hub_harness(tmp_path)
+    runtime_a = harness.runtimes["a"]
+    runtime_b = harness.runtimes["b"]
+    runtime_b.store.create_session("b-only-chat", runtime_b.repository)
+    runtime_b.store.save_task(
+        "b-only-chat", replace(valid_brief, task_id="b-only-task"),
+        TaskState.AWAITING_USER_APPROVAL,
+    )
+    before_a = tuple(event.to_dict() for event in runtime_a.store.events_after("shared-chat", 0))
+    before_b = tuple(event.to_dict() for event in runtime_b.store.events_after("b-only-chat", 0))
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            for path, body in (
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/messages", {"text": "never"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/approve", {"revision": 1}),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/edit", _edited_brief(replace(valid_brief, task_id="b-only-task"))),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/reject", None),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/answer", {"answer": "never"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/resume", None),
+            ):
+                assert client.post(path, json=body, headers=headers).status_code == 404
+            assert client.post(
+                f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/stop",
+                headers=headers,
+            ).status_code == 409
+            assert client.get(
+                f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/bootstrap"
+            ).status_code == 404
+            with pytest.raises(WebSocketDisconnect) as caught:
+                with client.websocket_connect(
+                    f"/ws?project_id={runtime_a.project_id}&session_id=b-only-chat&after=0"
+                ):
+                    pass
+        assert caught.value.code == 1008
+        assert tuple(event.to_dict() for event in runtime_a.store.events_after("shared-chat", 0)) == before_a
+        assert tuple(event.to_dict() for event in runtime_b.store.events_after("b-only-chat", 0)) == before_b
+        assert runtime_b.store.get_task("b-only-task", 1).state is TaskState.AWAITING_USER_APPROVAL
+        assert harness.lease.snapshot() is None
+    finally:
+        harness.close()
+
+
 def test_hub_chats_are_project_local_and_first_message_updates_only_its_title(
     hub_harness: _HubHarness,
 ) -> None:
@@ -2144,15 +2379,15 @@ def test_active_lease_synchronously_gates_navigation_model_mutations_and_exact_s
     assert hub_harness.workflows.prepared == []
 
 
-def test_stop_route_carries_generation_one_token_into_a_delayed_same_identity_reacquire(
+def test_stop_route_reserves_generation_one_before_a_delayed_child_can_start(
     tmp_path: Path,
     valid_brief: TaskBrief,
 ) -> None:
-    """Passing only IDs here would let the delayed Stop terminate generation two."""
+    """A route that schedules before reserving would let generation two replace Stop."""
     harness = _real_hub_harness(tmp_path)
     runtime = harness.runtimes["a"]
     runtime.store.save_task(
-        "shared-chat", valid_brief, TaskState.AWAITING_USER_APPROVAL,
+        "shared-chat", valid_brief, TaskState.FABLE_PLANNING,
     )
     token = harness.lease.acquire(
         project_id=runtime.project_id,
@@ -2178,21 +2413,59 @@ def test_stop_route_carries_generation_one_token_into_a_delayed_same_identity_re
             assert response.status_code == 202
             client.portal.call(delayed.entered.wait)
             harness.lease.release(token)
-            successor = harness.lease.acquire(
-                project_id=runtime.project_id,
-                session_id="shared-chat",
-                task_id=valid_brief.task_id,
-            )
-            assert successor.generation == token.generation + 1
+            assert harness.lease.snapshot() == token
+            with pytest.raises(RuntimeError, match="another workflow"):
+                harness.lease.acquire(
+                    project_id=runtime.project_id,
+                    session_id="shared-chat",
+                    task_id=valid_brief.task_id,
+                )
             client.portal.call(delayed.release.set)
             _wait_until(lambda: not app.state.active_coroutines)
         task = runtime.store.get_task(valid_brief.task_id, valid_brief.revision)
-        assert task.state is TaskState.AWAITING_USER_APPROVAL
-        assert harness.lease.snapshot() == successor
-        assert [event.kind for event in runtime.store.events_after("shared-chat", 0)] == [
-            "action_error",
-        ]
+        assert task.state is TaskState.INTERRUPTED
+        assert harness.lease.snapshot() is None
+        assert runtime.store.events_after("shared-chat", 0)[-1].kind == "task_state"
         assert app.state.coroutine_observation_failures == []
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("owner_finishes", (False, True))
+def test_stop_scheduler_rejection_cancels_only_its_reservation_without_mutating_the_task(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_finishes: bool,
+) -> None:
+    """A failed outer schedule must not clear the still-active exact workflow."""
+    harness = _real_hub_harness(tmp_path)
+    runtime = harness.runtimes["a"]
+    runtime.store.save_task("shared-chat", valid_brief, TaskState.FABLE_PLANNING)
+    token = harness.lease.acquire(
+        project_id=runtime.project_id,
+        session_id="shared-chat",
+        task_id=valid_brief.task_id,
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        if owner_finishes:
+            harness.lease.release(token)
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/tasks/{valid_brief.task_id}/stop",
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 503
+        assert runtime.store.get_task(valid_brief.task_id, valid_brief.revision).state is TaskState.FABLE_PLANNING
+        assert runtime.store.events_after("shared-chat", 0) == ()
+        assert harness.lease.snapshot() is (None if owner_finishes else token)
+        assert harness.app.state.active_coroutines == set()
     finally:
         harness.close()
 
@@ -2211,7 +2484,9 @@ def test_real_foreign_lease_rejects_navigation_and_model_preparation_before_stor
     runtime_a.store.save_task("shared-chat", approval, TaskState.AWAITING_USER_APPROVAL)
     runtime_a.store.save_task("shared-chat", answer, TaskState.AWAITING_USER_INPUT)
     runtime_a.store.save_task("shared-chat", resume, TaskState.INTERRUPTED)
-    token = harness.lease.acquire(
+    foreign_brief = replace(valid_brief, task_id="foreign-task")
+    runtime_b.store.save_task("shared-chat", foreign_brief, TaskState.FABLE_PLANNING)
+    harness.lease.acquire(
         project_id=runtime_b.project_id,
         session_id="shared-chat",
         task_id="foreign-task",
@@ -2236,17 +2511,29 @@ def test_real_foreign_lease_rejects_navigation_and_model_preparation_before_stor
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/resume-task/resume", None),
             ):
                 assert client.post(path, json=body, headers=headers).status_code == 409
+            with pytest.raises(WebSocketDisconnect) as caught:
+                with client.websocket_connect(
+                    f"/ws?project_id={runtime_a.project_id}&session_id=shared-chat&after=0"
+                ):
+                    pass
+            assert caught.value.code == 1008
+            assert client.post(
+                f"/api/projects/{runtime_b.project_id}/chats/shared-chat/tasks/foreign-task/stop",
+                headers=headers,
+            ).status_code == 202
+            _wait_until(lambda: harness.lease.snapshot() is None)
         assert harness.probes["a"].fable_calls == 0
         assert harness.probes["a"].sol_calls == 0
         assert harness.app.state.active_coroutines == set()
         assert runtime_a.store.events_after("shared-chat", 0) == ()
-        assert runtime_a.store.latest_prepared_action_for_task(
-            project_id=runtime_a.project_id,
-            session_id="shared-chat",
-            task_id="approval-task",
-            revision=1,
-        ) is None
-        assert harness.lease.snapshot() == token
+        for task_id in ("approval-task", "answer-task", "resume-task"):
+            assert runtime_a.store.latest_prepared_action_for_task(
+                project_id=runtime_a.project_id,
+                session_id="shared-chat",
+                task_id=task_id,
+                revision=1,
+            ) is None
+        assert runtime_b.store.get_task("foreign-task", 1).state is TaskState.INTERRUPTED
     finally:
         harness.close()
 
@@ -2348,10 +2635,15 @@ def test_real_http_preparation_refreshes_fable_readiness_after_each_lease_acquis
     (
         (_HANGING_PROBE, "ready", RuntimeStatus(False, "subscription_unavailable", "unavailable")),
         ("malformed-fable-result", "ready", RuntimeStatus(False, "subscription_unavailable", "unavailable")),
+        ((True, "subscription_ready"), _HANGING_PROBE, RuntimeStatus(False, "subscription_unavailable", "unavailable")),
+        ((True, "subscription_ready"), 7, RuntimeStatus(False, "subscription_unavailable", "unavailable")),
         ((False, "subscription_unavailable"), "ready", RuntimeStatus(False, "subscription_unavailable", "ready")),
         ((True, "subscription_ready"), "unavailable", RuntimeStatus(True, "subscription_ready", "unavailable")),
     ),
-    ids=("timeout", "malformed", "fable-unavailable", "sol-unavailable"),
+    ids=(
+        "fable-timeout", "fable-malformed", "sol-timeout", "sol-malformed",
+        "fable-unavailable", "sol-unavailable",
+    ),
 )
 def test_real_http_readiness_failures_release_lease_without_durable_preparation(
     tmp_path: Path,

@@ -551,6 +551,49 @@ def create_hub_app(
         )
         return True
 
+    def install_stop_action(
+        *,
+        runtime: object,
+        session_id: str,
+        task_id: str,
+        coroutine_factory: Callable[[], Coroutine[object, object, None]],
+        cancel_reservation: Callable[[], None],
+    ) -> bool:
+        """Install a reserved Stop or synchronously return its exact claim."""
+        if app.state.shutting_down:
+            try:
+                cancel_reservation()
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "stop_reservation", "error_type": type(error).__name__}
+                )
+            return False
+        coroutine: Coroutine[object, object, None] | None = None
+        try:
+            coroutine = coroutine_factory()
+            task = asyncio.create_task(coroutine, name="agent-bridge-stop")
+        except BaseException:
+            if coroutine is not None:
+                coroutine.close()
+            try:
+                cancel_reservation()
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "stop_reservation", "error_type": type(error).__name__}
+                )
+            return False
+        app.state.active_coroutines.add(task)
+        task.add_done_callback(
+            lambda completed: observe_coroutine(
+                completed,
+                runtime=runtime,
+                session_id=session_id,
+                task_id=task_id,
+                action="stop",
+            )
+        )
+        return True
+
     # This closure deliberately owns only the task it installs.  The workflow
     # object remains the sole owner of the lease and durable preparation.
     def install_prepared_action(
@@ -955,24 +998,25 @@ def create_hub_app(
     ) -> Response:
         runtime = selected_runtime(project_id)
         try:
-            stop_token = workflows.require_exact_stop_owner(
+            stop_reservation = workflows.reserve_stop(
                 project_id=project_id, session_id=session_id, task_id=task_id,
             )
         except BaseException as error:
             workflow_http_error(error)
-        selected_chat(runtime, session_id)
-        selected_task(runtime, session_id, task_id)
-        if not install_action(
+        try:
+            selected_chat(runtime, session_id)
+            selected_task(runtime, session_id, task_id)
+        except BaseException:
+            workflows.cancel_stop_reservation(stop_reservation)
+            raise
+        if not install_stop_action(
             runtime=runtime,
             session_id=session_id,
             task_id=task_id,
-            action="stop",
             coroutine_factory=lambda: workflows.stop(
-                project_id=project_id,
-                session_id=session_id,
-                task_id=task_id,
-                token=stop_token,
+                reservation=stop_reservation,
             ),
+            cancel_reservation=lambda: workflows.cancel_stop_reservation(stop_reservation),
         ):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

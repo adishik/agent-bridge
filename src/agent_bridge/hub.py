@@ -224,6 +224,14 @@ class LeaseToken:
     task_id: str
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class StopReservation:
+    """Opaque, exact ownership claim for one reserved Stop operation."""
+
+    _token: LeaseToken
+    _claim_id: int
+
+
 class ActiveAgentLease:
     """One process-wide lease whose generation prevents stale release races."""
 
@@ -231,6 +239,9 @@ class ActiveAgentLease:
         self._lock = threading.Lock()
         self._generation = 0
         self._active: LeaseToken | None = None
+        self._stop_reservation: StopReservation | None = None
+        self._pending_owner_release = False
+        self._next_stop_claim_id = 0
 
     def acquire_new(
         self, *, project_id: str, session_id: str, ids: IdFactory,
@@ -260,7 +271,74 @@ class ActiveAgentLease:
             raise ValueError("token must be a LeaseToken")
         with self._lock:
             if self._active == token:
+                if (
+                    self._stop_reservation is not None
+                    and self._stop_reservation._token == token
+                ):
+                    self._pending_owner_release = True
+                    return
                 self._active = None
+
+    def reserve_stop(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> StopReservation:
+        """Pin the exact active lease before any Stop coroutine may be created."""
+        self._require_id(project_id, "project_id")
+        self._require_id(session_id, "session_id")
+        self._require_id(task_id, "task_id")
+        with self._lock:
+            token = self._active
+            if (
+                token is None
+                or token.project_id != project_id
+                or token.session_id != session_id
+                or token.task_id != task_id
+                or self._stop_reservation is not None
+            ):
+                raise RuntimeError("stop requires the exact active workflow")
+            self._next_stop_claim_id += 1
+            reservation = StopReservation(token, self._next_stop_claim_id)
+            self._stop_reservation = reservation
+            self._pending_owner_release = False
+            return reservation
+
+    def stop_reservation_token(self, reservation: StopReservation) -> LeaseToken:
+        """Validate and return the precise token held by a Stop reservation."""
+        if not isinstance(reservation, StopReservation):
+            raise ValueError("stop reservation is invalid")
+        with self._lock:
+            if (
+                self._stop_reservation != reservation
+                or self._active != reservation._token
+            ):
+                raise RuntimeError("stop requires the exact active workflow")
+            return reservation._token
+
+    def cancel_stop_reservation(self, reservation: StopReservation) -> None:
+        """Cancel only this reservation and apply any deferred owner release."""
+        if not isinstance(reservation, StopReservation):
+            raise ValueError("stop reservation is invalid")
+        with self._lock:
+            if self._stop_reservation is None:
+                return
+            if self._stop_reservation != reservation:
+                raise RuntimeError("stop requires the exact active workflow")
+            if self._active != reservation._token:
+                raise RuntimeError("stop requires the exact active workflow")
+            if self._pending_owner_release:
+                self._active = None
+            self._stop_reservation = None
+            self._pending_owner_release = False
+
+    def complete_stop_reservation(self, reservation: StopReservation) -> None:
+        """Finalize an exact Stop and release its pinned active lease."""
+        self.stop_reservation_token(reservation)
+        with self._lock:
+            if self._stop_reservation != reservation:
+                raise RuntimeError("stop requires the exact active workflow")
+            self._active = None
+            self._stop_reservation = None
+            self._pending_owner_release = False
 
     def snapshot(self) -> LeaseToken | None:
         with self._lock:
@@ -392,6 +470,18 @@ class HubWorkflowOrchestrator:
             raise RuntimeError("stop requires the exact active workflow")
         return token
 
+    def reserve_stop(
+        self, *, project_id: str, session_id: str, task_id: str,
+    ) -> StopReservation:
+        """Atomically pin one exact active lease for a Stop installation."""
+        return self._lease.reserve_stop(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
+
+    def cancel_stop_reservation(self, reservation: StopReservation) -> None:
+        """Release a failed Stop installation without disturbing its workflow."""
+        self._lease.cancel_stop_reservation(reservation)
+
     async def prepare_new_request(
         self,
         *,
@@ -511,31 +601,25 @@ class HubWorkflowOrchestrator:
     async def stop(
         self,
         *,
-        project_id: str,
-        session_id: str,
-        task_id: str,
-        token: LeaseToken,
+        reservation: StopReservation,
     ) -> None:
-        self._require_exact_stop_token(
-            project_id=project_id, session_id=session_id, task_id=task_id, token=token,
-        )
-        runtime = self._runtime_for_session(project_id, session_id)
-        stopping = asyncio.create_task(runtime.coordinator.stop_task(task_id))
+        token = self._lease.stop_reservation_token(reservation)
+        stopping: asyncio.Task[None] | None = None
         try:
+            runtime = self._runtime_for_session(token.project_id, token.session_id)
+            stopping = asyncio.create_task(runtime.coordinator.stop_task(token.task_id))
             # ``stop_task`` persists the interrupted task before it waits for
             # the child.  Let it reach that durable boundary, then record the
             # exact claim as stopped before the child completion can look like
             # a normal prepared-action completion.
             await asyncio.sleep(0)
-            self._require_exact_stop_token(
-                project_id=project_id, session_id=session_id, task_id=task_id, token=token,
-            )
-            latest = runtime.store.latest_task(task_id)
+            self._lease.stop_reservation_token(reservation)
+            latest = runtime.store.latest_task(token.task_id)
             if latest is not None:
                 record = runtime.store.latest_prepared_action_for_task(
-                    project_id=project_id,
-                    session_id=session_id,
-                    task_id=task_id,
+                    project_id=token.project_id,
+                    session_id=token.session_id,
+                    task_id=token.task_id,
                     revision=latest.revision,
                 )
                 if (
@@ -547,14 +631,12 @@ class HubWorkflowOrchestrator:
                         record.preparation_id, generation=token.generation, reason="stop",
                     )
             await stopping
-            self._require_exact_stop_token(
-                project_id=project_id, session_id=session_id, task_id=task_id, token=token,
-            )
-            self._lease.release(token)
+            self._lease.complete_stop_reservation(reservation)
         except BaseException:
-            if not stopping.done():
+            if stopping is not None and not stopping.done():
                 stopping.cancel()
                 await asyncio.gather(stopping, return_exceptions=True)
+            self._lease.cancel_stop_reservation(reservation)
             raise
 
     async def _prepare_existing(
@@ -620,24 +702,6 @@ class HubWorkflowOrchestrator:
     def _require_acknowledgement(self) -> None:
         if self._usage_credits_acknowledged() is not True:
             raise PermissionError("usage credits must be acknowledged")
-
-    def _require_exact_stop_token(
-        self,
-        *,
-        project_id: str,
-        session_id: str,
-        task_id: str,
-        token: LeaseToken,
-    ) -> None:
-        if not isinstance(token, LeaseToken):
-            raise ValueError("stop token must be a LeaseToken")
-        if (
-            token.project_id != project_id
-            or token.session_id != session_id
-            or token.task_id != task_id
-            or self._lease.snapshot() != token
-        ):
-            raise RuntimeError("stop requires the exact active workflow")
 
     @staticmethod
     def _require_non_empty(value: object, name: str) -> None:
