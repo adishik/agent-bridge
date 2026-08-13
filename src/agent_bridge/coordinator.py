@@ -44,6 +44,7 @@ from agent_bridge.store import (
     ReviewContext,
     ResumeDriftProjection,
     ResumePayload,
+    RecoverySummary,
     ScopeApprovalContext,
     SolResumeContext,
     SQLiteStore,
@@ -528,7 +529,7 @@ class Coordinator:
             preparation_id, generation=generation, reason=reason,
         )
 
-    def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]:
+    def recover_unfinished_prepared_actions(self) -> RecoverySummary:
         return self._store.recover_unfinished_prepared_actions()
 
     def _sol_context(self, task: TaskRecord, prompt: str) -> SolResumeContext:

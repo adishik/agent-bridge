@@ -22,6 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import agent_bridge.store as store_module
 from agent_bridge.adapters.claude_cli import (
     ClaudeCLI,
     ClaudeRunError,
@@ -1092,7 +1093,11 @@ def test_restart_recovers_active_task_then_resumes_from_persisted_authority(
         )
 
         recovered = fake_bridge.restart()
-        assert [task.task_id for task in recovered] == [task_id]
+        assert recovered == store_module.RecoverySummary(
+            prepared_actions_recovered=0,
+            tasks_interrupted=1,
+            agent_runs_interrupted=1,
+        )
         interrupted = fake_bridge.latest(task_id)
         assert interrupted.state is TaskState.INTERRUPTED
         assert interrupted.continuation_state is active.state
@@ -2038,8 +2043,12 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
             label: hub.runtime(label) for label in ("alpha", "beta")
         }
         recovered = hub.restart()
-        assert [task.task_id for task in recovered["alpha"]] == ["recovery-only"]
-        assert recovered["beta"] == ()
+        assert recovered["alpha"] == store_module.RecoverySummary(
+            prepared_actions_recovered=0,
+            tasks_interrupted=1,
+            agent_runs_interrupted=0,
+        )
+        assert recovered["beta"] == store_module.RecoverySummary(0, 0, 0)
         assert hub.hub_store is not former_hub_store
         assert hub.registry is not former_registry
         assert hub.app is not former_app

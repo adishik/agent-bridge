@@ -818,8 +818,10 @@ def test_startup_recovery_interrupts_active_tasks_and_stale_runs_without_signals
 
     recovered = store.recover_active_tasks()
 
-    assert tuple((task.task_id, task.revision) for task in recovered) == tuple(
-        (task_id, revision) for task_id, revision, _ in identities
+    assert recovered == store_module.RecoverySummary(
+        prepared_actions_recovered=0,
+        tasks_interrupted=5,
+        agent_runs_interrupted=2,
     )
     for task_id, revision, prior_state in identities:
         task = store.get_task(task_id, revision)
@@ -835,7 +837,7 @@ def test_startup_recovery_interrupts_active_tasks_and_stale_runs_without_signals
     assert store.agent_run("inconsistent-run").status == "interrupted"
     assert store.active_run_for_task("active-1", 1) is None
     assert signal_calls == []
-    assert store.recover_active_tasks() == ()
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
 
 
 def test_startup_recovery_rolls_back_task_and_run_retirement_together(
@@ -876,8 +878,10 @@ def test_startup_recovery_interrupts_only_latest_active_task_revision(
 
     recovered = store.recover_active_tasks()
 
-    assert tuple((task.task_id, task.revision) for task in recovered) == (
-        (latest.task_id, latest.revision),
+    assert recovered == store_module.RecoverySummary(
+        prepared_actions_recovered=0,
+        tasks_interrupted=1,
+        agent_runs_interrupted=1,
     )
     assert store.get_task(historical.task_id, historical.revision).state is (
         TaskState.FABLE_PLANNING
@@ -887,7 +891,93 @@ def test_startup_recovery_interrupts_only_latest_active_task_revision(
     assert interrupted.continuation_state is TaskState.SOL_RUNNING
     assert store.agent_run("finished-plan").status == "completed"
     assert store.agent_run("active-sol").status == "interrupted"
-    assert store.recover_active_tasks() == ()
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+
+
+def test_recovery_summary_counts_only_this_calls_transitions(tmp_path, valid_brief) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    prepared = tuple(
+        store.prepare_new_request_action(
+            project_id="a" * 32,
+            session_id="session-1",
+            task_id=f"prepared-{index}",
+            generation=index,
+            payload=NewRequestPayload(text=f"prepared request {index}"),
+        )
+        for index in range(2)
+    )
+
+    assert store.recover_unfinished_prepared_actions() == store_module.RecoverySummary(
+        prepared_actions_recovered=2,
+        tasks_interrupted=2,
+        agent_runs_interrupted=0,
+    )
+    for record in prepared:
+        assert store.prepared_action(record.preparation_id).status == "RECOVERED"
+        assert store.get_task(record.task_id, record.revision).state is TaskState.INTERRUPTED
+
+    for index in range(3):
+        store.create_planning_task("session-1", f"active-{index}")
+        store.start_agent_run(f"active-run-{index}", f"active-{index}", 0, "fable")
+    paused = replace(valid_brief, task_id="paused", title="Paused")
+    store.save_task("session-1", paused, TaskState.AWAITING_USER_APPROVAL)
+    store.start_agent_run("inactive-run", "paused", paused.revision, "fable")
+
+    assert store.recover_active_tasks() == store_module.RecoverySummary(
+        prepared_actions_recovered=0,
+        tasks_interrupted=3,
+        agent_runs_interrupted=4,
+    )
+    for index in range(3):
+        assert store.get_task(f"active-{index}", 0).state is TaskState.INTERRUPTED
+        assert store.agent_run(f"active-run-{index}").status == "interrupted"
+    assert store.agent_run("inactive-run").status == "interrupted"
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+
+
+def test_recovery_summary_is_immutable_and_validated() -> None:
+    summary_type = store_module.RecoverySummary
+    summary = summary_type(1, 2, 3)
+
+    assert summary.prepared_actions_recovered == 1
+    assert summary.tasks_interrupted == 2
+    assert summary.agent_runs_interrupted == 3
+    with pytest.raises(ValueError, match="prepared_actions_recovered must be a non-negative integer"):
+        summary_type(True, 0, 0)
+    with pytest.raises(ValueError, match="tasks_interrupted must be a non-negative integer"):
+        summary_type(0, 1.5, 0)
+    with pytest.raises(ValueError, match="agent_runs_interrupted must be a non-negative integer"):
+        summary_type(0, 0, -1)
+
+
+def test_active_recoverable_rows_are_bounded(tmp_path) -> None:
+    """Active recovery retains no Python-sized record collection after batching."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    recoverable_count = 4_000
+    store._connection.executemany(
+        """
+        INSERT INTO tasks (task_id, revision, session_id, state, correction_count)
+        VALUES (?, 0, 'session-1', ?, 0)
+        """,
+        (
+            (f"active-bounded-{index:05d}", TaskState.FABLE_PLANNING.value)
+            for index in range(recoverable_count)
+        ),
+    )
+
+    tracemalloc.start()
+    try:
+        recovered = store.recover_active_tasks()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1_000_000
+    assert recovered == store_module.RecoverySummary(0, recoverable_count, 0)
+    assert store.get_task("active-bounded-00000", 0).state is TaskState.INTERRUPTED
+    assert store.get_task("active-bounded-03999", 0).state is TaskState.INTERRUPTED
 
 
 def test_session_repository_lookup_is_exact_and_absent_safe(tmp_path) -> None:
@@ -2018,29 +2108,26 @@ def test_legacy_audit_accepts_answer_context_with_matching_existing_sol_run(
     assert store.audit_legacy_project_ownership(canonical_root) is None
 
 
-def test_startup_audit_and_recovery_do_not_materialize_large_unrelated_history(
+def test_prepared_recoverable_rows_are_bounded(
     tmp_path,
 ) -> None:
-    """Large completed history must not become a Python-sized startup snapshot."""
+    """Prepared recovery retains no Python-sized record collection after batching."""
     repo = tmp_path / "repo"
     repo.mkdir()
     canonical_repo = str(repo.resolve())
     store = _store(tmp_path)
     store.create_session("session-1", canonical_repo)
     store.set_setting("agent_bridge.active_session_id", "session-1")
-    store._connection.executemany(
-        """
-        INSERT INTO tasks (task_id, revision, session_id, state, correction_count)
-        VALUES (?, 0, 'session-1', 'completed', 0)
-        """,
-        ((f"finished-{index:05d}",) for index in range(20_000)),
-    )
-    prepared = store.prepare_new_request_action(
-        project_id=project_id_for_root(repo.resolve()),
-        session_id="session-1",
-        task_id="active-task",
-        generation=1,
-        payload=NewRequestPayload("one active action"),
+    recoverable_count = 4_000
+    prepared = tuple(
+        store.prepare_new_request_action(
+            project_id=project_id_for_root(repo.resolve()),
+            session_id="session-1",
+            task_id=f"prepared-bounded-{index:05d}",
+            generation=index,
+            payload=NewRequestPayload(f"prepared request {index}"),
+        )
+        for index in range(recoverable_count)
     )
 
     tracemalloc.start()
@@ -2051,8 +2138,12 @@ def test_startup_audit_and_recovery_do_not_materialize_large_unrelated_history(
     finally:
         tracemalloc.stop()
 
-    assert recovered[0].preparation_id == prepared.preparation_id
-    assert peak < 2_500_000
+    assert peak < 1_000_000
+    assert recovered == store_module.RecoverySummary(recoverable_count, recoverable_count, 0)
+    assert store.prepared_action(prepared[0].preparation_id).status == "RECOVERED"
+    assert store.prepared_action(prepared[-1].preparation_id).status == "RECOVERED"
+    assert store.get_task(prepared[0].task_id, prepared[0].revision).state is TaskState.INTERRUPTED
+    assert store.get_task(prepared[-1].task_id, prepared[-1].revision).state is TaskState.INTERRUPTED
 
 
 def test_prepared_action_new_request_is_store_owned_and_has_no_task_pending_context(
@@ -2118,7 +2209,10 @@ def test_prepared_action_claim_abort_and_recovery_are_exact_and_durable(tmp_path
     recovered = store.recover_unfinished_prepared_actions()
 
     assert claimed.status == "CLAIMED"
-    assert recovered == (replace(claimed, status="RECOVERED", reason=None),)
+    assert recovered == store_module.RecoverySummary(1, 1, 0)
+    assert store.prepared_action(claimed.preparation_id) == replace(
+        claimed, status="RECOVERED", reason=None,
+    )
     interrupted = store.get_task("task-2", 0)
     assert interrupted.state is TaskState.INTERRUPTED
     assert interrupted.continuation_state is TaskState.FABLE_PLANNING

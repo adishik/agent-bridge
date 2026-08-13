@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_bridge.store as store_module
 from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.adapters.claude_cli import ClaudeRunError
 from agent_bridge.adapters.codex_cli import CodexRunError
@@ -420,6 +421,24 @@ def harness(tmp_path: Path, valid_brief: TaskBrief) -> CoordinatorHarness:
         ids=ids,
         coordinator=coordinator,
     )
+
+
+def test_coordinator_forwards_recovery_summary(harness: CoordinatorHarness) -> None:
+    prepared = harness.store.prepare_new_request_action(
+        project_id=harness.coordinator.project_id,
+        session_id="session-1",
+        task_id="recover-through-coordinator",
+        generation=1,
+        payload=NewRequestPayload("recover this prepared action"),
+    )
+
+    assert harness.coordinator.recover_unfinished_prepared_actions() == store_module.RecoverySummary(
+        prepared_actions_recovered=1,
+        tasks_interrupted=1,
+        agent_runs_interrupted=0,
+    )
+    assert harness.store.prepared_action(prepared.preparation_id).status == "RECOVERED"
+    assert harness.store.get_task(prepared.task_id, prepared.revision).state is TaskState.INTERRUPTED
 
 
 def test_sol_never_starts_before_exact_revision_approval(harness) -> None:

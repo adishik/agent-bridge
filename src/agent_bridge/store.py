@@ -81,6 +81,25 @@ class TaskRecord:
     pending: Mapping[str, JsonValue] | None
 
 
+@dataclass(frozen=True, slots=True)
+class RecoverySummary:
+    """Constant-size durable-transition counts from one startup recovery call."""
+
+    prepared_actions_recovered: int
+    tasks_interrupted: int
+    agent_runs_interrupted: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prepared_actions_recovered",
+            "tasks_interrupted",
+            "agent_runs_interrupted",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+
 def _prepared_text(value: object, name: str) -> str:
     text = _require_string(value, name)
     if len(text) > _MAX_PREPARED_TEXT_LENGTH:
@@ -1565,8 +1584,9 @@ class SQLiteStore:
             self._publish_committed_events(emitted)
         return self._prepared_required(preparation_id)
 
-    def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]:
-        recovered_ids: list[str] = []
+    def recover_unfinished_prepared_actions(self) -> RecoverySummary:
+        prepared_actions_recovered = 0
+        tasks_interrupted = 0
         with self._immediate_transaction():
             last_preparation_id = ""
             while True:
@@ -1603,6 +1623,7 @@ class SQLiteStore:
                         )
                         if cursor.rowcount != 1:
                             raise RuntimeError("unfinished prepared action task changed")
+                        tasks_interrupted += cursor.rowcount
                     elif task.state is not TaskState.INTERRUPTED:
                         raise RuntimeError("unfinished prepared action task changed")
                     else:
@@ -1627,13 +1648,22 @@ class SQLiteStore:
                         )
                         if cursor.rowcount != 1:
                             raise RuntimeError("unfinished prepared action task changed")
-                    self._connection.execute(
-                        "UPDATE prepared_actions SET status = 'RECOVERED', reason = NULL WHERE preparation_id = ?",
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE prepared_actions SET status = 'RECOVERED', reason = NULL
+                        WHERE preparation_id = ? AND status IN ('PREPARED', 'CLAIMED')
+                        """,
                         (record.preparation_id,),
                     )
-                    recovered_ids.append(record.preparation_id)
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("unfinished prepared action changed")
+                    prepared_actions_recovered += cursor.rowcount
                 last_preparation_id = str(rows[-1]["preparation_id"])
-        return tuple(self._prepared_required(identifier) for identifier in recovered_ids)
+        return RecoverySummary(
+            prepared_actions_recovered=prepared_actions_recovered,
+            tasks_interrupted=tasks_interrupted,
+            agent_runs_interrupted=0,
+        )
 
     def _prepared_identity(
         self,
@@ -3118,7 +3148,7 @@ class SQLiteStore:
         ).fetchone()
         return None if row is None else self._agent_run_from_row(row)
 
-    def recover_active_tasks(self) -> tuple[TaskRecord, ...]:
+    def recover_active_tasks(self) -> RecoverySummary:
         """Atomically retire process-local work left active by an old server.
 
         Persisted PIDs and process groups are inert audit data. Startup recovery
@@ -3127,7 +3157,7 @@ class SQLiteStore:
         """
         active_values = tuple(state.value for state in _ACTIVE_TASK_STATES)
         placeholders = ", ".join("?" for _ in active_values)
-        identities: list[tuple[str, int]] = []
+        tasks_interrupted = 0
         with self._immediate_transaction():
             while True:
                 rows = self._connection.execute(
@@ -3160,8 +3190,8 @@ class SQLiteStore:
                     )
                     if cursor.rowcount != 1:
                         raise RuntimeError("active task changed during startup recovery")
-                    identities.append((task_id, revision))
-            self._connection.execute(
+                    tasks_interrupted += cursor.rowcount
+            cursor = self._connection.execute(
                 """
                 UPDATE agent_runs
                 SET status = 'interrupted', ended_at = ?
@@ -3169,7 +3199,12 @@ class SQLiteStore:
                 """,
                 (self._timestamp(),),
             )
-        return tuple(self.get_task(task_id, revision) for task_id, revision in identities)
+            agent_runs_interrupted = cursor.rowcount
+        return RecoverySummary(
+            prepared_actions_recovered=0,
+            tasks_interrupted=tasks_interrupted,
+            agent_runs_interrupted=agent_runs_interrupted,
+        )
 
     def set_setting(self, key: str, value: object) -> None:
         self._connection.execute(
