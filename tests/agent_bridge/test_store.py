@@ -1663,6 +1663,36 @@ def _prepared_answer_for_legacy_audit(
     return store, canonical_root, prepared
 
 
+def _replace_prepared_answer_context(
+    store: SQLiteStore,
+    preparation_id: str,
+    *,
+    payload_context,
+    pending_context=None,
+) -> None:
+    """Persist a deliberately substituted Answer payload/pending context pair."""
+    if pending_context is None:
+        pending_context = payload_context
+    payload_data = store_module._context_to_data(payload_context)
+    pending_data = store_module._context_to_data(pending_context)
+    payload = json.loads(store._connection.execute(
+        "SELECT payload_json FROM prepared_actions WHERE preparation_id = ?",
+        (preparation_id,),
+    ).fetchone()["payload_json"])
+    payload["continuation"] = payload_data
+    store._connection.execute(
+        """
+        UPDATE prepared_actions SET payload_json = ?, pending_context_json = ?
+        WHERE preparation_id = ?
+        """,
+        (
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            json.dumps(pending_data, separators=(",", ":"), sort_keys=True),
+            preparation_id,
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("prepared_active_state", "corrupt_active_state", "corrupt_context"),
     (
@@ -1751,25 +1781,12 @@ def test_legacy_audit_rejects_answer_context_incompatible_with_active_state(
         active_state=prepared_active_state,
         continuation=valid_continuation,
     )
-    corrupt_data = store_module._context_to_data(corrupt_context)
-    payload = json.loads(store._connection.execute(
-        "SELECT payload_json FROM prepared_actions WHERE preparation_id = ?",
-        (prepared.preparation_id,),
-    ).fetchone()["payload_json"])
-    payload["continuation"] = corrupt_data
+    _replace_prepared_answer_context(
+        store, prepared.preparation_id, payload_context=corrupt_context,
+    )
     store._connection.execute(
-        """
-        UPDATE prepared_actions
-        SET payload_json = ?, pending_context_json = ?, active_state = ?, continuation_state = ?
-        WHERE preparation_id = ?
-        """,
-        (
-            json.dumps(payload, separators=(",", ":"), sort_keys=True),
-            json.dumps(corrupt_data, separators=(",", ":"), sort_keys=True),
-            corrupt_active_state.value,
-            corrupt_active_state.value,
-            prepared.preparation_id,
-        ),
+        "UPDATE prepared_actions SET active_state = ?, continuation_state = ? WHERE preparation_id = ?",
+        (corrupt_active_state.value, corrupt_active_state.value, prepared.preparation_id),
     )
     before = _legacy_table_rows(store._connection)
 
@@ -1792,6 +1809,19 @@ def test_legacy_audit_rejects_answer_context_incompatible_with_active_state(
                 "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
             ),
             id="sol_running",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            ScopeApprovalContext(
+                "baseline-1",
+                1,
+                SolResumeContext(
+                    "11111111-1111-4111-8111-111111111111",
+                    "run-sol",
+                    "continue exact work",
+                ),
+            ),
+            id="sol_running_top_level_scope",
         ),
         pytest.param(
             TaskState.SOL_CORRECTING,
@@ -1823,6 +1853,121 @@ def test_legacy_audit_accepts_each_valid_prepared_answer_context_family(
 
     assert store.audit_legacy_project_ownership(canonical_root) is None
     assert store.prepared_action(prepared.preparation_id) == prepared
+
+
+def test_legacy_audit_rejects_answer_context_when_payload_and_pending_differ(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """Payload and pending continuation must remain the same persisted context."""
+    payload_context = SolResumeContext(
+        "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+    )
+    pending_context = SolResumeContext(
+        "11111111-1111-4111-8111-111111111111", "run-sol-other", "continue other work",
+    )
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=TaskState.SOL_RUNNING,
+        continuation=payload_context,
+    )
+    _replace_prepared_answer_context(
+        store,
+        prepared.preparation_id,
+        payload_context=payload_context,
+        pending_context=pending_context,
+    )
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(canonical_root)
+
+    assert _legacy_table_rows(store._connection) == before
+
+
+@pytest.mark.parametrize(
+    ("active_state", "valid_context", "corrupt_context"),
+    (
+        pytest.param(
+            TaskState.FABLE_REVIEWING,
+            ReviewContext(
+                "fable-session", "review exact work", False,
+                ScopeApprovalContext("baseline-1", 1, None),
+            ),
+            ReviewContext(
+                "foreign-fable-session", "review exact work", False,
+                ScopeApprovalContext("baseline-1", 1, None),
+            ),
+            id="wrong_fable_session",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            SolResumeContext(
+                "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+            ),
+            SolResumeContext(
+                "22222222-2222-4222-8222-222222222222", "run-sol", "continue exact work",
+            ),
+            id="wrong_sol_thread",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            ScopeApprovalContext(
+                "baseline-1", 1,
+                SolResumeContext(
+                    "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+                ),
+            ),
+            ScopeApprovalContext(
+                "foreign-baseline", 1,
+                SolResumeContext(
+                    "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+                ),
+            ),
+            id="wrong_baseline",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            ScopeApprovalContext(
+                "baseline-1", 1,
+                SolResumeContext(
+                    "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+                ),
+            ),
+            ScopeApprovalContext(
+                "baseline-1", 2,
+                SolResumeContext(
+                    "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+                ),
+            ),
+            id="wrong_approved_revision",
+        ),
+    ),
+)
+def test_legacy_audit_rejects_answer_context_with_wrong_task_identifier(
+    tmp_path,
+    valid_brief,
+    active_state: TaskState,
+    valid_context,
+    corrupt_context,
+) -> None:
+    """Each independently persisted task identifier must authenticate exactly."""
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=active_state,
+        continuation=valid_context,
+    )
+    _replace_prepared_answer_context(
+        store, prepared.preparation_id, payload_context=corrupt_context,
+    )
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(canonical_root)
+
+    assert _legacy_table_rows(store._connection) == before
 
 
 def test_legacy_audit_rejects_answer_context_with_foreign_existing_sol_run(
