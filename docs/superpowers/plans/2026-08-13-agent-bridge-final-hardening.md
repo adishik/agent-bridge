@@ -82,7 +82,7 @@ Expected: FAIL because the current Answer audit checks state shape and lineage b
 - [ ] **Step 3: Add positive context-family coverage**
 
 Use real store transitions to persist valid Answer continuations for
-`SOL_RUNNING`, `SOL_CORRECTING`, review, and clarification families accepted by
+`SOL_RUNNING`, `SOL_CORRECTING`, and review families accepted by
 `prepare_answer_action()`. Include the valid no-agent-run `SOL_CORRECTING` case.
 Assert the audit accepts each exact row. Expectations must be literal and must
 not call the new private helper.
@@ -107,14 +107,6 @@ def _legacy_prepared_context_matches_task(
                 task, context.underlying_continuation
             )
         )
-    if active_state is TaskState.FABLE_CLARIFYING:
-        return (
-            isinstance(context, ClarificationContext)
-            and context.fable_session_id == task.fable_session_id
-            and self._legacy_continuation_identifiers_match_task(
-                task, context.underlying_continuation
-            )
-        )
     return (
         active_state in _SOL_TASK_STATES
         and isinstance(context, (ScopeApprovalContext, SolResumeContext))
@@ -123,7 +115,7 @@ def _legacy_prepared_context_matches_task(
 ```
 
 Define the referenced identifier helper in the same task. It must recursively
-handle the four continuation families normal Answer preparation accepts. For a
+handle the three continuation families normal Answer preparation accepts. For a
 `SolResumeContext`, an existing agent-run row is additional authority; absence
 is allowed because the Store supports preparation before run persistence:
 
@@ -160,7 +152,7 @@ def _legacy_continuation_identifiers_match_task(
                 )
             )
         )
-    if isinstance(context, (ReviewContext, ClarificationContext)):
+    if isinstance(context, ReviewContext):
         return (
             context.fable_session_id == task.fable_session_id
             and self._legacy_continuation_identifiers_match_task(
@@ -174,9 +166,10 @@ It must:
 
 - reject `AnswerContext`, which normal `prepare_answer_action()` does not accept
   for any continuation state;
-- require `ReviewContext` only for `FABLE_REVIEWING`, `ClarificationContext`
-  only for `FABLE_CLARIFYING`, and scope/Sol continuation forms only for the
-  existing `_SOL_TASK_STATES` (`SOL_RUNNING` and `SOL_CORRECTING`);
+- require `ReviewContext` only for `FABLE_REVIEWING` and scope/Sol continuation
+  forms only for the existing `_SOL_TASK_STATES` (`SOL_RUNNING` and
+  `SOL_CORRECTING`); reject every prepared Answer targeting
+  `FABLE_CLARIFYING`, because normal creation cannot traverse that state edge;
 - bind Fable session, Sol thread, baseline, revision, and task fields exactly;
   when the referenced run exists, bind its task/revision/CLI session too, but do
   not require a run row or claim an independent prompt copy exists;

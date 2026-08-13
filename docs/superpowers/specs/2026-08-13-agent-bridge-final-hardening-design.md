@@ -31,9 +31,12 @@ The audit will apply the same context-to-state rules used by normal prepared
 action creation and Resume:
 
 - Answer continuations must match the task's exact continuation state and the
-  corresponding `ScopeApprovalContext`, `SolResumeContext`, `ReviewContext`, or
-  `ClarificationContext`. Sol continuations may target either `SOL_RUNNING` or
-  the existing valid `SOL_CORRECTING` state.
+  corresponding `ScopeApprovalContext`, `SolResumeContext`, or `ReviewContext`.
+  Sol continuations may target either `SOL_RUNNING` or the existing valid
+  `SOL_CORRECTING` state. A prepared Answer cannot validly target
+  `FABLE_CLARIFYING`: the finite state machine has no
+  `AWAITING_USER_INPUT -> FABLE_CLARIFYING` edge, so the legacy audit rejects
+  such rows rather than adding a new workflow in this hardening task.
 - Approval and Resume retain their existing baseline, predecessor, generation,
   and pending-projection checks.
 - A mismatched context type, Fable session, Sol thread, baseline, revision, or
