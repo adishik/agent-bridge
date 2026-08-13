@@ -119,3 +119,42 @@ in the handoff after the report is committed).
 Concern: the full required three-file test command has the pre-existing/reproducible
 unrelated two-project hub-ID failure described above. No Task 2 changes were
 made to that out-of-scope fixture.
+
+## Correction — E2E regression retracted and fixed
+
+The preceding “unrelated” classification was incorrect and is retracted.
+Comparing the exact E2E node against the clean `b6b0919` archive identified a
+Task 2 regression: `materialize_sol_schema_file()` used
+`secrets.token_hex(16)` for its internal temporary filename. The E2E fixture
+patches that module-global application ID source with a deterministic iterator,
+so each schema materialization consumed a browser-ID value and shifted
+`alpha-restarted` to `beta-restarted`.
+
+The exact node was rerun honestly as RED at `ea47789`:
+
+```sh
+PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+  tests/agent_bridge/test_e2e_fake_agents.py::test_two_project_http_websocket_workflow_isolated_by_hub_lease
+```
+
+Result: `1 failed`, with `beta-restarted` returned where
+`alpha-restarted` was expected.
+
+The minimal correction changes only the private temporary filename source to
+`os.urandom(16).hex()`. `O_EXCL` remains the collision safeguard; application
+ID generation and E2E expectations are untouched.
+
+GREEN evidence after that correction:
+
+```sh
+PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+  tests/agent_bridge/test_e2e_fake_agents.py::test_two_project_http_websocket_workflow_isolated_by_hub_lease
+PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+  tests/agent_bridge/test_e2e_fake_agents.py
+PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
+  tests/agent_bridge/test_codex_cli.py tests/agent_bridge/test_main.py \
+  tests/agent_bridge/test_e2e_fake_agents.py
+```
+
+Results: exact node passed; full fake-agent file `30 passed`; required combined
+lane `112 passed`.

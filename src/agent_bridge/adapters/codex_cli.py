@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import secrets
 import stat
 from uuid import UUID
 
@@ -97,7 +96,7 @@ def materialize_sol_schema_file(directory_fd: int) -> int:
     schema_file_descriptor = -1
     temporary_name: str | None = None
     try:
-        temporary_name = f".{_SOL_SCHEMA_FILENAME}-{secrets.token_hex(16)}.tmp"
+        temporary_name = f".{_SOL_SCHEMA_FILENAME}-{os.urandom(16).hex()}.tmp"
         write_descriptor = os.open(
             temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
