@@ -3726,7 +3726,7 @@ class SQLiteStore:
             else:
                 cursor = self._connection.execute(
                     """
-                    UPDATE tasks SET state = ?
+                    UPDATE tasks SET state = ?, continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND state = ?
                     """,
                     (target.value, task_id, revision, expected.value),
@@ -3750,7 +3750,8 @@ class SQLiteStore:
         with self._immediate_transaction():
             cursor = self._connection.execute(
                 """
-                UPDATE tasks SET state = ?, pending_json = NULL
+                UPDATE tasks
+                SET state = ?, pending_json = NULL, continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                   AND continuation_state IS NULL AND pending_json IS NOT NULL
                 """,
@@ -3922,7 +3923,7 @@ class SQLiteStore:
             raise ValueError("pending must be an object")
         cursor = self._connection.execute(
             """
-            UPDATE tasks SET pending_json = ?
+            UPDATE tasks SET pending_json = ?, continuation_pause_id = NULL
             WHERE task_id = ? AND revision = ? AND state = ?
               AND continuation_state IS NULL AND pending_json IS NULL
             """,
@@ -3942,7 +3943,7 @@ class SQLiteStore:
     ) -> TaskRecord:
         cursor = self._connection.execute(
             """
-            UPDATE tasks SET pending_json = NULL
+            UPDATE tasks SET pending_json = NULL, continuation_pause_id = NULL
             WHERE task_id = ? AND revision = ? AND state = ?
               AND continuation_state IS NULL AND pending_json IS NOT NULL
             """,
