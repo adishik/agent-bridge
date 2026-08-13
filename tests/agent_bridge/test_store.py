@@ -3127,31 +3127,36 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
     task_columns = tuple(
         row["name"] for row in migrated._connection.execute("PRAGMA table_info(tasks)")
     )
-    assert task_columns[-3:] == (
+    assert task_columns[-4:] == (
         "continuation_generation",
         "exchange_allowance",
         "exchange_consumed",
+        "continuation_pause_id",
     )
     assert tuple(migrated._connection.execute(
         """
-        SELECT continuation_generation, exchange_allowance, exchange_consumed
+        SELECT continuation_generation, exchange_allowance, exchange_consumed,
+               continuation_pause_id
         FROM tasks WHERE task_id = ? AND revision = ?
         """,
         ("task.legacy", 1),
-    ).fetchone()) == (1, INITIAL_INTERNAL_EXCHANGES, 0)
+    ).fetchone()) == (1, INITIAL_INTERNAL_EXCHANGES, 0, None)
     tables = {
         row["name"]
         for row in migrated._connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
-    assert {"questions", "exchange_reservations", "exchange_grants"} <= tables
+    assert {
+        "questions", "exchange_reservations", "exchange_grants", "exchange_permissions",
+    } <= tables
     question_columns = tuple(
         row["name"]
         for row in migrated._connection.execute("PRAGMA table_info(questions)")
     )
     assert "continuation_state" in question_columns
     assert "pending_action_json" in question_columns
+    assert "continuation_pause_id" in question_columns
     grant_columns = tuple(
         row["name"]
         for row in migrated._connection.execute("PRAGMA table_info(exchange_grants)")
@@ -3168,6 +3173,7 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
         "exchange_reservations_request_identity",
         "exchange_grants_request_identity",
         "exchange_grants_permission_identity",
+        "exchange_permissions_pause_identity",
     } <= indexes
     migrated.close()
 
@@ -3219,6 +3225,7 @@ def test_directed_question_exchange_migration_rolls_back_all_ddl_on_injected_fai
     assert "questions" not in tables
     assert "exchange_reservations" not in tables
     assert "exchange_grants" not in tables
+    assert "exchange_permissions" not in tables
     inspected.close()
 
 
@@ -3669,9 +3676,10 @@ def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
             "text": "A fourth question needs permission.",
             "reason": "The initial exchange allowance is exhausted.",
         },
-        "exchange_permission_id": (paused.pending or {})["exchange_permission_id"],
     }
-    assert isinstance((paused.pending or {})["exchange_permission_id"], str)
+    assert store._connection.execute(
+        "SELECT COUNT(*) FROM exchange_permissions WHERE grant_request_id IS NULL"
+    ).fetchone()[0] == 1
     assert store._connection.execute("SELECT COUNT(*) FROM exchange_reservations").fetchone()[0] == 3
     assert store._connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 3
 
@@ -3709,6 +3717,9 @@ def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
         WHERE exchange_allowance IS NULL OR exchange_consumed IS NULL
         """
     ).fetchone()[0] == 0
+    assert store._connection.execute(
+        "SELECT grant_request_id FROM exchange_permissions"
+    ).fetchone()[0] == "grant-1"
 
     store.resume_continuation(
         "exchange-task", 1, expected=TaskState.AWAITING_USER_INPUT,
@@ -4118,7 +4129,7 @@ def test_answer_rejects_a_question_detached_from_its_exact_pause(
         expected=TaskState.SOL_RUNNING,
         target=TaskState.AWAITING_USER_INPUT,
         continuation_state=TaskState.SOL_RUNNING,
-        pending={"next": "resume-unrelated-pause"},
+        pending={"next": "resume-original-question"},
     )
     before_task = store.get_task("detached-question-task", 1)
     before_question = store.question("detached-question")
@@ -4148,4 +4159,95 @@ def test_answer_rejects_a_question_detached_from_its_exact_pause(
 
     assert store.get_task("detached-question-task", 1) == before_task
     assert store.question("detached-question") == before_question
+    assert store.events_after("session-1", 0) == before_events
+
+
+def test_exchange_permission_requires_store_provenance_and_a_system_status_card(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="permission-provenance-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store._connection.execute(
+        """
+        UPDATE tasks SET exchange_allowance = 0
+        WHERE task_id = ? AND revision = ?
+        """,
+        ("permission-provenance-task", 1),
+    )
+    store.pause_for_continuation(
+        "permission-provenance-task",
+        1,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={
+            "next": "forged-permission",
+            "attempted_question": {
+                "addressed_to": "fable",
+                "text": "A fabricated fourth question.",
+                "reason": "No durable permission record exists.",
+            },
+            "exchange_permission_id": "f" * 48,
+        },
+    )
+    before_forged_grant = store.get_task("permission-provenance-task", 1)
+
+    with pytest.raises(RuntimeError, match="permission"):
+        store.grant_internal_exchanges(
+            session_id="session-1",
+            task_id="permission-provenance-task",
+            revision=1,
+            expected_generation=1,
+            request_id="forged-grant",
+        )
+
+    assert store.get_task("permission-provenance-task", 1) == before_forged_grant
+    assert store._connection.execute(
+        "SELECT COUNT(*) FROM exchange_grants"
+    ).fetchone()[0] == 0
+
+
+def test_exchange_permission_requires_a_system_status_card(tmp_path, valid_brief) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="permission-card-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store._connection.execute(
+        """
+        UPDATE tasks SET exchange_allowance = 0
+        WHERE task_id = ? AND revision = ?
+        """,
+        ("permission-card-task", 1),
+    )
+    before_invalid_card = store.get_task("permission-card-task", 1)
+    before_events = store.events_after("session-1", 0)
+
+    with pytest.raises(ValueError, match="exchange permission event"):
+        store.pause_for_exchange_permission(
+            session_id="session-1",
+            task_id="permission-card-task",
+            revision=1,
+            expected_generation=1,
+            attempted_question=DirectedAgentQuestion(
+                addressed_to="fable",
+                text="A fourth question needs permission.",
+                reason="The allowance is exhausted.",
+            ),
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"next": "retry-fourth-question"},
+            event=ConversationEnvelope(
+                sender=ConversationActor.FABLE,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                message_type=ConversationMessageType.STATEMENT,
+                text="This is not an exchange permission card.",
+                task_id="permission-card-task",
+                revision=1,
+                continuation_generation=1,
+            ),
+        )
+
+    assert store.get_task("permission-card-task", 1) == before_invalid_card
     assert store.events_after("session-1", 0) == before_events

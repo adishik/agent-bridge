@@ -828,6 +828,7 @@ _MIGRATION_STATEMENTS = (
         correction_count INTEGER NOT NULL DEFAULT 0,
         continuation_state TEXT,
         pending_json TEXT,
+        continuation_pause_id TEXT,
         continuation_generation INTEGER NOT NULL DEFAULT 1
             CHECK (continuation_generation >= 1),
         exchange_allowance INTEGER NOT NULL DEFAULT 3
@@ -906,6 +907,7 @@ _MIGRATION_STATEMENTS = (
         exchange_id TEXT,
         continuation_state TEXT NOT NULL,
         pending_action_json TEXT NOT NULL,
+        continuation_pause_id TEXT NOT NULL,
         answer_text TEXT,
         answered_by TEXT,
         CHECK (
@@ -941,6 +943,19 @@ _MIGRATION_STATEMENTS = (
         permission_id TEXT NOT NULL,
         continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
         grant_size INTEGER NOT NULL CHECK (grant_size = 3),
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS exchange_permissions (
+        permission_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
+        continuation_pause_id TEXT NOT NULL,
+        grant_request_id TEXT,
         FOREIGN KEY (session_id) REFERENCES sessions(session_id),
         FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
     )
@@ -986,6 +1001,12 @@ _MIGRATION_STATEMENTS = (
     """
     CREATE UNIQUE INDEX IF NOT EXISTS exchange_grants_request_identity
     ON exchange_grants (session_id, task_id, revision, request_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS exchange_permissions_pause_identity
+    ON exchange_permissions (
+        session_id, task_id, revision, continuation_generation, continuation_pause_id
+    )
     """,
 )
 
@@ -1133,6 +1154,10 @@ class SQLiteStore:
                     CHECK (exchange_consumed >= 0)
                 """,
             ),
+            (
+                "continuation_pause_id",
+                "ALTER TABLE tasks ADD COLUMN continuation_pause_id TEXT",
+            ),
         )
         for column, statement in additions:
             if column not in columns:
@@ -1156,6 +1181,10 @@ class SQLiteStore:
         if "pending_action_json" not in question_columns:
             self._connection.execute(
                 "ALTER TABLE questions ADD COLUMN pending_action_json TEXT"
+            )
+        if "continuation_pause_id" not in question_columns:
+            self._connection.execute(
+                "ALTER TABLE questions ADD COLUMN continuation_pause_id TEXT"
             )
         self._connection.execute(
             """
@@ -1420,10 +1449,12 @@ class SQLiteStore:
                 self._require_task_can_pause(task, continuation_state)
                 if self.question(question_id) is not None:
                     raise RuntimeError("question identifier already exists")
+                pause_id = self._new_continuation_pause_id()
                 self._insert_question(
                     question,
                     continuation_state=continuation_state,
                     pending_action=frozen_pending,
+                    continuation_pause_id=pause_id,
                 )
                 self._pause_task_for_directed_action(
                     session_id=session_id,
@@ -1432,6 +1463,7 @@ class SQLiteStore:
                     expected_generation=expected_generation,
                     continuation_state=continuation_state,
                     pending_action=frozen_pending,
+                    continuation_pause_id=pause_id,
                 )
                 emitted.append(self._insert_conversation_event_in_transaction(
                     session_id=session_id,
@@ -1481,7 +1513,12 @@ class SQLiteStore:
                     revision=revision,
                     expected_generation=expected_generation,
                 )
-                question, question_continuation, question_pending = self._question_exact(
+                (
+                    question,
+                    question_continuation,
+                    question_pending,
+                    question_pause_id,
+                ) = self._question_exact(
                     session_id=session_id,
                     task_id=task_id,
                     revision=revision,
@@ -1490,10 +1527,17 @@ class SQLiteStore:
                 )
                 if question.answer_text is not None:
                     raise RuntimeError("question was already answered")
+                task_pause_id = self._directed_pause_id(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                )
                 if (
                     task.state is not TaskState.AWAITING_USER_INPUT
                     or task.continuation_state is not question_continuation
                     or task.pending != question_pending
+                    or task_pause_id != question_pause_id
                 ):
                     raise RuntimeError("question continuation changed concurrently")
                 continuation_state = question_continuation
@@ -1536,10 +1580,12 @@ class SQLiteStore:
                 cursor = self._connection.execute(
                     """
                     UPDATE tasks
-                    SET state = ?, continuation_state = NULL, pending_json = ?
+                    SET state = ?, continuation_state = NULL, pending_json = ?,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ?
                       AND state = ? AND continuation_state = ?
                       AND continuation_generation = ? AND pending_json = ?
+                      AND continuation_pause_id = ?
                     """,
                     (
                         continuation_state.value,
@@ -1551,6 +1597,7 @@ class SQLiteStore:
                         continuation_state.value,
                         next_generation,
                         _encode_json(question_pending),
+                        question_pause_id,
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -1636,6 +1683,13 @@ class SQLiteStore:
                 )
                 if existing is not None:
                     reservation, question = existing
+                    task_pause_id = self._directed_pause_id_exact(
+                        session_id=session_id,
+                        task_id=task_id,
+                        revision=revision,
+                        expected_generation=expected_generation,
+                    )
+                    question_pause_id = self._question_pause_id(question.question_id)
                     if (
                         reservation.question_id != question_id
                         or reservation.continuation_generation != expected_generation
@@ -1648,6 +1702,7 @@ class SQLiteStore:
                         or task.state is not TaskState.AWAITING_USER_INPUT
                         or task.continuation_state is not continuation_state
                         or task.pending != frozen_pending
+                        or task_pause_id != question_pause_id
                     ):
                         raise RuntimeError("exchange request key does not match its reservation")
                     result = existing
@@ -1660,6 +1715,7 @@ class SQLiteStore:
                     if self.question(question_id) is not None:
                         raise RuntimeError("question identifier already exists")
                     exchange_id = self._new_exchange_id()
+                    pause_id = self._new_continuation_pause_id()
                     reservation = ExchangeReservation(
                         exchange_id=exchange_id,
                         question_id=question_id,
@@ -1697,6 +1753,7 @@ class SQLiteStore:
                         ),
                         continuation_state=continuation_state,
                         pending_action=frozen_pending,
+                        continuation_pause_id=pause_id,
                     )
                     self._connection.execute(
                         """
@@ -1730,15 +1787,18 @@ class SQLiteStore:
                         UPDATE tasks
                         SET exchange_allowance = exchange_allowance - 1,
                             exchange_consumed = exchange_consumed + 1,
-                            state = ?, continuation_state = ?, pending_json = ?
+                            state = ?, continuation_state = ?, pending_json = ?,
+                            continuation_pause_id = ?
                         WHERE task_id = ? AND revision = ? AND session_id = ?
                           AND continuation_generation = ? AND state = ?
-                          AND continuation_state IS NULL AND exchange_allowance > 0
+                          AND continuation_state IS NULL AND continuation_pause_id IS NULL
+                          AND exchange_allowance > 0
                         """,
                         (
                             TaskState.AWAITING_USER_INPUT.value,
                             continuation_state.value,
                             _encode_json(frozen_pending),
+                            pause_id,
                             task_id,
                             revision,
                             session_id,
@@ -1786,9 +1846,7 @@ class SQLiteStore:
             expected_generation=expected_generation,
         )
         frozen_pending = self._directed_pending_action(pending_action)
-        if {
-            "attempted_question", "exchange_permission_id",
-        } & set(frozen_pending):
+        if {"attempted_question", "exchange_permission_id"} & set(frozen_pending):
             raise ValueError("pending_action must not replace exchange permission state")
         permission_pending = {
             **frozen_pending,
@@ -1797,7 +1855,6 @@ class SQLiteStore:
                 "text": attempted_question.text,
                 "reason": attempted_question.reason,
             },
-            "exchange_permission_id": self._new_exchange_permission_id(),
         }
         emitted: list[StreamEvent] = []
         with self._event_listener_lock:
@@ -1811,6 +1868,8 @@ class SQLiteStore:
                 self._require_task_can_pause(task, continuation_state)
                 if task.exchange_allowance != 0:
                     raise RuntimeError("internal exchange allowance is not exhausted")
+                pause_id = self._new_continuation_pause_id()
+                permission_id = self._new_exchange_permission_id()
                 self._pause_task_for_directed_action(
                     session_id=session_id,
                     task_id=task_id,
@@ -1818,6 +1877,23 @@ class SQLiteStore:
                     expected_generation=expected_generation,
                     continuation_state=continuation_state,
                     pending_action=permission_pending,
+                    continuation_pause_id=pause_id,
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO exchange_permissions (
+                        permission_id, session_id, task_id, revision,
+                        continuation_generation, continuation_pause_id, grant_request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        permission_id,
+                        session_id,
+                        task_id,
+                        revision,
+                        expected_generation,
+                        pause_id,
+                    ),
                 )
                 emitted.append(self._insert_conversation_event_in_transaction(
                     session_id=session_id,
@@ -1848,12 +1924,22 @@ class SQLiteStore:
                 revision=revision,
                 expected_generation=expected_generation,
             )
-            pending = task.pending or {}
-            raw_permission_id = pending.get("exchange_permission_id")
-            permission_id = (
-                raw_permission_id
-                if isinstance(raw_permission_id, str)
-                else None
+            pause_id = self._directed_pause_id(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                expected_generation=expected_generation,
+            )
+            permission = (
+                None
+                if pause_id is None
+                else self._exchange_permission_for_pause(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                    continuation_pause_id=pause_id,
+                )
             )
             existing = self._connection.execute(
                 """
@@ -1867,8 +1953,8 @@ class SQLiteStore:
                     int(existing["continuation_generation"]) != expected_generation
                     or int(existing["grant_size"]) != EXCHANGE_GRANT_SIZE
                     or (
-                        permission_id is not None
-                        and existing["permission_id"] != permission_id
+                        permission is not None
+                        and existing["permission_id"] != permission["permission_id"]
                     )
                 ):
                     raise RuntimeError("exchange grant request changed")
@@ -1876,20 +1962,21 @@ class SQLiteStore:
             if (
                 task.state is not TaskState.AWAITING_USER_INPUT
                 or task.continuation_state is None
-                or not isinstance(pending.get("attempted_question"), Mapping)
-                or permission_id is None
-                or not _SAFE_PREPARED_IDENTIFIER.fullmatch(permission_id)
                 or task.exchange_allowance != 0
+                or permission is None
             ):
                 raise RuntimeError("task is not awaiting exchange permission")
-            granted = self._connection.execute(
+            if permission["grant_request_id"] is not None:
+                raise RuntimeError("exchange permission already received its grant")
+            permission_id = str(permission["permission_id"])
+            cursor = self._connection.execute(
                 """
-                SELECT 1 FROM exchange_grants
-                WHERE session_id = ? AND task_id = ? AND revision = ? AND permission_id = ?
+                UPDATE exchange_permissions SET grant_request_id = ?
+                WHERE permission_id = ? AND grant_request_id IS NULL
                 """,
-                (session_id, task_id, revision, permission_id),
-            ).fetchone()
-            if granted is not None:
+                (request_id, permission_id),
+            )
+            if cursor.rowcount != 1:
                 raise RuntimeError("exchange permission already received its grant")
             self._connection.execute(
                 """
@@ -1912,7 +1999,8 @@ class SQLiteStore:
                 """
                 UPDATE tasks SET exchange_allowance = exchange_allowance + ?
                 WHERE task_id = ? AND revision = ? AND session_id = ?
-                  AND continuation_generation = ?
+                  AND continuation_generation = ? AND continuation_pause_id = ?
+                  AND state = ? AND exchange_allowance = 0
                 """,
                 (
                     EXCHANGE_GRANT_SIZE,
@@ -1920,6 +2008,8 @@ class SQLiteStore:
                     revision,
                     session_id,
                     expected_generation,
+                    pause_id,
+                    TaskState.AWAITING_USER_INPUT.value,
                 ),
             )
             if cursor.rowcount != 1:
@@ -2058,10 +2148,14 @@ class SQLiteStore:
             expected_generation=expected_generation,
         )
         if (
-            event.addressed_to is not ConversationTarget.USER
+            event.message_type is not ConversationMessageType.STATUS
+            or event.sender is not ConversationActor.SYSTEM
+            or event.addressed_to is not ConversationTarget.USER
             or event.routed_to is not ConversationTarget.USER
+            or event.question_id is not None
+            or event.reply_to_question_id is not None
         ):
-            raise ValueError("exchange permission event must route to the user")
+            raise ValueError("exchange permission event must be a system status card for the user")
 
     def _directed_task_exact(
         self,
@@ -2089,6 +2183,73 @@ class SQLiteStore:
         if task.state is not continuation_state or task.continuation_state is not None:
             raise RuntimeError("task continuation changed concurrently")
 
+    def _directed_pause_id(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> str | None:
+        row = self._connection.execute(
+            """
+            SELECT continuation_pause_id FROM tasks
+            WHERE task_id = ? AND revision = ? AND session_id = ?
+              AND continuation_generation = ?
+            """,
+            (task_id, revision, session_id, expected_generation),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("task continuation identity changed")
+        raw_pause_id = row["continuation_pause_id"]
+        if raw_pause_id is None:
+            return None
+        if not isinstance(raw_pause_id, str) or not _SAFE_PREPARED_IDENTIFIER.fullmatch(raw_pause_id):
+            raise RuntimeError("task continuation pause identity is invalid")
+        return raw_pause_id
+
+    def _directed_pause_id_exact(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> str:
+        pause_id = self._directed_pause_id(
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+        )
+        if pause_id is None:
+            raise RuntimeError("task continuation pause identity is missing")
+        return pause_id
+
+    def _exchange_permission_for_pause(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        continuation_pause_id: str,
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT * FROM exchange_permissions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND continuation_generation = ? AND continuation_pause_id = ?
+            """,
+            (
+                session_id,
+                task_id,
+                revision,
+                expected_generation,
+                continuation_pause_id,
+            ),
+        ).fetchone()
+
     def _unanswered_question_for_task(
         self, task_id: str, revision: int,
     ) -> QuestionRecord | None:
@@ -2109,7 +2270,7 @@ class SQLiteStore:
         revision: int,
         expected_generation: int,
         question_id: str,
-    ) -> tuple[QuestionRecord, TaskState, Mapping[str, JsonValue]]:
+    ) -> tuple[QuestionRecord, TaskState, Mapping[str, JsonValue], str]:
         row = self._connection.execute(
             """
             SELECT * FROM questions
@@ -2129,14 +2290,29 @@ class SQLiteStore:
         question = self._question_from_row(row)
         raw_continuation = row["continuation_state"]
         raw_pending = row["pending_action_json"]
-        if raw_continuation is None or raw_pending is None:
+        raw_pause_id = row["continuation_pause_id"]
+        if raw_continuation is None or raw_pending is None or raw_pause_id is None:
             raise RuntimeError("question continuation is missing")
         try:
             continuation = TaskState(raw_continuation)
             pending = _decode_mapping(raw_pending, "question pending action")
         except (TypeError, ValueError) as error:
             raise RuntimeError("question continuation is invalid") from error
-        return question, continuation, pending
+        if not isinstance(raw_pause_id, str) or not _SAFE_PREPARED_IDENTIFIER.fullmatch(raw_pause_id):
+            raise RuntimeError("question continuation pause identity is invalid")
+        return question, continuation, pending, raw_pause_id
+
+    def _question_pause_id(self, question_id: str) -> str:
+        row = self._connection.execute(
+            "SELECT continuation_pause_id FROM questions WHERE question_id = ?",
+            (question_id,),
+        ).fetchone()
+        if row is None or row["continuation_pause_id"] is None:
+            raise RuntimeError("question continuation pause identity is missing")
+        pause_id = row["continuation_pause_id"]
+        if not isinstance(pause_id, str) or not _SAFE_PREPARED_IDENTIFIER.fullmatch(pause_id):
+            raise RuntimeError("question continuation pause identity is invalid")
+        return pause_id
 
     def _reservation_for_request_key(
         self,
@@ -2174,19 +2350,24 @@ class SQLiteStore:
         *,
         continuation_state: TaskState,
         pending_action: Mapping[str, JsonValue],
+        continuation_pause_id: str,
     ) -> None:
         if not isinstance(continuation_state, TaskState):
             raise ValueError("question continuation_state must be a TaskState")
         frozen_pending = freeze_json(pending_action)
         if not isinstance(frozen_pending, Mapping):
             raise ValueError("question pending_action must be an object")
+        continuation_pause_id = _prepared_identifier(
+            continuation_pause_id, "question continuation_pause_id",
+        )
         self._connection.execute(
             """
             INSERT INTO questions (
                 question_id, session_id, task_id, revision, continuation_generation,
                 asked_by, addressed_to, routed_to, text, exchange_id,
-                continuation_state, pending_action_json, answer_text, answered_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                continuation_state, pending_action_json, continuation_pause_id,
+                answer_text, answered_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 question.question_id,
@@ -2201,6 +2382,7 @@ class SQLiteStore:
                 question.exchange_id,
                 continuation_state.value,
                 _encode_json(frozen_pending),
+                continuation_pause_id,
                 question.answer_text,
                 None if question.answered_by is None else question.answered_by.value,
             ),
@@ -2215,19 +2397,25 @@ class SQLiteStore:
         expected_generation: int,
         continuation_state: TaskState,
         pending_action: Mapping[str, object],
+        continuation_pause_id: str,
     ) -> None:
+        continuation_pause_id = _prepared_identifier(
+            continuation_pause_id, "continuation_pause_id",
+        )
         cursor = self._connection.execute(
             """
             UPDATE tasks
-            SET state = ?, continuation_state = ?, pending_json = ?
+            SET state = ?, continuation_state = ?, pending_json = ?,
+                continuation_pause_id = ?
             WHERE task_id = ? AND revision = ? AND session_id = ?
               AND continuation_generation = ? AND state = ?
-              AND continuation_state IS NULL
+              AND continuation_state IS NULL AND continuation_pause_id IS NULL
             """,
             (
                 TaskState.AWAITING_USER_INPUT.value,
                 continuation_state.value,
                 _encode_json(pending_action),
+                continuation_pause_id,
                 task_id,
                 revision,
                 session_id,
@@ -2294,12 +2482,30 @@ class SQLiteStore:
         for _ in range(_MAX_PREPARATION_ID_ATTEMPTS):
             permission_id = secrets.token_hex(24)
             row = self._connection.execute(
-                "SELECT 1 FROM exchange_grants WHERE permission_id = ?",
+                "SELECT 1 FROM exchange_permissions WHERE permission_id = ?",
                 (permission_id,),
             ).fetchone()
             if row is None:
                 return permission_id
         raise RuntimeError("could not allocate exchange permission identifier")
+
+    def _new_continuation_pause_id(self) -> str:
+        for _ in range(_MAX_PREPARATION_ID_ATTEMPTS):
+            pause_id = secrets.token_hex(24)
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM tasks WHERE continuation_pause_id = ?
+                UNION ALL
+                SELECT 1 FROM questions WHERE continuation_pause_id = ?
+                UNION ALL
+                SELECT 1 FROM exchange_permissions WHERE continuation_pause_id = ?
+                LIMIT 1
+                """,
+                (pause_id, pause_id, pause_id),
+            ).fetchone()
+            if row is None:
+                return pause_id
+        raise RuntimeError("could not allocate continuation pause identifier")
 
     def _reset_internal_exchanges_for_human_direction_in_transaction(
         self,
@@ -2468,7 +2674,8 @@ class SQLiteStore:
                     """
                     UPDATE tasks
                     SET approved_at = ?, baseline_id = ?, state = ?,
-                        continuation_state = NULL, pending_json = NULL
+                        continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                       AND NOT EXISTS (
                         SELECT 1 FROM tasks AS newer
@@ -2525,7 +2732,9 @@ class SQLiteStore:
                 require_transition(task.state, active)
                 cursor = self._connection.execute(
                     """
-                    UPDATE tasks SET state = ?, continuation_state = NULL, pending_json = NULL
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                     """,
                     (active.value, task_id, revision, session_id, task.state.value),
@@ -2584,7 +2793,9 @@ class SQLiteStore:
                 )
                 cursor = self._connection.execute(
                     """
-                    UPDATE tasks SET state = ?, continuation_state = NULL, pending_json = NULL
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                     """,
                     (active.value, task_id, revision, session_id, TaskState.INTERRUPTED.value),
@@ -2638,7 +2849,8 @@ class SQLiteStore:
                 cursor = self._connection.execute(
                     """
                     UPDATE tasks
-                    SET state = ?, continuation_state = NULL, pending_json = NULL
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                     """,
                     (
@@ -2722,7 +2934,8 @@ class SQLiteStore:
                 pending = self._prepared_pending_projection(record, reason=reason)
             task_cursor = self._connection.execute(
                 """
-                UPDATE tasks SET continuation_state = ?, pending_json = ?
+                UPDATE tasks
+                SET continuation_state = ?, pending_json = ?, continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                 """,
                 (
@@ -2769,7 +2982,9 @@ class SQLiteStore:
                 pending = self._prepared_pending_projection(record, reason=reason)
                 cursor = self._connection.execute(
                     """
-                    UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?
+                    UPDATE tasks
+                    SET state = ?, continuation_state = ?, pending_json = ?,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                     """,
                     (
@@ -2820,7 +3035,8 @@ class SQLiteStore:
                         cursor = self._connection.execute(
                             """
                             UPDATE tasks
-                            SET state = ?, continuation_state = ?, pending_json = ?
+                            SET state = ?, continuation_state = ?, pending_json = ?,
+                                continuation_pause_id = NULL
                             WHERE task_id = ? AND revision = ? AND state = ?
                             """,
                             (
@@ -2846,7 +3062,9 @@ class SQLiteStore:
                             pending = task.pending
                         cursor = self._connection.execute(
                             """
-                            UPDATE tasks SET continuation_state = ?, pending_json = ?
+                            UPDATE tasks
+                            SET continuation_state = ?, pending_json = ?,
+                                continuation_pause_id = NULL
                             WHERE task_id = ? AND revision = ? AND state = ?
                             """,
                             (
@@ -3499,7 +3717,8 @@ class SQLiteStore:
                 cursor = self._connection.execute(
                     """
                     UPDATE tasks
-                    SET state = ?, continuation_state = NULL, pending_json = NULL
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
                     WHERE task_id = ? AND revision = ? AND state = ?
                     """,
                     (target.value, task_id, revision, expected.value),
@@ -3580,7 +3799,8 @@ class SQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET state = ?, continuation_state = ?, pending_json = ?
+                SET state = ?, continuation_state = ?, pending_json = ?,
+                    continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                   AND continuation_state IS NULL AND pending_json IS NULL
                 """,
@@ -3619,7 +3839,8 @@ class SQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET state = ?, continuation_state = ?, pending_json = ?
+                SET state = ?, continuation_state = ?, pending_json = ?,
+                    continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                   AND continuation_state IS NULL AND pending_json IS NOT NULL
                 """,
@@ -3669,7 +3890,8 @@ class SQLiteStore:
             require_transition(target, continuation)
             cursor = self._connection.execute(
                 """
-                UPDATE tasks SET state = ?, pending_json = ?
+                UPDATE tasks
+                SET state = ?, pending_json = ?, continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                   AND continuation_state = ?
                 """,
@@ -3753,7 +3975,8 @@ class SQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET state = ?, continuation_state = ?, pending_json = ?
+                SET state = ?, continuation_state = ?, pending_json = ?,
+                    continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                   AND continuation_state = ?
                 """,
@@ -3797,7 +4020,8 @@ class SQLiteStore:
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET state = ?, continuation_state = NULL, pending_json = NULL
+                SET state = ?, continuation_state = NULL, pending_json = NULL,
+                    continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ? AND continuation_state = ?
                 """,
                 (target.value, task_id, revision, expected.value, target.value),
@@ -3824,7 +4048,8 @@ class SQLiteStore:
                 """
                 UPDATE tasks
                 SET state = ?, continuation_state = ?,
-                    fable_session_id = COALESCE(?, fable_session_id)
+                    fable_session_id = COALESCE(?, fable_session_id),
+                    continuation_pause_id = NULL
                 WHERE task_id = ? AND revision = ? AND state = ?
                 """,
                 (
@@ -4394,7 +4619,8 @@ class SQLiteStore:
                     cursor = self._connection.execute(
                         f"""
                         UPDATE tasks
-                        SET continuation_state = state, state = ?
+                        SET continuation_state = state, state = ?,
+                            continuation_pause_id = NULL
                         WHERE task_id = ? AND revision = ? AND state IN ({placeholders})
                         """,
                         (TaskState.INTERRUPTED.value, task_id, revision, *active_values),
