@@ -32,11 +32,19 @@ action creation and Resume:
 
 - Answer continuations must match the task's exact continuation state and the
   corresponding `ScopeApprovalContext`, `SolResumeContext`, `ReviewContext`, or
-  `ClarificationContext` identifiers and values.
+  `ClarificationContext`. Sol continuations may target either `SOL_RUNNING` or
+  the existing valid `SOL_CORRECTING` state.
 - Approval and Resume retain their existing baseline, predecessor, generation,
   and pending-projection checks.
-- A mismatched context type, session, run, thread, prompt, baseline, revision,
-  or continuation state fails the legacy audit generically before recovery.
+- A mismatched context type, Fable session, Sol thread, baseline, revision, or
+  continuation state fails the legacy audit generically before recovery. When
+  the referenced agent-run row exists, its task, revision, and CLI session must
+  also match. A missing agent-run row remains valid because prepared Store
+  workflows legitimately exist before process-run persistence; the audit must
+  not invent or require authority that the durable model does not guarantee.
+- Prompts and run identifiers remain bounded and typed by the prepared row
+  schema. They are compared only where an independent durable copy exists; the
+  audit must not falsely claim that the prepared row authenticates itself.
 
 This remains a read-only audit. It must not repair or normalize corrupt rows.
 
