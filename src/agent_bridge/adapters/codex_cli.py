@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
-import tempfile
 from uuid import UUID
 
 from agent_bridge.adapters.base import AgentRunResult
@@ -37,6 +38,111 @@ _AUDIT_ITEM_STATUSES = frozenset({
     "interrupted",
 })
 MAX_CODEX_AUDIT_EVENTS = 1_024
+_SOL_SCHEMA_FILENAME = "sol-outcome.json"
+
+
+def _serialized_sol_outcome_schema() -> bytes:
+    return json.dumps(
+        SOL_OUTCOME_SCHEMA,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _validated_sol_schema_file_descriptor(descriptor: int) -> None:
+    """Fail closed unless *descriptor* is the exact read-only schema file."""
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+    try:
+        if fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+        entry = os.fstat(descriptor)
+        expected = _serialized_sol_outcome_schema()
+        if not stat.S_ISREG(entry.st_mode) or entry.st_size != len(expected):
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+        duplicate = os.dup(descriptor)
+        try:
+            contents = os.pread(duplicate, len(expected) + 1, 0)
+        finally:
+            os.close(duplicate)
+        if contents != expected:
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+    except OSError as error:
+        raise ValueError("schema_file_fd must be an open read-only schema file descriptor") from error
+
+
+def _validated_sol_schema_directory_descriptor(descriptor: int) -> None:
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        raise ValueError("schema directory descriptor must be an open directory descriptor")
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError("schema directory descriptor must be an open directory descriptor")
+    except OSError as error:
+        raise ValueError("schema directory descriptor must be an open directory descriptor") from error
+
+
+def materialize_sol_schema_file(directory_fd: int) -> int:
+    """Atomically return one caller-owned, authenticated schema-file descriptor."""
+    _validated_sol_schema_directory_descriptor(directory_fd)
+    expected = _serialized_sol_outcome_schema()
+    write_descriptor = -1
+    schema_file_descriptor = -1
+    temporary_name: str | None = None
+    try:
+        temporary_name = f".{_SOL_SCHEMA_FILENAME}-{secrets.token_hex(16)}.tmp"
+        write_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(write_descriptor, 0o600)
+        written = 0
+        while written < len(expected):
+            count = os.write(write_descriptor, expected[written:])
+            if count <= 0:
+                raise OSError("schema write did not make progress")
+            written += count
+        os.fsync(write_descriptor)
+        os.close(write_descriptor)
+        write_descriptor = -1
+        os.replace(
+            temporary_name,
+            _SOL_SCHEMA_FILENAME,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
+        schema_file_descriptor = os.open(
+            _SOL_SCHEMA_FILENAME,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        _validated_sol_schema_file_descriptor(schema_file_descriptor)
+        result = schema_file_descriptor
+        schema_file_descriptor = -1
+        return result
+    except OSError as error:
+        raise ValueError("Sol schema file could not be materialized") from error
+    finally:
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if schema_file_descriptor >= 0:
+            os.close(schema_file_descriptor)
 
 
 class CodexRunError(RuntimeError):
@@ -77,7 +183,7 @@ class CodexCLI:
         repo_root: str | Path,
         schema_dir: str | Path,
         env: Mapping[str, str] | None = None,
-        schema_directory_fd: int | None = None,
+        schema_file_fd: int | None = None,
     ) -> None:
         executable_path = Path(executable)
         if not executable_path.is_absolute():
@@ -94,23 +200,14 @@ class CodexCLI:
         self._runner = runner
         self.repo_root = repo_root_path
         self._env = dict(os.environ if env is None else env)
-        if schema_directory_fd is None:
+        if schema_file_fd is None:
             self._schema_pass_fds: tuple[int, ...] = ()
+            self.schema_path = schema_dir_path / _SOL_SCHEMA_FILENAME
+            self._materialize_schema()
         else:
-            if (
-                not isinstance(schema_directory_fd, int)
-                or isinstance(schema_directory_fd, bool)
-                or schema_directory_fd < 0
-            ):
-                raise ValueError("schema_directory_fd must be an open directory descriptor")
-            try:
-                if not stat.S_ISDIR(os.fstat(schema_directory_fd).st_mode):
-                    raise ValueError("schema_directory_fd must be an open directory descriptor")
-            except OSError as error:
-                raise ValueError("schema_directory_fd must be an open directory descriptor") from error
-            self._schema_pass_fds = (schema_directory_fd,)
-        self.schema_path = schema_dir_path / "sol-outcome.json"
-        self._materialize_schema()
+            _validated_sol_schema_file_descriptor(schema_file_fd)
+            self._schema_pass_fds = (schema_file_fd,)
+            self.schema_path = Path(f"/proc/self/fd/{schema_file_fd}")
 
     async def start(
         self, *, run_id: str, brief: TaskBrief, context: str,
@@ -157,32 +254,19 @@ class CodexCLI:
     def _materialize_schema(self) -> None:
         schema_dir = self.schema_path.parent
         schema_dir.mkdir(parents=True, exist_ok=True)
-        serialized = json.dumps(
-            SOL_OUTCOME_SCHEMA,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=schema_dir,
-            prefix=".sol-outcome-",
-            suffix=".tmp",
-        )
-        temporary_path = Path(temporary_name)
+        directory_descriptor = -1
+        schema_file_descriptor = -1
         try:
-            os.chmod(temporary_path, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = -1
-                handle.write(serialized)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self.schema_path)
+            directory_descriptor = os.open(
+                schema_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+            schema_file_descriptor = materialize_sol_schema_file(directory_descriptor)
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+            if schema_file_descriptor >= 0:
+                os.close(schema_file_descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
 
     async def _run_contract(
         self,

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 from pathlib import Path
 import stat
+import sys
 
 import pytest
 
-from agent_bridge.adapters.codex_cli import CodexCLI, CodexRunError
+from agent_bridge.adapters.codex_cli import (
+    CodexCLI,
+    CodexRunError,
+    materialize_sol_schema_file,
+)
 from agent_bridge.contracts import SOL_OUTCOME_SCHEMA, TaskBrief
 from agent_bridge.process import ProcessRunner
 
@@ -189,30 +195,108 @@ def test_sol_materializes_schema_with_owner_only_mode(
     assert stat.S_IMODE(schema_path.stat().st_mode) == 0o600
 
 
-def test_sol_keeps_a_descriptor_anchored_schema_path_available_to_its_child(
-    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+def test_materialize_sol_schema_file_returns_exact_read_only_regular_file(
+    tmp_path: Path,
 ) -> None:
-    """A child must resolve the schema through the retained state authority."""
+    schemas = tmp_path / "schemas"
+    schemas.mkdir()
+    directory_fd = os.open(schemas, os.O_RDONLY | os.O_DIRECTORY)
+    schema_file_fd = -1
+    try:
+        schema_file_fd = materialize_sol_schema_file(directory_fd)
+        assert stat.S_ISREG(os.fstat(schema_file_fd).st_mode)
+        assert fcntl.fcntl(schema_file_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        duplicate = os.dup(schema_file_fd)
+        try:
+            assert os.read(duplicate, 1_000_000) == json.dumps(
+                SOL_OUTCOME_SCHEMA, separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+        finally:
+            os.close(duplicate)
+    finally:
+        if schema_file_fd >= 0:
+            os.close(schema_file_fd)
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("kind", ("directory", "writable", "closed", "wrong_content"))
+def test_sol_rejects_noncanonical_schema_file_descriptors(
+    fake_codex: Path, tmp_path: Path, kind: str,
+) -> None:
+    schemas = tmp_path / "schemas"
+    schemas.mkdir()
+    if kind == "directory":
+        descriptor = os.open(schemas, os.O_RDONLY | os.O_DIRECTORY)
+    else:
+        path = schemas / f"{kind}.json"
+        path.write_text(
+            "{}" if kind == "wrong_content" else json.dumps(SOL_OUTCOME_SCHEMA),
+            encoding="utf-8",
+        )
+        descriptor = os.open(
+            path,
+            os.O_WRONLY if kind == "writable" else os.O_RDONLY,
+        )
+        if kind == "closed":
+            os.close(descriptor)
+    try:
+        with pytest.raises(ValueError, match="schema_file_fd"):
+            CodexCLI(
+                fake_codex,
+                ProcessRunner(),
+                repo_root=tmp_path,
+                schema_dir=schemas,
+                schema_file_fd=descriptor,
+                env=SAFE_ENV,
+            )
+    finally:
+        if kind != "closed":
+            os.close(descriptor)
+
+
+def test_sol_keeps_an_injected_schema_file_available_to_its_child(
+    brief: TaskBrief, tmp_path: Path,
+) -> None:
+    """A child gets the one schema file through its caller-owned descriptor."""
     async def scenario() -> None:
+        capability_codex = tmp_path / "schema-file-codex"
+        capability_codex.write_text(
+            f"#!{sys.executable}\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('codex-cli capability')\n"
+            "    raise SystemExit(0)\n"
+            "schema_path = Path(sys.argv[sys.argv.index('--output-schema') + 1])\n"
+            "json.loads(schema_path.read_text(encoding='utf-8'))\n"
+            "print(json.dumps({'type': 'thread.started', 'thread_id': '0199a213-81c0-7800-8aa1-bbab2a035a53'}))\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps({'status': 'completed', 'summary': 'schema read', 'changed_files': [], 'commands_run': [], 'known_failures': [], 'remaining_risks': [], 'architecture_docs': 'No change.', 'question': None})}}))\n",
+            encoding="utf-8",
+        )
+        capability_codex.chmod(0o700)
         state = tmp_path / "state"
         state.mkdir()
         schemas = state / "schemas"
         schemas.mkdir()
-        descriptor = os.open(schemas, os.O_RDONLY | os.O_DIRECTORY)
+        directory_fd = os.open(schemas, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = materialize_sol_schema_file(directory_fd)
         try:
             adapter = CodexCLI(
-                fake_codex,
+                capability_codex,
                 ProcessRunner(stop_grace_seconds=0.02),
                 repo_root=tmp_path,
-                schema_dir=Path(f"/proc/self/fd/{descriptor}"),
-                schema_directory_fd=descriptor,
+                schema_dir=schemas,
+                schema_file_fd=descriptor,
                 env=SAFE_ENV,
             )
+            assert adapter.schema_path == Path(f"/proc/self/fd/{descriptor}")
             result = await adapter.start(
                 run_id="descriptor-anchored-schema", brief=brief, context="context",
             )
         finally:
             os.close(descriptor)
+            os.close(directory_fd)
         assert result.payload is not None
 
     asyncio.run(scenario())

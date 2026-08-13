@@ -890,6 +890,132 @@ def test_state_authority_stays_with_the_opened_directory_when_an_ancestor_is_swa
     assert not list(outside.rglob("schemas"))
 
 
+def test_provider_cannot_traverse_schema_file_capability(
+    tmp_path: Path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real launcher must give Codex one schema file, never its state directory."""
+    tools = _fake_tools(tmp_path)
+    report_path = tmp_path / "codex-home" / "schema-capability.json"
+    tools["codex"] = _write_executable(
+        tmp_path / "capability-codex",
+        """
+import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli capability")
+    raise SystemExit(0)
+if sys.argv[1:3] != ["exec", "--json"]:
+    raise SystemExit(92)
+schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
+schema = json.loads(schema_path.read_text(encoding="utf-8"))
+siblings = {}
+for sibling in ("bridge.sqlite3", "artifacts", "locks"):
+    try:
+        descriptor = os.open(schema_path / ".." / sibling, os.O_RDONLY)
+    except OSError:
+        siblings[sibling] = False
+    else:
+        os.close(descriptor)
+        siblings[sibling] = True
+report_path = Path(os.environ["CODEX_HOME"]) / "schema-capability.json"
+report_path.parent.mkdir(parents=True, exist_ok=True)
+report_path.write_text(json.dumps({"schema": schema, "siblings": siblings}), encoding="utf-8")
+print(json.dumps({"type": "thread.started", "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps({"status": "completed", "summary": "capability checked", "changed_files": [], "commands_run": [], "known_failures": [], "remaining_risks": [], "architecture_docs": "No change.", "question": None})}}))
+""",
+    )
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    state_dir = settings.projects[0].state_dir
+    (state_dir / "artifacts").mkdir(parents=True)
+    (state_dir / "artifacts" / "private-artifact").write_text("artifact", encoding="utf-8")
+    (state_dir / "locks").mkdir()
+    (state_dir / "locks" / "private-lock").write_text("lock", encoding="utf-8")
+    observed_pass_fds: list[tuple[tuple[int, bool, bool], ...]] = []
+    runtime_schema_fds: list[int] = []
+
+    class RecordingProcessRunner(ProcessRunner):
+        async def run(self, *, pass_fds=(), **kwargs):
+            observed_pass_fds.append(tuple(
+                (descriptor, stat.S_ISREG(os.fstat(descriptor).st_mode), stat.S_ISDIR(os.fstat(descriptor).st_mode))
+                for descriptor in pass_fds
+            ))
+            return await super().run(pass_fds=pass_fds, **kwargs)
+
+    monkeypatch.setattr("agent_bridge.process.ProcessRunner", RecordingProcessRunner)
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        runtime = app.state.project_registry.projects()[0]
+        runtime_schema_fds.append(runtime.sol._schema_pass_fds[0])
+        result = asyncio.run(runtime.sol.start(
+            run_id="schema-file-capability", brief=valid_brief, context="capability test",
+        ))
+        assert result.payload is not None
+
+    assert main(
+        _args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=run_uvicorn,
+    ) == 0
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    from agent_bridge.contracts import SOL_OUTCOME_SCHEMA
+    assert report["schema"] == SOL_OUTCOME_SCHEMA
+    assert report["siblings"] == {
+        "bridge.sqlite3": False,
+        "artifacts": False,
+        "locks": False,
+    }
+    codex_pass_fds = [pass_fds for pass_fds in observed_pass_fds if pass_fds]
+    assert len(codex_pass_fds) == 1
+    assert len(codex_pass_fds[0]) == 1
+    _, is_regular, is_directory = codex_pass_fds[0][0]
+    assert is_regular is True
+    assert is_directory is False
+    assert len(runtime_schema_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(runtime_schema_fds[0])
+
+
+def test_schema_file_descriptor_closes_during_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    created_descriptors: list[int] = []
+    from agent_bridge.adapters import codex_cli
+
+    original_materialize = codex_cli.materialize_sol_schema_file
+
+    def record_schema_file(directory_fd: int) -> int:
+        descriptor = original_materialize(directory_fd)
+        created_descriptors.append(descriptor)
+        return descriptor
+
+    class RejectingCodexCLI:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("injected Codex construction failure")
+
+    monkeypatch.setattr(codex_cli, "materialize_sol_schema_file", record_schema_file)
+    monkeypatch.setattr(codex_cli, "CodexCLI", RejectingCodexCLI)
+
+    with pytest.raises(RuntimeError, match="injected Codex construction failure"):
+        main(
+            _args(repo, tools), environ=environment, stdout=io.StringIO(),
+            uvicorn_run=lambda *args, **kwargs: None,
+        )
+
+    assert len(created_descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(created_descriptors[0])
+
+
 def test_main_acquires_every_lock_before_opening_any_database_and_releases_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -123,18 +123,17 @@ class _OpenedProjectState:
     lock: InstanceLock
     store: object
     artifacts: Path
-    schemas: Path
     state_directory: _StateDirectory
     artifact_descriptor: int | None
-    schema_descriptor: int | None
+    schema_file_descriptor: int | None
 
     def release_state_authority(self) -> None:
         if self.artifact_descriptor is not None:
             os.close(self.artifact_descriptor)
             self.artifact_descriptor = None
-        if self.schema_descriptor is not None:
-            os.close(self.schema_descriptor)
-            self.schema_descriptor = None
+        if self.schema_file_descriptor is not None:
+            os.close(self.schema_file_descriptor)
+            self.schema_file_descriptor = None
         self.state_directory.close()
 
 
@@ -905,7 +904,8 @@ def _open_project_state(
     database_path = spec.state_dir / "bridge.sqlite3"
     store = None
     artifact_descriptor: int | None = None
-    schema_descriptor: int | None = None
+    schema_directory_descriptor: int | None = None
+    schema_file_descriptor: int | None = None
     try:
         if state_directory is None:
             descriptor = _open_nofollow_directory(spec.state_dir, create=True)
@@ -917,9 +917,13 @@ def _open_project_state(
         artifact_descriptor = _open_private_directory(
             spec.state_dir / "artifacts", directory_fd=state_directory.descriptor,
         )
-        schema_descriptor = _open_private_directory(
+        schema_directory_descriptor = _open_private_directory(
             spec.state_dir / "schemas", directory_fd=state_directory.descriptor,
         )
+        from agent_bridge.adapters.codex_cli import materialize_sol_schema_file
+        schema_file_descriptor = materialize_sol_schema_file(schema_directory_descriptor)
+        os.close(schema_directory_descriptor)
+        schema_directory_descriptor = None
         store = SQLiteStore(
             state_directory.child_path("bridge.sqlite3"),
             clock=_store_clock(clock),
@@ -930,10 +934,9 @@ def _open_project_state(
             lock=lock,
             store=store,
             artifacts=spec.state_dir / "artifacts",
-            schemas=Path(f"/proc/self/fd/{schema_descriptor}"),
             state_directory=state_directory,
             artifact_descriptor=artifact_descriptor,
-            schema_descriptor=schema_descriptor,
+            schema_file_descriptor=schema_file_descriptor,
         )
     except BaseException:
         if store is not None:
@@ -943,8 +946,10 @@ def _open_project_state(
                 pass
         if artifact_descriptor is not None:
             os.close(artifact_descriptor)
-        if schema_descriptor is not None:
-            os.close(schema_descriptor)
+        if schema_directory_descriptor is not None:
+            os.close(schema_directory_descriptor)
+        if schema_file_descriptor is not None:
+            os.close(schema_file_descriptor)
         if owns_state_directory and state_directory is not None:
             state_directory.close()
         raise
@@ -1012,9 +1017,9 @@ def assemble_project_runtime(
             settings.codex_executable,
             runner,
             repo_root=spec.repo_root,
-            schema_dir=opened.schemas,
+            schema_dir=spec.state_dir / "schemas",
             env=codex_child_environment,
-            schema_directory_fd=opened.schema_descriptor,
+            schema_file_fd=opened.schema_file_descriptor,
         )
         preflight = asyncio.run(_run_preflights(
             runner=runner,
