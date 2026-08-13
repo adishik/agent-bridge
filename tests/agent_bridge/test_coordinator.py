@@ -14,12 +14,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    SubscriptionAuthError,
+)
 import agent_bridge.store as store_module
 from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.adapters.claude_cli import ClaudeRunError
 from agent_bridge.adapters.codex_cli import CodexRunError
 from agent_bridge.contracts import (
     ConversationActor,
+    ConversationEnvelope,
     ConversationMessageType,
     ConversationTarget,
     DirectedAgentQuestion,
@@ -540,6 +545,114 @@ def test_coordinator_forwards_recovery_summary(harness: CoordinatorHarness) -> N
     )
     assert harness.store.prepared_action(prepared.preparation_id).status == "RECOVERED"
     assert harness.store.get_task(prepared.task_id, prepared.revision).state is TaskState.INTERRUPTED
+
+
+def test_expired_fable_login_preserves_early_planning_and_emits_fixed_guidance(
+    harness: CoordinatorHarness,
+) -> None:
+    async def scenario() -> None:
+        async def expired_plan(**_: object) -> AgentRunResult:
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
+
+        harness.fable.plan = expired_plan  # type: ignore[method-assign]
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await harness.coordinator.handle_user_request("session-1", "Plan work")
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        task = harness.store.get_task("task-1", 0)
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.FABLE_PLANNING
+        assert task.pending is None
+        prepared = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=0,
+        )
+        assert prepared is not None
+        assert prepared.status == "INTERRUPTED"
+        assert prepared.reason == "adapter_interrupted"
+        run = harness.store.agent_run("run-1")
+        assert run.agent == "fable"
+        assert run.status == "interrupted"
+        event = harness.store.events_after("session-1", 0)[-1]
+        assert event.kind == "conversation"
+        assert event.payload == ConversationEnvelope(
+            sender=ConversationActor.SYSTEM,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            message_type=ConversationMessageType.STATUS,
+            text="Fable login expired. Run claude auth login on the host, then Resume.",
+        ).to_dict()
+
+    asyncio.run(scenario())
+
+
+def test_expired_fable_login_preserves_clarification_continuation(
+    harness: CoordinatorHarness,
+) -> None:
+    async def scenario() -> None:
+        async def expired_clarification(**_: object) -> AgentRunResult:
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
+
+        harness.sol.queue(_question("Which bounded option?"))
+        harness.fable.clarify = expired_clarification  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        task = harness.store.get_task("task-1", 1)
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.FABLE_CLARIFYING
+        assert task.pending is not None
+        assert isinstance(task.pending.get("clarification_prompt"), str)
+        assert harness.store.agent_run("run-3").status == "interrupted"
+        prepared = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+        )
+        assert prepared is not None
+        assert prepared.status == "INTERRUPTED"
+        assert prepared.reason == "adapter_interrupted"
+
+    asyncio.run(scenario())
+
+
+def test_expired_fable_login_preserves_review_continuation(
+    harness: CoordinatorHarness,
+) -> None:
+    async def scenario() -> None:
+        async def expired_review(**_: object) -> AgentRunResult:
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
+
+        harness.fable.review = expired_review  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        task = harness.store.get_task("task-1", 1)
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.FABLE_REVIEWING
+        assert task.pending is not None
+        assert isinstance(task.pending.get("review_prompt"), str)
+        assert harness.store.agent_run("run-3").status == "interrupted"
+        prepared = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+        )
+        assert prepared is not None
+        assert prepared.status == "INTERRUPTED"
+        assert prepared.reason == "adapter_interrupted"
+
+    asyncio.run(scenario())
 
 
 def test_legacy_audit_blocks_corrupt_scope_before_recovery_can_route_a_fresh_sol_start(

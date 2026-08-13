@@ -9,6 +9,10 @@ from typing import Any
 
 import pytest
 
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    SubscriptionAuthError,
+)
 from agent_bridge.contracts import ConversationTarget, DirectedAgentQuestion
 from agent_bridge.hub import (
     ActiveAgentLease,
@@ -952,6 +956,44 @@ def test_hub_run_retains_the_exact_lease_when_terminal_persistence_fails() -> No
 
         assert runtime.store.prepared_action(prepared.preparation_id).status == "PREPARED"  # type: ignore[union-attr]
         assert lease.snapshot() == prepared.token
+
+    asyncio.run(exercise())
+
+
+def test_hub_invalidates_only_the_selected_fable_readiness_after_login_expiry() -> None:
+    async def exercise() -> None:
+        selected = _runtime("project-a")
+        untouched = _runtime("project-b")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((selected, untouched)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        async def login_expired(preparation_id: str) -> PreparedActionOutcome:
+            record = selected.store.prepared_action(preparation_id)
+            assert record is not None
+            selected.store.prepared_rows[preparation_id] = replace(
+                record, status="INTERRUPTED", reason="adapter_interrupted",
+            )
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
+
+        selected.coordinator.run_prepared_action = login_expired  # type: ignore[method-assign]
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await workflows.run(prepared)
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        assert selected.readiness.snapshot() == RuntimeStatus(
+            False, "subscription_unavailable", "ready",
+        )
+        assert untouched.readiness.snapshot() == RuntimeStatus(
+            False, "checking", "checking",
+        )
+        assert lease.snapshot() is None
 
     asyncio.run(exercise())
 

@@ -12,6 +12,10 @@ import threading
 from typing import Protocol
 
 from agent_bridge.adapters.base import FableAdapter, SolAdapter
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    SubscriptionAuthError,
+)
 from agent_bridge.app import EventBroadcaster
 from agent_bridge.contracts import ConversationTarget
 from agent_bridge.coordinator import Coordinator, IdFactory
@@ -677,6 +681,13 @@ class HubWorkflowOrchestrator:
                 )
             else:
                 await runtime.coordinator.run_prepared_action(prepared.preparation_id)
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                runtime.readiness.invalidate_fable_subscription()
+            record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
+            if record.status in _TERMINAL_PREPARED_STATUSES:
+                self._lease.release(prepared.token)
+            raise
         except BaseException:
             record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
             if record.status in _TERMINAL_PREPARED_STATUSES:

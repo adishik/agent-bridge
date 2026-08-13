@@ -16,7 +16,12 @@ from typing import Protocol
 from uuid import UUID
 
 from agent_bridge.adapters.base import AgentRunResult, FableAdapter, SolAdapter
-from agent_bridge.adapters.claude_cli import ClaudeCLI, ClaudeRunError, SubscriptionAuthError
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    ClaudeCLI,
+    ClaudeRunError,
+    SubscriptionAuthError,
+)
 from agent_bridge.adapters.codex_cli import CodexCLI, CodexRunError
 from agent_bridge.contracts import (
     ConversationActor,
@@ -105,6 +110,9 @@ _CONVERSATION_PREPARED_ACTIONS = frozenset({
 })
 _EXCHANGE_PERMISSION_TEXT = (
     "Automatic exchange limit reached. Allow three more internal exchanges to continue."
+)
+_FABLE_LOGIN_EXPIRED_TEXT = (
+    "Fable login expired. Run claude auth login on the host, then Resume."
 )
 
 
@@ -776,6 +784,11 @@ class Coordinator:
                 self._compatibility_errors[claimed.preparation_id] = (
                     self._bounded_compatibility_error(sys.exception())
                 )
+            if (
+                isinstance(error, SubscriptionAuthError)
+                and error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+            ):
+                raise error from None
             raise PreparedActionFailed() from None
         return self._persist_terminal_prepared_outcome(
             claimed, self._terminal_outcome_after_child(claimed),
@@ -955,7 +968,7 @@ class Coordinator:
     def _bounded_compatibility_error(self, error: BaseException) -> RuntimeError:
         """Keep old wrapper exception types without exposing provider text."""
         if isinstance(error, SubscriptionAuthError) and isinstance(self._fable, ClaudeCLI):
-            return SubscriptionAuthError("subscription authentication is unavailable")
+            return SubscriptionAuthError()
         if isinstance(error, ClaudeRunError) and isinstance(self._fable, ClaudeCLI):
             return ClaudeRunError("Fable did not return a valid contract")
         if isinstance(error, CodexRunError) and isinstance(self._sol, CodexCLI):
@@ -1433,6 +1446,23 @@ class Coordinator:
         except asyncio.CancelledError:
             self._interrupt_if_active(
                 run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING
+            )
+            raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_PLANNING,
+                    expected_fable_session_id=resume_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=resume_session_id,
             )
             raise
         except BaseException as error:
@@ -2283,6 +2313,23 @@ class Coordinator:
                 TaskState.FABLE_CLARIFYING,
             )
             raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_CLARIFYING,
+                    expected_fable_session_id=task.fable_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=task.fable_session_id,
+            )
+            raise
         except BaseException as error:
             self._record_agent_failure(
                 task,
@@ -2547,6 +2594,23 @@ class Coordinator:
                 task.task_id,
                 task.revision,
                 TaskState.FABLE_REVIEWING,
+            )
+            raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_REVIEWING,
+                    expected_fable_session_id=task.fable_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=task.fable_session_id,
             )
             raise
         except BaseException as error:
@@ -3106,6 +3170,47 @@ class Coordinator:
         else:
             self._finish_failed_run(run_id)
         self._fail_if_active(task.task_id, task.revision)
+
+    def _interrupt_fable_login_expired(
+        self,
+        task: TaskRecord,
+        *,
+        run_id: str,
+        continuation: TaskState,
+        expected_fable_session_id: str | None,
+    ) -> None:
+        """Retain one exact Fable continuation without provider-text leakage."""
+        record = self._store.latest_prepared_action_for_task(
+            project_id=self.project_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+        )
+        if record is None or record.status != "CLAIMED":
+            raise RuntimeError("expired Fable login has no claimed preparation")
+        self._store.interrupt_fable_login_expired(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_state=continuation,
+            expected_fable_session_id=expected_fable_session_id,
+            expected_pending=task.pending,
+            run_id=run_id,
+            event=ConversationEnvelope(
+                sender=ConversationActor.SYSTEM,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                message_type=ConversationMessageType.STATUS,
+                text=_FABLE_LOGIN_EXPIRED_TEXT,
+                task_id=None if task.revision == 0 else task.task_id,
+                revision=None if task.revision == 0 else task.revision,
+                continuation_generation=(
+                    None if task.revision == 0 else task.continuation_generation
+                ),
+            ),
+            preparation_id=record.preparation_id,
+            generation=record.generation,
+        )
 
     def _finish_failed_run(self, run_id: str, *, exit_code: int = 1) -> None:
         try:

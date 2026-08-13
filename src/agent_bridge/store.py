@@ -5674,6 +5674,225 @@ class SQLiteStore:
                 raise RuntimeError("task state changed concurrently")
         return self.get_task(task_id, revision)
 
+    def interrupt_fable_login_expired(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_state: TaskState,
+        expected_fable_session_id: str | None,
+        expected_pending: Mapping[str, object] | None,
+        run_id: str,
+        event: ConversationEnvelope,
+        preparation_id: str,
+        generation: int,
+    ) -> TaskRecord:
+        """Atomically retain one Fable continuation and its fixed login notice."""
+        if expected_state not in {
+            TaskState.FABLE_PLANNING,
+            TaskState.FABLE_CLARIFYING,
+            TaskState.FABLE_REVIEWING,
+        }:
+            raise ValueError("expired Fable login requires a Fable phase")
+        session_id = _require_string(session_id, "session_id")
+        task_id = _require_string(task_id, "task_id")
+        revision = _require_integer(revision, "revision")
+        if expected_fable_session_id is not None:
+            expected_fable_session_id = _require_string(
+                expected_fable_session_id, "expected_fable_session_id",
+            )
+        frozen_pending = None if expected_pending is None else freeze_json(expected_pending)
+        if frozen_pending is not None and not isinstance(frozen_pending, Mapping):
+            raise ValueError("expected_pending must be an object or null")
+        run_id = _require_string(run_id, "run_id")
+        if not isinstance(event, ConversationEnvelope) or (
+            event.sender is not ConversationActor.SYSTEM
+            or event.addressed_to is not ConversationTarget.USER
+            or event.routed_to is not ConversationTarget.USER
+            or event.message_type is not ConversationMessageType.STATUS
+            or event.text
+            != "Fable login expired. Run claude auth login on the host, then Resume."
+            or event.question_id is not None
+            or event.reply_to_question_id is not None
+        ):
+            raise ValueError("expired Fable login event is invalid")
+        if revision == 0:
+            if (
+                event.task_id is not None
+                or event.revision is not None
+                or event.continuation_generation is not None
+            ):
+                raise ValueError("early planning login event must be unbound")
+        elif (
+            event.task_id != task_id
+            or event.revision != revision
+            or not isinstance(event.continuation_generation, int)
+        ):
+            raise ValueError("expired Fable login event does not bind the exact task")
+        preparation_id = _prepared_identifier(preparation_id, "preparation_id")
+        generation = _require_integer(generation, "generation")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                if task.state is TaskState.INTERRUPTED:
+                    if revision == 0:
+                        notice_exists = any(
+                            _decode_mapping(row["payload_json"], "conversation event")
+                            == event.to_dict()
+                            for row in self._connection.execute(
+                                """
+                                SELECT payload_json FROM events
+                                WHERE session_id = ? AND task_id = ? AND kind = 'conversation'
+                                """,
+                                (session_id, task_id),
+                            )
+                        )
+                    else:
+                        notice_exists = self._conversation_event_exists(
+                            session_id=session_id,
+                            task_id=task_id,
+                            sender=event.sender,
+                            addressed_to=event.addressed_to,
+                            routed_to=event.routed_to,
+                            message_type=event.message_type,
+                            text=event.text,
+                            revision=revision,
+                            continuation_generation=event.continuation_generation,
+                        )
+                    if (
+                        task.continuation_state is not expected_state
+                        or task.fable_session_id != expected_fable_session_id
+                        or task.pending != frozen_pending
+                        or not notice_exists
+                    ):
+                        raise RuntimeError("expired Fable login incident changed concurrently")
+                    record = self._prepared_required(preparation_id)
+                    self._require_record_generation(record, generation)
+                    run = self.agent_run(run_id)
+                    if (
+                        not self._fable_login_preparation_matches(
+                            record, task, expected_state, status="INTERRUPTED",
+                        )
+                        or run.task_id != task_id
+                        or run.revision != revision
+                        or run.agent != "fable"
+                        or run.status != "interrupted"
+                        or run.cli_session_id not in {None, expected_fable_session_id}
+                    ):
+                        raise RuntimeError("expired Fable login lifecycle changed concurrently")
+                    return task
+                if task.state is not expected_state:
+                    raise RuntimeError("task is not in the expected Fable phase")
+                if task.fable_session_id != expected_fable_session_id:
+                    raise RuntimeError("Fable identity changed concurrently")
+                if task.pending != frozen_pending:
+                    raise RuntimeError("Fable pending context changed concurrently")
+                if (
+                    revision > 0
+                    and event.continuation_generation != task.continuation_generation
+                ):
+                    raise RuntimeError("task continuation generation changed concurrently")
+                record = self._prepared_required(preparation_id)
+                self._require_record_generation(record, generation)
+                run = self.agent_run(run_id)
+                if (
+                    not self._fable_login_preparation_matches(
+                        record, task, expected_state, status="CLAIMED",
+                    )
+                    or run.task_id != task_id
+                    or run.revision != revision
+                    or run.agent != "fable"
+                    or run.status != "running"
+                    or run.cli_session_id not in {None, expected_fable_session_id}
+                ):
+                    raise RuntimeError("expired Fable login lifecycle changed concurrently")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = ?, continuation_pause_id = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value,
+                        expected_state.value,
+                        task_id,
+                        revision,
+                        session_id,
+                        expected_state.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("expired Fable login task changed concurrently")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE prepared_actions SET status = 'INTERRUPTED', reason = 'adapter_interrupted'
+                    WHERE preparation_id = ? AND generation = ? AND status = 'CLAIMED'
+                    """,
+                    (preparation_id, generation),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("expired Fable login preparation changed concurrently")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE agent_runs SET status = 'interrupted', exit_code = ?, ended_at = ?
+                    WHERE run_id = ? AND task_id = ? AND revision = ?
+                      AND agent = 'fable' AND status = 'running'
+                    """,
+                    (-1, self._timestamp(), run_id, task_id, revision),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("expired Fable login run changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id, task_id=task_id, event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return self.get_task(task_id, revision)
+
+    def _fable_login_preparation_matches(
+        self,
+        record: PreparedActionRecord,
+        task: TaskRecord,
+        expected_state: TaskState,
+        *,
+        status: Literal["CLAIMED", "INTERRUPTED"],
+    ) -> bool:
+        """Authenticate the one claimed Hub action that owns a Fable run.
+
+        A prepared Hub action can legitimately begin in Sol and subsequently
+        route into Fable clarification or review.  Its typed lineage therefore
+        authenticates the action and its context; the exact live Fable phase
+        is authenticated separately from the current task row above.
+        """
+        if (
+            record.session_id != task.session_id
+            or record.task_id != task.task_id
+            or record.revision != task.revision
+            or record.status != status
+            or (status == "INTERRUPTED" and record.reason != "adapter_interrupted")
+            or (status == "CLAIMED" and record.reason is not None)
+        ):
+            return False
+        row = self._connection.execute(
+            "SELECT rowid FROM prepared_actions WHERE preparation_id = ?",
+            (record.preparation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            self._verify_prepared_project_identity(record.project_id, record.session_id)
+        except RuntimeError:
+            return False
+        if not self._legacy_prepared_action_is_authenticated(record, int(row["rowid"])):
+            return False
+        if expected_state is TaskState.FABLE_PLANNING:
+            return (
+                record.action in {"new_request", "resume"}
+                and record.pending_context is None
+            )
+        return record.action != "new_request"
+
     def approve_task(
         self,
         task_id: str,

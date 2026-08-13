@@ -3729,6 +3729,33 @@ def test_real_http_preparation_refreshes_fable_readiness_after_each_lease_acquis
         harness.close()
 
 
+def test_hub_bootstrap_immediately_projects_only_invalidated_fable_subscription(
+    tmp_path: Path,
+) -> None:
+    harness = _real_hub_harness(tmp_path)
+    failed = harness.runtimes["a"]
+    unaffected = harness.runtimes["b"]
+    try:
+        failed.readiness.invalidate_fable_subscription()
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            failed_payload = client.get(
+                f"/api/projects/{failed.project_id}/chats/shared-chat/bootstrap"
+            ).json()
+            unaffected_payload = client.get(
+                f"/api/projects/{unaffected.project_id}/chats/shared-chat/bootstrap"
+            ).json()
+
+        assert (failed_payload["fable_ready"], failed_payload["fable_status"]) == (
+            False, "subscription_unavailable",
+        )
+        assert (unaffected_payload["fable_ready"], unaffected_payload["fable_status"]) == (
+            False, "checking",
+        )
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize(
     ("fable_result", "sol_result", "expected_status"),
     (

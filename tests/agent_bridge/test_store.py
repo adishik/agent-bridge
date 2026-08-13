@@ -704,6 +704,152 @@ def test_interruption_requires_a_resumable_continuation_target(tmp_path, valid_b
         )
 
 
+def test_expired_fable_login_requires_exact_claimed_fable_run_and_rolls_back(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    prepared = store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-login",
+        generation=7,
+        payload=NewRequestPayload(text="Plan the bounded task."),
+    )
+    claimed = store.claim_prepared_action(prepared.preparation_id, generation=7)
+    started = store.start_agent_run("run-login", "task-login", 0, "fable")
+    task = store.get_task("task-login", 0)
+    notice = ConversationEnvelope(
+        sender=ConversationActor.SYSTEM,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        message_type=ConversationMessageType.STATUS,
+        text="Fable login expired. Run claude auth login on the host, then Resume.",
+    )
+
+    with pytest.raises(RuntimeError, match="pending context"):
+        store.interrupt_fable_login_expired(
+            session_id="session-1",
+            task_id="task-login",
+            revision=0,
+            expected_state=TaskState.FABLE_PLANNING,
+            expected_fable_session_id=None,
+            expected_pending={"tampered": "context"},
+            run_id=started.run_id,
+            preparation_id=claimed.preparation_id,
+            generation=claimed.generation,
+            event=notice,
+        )
+    assert store.get_task("task-login", 0) == task
+    assert store.prepared_action(claimed.preparation_id) == claimed
+    assert store.agent_run(started.run_id) == started
+
+    other = store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="other-login-task",
+        generation=1,
+        payload=NewRequestPayload(text="Plan another bounded task."),
+    )
+    store.claim_prepared_action(other.preparation_id, generation=other.generation)
+    wrong_run = store.start_agent_run("run-other", "other-login-task", 0, "fable")
+    with pytest.raises(RuntimeError, match="lifecycle changed"):
+        store.interrupt_fable_login_expired(
+            session_id="session-1",
+            task_id="task-login",
+            revision=0,
+            expected_state=TaskState.FABLE_PLANNING,
+            expected_fable_session_id=None,
+            expected_pending=None,
+            run_id=wrong_run.run_id,
+            preparation_id=claimed.preparation_id,
+            generation=claimed.generation,
+            event=notice,
+        )
+    assert store.get_task("task-login", 0) == task
+    assert store.prepared_action(claimed.preparation_id) == claimed
+    assert store.agent_run(started.run_id) == started
+
+    store._connection.execute(
+        """
+        CREATE TRIGGER fail_login_guidance_event
+        BEFORE INSERT ON events WHEN NEW.kind = 'conversation'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected login guidance failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected login guidance failure"):
+        store.interrupt_fable_login_expired(
+            session_id="session-1",
+            task_id="task-login",
+            revision=0,
+            expected_state=TaskState.FABLE_PLANNING,
+            expected_fable_session_id=None,
+            expected_pending=None,
+            run_id=started.run_id,
+            preparation_id=claimed.preparation_id,
+            generation=claimed.generation,
+            event=notice,
+        )
+
+    assert store.get_task("task-login", 0) == task
+    assert store.prepared_action(claimed.preparation_id) == claimed
+    assert store.agent_run(started.run_id) == started
+    initial_events = store.events_after("session-1", 0)
+    assert len(initial_events) == 2
+
+    store._connection.execute("DROP TRIGGER fail_login_guidance_event")
+    interrupted = store.interrupt_fable_login_expired(
+        session_id="session-1",
+        task_id="task-login",
+        revision=0,
+        expected_state=TaskState.FABLE_PLANNING,
+        expected_fable_session_id=None,
+        expected_pending=None,
+        run_id=started.run_id,
+        preparation_id=claimed.preparation_id,
+        generation=claimed.generation,
+        event=notice,
+    )
+    assert interrupted.state is TaskState.INTERRUPTED
+    assert interrupted.continuation_state is TaskState.FABLE_PLANNING
+    assert store.prepared_action(claimed.preparation_id).status == "INTERRUPTED"
+    assert store.prepared_action(claimed.preparation_id).reason == "adapter_interrupted"
+    assert store.agent_run(started.run_id).status == "interrupted"
+    assert store.agent_run(started.run_id).exit_code == -1
+    assert len(store.events_after("session-1", 0)) == len(initial_events) + 1
+
+    assert store.interrupt_fable_login_expired(
+        session_id="session-1",
+        task_id="task-login",
+        revision=0,
+        expected_state=TaskState.FABLE_PLANNING,
+        expected_fable_session_id=None,
+        expected_pending=None,
+        run_id=started.run_id,
+        preparation_id=claimed.preparation_id,
+        generation=claimed.generation,
+        event=notice,
+    ) == interrupted
+    assert len(store.events_after("session-1", 0)) == len(initial_events) + 1
+
+    with pytest.raises(ValueError, match="preparation_id"):
+        store.interrupt_fable_login_expired(
+            session_id="session-1",
+            task_id="task-login",
+            revision=0,
+            expected_state=TaskState.FABLE_PLANNING,
+            expected_fable_session_id=None,
+            expected_pending=None,
+            run_id=started.run_id,
+            preparation_id=None,  # type: ignore[arg-type]
+            generation=claimed.generation,
+            event=notice,
+        )
+
+
 def test_revision_zero_task_cannot_enter_approval_without_a_brief(tmp_path, valid_brief) -> None:
     store = _store(tmp_path)
     store.create_session("session-1", "/repo")

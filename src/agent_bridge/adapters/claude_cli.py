@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+from enum import Enum
 
 from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.contracts import (
@@ -31,10 +32,27 @@ METERED_ENV_KEYS = frozenset({
 })
 MAX_CLAUDE_AUDIT_EVENTS = 1_024
 _SAFE_CLAUDE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_LOGIN_REQUIRED_SUBSCRIPTION_TYPES = frozenset({"max"})
+
+
+class ClaudeAuthFailureCategory(str, Enum):
+    """Allowlisted structural auth failures safe for coordinator handling."""
+
+    LOGIN_REQUIRED = "login_required"
 
 
 class SubscriptionAuthError(RuntimeError):
     """Claude CLI is not unambiguously using a saved paid subscription."""
+
+    def __init__(self, category: ClaudeAuthFailureCategory | None = None) -> None:
+        if category is not None and not isinstance(category, ClaudeAuthFailureCategory):
+            raise ValueError("subscription auth failure category is invalid")
+        self.category = category
+        super().__init__(
+            "Claude subscription login is required"
+            if category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+            else "Claude subscription authentication could not be verified"
+        )
 
 
 class ClaudeRunError(RuntimeError):
@@ -104,7 +122,7 @@ class ClaudeCLI:
         run_id = f"claude-subscription-preflight-{next(self._preflight_ids)}"
         result = await self._run_preflight(run_id)
         if result.interrupted:
-            raise SubscriptionAuthError("Claude subscription authentication was interrupted")
+            raise SubscriptionAuthError()
         return self._parse_auth_status(result)
 
     async def plan(
@@ -209,17 +227,23 @@ class ClaudeCLI:
 
     def _parse_auth_status(self, result: ProcessResult) -> ClaudeAuthStatus:
         if result.exit_code != 0 or not result.stdout:
-            raise SubscriptionAuthError("Claude subscription authentication could not be verified")
+            raise SubscriptionAuthError()
         auth_document = "\n".join(result.stdout)
         try:
             status = json.loads(auth_document)
         except (json.JSONDecodeError, TypeError):
-            raise SubscriptionAuthError(
-                "Claude subscription authentication could not be verified"
-            ) from None
+            raise SubscriptionAuthError() from None
         if not isinstance(status, Mapping):
-            raise SubscriptionAuthError("Claude subscription authentication could not be verified")
+            raise SubscriptionAuthError()
         subscription_type = status.get("subscriptionType")
+        if (
+            status.get("loggedIn") is False
+            and status.get("authMethod") == "claude.ai"
+            and status.get("apiProvider") == "firstParty"
+            and isinstance(subscription_type, str)
+            and subscription_type in _LOGIN_REQUIRED_SUBSCRIPTION_TYPES
+        ):
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
         if (
             status.get("loggedIn") is not True
             or status.get("authMethod") != "claude.ai"
@@ -227,7 +251,7 @@ class ClaudeCLI:
             or not isinstance(subscription_type, str)
             or not subscription_type.strip()
         ):
-            raise SubscriptionAuthError("Claude subscription authentication is required")
+            raise SubscriptionAuthError()
         return ClaudeAuthStatus(
             logged_in=True,
             auth_method="claude.ai",

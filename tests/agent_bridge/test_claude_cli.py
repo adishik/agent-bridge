@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
     METERED_ENV_KEYS,
     METERED_ENV_PREFIXES,
     ClaudeCLI,
@@ -257,6 +258,96 @@ def test_fable_fails_closed_on_unusable_auth_status(
     async def scenario() -> None:
         with pytest.raises(SubscriptionAuthError, match=error_match):
             await _adapter(fake_claude, tmp_path, **extra_env).preflight()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("subscription_type", ("max",))
+def test_fable_maps_only_allowlisted_logged_out_subscription_shapes_to_login_required(
+    fake_claude: Path, tmp_path: Path, subscription_type: str,
+) -> None:
+    async def scenario() -> None:
+        adapter = _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_AUTH_STATUS=json.dumps({
+                "loggedIn": False,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "subscriptionType": subscription_type,
+            }),
+        )
+
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await adapter.plan(
+                run_id="run-login-expired",
+                task_id="task-1",
+                prompt="Plan it",
+                context="Repository context",
+            )
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        assert str(raised.value) == "Claude subscription login is required"
+        assert json.loads((tmp_path / "captured-argv.json").read_text()) == [
+            "auth", "status", "--json",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_fable_fails_closed_for_auth_looking_unallowlisted_output_without_leaking_it(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        sentinel = "SECRET_AUTH_LOOKING_PROVIDER_MESSAGE"
+        adapter = _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_AUTH_STATUS=json.dumps({
+                "loggedIn": False,
+                "authMethod": "unknown",
+                "apiProvider": "firstParty",
+                "subscriptionType": "max",
+                "message": f"login expired: {sentinel}",
+            }),
+        )
+
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await adapter.preflight()
+
+        assert raised.value.category is None
+        assert sentinel not in str(raised.value)
+        assert sentinel not in repr(raised.value)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "subscription_type",
+    (
+        "pro", "MAX", "max ", "enterprise_secret_login_hint", "", "   ",
+        1, None, [], {"type": "max"},
+    ),
+)
+def test_fable_does_not_classify_unrecognized_logged_out_subscription_types_as_login_required(
+    fake_claude: Path, tmp_path: Path, subscription_type: object,
+) -> None:
+    async def scenario() -> None:
+        adapter = _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_AUTH_STATUS=json.dumps({
+                "loggedIn": False,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "subscriptionType": subscription_type,
+            }),
+        )
+
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await adapter.preflight()
+
+        assert raised.value.category is None
 
     asyncio.run(scenario())
 
