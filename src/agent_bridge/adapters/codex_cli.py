@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -38,6 +38,13 @@ _AUDIT_ITEM_STATUSES = frozenset({
 })
 MAX_CODEX_AUDIT_EVENTS = 1_024
 _SOL_SCHEMA_FILENAME = "sol-outcome.json"
+_SOL_SCHEMA_MEMFD_NAME = "agent-bridge-sol-schema"
+_REQUIRED_SOL_SCHEMA_SEALS = (
+    fcntl.F_SEAL_WRITE
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_SEAL
+)
 
 
 def _serialized_sol_outcome_schema() -> bytes:
@@ -72,6 +79,17 @@ def _validated_sol_schema_file_descriptor(descriptor: int) -> None:
             raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
     except OSError as error:
         raise ValueError("schema_file_fd must be an open read-only schema file descriptor") from error
+
+
+def _validated_sealed_sol_schema_memfd(descriptor: int) -> None:
+    _validated_sol_schema_file_descriptor(descriptor)
+    try:
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o400:
+            raise ValueError("Sol schema memfd must be sealed read-only canonical data")
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != _REQUIRED_SOL_SCHEMA_SEALS:
+            raise ValueError("Sol schema memfd must be sealed read-only canonical data")
+    except OSError as error:
+        raise ValueError("Sol schema memfd must be sealed read-only canonical data") from error
 
 
 def _validated_sol_schema_directory_descriptor(descriptor: int) -> None:
@@ -144,6 +162,48 @@ def materialize_sol_schema_file(directory_fd: int) -> int:
             os.close(schema_file_descriptor)
 
 
+def _create_sealed_sol_schema_memfd() -> int:
+    """Create one adapter-owned sealed anonymous schema descriptor."""
+    expected = _serialized_sol_outcome_schema()
+    writable_descriptor = -1
+    readonly_descriptor = -1
+    try:
+        writable_descriptor = os.memfd_create(
+            _SOL_SCHEMA_MEMFD_NAME,
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        written = 0
+        while written < len(expected):
+            count = os.write(writable_descriptor, expected[written:])
+            if count <= 0:
+                raise OSError("schema write did not make progress")
+            written += count
+        os.fchmod(writable_descriptor, 0o400)
+        os.fsync(writable_descriptor)
+        fcntl.fcntl(
+            writable_descriptor,
+            fcntl.F_ADD_SEALS,
+            _REQUIRED_SOL_SCHEMA_SEALS,
+        )
+        readonly_descriptor = os.open(
+            f"/proc/self/fd/{writable_descriptor}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        _validated_sealed_sol_schema_memfd(readonly_descriptor)
+        os.close(writable_descriptor)
+        writable_descriptor = -1
+        result = readonly_descriptor
+        readonly_descriptor = -1
+        return result
+    except OSError as error:
+        raise ValueError("Sol schema memfd could not be created") from error
+    finally:
+        if readonly_descriptor >= 0:
+            os.close(readonly_descriptor)
+        if writable_descriptor >= 0:
+            os.close(writable_descriptor)
+
+
 class CodexRunError(RuntimeError):
     """A completed Codex CLI run did not satisfy the adapter contract."""
 
@@ -199,14 +259,11 @@ class CodexCLI:
         self._runner = runner
         self.repo_root = repo_root_path
         self._env = dict(os.environ if env is None else env)
+        self.schema_path = schema_dir_path / _SOL_SCHEMA_FILENAME
         if schema_file_fd is None:
-            self._schema_pass_fds: tuple[int, ...] = ()
-            self.schema_path = schema_dir_path / _SOL_SCHEMA_FILENAME
             self._materialize_schema()
         else:
             _validated_sol_schema_file_descriptor(schema_file_fd)
-            self._schema_pass_fds = (schema_file_fd,)
-            self.schema_path = Path(f"/proc/self/fd/{schema_file_fd}")
 
     async def start(
         self, *, run_id: str, brief: TaskBrief, context: str,
@@ -214,40 +271,36 @@ class CodexCLI:
         if not isinstance(brief, TaskBrief):
             raise ValueError("brief must be a TaskBrief")
         prompt = self._start_prompt(brief, context)
-        argv = (
-            str(self.executable),
-            "exec", "--json",
-            "--model", "gpt-5.6-sol",
-            "--sandbox", "workspace-write",
-            "--approve-for-me",
-            "--cd", str(self.repo_root),
-            "--output-schema", str(self.schema_path),
-            prompt,
-        )
-        return await self._run_contract(
+        return await self._run_with_sealed_schema(
             run_id=run_id,
-            argv=argv,
             expected_thread_id=None,
-            pass_fds=self._schema_pass_fds,
+            build_argv=lambda schema_path: (
+                str(self.executable),
+                "exec", "--json",
+                "--model", "gpt-5.6-sol",
+                "--sandbox", "workspace-write",
+                "--approve-for-me",
+                "--cd", str(self.repo_root),
+                "--output-schema", schema_path,
+                prompt,
+            ),
         )
 
     async def resume(
         self, *, run_id: str, thread_id: str, prompt: str,
     ) -> AgentRunResult:
         thread_id = self._canonical_thread_id(thread_id)
-        argv = (
-            str(self.executable),
-            "exec", "resume", "--json",
-            "--model", "gpt-5.6-sol",
-            "--output-schema", str(self.schema_path),
-            thread_id,
-            self._resume_prompt(prompt),
-        )
-        return await self._run_contract(
+        return await self._run_with_sealed_schema(
             run_id=run_id,
-            argv=argv,
             expected_thread_id=thread_id,
-            pass_fds=self._schema_pass_fds,
+            build_argv=lambda schema_path: (
+                str(self.executable),
+                "exec", "resume", "--json",
+                "--model", "gpt-5.6-sol",
+                "--output-schema", schema_path,
+                thread_id,
+                self._resume_prompt(prompt),
+            ),
         )
 
     def _materialize_schema(self) -> None:
@@ -266,6 +319,24 @@ class CodexCLI:
                 os.close(schema_file_descriptor)
             if directory_descriptor >= 0:
                 os.close(directory_descriptor)
+
+    async def _run_with_sealed_schema(
+        self,
+        *,
+        run_id: str,
+        expected_thread_id: str | None,
+        build_argv: Callable[[str], tuple[str, ...]],
+    ) -> AgentRunResult:
+        schema_file_descriptor = _create_sealed_sol_schema_memfd()
+        try:
+            return await self._run_contract(
+                run_id=run_id,
+                argv=build_argv(f"/proc/self/fd/{schema_file_descriptor}"),
+                expected_thread_id=expected_thread_id,
+                pass_fds=(schema_file_descriptor,),
+            )
+        finally:
+            os.close(schema_file_descriptor)
 
     async def _run_contract(
         self,

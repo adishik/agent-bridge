@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import json
 import os
@@ -901,6 +902,7 @@ def test_provider_cannot_traverse_schema_file_capability(
     tools["codex"] = _write_executable(
         tmp_path / "capability-codex",
         """
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -913,18 +915,42 @@ if sys.argv[1:3] != ["exec", "--json"]:
     raise SystemExit(92)
 schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
 schema = json.loads(schema_path.read_text(encoding="utf-8"))
+proc_target = os.readlink(schema_path)
 siblings = {}
 for sibling in ("bridge.sqlite3", "artifacts", "locks"):
     try:
-        descriptor = os.open(schema_path / ".." / sibling, os.O_RDONLY)
+        descriptor = os.open(Path(proc_target).parent / sibling, os.O_RDONLY)
     except OSError:
         siblings[sibling] = False
     else:
         os.close(descriptor)
         siblings[sibling] = True
+try:
+    writable_descriptor = os.open(schema_path, os.O_WRONLY)
+except OSError:
+    writable_opened = False
+    writable_write = False
+else:
+    writable_opened = True
+    try:
+        os.write(writable_descriptor, b"X")
+    except OSError:
+        writable_write = False
+    else:
+        writable_write = True
+    finally:
+        os.close(writable_descriptor)
+try:
+    readonly_descriptor = os.open(schema_path, os.O_RDONLY)
+    try:
+        seals = fcntl.fcntl(readonly_descriptor, fcntl.F_GET_SEALS)
+    finally:
+        os.close(readonly_descriptor)
+except OSError:
+    seals = None
 report_path = Path(os.environ["CODEX_HOME"]) / "schema-capability.json"
 report_path.parent.mkdir(parents=True, exist_ok=True)
-report_path.write_text(json.dumps({"schema": schema, "siblings": siblings}), encoding="utf-8")
+report_path.write_text(json.dumps({"schema": schema, "proc_target": proc_target, "siblings": siblings, "writable_opened": writable_opened, "writable_write": writable_write, "seals": seals}), encoding="utf-8")
 print(json.dumps({"type": "thread.started", "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"}))
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps({"status": "completed", "summary": "capability checked", "changed_files": [], "commands_run": [], "known_failures": [], "remaining_risks": [], "architecture_docs": "No change.", "question": None})}}))
 """,
@@ -937,22 +963,56 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
     (state_dir / "artifacts" / "private-artifact").write_text("artifact", encoding="utf-8")
     (state_dir / "locks").mkdir()
     (state_dir / "locks" / "private-lock").write_text("lock", encoding="utf-8")
-    observed_pass_fds: list[tuple[tuple[int, bool, bool], ...]] = []
-    runtime_schema_fds: list[int] = []
+    observed_pass_fds: list[tuple[tuple[int, bool, bool, str, int | None], ...]] = []
+    persisted_schema_fds: list[int] = []
+    closed_descriptors: list[int] = []
+    from agent_bridge.adapters import codex_cli
+
+    original_materialize = codex_cli.materialize_sol_schema_file
+    original_close = os.close
+
+    def capture_persisted_schema_fd(directory_fd: int) -> int:
+        descriptor = original_materialize(directory_fd)
+        persisted_schema_fds.append(descriptor)
+        return descriptor
+
+    original_preflights = launcher._run_preflights
+
+    async def verify_persisted_schema_fd_closed(**kwargs):
+        assert len(persisted_schema_fds) == 1
+        assert persisted_schema_fds[0] in closed_descriptors
+        return await original_preflights(**kwargs)
+
+    def record_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(codex_cli, "materialize_sol_schema_file", capture_persisted_schema_fd)
+    monkeypatch.setattr(launcher, "_run_preflights", verify_persisted_schema_fd_closed)
+    monkeypatch.setattr(os, "close", record_close)
 
     class RecordingProcessRunner(ProcessRunner):
         async def run(self, *, pass_fds=(), **kwargs):
-            observed_pass_fds.append(tuple(
-                (descriptor, stat.S_ISREG(os.fstat(descriptor).st_mode), stat.S_ISDIR(os.fstat(descriptor).st_mode))
-                for descriptor in pass_fds
-            ))
+            descriptors = []
+            for descriptor in pass_fds:
+                try:
+                    seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+                except OSError:
+                    seals = None
+                descriptors.append((
+                    descriptor,
+                    stat.S_ISREG(os.fstat(descriptor).st_mode),
+                    stat.S_ISDIR(os.fstat(descriptor).st_mode),
+                    os.readlink(f"/proc/self/fd/{descriptor}"),
+                    seals,
+                ))
+            observed_pass_fds.append(tuple(descriptors))
             return await super().run(pass_fds=pass_fds, **kwargs)
 
     monkeypatch.setattr("agent_bridge.process.ProcessRunner", RecordingProcessRunner)
 
     def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
         runtime = app.state.project_registry.projects()[0]
-        runtime_schema_fds.append(runtime.sol._schema_pass_fds[0])
         result = asyncio.run(runtime.sol.start(
             run_id="schema-file-capability", brief=valid_brief, context="capability test",
         ))
@@ -965,20 +1025,33 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
     report = json.loads(report_path.read_text(encoding="utf-8"))
     from agent_bridge.contracts import SOL_OUTCOME_SCHEMA
     assert report["schema"] == SOL_OUTCOME_SCHEMA
+    assert str(state_dir) not in report["proc_target"]
+    assert report["proc_target"].startswith("/memfd:agent-bridge-sol-schema")
     assert report["siblings"] == {
         "bridge.sqlite3": False,
         "artifacts": False,
         "locks": False,
     }
+    assert report["writable_opened"] is False
+    assert report["writable_write"] is False
+    required_seals = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    assert report["seals"] == required_seals
     codex_pass_fds = [pass_fds for pass_fds in observed_pass_fds if pass_fds]
     assert len(codex_pass_fds) == 1
     assert len(codex_pass_fds[0]) == 1
-    _, is_regular, is_directory = codex_pass_fds[0][0]
+    descriptor, is_regular, is_directory, target, seals = codex_pass_fds[0][0]
     assert is_regular is True
     assert is_directory is False
-    assert len(runtime_schema_fds) == 1
+    assert target.startswith("/memfd:agent-bridge-sol-schema")
+    assert str(state_dir) not in target
+    assert seals == required_seals
     with pytest.raises(OSError):
-        os.fstat(runtime_schema_fds[0])
+        os.fstat(descriptor)
 
 
 def test_schema_file_descriptor_closes_during_startup_rollback(

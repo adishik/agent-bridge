@@ -13,6 +13,7 @@ import pytest
 from agent_bridge.adapters.codex_cli import (
     CodexCLI,
     CodexRunError,
+    _create_sealed_sol_schema_memfd,
     materialize_sol_schema_file,
 )
 from agent_bridge.contracts import SOL_OUTCOME_SCHEMA, TaskBrief
@@ -219,6 +220,96 @@ def test_materialize_sol_schema_file_returns_exact_read_only_regular_file(
         os.close(directory_fd)
 
 
+def test_sealed_sol_schema_memfd_is_anonymous_immutable_read_only_schema() -> None:
+    descriptor = _create_sealed_sol_schema_memfd()
+    try:
+        assert stat.S_ISREG(os.fstat(descriptor).st_mode)
+        assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o400
+        assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        assert fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) == (
+            fcntl.F_SEAL_WRITE
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_SEAL
+        )
+        assert os.readlink(f"/proc/self/fd/{descriptor}").startswith(
+            "/memfd:agent-bridge-sol-schema"
+        )
+        duplicate = os.dup(descriptor)
+        try:
+            assert os.read(duplicate, 1_000_000) == json.dumps(
+                SOL_OUTCOME_SCHEMA, separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+        finally:
+            os.close(duplicate)
+        with pytest.raises(OSError):
+            os.open(f"/proc/self/fd/{descriptor}", os.O_WRONLY)
+    finally:
+        os.close(descriptor)
+
+
+def test_sol_closes_per_invocation_schema_memfd_after_runner_error(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    captured: list[int] = []
+
+    class FailingRunner:
+        async def run(self, *, pass_fds=(), **kwargs):
+            captured.extend(pass_fds)
+            raise OSError("injected runner error")
+
+    async def scenario() -> None:
+        adapter = CodexCLI(
+            fake_codex,
+            FailingRunner(),
+            repo_root=tmp_path,
+            schema_dir=tmp_path / "schemas",
+            env=SAFE_ENV,
+        )
+        with pytest.raises(OSError, match="injected runner error"):
+            await adapter.start(run_id="runner-error", brief=brief, context="context")
+
+    asyncio.run(scenario())
+    assert len(captured) == 1
+    with pytest.raises(OSError):
+        os.fstat(captured[0])
+
+
+def test_sol_closes_per_invocation_schema_memfd_after_cancellation(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    captured: list[int] = []
+    entered = asyncio.Event()
+
+    class BlockingRunner:
+        async def run(self, *, pass_fds=(), **kwargs):
+            captured.extend(pass_fds)
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def scenario() -> None:
+        adapter = CodexCLI(
+            fake_codex,
+            BlockingRunner(),
+            repo_root=tmp_path,
+            schema_dir=tmp_path / "schemas",
+            env=SAFE_ENV,
+        )
+        run = asyncio.create_task(
+            adapter.start(run_id="cancelled", brief=brief, context="context")
+        )
+        await entered.wait()
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    asyncio.run(scenario())
+    assert len(captured) == 1
+    with pytest.raises(OSError):
+        os.fstat(captured[0])
+
+
 @pytest.mark.parametrize("kind", ("directory", "writable", "closed", "wrong_content"))
 def test_sol_rejects_noncanonical_schema_file_descriptors(
     fake_codex: Path, tmp_path: Path, kind: str,
@@ -290,7 +381,7 @@ def test_sol_keeps_an_injected_schema_file_available_to_its_child(
                 schema_file_fd=descriptor,
                 env=SAFE_ENV,
             )
-            assert adapter.schema_path == Path(f"/proc/self/fd/{descriptor}")
+            assert adapter.schema_path == schemas / "sol-outcome.json"
             result = await adapter.start(
                 run_id="descriptor-anchored-schema", brief=brief, context="context",
             )
@@ -320,7 +411,9 @@ def test_sol_resume_uses_exact_thread_and_validates_outcome(
         argv = json.loads((tmp_path / "captured-codex-argv.json").read_text())
         assert argv[:4] == ["exec", "resume", "--json", "--model"]
         assert argv[4] == "gpt-5.6-sol"
-        assert argv[argv.index("--output-schema") + 1] == str(adapter.schema_path)
+        schema_argument = argv[argv.index("--output-schema") + 1]
+        assert schema_argument.startswith("/proc/self/fd/")
+        assert schema_argument != str(adapter.schema_path)
         assert argv[-2] == THREAD_ID
         assert "Fable answered" in argv[-1]
         assert "latest exact user-approved TaskBrief revision" in argv[-1]

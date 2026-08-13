@@ -90,6 +90,7 @@ class RecordingProcessRunner(ProcessRunner):
         env: Mapping[str, str],
         stdin: bytes | None,
         on_line: LineCallback,
+        pass_fds: Sequence[int] = (),
     ) -> ProcessResult:
         executable = Path(argv[0])
         if not executable.is_absolute():
@@ -106,6 +107,7 @@ class RecordingProcessRunner(ProcessRunner):
             env=env,
             stdin=stdin,
             on_line=on_line,
+            pass_fds=pass_fds,
         )
 
 

@@ -1013,14 +1013,19 @@ def assemble_project_runtime(
             env=environment,
             cwd=spec.repo_root,
         )
-        sol = CodexCLI(
-            settings.codex_executable,
-            runner,
-            repo_root=spec.repo_root,
-            schema_dir=spec.state_dir / "schemas",
-            env=codex_child_environment,
-            schema_file_fd=opened.schema_file_descriptor,
-        )
+        try:
+            sol = CodexCLI(
+                settings.codex_executable,
+                runner,
+                repo_root=spec.repo_root,
+                schema_dir=spec.state_dir / "schemas",
+                env=codex_child_environment,
+                schema_file_fd=opened.schema_file_descriptor,
+            )
+        finally:
+            if opened.schema_file_descriptor is not None:
+                os.close(opened.schema_file_descriptor)
+                opened.schema_file_descriptor = None
         preflight = asyncio.run(_run_preflights(
             runner=runner,
             fable=fable,
