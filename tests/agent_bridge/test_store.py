@@ -3146,6 +3146,17 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
         )
     }
     assert {"questions", "exchange_reservations", "exchange_grants"} <= tables
+    question_columns = tuple(
+        row["name"]
+        for row in migrated._connection.execute("PRAGMA table_info(questions)")
+    )
+    assert "continuation_state" in question_columns
+    assert "pending_action_json" in question_columns
+    grant_columns = tuple(
+        row["name"]
+        for row in migrated._connection.execute("PRAGMA table_info(exchange_grants)")
+    )
+    assert "permission_id" in grant_columns
     indexes = {
         row["name"]
         for row in migrated._connection.execute(
@@ -3156,6 +3167,7 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
         "one_unanswered_question_per_task_revision",
         "exchange_reservations_request_identity",
         "exchange_grants_request_identity",
+        "exchange_grants_permission_identity",
     } <= indexes
     migrated.close()
 
@@ -3650,14 +3662,16 @@ def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
     )
     assert paused.state is TaskState.AWAITING_USER_INPUT
     assert paused.continuation_state is TaskState.SOL_RUNNING
-    assert paused.pending == {
+    assert dict(paused.pending or {}) == {
         "next": "retry-fourth-question",
         "attempted_question": {
             "addressed_to": "fable",
             "text": "A fourth question needs permission.",
             "reason": "The initial exchange allowance is exhausted.",
         },
+        "exchange_permission_id": (paused.pending or {})["exchange_permission_id"],
     }
+    assert isinstance((paused.pending or {})["exchange_permission_id"], str)
     assert store._connection.execute("SELECT COUNT(*) FROM exchange_reservations").fetchone()[0] == 3
     assert store._connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 3
 
@@ -3675,6 +3689,16 @@ def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
         expected_generation=1,
         request_id="grant-1",
     ) == EXCHANGE_GRANT_SIZE
+    before_distinct_grant = store.get_task("exchange-task", 1)
+    with pytest.raises(RuntimeError, match="permission"):
+        store.grant_internal_exchanges(
+            session_id="session-1",
+            task_id="exchange-task",
+            revision=1,
+            expected_generation=1,
+            request_id="grant-2",
+        )
+    assert store.get_task("exchange-task", 1) == before_distinct_grant
     granted = store.get_task("exchange-task", 1)
     assert granted.exchange_allowance == EXCHANGE_GRANT_SIZE
     assert granted.exchange_consumed == 3
@@ -4030,3 +4054,98 @@ def test_question_generation_reset_and_non_question_work_do_not_consume_exchange
     assert separate.continuation_generation == 1
     assert separate.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
     assert separate.exchange_consumed == 0
+
+
+def test_human_direction_reset_helper_rejects_autocommit_invocation(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="reset-helper-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    before = store.get_task("reset-helper-task", 1)
+
+    with pytest.raises(RuntimeError, match="transaction"):
+        store._reset_internal_exchanges_for_human_direction_in_transaction(
+            store._connection.cursor(),
+            session_id="session-1",
+            task_id="reset-helper-task",
+            revision=1,
+            expected_generation=1,
+        )
+
+    assert store.get_task("reset-helper-task", 1) == before
+
+
+def test_answer_rejects_a_question_detached_from_its_exact_pause(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="detached-question-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store.pause_for_question(
+        session_id="session-1",
+        task_id="detached-question-task",
+        revision=1,
+        expected_generation=1,
+        question_id="detached-question",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="Resolve the original exact ambiguity.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-original-question"},
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id="detached-question-task",
+            revision=1,
+            generation=1,
+            question_id="detached-question",
+            text="Resolve the original exact ambiguity.",
+        ),
+    )
+    store.resume_continuation(
+        "detached-question-task",
+        1,
+        expected=TaskState.AWAITING_USER_INPUT,
+    )
+    store.pause_for_continuation(
+        "detached-question-task",
+        1,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"next": "resume-unrelated-pause"},
+    )
+    before_task = store.get_task("detached-question-task", 1)
+    before_question = store.question("detached-question")
+    before_events = store.events_after("session-1", 0)
+
+    with pytest.raises(RuntimeError, match="question continuation"):
+        store.answer_question_and_prepare_resume(
+            session_id="session-1",
+            task_id="detached-question-task",
+            revision=1,
+            question_id="detached-question",
+            expected_generation=1,
+            answer_text="This answer belongs to the original pause only.",
+            answered_by=ConversationActor.FABLE,
+            pending_action={"next": "must-not-replace-unrelated-pause"},
+            event=_conversation_answer(
+                sender=ConversationActor.FABLE,
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                task_id="detached-question-task",
+                revision=1,
+                generation=1,
+                question_id="detached-question",
+                text="This answer belongs to the original pause only.",
+            ),
+        )
+
+    assert store.get_task("detached-question-task", 1) == before_task
+    assert store.question("detached-question") == before_question
+    assert store.events_after("session-1", 0) == before_events
