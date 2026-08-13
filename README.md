@@ -129,10 +129,29 @@ project/chat's live workflow are rejected until it reaches a terminal state or
 is stopped. This is deliberate: finish or stop the active workflow before
 changing the selected project.
 
-Phase 1 does not implement directed agent-to-agent questions, agent-directed
-intervention, or cross-project handoffs. Fable and Sol communicate only through
-the persisted task workflow; the user remains the control point for approval,
-answers, Stop, and Resume.
+The composer always records the selected recipient. An ordinary request to
+Fable begins planning. An ordinary request addressed to Sol is still visibly
+routed through Fable until the exact displayed task revision has been approved;
+it does not start Sol early. Fable is the planner and reviewer with authority
+over intent and scope. Sol is the executor only for an exact approved,
+non-terminal revision.
+
+During an approved task, either agent may ask the other a structured question.
+The question and its exact reply are shown in the main conversation before the
+next agent runs, and each reply is bound to its project, chat, task, revision,
+continuation generation, and question identifier. A reply that does not match
+that exact question is rejected; it cannot be applied to another task. Agent
+messages are limited to the task discussion: directed messaging never supplies
+file paths, shell commands, executable names, environment values, or other
+execution instructions.
+
+Automatic agent-to-agent exchanges are deliberately bounded. Each approved
+revision starts with three exchanges. At the limit the bridge pauses visibly and
+asks the user to allow exactly three more; it never grants an open-ended agent
+conversation. A scope-changing answer creates the next revision and requires
+approval of that exact revision before Sol can continue. The user remains the
+control point for approvals, question answers, Stop, and Resume. Directed
+intervention and cross-project handoffs remain out of scope pending Phase 3.
 
 ## Repository safety
 
@@ -196,7 +215,8 @@ to signal or resume a process. Resume is always an explicit user action.
   absolute path with the matching `--*-executable` option. The launcher checks
   every configured executable before starting the server.
 - **Fable subscription unavailable:** sign in through Claude Code's supported
-  subscription flow, then restart the foreground bridge. API keys and
+  subscription flow (for example, run its normal `claude auth login` flow in
+  the launch shell), then restart the foreground bridge. API keys and
   usage-based fallbacks are not accepted.
 - **Sol executable unavailable:** install or authenticate the Codex CLI, or
   pass its absolute executable path with `--codex-executable`; the startup

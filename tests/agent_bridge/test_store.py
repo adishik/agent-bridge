@@ -3660,7 +3660,16 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
         "exchange_grants_request_identity",
         "exchange_grants_permission_identity",
         "exchange_permissions_pause_identity",
+        "prepared_actions_preparation_identifier",
+        "directed_fable_answer_checkpoints_identity",
     } <= indexes
+    checkpoint_columns = tuple(
+        row["name"]
+        for row in migrated._connection.execute(
+            "PRAGMA table_info(directed_fable_answer_checkpoints)"
+        )
+    )
+    assert "project_id" in checkpoint_columns
     migrated.close()
 
     first_migration_bytes = path.read_bytes()
@@ -3668,6 +3677,52 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
     assert _pre_directed_rows(reopened._connection) == before
     reopened.close()
     assert path.read_bytes() == first_migration_bytes
+
+
+def test_pre_directed_preparation_identifiers_are_globally_unique_before_checkpoint_migration(
+    tmp_path,
+) -> None:
+    """The released legacy schema rejects an ambiguous cross-project preparation ID."""
+    connection = _create_pre_directed_conversation_schema(tmp_path / "legacy.sqlite3")
+    connection.execute(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES ('session-1', '/repo/one', '2026-08-10T10:00:00Z', 'One', '2026-08-10T10:00:00Z')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            task_id, revision, session_id, state, correction_count
+        ) VALUES ('task-1', 1, 'session-1', 'SOL_RUNNING', 0)
+        """
+    )
+    values = (
+        'prepared-global', 'a' * 32, 'session-1', 'task-1', 1, 'approval', '{}',
+        'AWAITING_USER_APPROVAL', 'SOL_RUNNING', None, None, None, 'COMPLETED', None, 0,
+    )
+    connection.execute(
+        """
+        INSERT INTO prepared_actions (
+            preparation_id, project_id, session_id, task_id, revision, action,
+            payload_json, source_state, active_state, continuation_state,
+            pending_context_json, previous_preparation_id, status, reason, generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        values,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO prepared_actions (
+                preparation_id, project_id, session_id, task_id, revision, action,
+                payload_json, source_state, active_state, continuation_state,
+                pending_context_json, previous_preparation_id, status, reason, generation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ('prepared-global', 'b' * 32, *values[2:]),
+        )
+    connection.close()
 
 
 def test_directed_question_exchange_migration_rolls_back_all_ddl_on_injected_failure(

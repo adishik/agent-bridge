@@ -547,6 +547,97 @@ def test_coordinator_forwards_recovery_summary(harness: CoordinatorHarness) -> N
     assert harness.store.get_task(prepared.task_id, prepared.revision).state is TaskState.INTERRUPTED
 
 
+def test_original_user_message_accepts_only_the_first_valid_unbound_user_source(
+    harness: CoordinatorHarness,
+) -> None:
+    """Directed planning must retain its exact user request without a duplicate event."""
+    task_id = "directed-original-message"
+    valid = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="The first exact directed request.",
+    )
+    harness.store.append_event(
+        "session-1", task_id, "user", "conversation", valid.to_dict(),
+    )
+    harness.store.append_event(
+        "session-1", task_id, "user", "conversation", ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="A later request must not substitute the original.",
+        ).to_dict(),
+    )
+    harness.store.append_event(
+        "session-1", task_id, "user", "message", {"text": "Later legacy text."},
+    )
+
+    assert harness.coordinator._original_user_message(  # noqa: SLF001 - source boundary
+        "session-1", task_id,
+    ) == "The first exact directed request."
+
+
+@pytest.mark.parametrize("event", (
+    ConversationEnvelope(
+        sender=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="An agent must not supply a user request.",
+    ),
+    ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Browser routing cannot select Sol.",
+    ),
+    ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="A user destination is not an ordinary planner request.",
+    ),
+    ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.APPROVAL,
+        text="An approval is not the original request.",
+        task_id="other-task",
+        revision=1,
+    ),
+))
+def test_original_user_message_rejects_nonexact_or_bound_conversation_sources(
+    harness: CoordinatorHarness,
+    event: ConversationEnvelope,
+) -> None:
+    """A forged, bound, or nonstatement envelope cannot become Sol's prompt."""
+    task_id = "directed-invalid-source"
+    harness.store.append_event(
+        "session-1", task_id, "user", "conversation", {"sender": "user"},
+    )
+    harness.store.append_event(
+        "session-1", task_id, "user", "conversation", event.to_dict(),
+    )
+    harness.store.append_event(
+        "session-1", "another-task", "user", "conversation", ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="A correct envelope with another task association is unavailable.",
+        ).to_dict(),
+    )
+
+    with pytest.raises(RuntimeError, match="original user message"):
+        harness.coordinator._original_user_message("session-1", task_id)  # noqa: SLF001
+
+
 def test_expired_fable_login_preserves_early_planning_and_emits_fixed_guidance(
     harness: CoordinatorHarness,
 ) -> None:
@@ -3427,10 +3518,10 @@ def test_directed_exchanges_pause_at_three_then_a_grant_allows_only_three_more(
     asyncio.run(scenario())
 
 
-def test_directed_exchange_retry_after_visible_reservation_reuses_one_charge_and_question(
+def test_directed_exchange_restart_after_visible_reservation_reuses_one_charge_and_question(
     harness: CoordinatorHarness,
 ) -> None:
-    """A crash after publication must not make retry reserve a second hop."""
+    """An atomic reservation/visible-question checkpoint survives full recreation."""
     async def scenario() -> None:
         harness.sol.queue(_directed_sol_question("Which invariant applies?"))
         original = harness.coordinator.answer_directed_question
@@ -3450,25 +3541,465 @@ def test_directed_exchange_retry_after_visible_reservation_reuses_one_charge_and
         assert len(captured) == 1
         question = captured[0]
         assert isinstance(question, store_module.QuestionRecord)
-        conversation = [
-            event for event in harness.store.events_after("session-1", 0)
-            if event.kind == "conversation"
-            and event.payload["message_type"] == "question"
+        before_events = harness.store.events_after("session-1", 0)
+        before_question_ids = harness.store._connection.execute(  # noqa: SLF001 - durable checkpoint
+            "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            ("task-1",),
+        ).fetchall()
+        assert len(before_question_ids) == 1
+        assert harness.fable.answer_sol_question_prompts == []
+        fable_session_id = paused.fable_session_id
+        sol_thread_id = paused.sol_thread_id
+
+        # Reservation and visible-question publication are one SQLite transaction;
+        # recreate exactly after that committed boundary, before any answer call.
+        harness.tracker.close()
+        harness.store.close()
+        reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        reopened_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        resumed_fable = FakeFable(harness.fable.brief)
+        resumed_sol = FakeSol()
+        resumed_sol.queue(_completed())
+        recreated = Coordinator(
+            store=reopened_store, repository=reopened_tracker, runner=RecordingRunner(),
+            fable=resumed_fable, sol=resumed_sol,
+            ids=DeterministicIds(task_number=1, run_number=40), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+        reopened = reopened_store.get_task("task-1", 1)
+        assert (
+            reopened.continuation_generation, reopened.exchange_allowance,
+            reopened.exchange_consumed, reopened.fable_session_id, reopened.sol_thread_id,
+        ) == (1, 2, 1, fable_session_id, sol_thread_id)
+        after_events = reopened_store.events_after("session-1", 0)
+        assert after_events[:len(before_events)] == before_events
+        assert [
+            event for event in after_events
+            if event.kind == "conversation" and event.payload["message_type"] == "answer"
+        ] == [
+            event for event in before_events
+            if event.kind == "conversation" and event.payload["message_type"] == "answer"
         ]
-        assert len(conversation) == 1
+        assert reopened_store._connection.execute(  # noqa: SLF001 - durable checkpoint
+            "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            ("task-1",),
+        ).fetchall() == before_question_ids
 
-        harness.coordinator.answer_directed_question = original  # type: ignore[method-assign]
-        await harness.coordinator.answer_directed_question(question)
+        persisted_question = reopened_store.question(question.question_id)
+        assert persisted_question is not None
+        await recreated.answer_directed_question(persisted_question)
 
-        retried = harness.store.get_task("task-1", 1)
+        retried = reopened_store.get_task("task-1", 1)
         assert (retried.exchange_allowance, retried.exchange_consumed) == (2, 1)
         conversation_after = [
-            event for event in harness.store.events_after("session-1", 0)
+            event for event in reopened_store.events_after("session-1", 0)
             if event.kind == "conversation"
             and event.payload["message_type"] == "question"
         ]
         assert len(conversation_after) == 1
+        assert conversation_after[0].payload["question_id"] == question.question_id
+        assert len(resumed_fable.answer_sol_question_prompts) == 1
+        assert resumed_sol.resume_threads == [sol_thread_id]
+        assert harness.sol.resume_threads == []
+        assert reopened_store._connection.execute(  # noqa: SLF001 - durable checkpoint
+            "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            ("task-1",),
+        ).fetchall() == before_question_ids
+        reopened_tracker.close()
+        reopened_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "tamper", [
+        None, "malformed", "cross_project", "generation", "question", "preparation",
+        "interrupt_rollback",
+    ],
+)
+def test_directed_fable_answer_checkpoint_reopens_through_real_resume_once(
+    harness: CoordinatorHarness, tamper: str | None,
+) -> None:
+    """A committed Fable answer resumes its exact Sol route without another Fable call."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which approved invariant applies?"))
+        original_handoff = harness.store.handoff_directed_fable_answer_same_scope
+
+        def crash_before_handoff(record: object) -> TaskRecord:
+            assert harness.coordinator._claimed_preparation_id is not None  # noqa: SLF001
+            assert harness.store._connection.execute(  # noqa: SLF001 - checkpoint boundary
+                "SELECT preparation_id FROM directed_fable_answer_checkpoints",
+            ).fetchone()[0] == harness.coordinator._claimed_preparation_id
+            raise RuntimeError("controlled checkpoint interruption")
+
+        harness.store.handoff_directed_fable_answer_same_scope = crash_before_handoff  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        if tamper == "interrupt_rollback":
+            harness.store._connection.execute(  # noqa: SLF001 - atomic checkpoint boundary
+                """
+                CREATE TRIGGER fail_fable_checkpoint_interrupt
+                BEFORE UPDATE OF status ON prepared_actions
+                WHEN NEW.status = 'INTERRUPTED'
+                BEGIN SELECT RAISE(ABORT, 'controlled checkpoint rollback'); END
+                """
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError if tamper == "interrupt_rollback" else PreparedActionFailed,
+        ):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        interrupted = harness.store.get_task("task-1", 1)
+        preparation = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert preparation is not None
+        checkpoint = harness.store.directed_fable_answer_checkpoint(preparation)
+        raw_checkpoints = harness.store._connection.execute(  # noqa: SLF001 - checkpoint diagnosis
+            "SELECT preparation_id, question_id, status FROM directed_fable_answer_checkpoints",
+        ).fetchall()
+        assert checkpoint is not None
+        if tamper == "interrupt_rollback":
+            assert preparation.status == "CLAIMED"
+            assert interrupted.state is TaskState.SOL_RUNNING
+            assert [tuple(row) for row in raw_checkpoints] == [
+                (preparation.preparation_id, checkpoint.question_id, "PENDING"),
+            ]
+            return
+        assert preparation.status == "INTERRUPTED", raw_checkpoints
+        before_events = harness.store.events_after("session-1", 0)
+        before_questions = harness.store._connection.execute(  # noqa: SLF001 - checkpoint identity
+            "SELECT question_id, answer_text, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            ("task-1",),
+        ).fetchall()
         assert len(harness.fable.answer_sol_question_prompts) == 1
+        harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+
+        if tamper == "malformed":
+            harness.store._connection.execute(  # noqa: SLF001 - startup audit boundary
+                "UPDATE directed_fable_answer_checkpoints SET clarification_json = '{}'",
+            )
+        elif tamper == "cross_project":
+            harness.store._connection.execute(  # noqa: SLF001 - startup audit boundary
+                "UPDATE directed_fable_answer_checkpoints SET project_id = 'foreign-project'",
+            )
+        elif tamper == "generation":
+            harness.store._connection.execute(  # noqa: SLF001 - startup audit boundary
+                "UPDATE directed_fable_answer_checkpoints SET continuation_generation = 2",
+            )
+        elif tamper == "question":
+            harness.store._connection.execute(  # noqa: SLF001 - startup audit boundary
+                "UPDATE questions SET answered_by = 'sol' WHERE question_id = ?",
+                (checkpoint.question_id,),
+            )
+        elif tamper == "preparation":
+            harness.store._connection.execute(  # noqa: SLF001 - startup audit boundary
+                "UPDATE directed_fable_answer_checkpoints SET preparation_id = 'missing-preparation'",
+            )
+
+        harness.tracker.close()
+        harness.store.close()
+        reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        reopened_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        if tamper is not None:
+            with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+                reopened_store.audit_legacy_project_ownership(str(harness.repo.resolve()))
+            reopened_tracker.close()
+            reopened_store.close()
+            return
+        reopened_store.audit_legacy_project_ownership(str(harness.repo.resolve()))
+        resumed_fable = FakeFable(harness.fable.brief)
+        resumed_sol = FakeSol()
+        resumed_sol.queue(_completed())
+        recreated = Coordinator(
+            store=reopened_store, repository=reopened_tracker, runner=RecordingRunner(),
+            fable=resumed_fable, sol=resumed_sol,
+            ids=DeterministicIds(task_number=1, run_number=60), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=recreated.project_id,
+            store=reopened_store,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        stale = lease.acquire(
+            project_id=recreated.project_id, session_id="session-1", task_id="task-1",
+        )
+        lease.release(stale)
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        resumed = await workflows.prepare_resume(
+            project_id=recreated.project_id,
+            session_id="session-1", task_id="task-1", revision=1,
+        )
+        assert resumed.token.generation == 2
+        record = reopened_store.prepared_action(resumed.preparation_id)
+        assert record is not None
+        assert record.previous_preparation_id == preparation.preparation_id
+        with pytest.raises(RuntimeError, match="no longer owns"):
+            await workflows.run(PreparedWorkflow(resumed.preparation_id, stale, revision=1))
+        await workflows.run(resumed)
+        assert workflows.active_lease_snapshot() is None
+        assert resumed_fable.answer_sol_question_prompts == []
+        assert resumed_sol.resume_threads == [interrupted.sol_thread_id]
+        after_events = reopened_store.events_after("session-1", 0)
+        assert after_events[:len(before_events)] == before_events
+        assert [
+            event for event in after_events
+            if event.kind == "conversation" and event.payload["message_type"] == "answer"
+        ] == [
+            event for event in before_events
+            if event.kind == "conversation" and event.payload["message_type"] == "answer"
+        ]
+        assert reopened_store._connection.execute(  # noqa: SLF001 - checkpoint identity
+            "SELECT question_id, answer_text, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            ("task-1",),
+        ).fetchall() == before_questions
+        assert reopened_store.directed_fable_answer_checkpoint(preparation) is None
+        reopened_tracker.close()
+        reopened_store.close()
+        harness.store.handoff_directed_fable_answer_same_scope = original_handoff  # type: ignore[method-assign]
+
+    asyncio.run(scenario())
+
+
+def test_directed_fable_answer_handoff_consumes_before_sol_failure(
+    harness: CoordinatorHarness,
+) -> None:
+    """A post-handoff Sol failure cannot resurrect the already-routed Fable answer."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which approved invariant applies?"))
+        original_resume = harness.coordinator._resume_sol
+
+        async def crash_after_handoff(*_: object, **__: object) -> None:
+            raise RuntimeError("controlled Sol handoff crash")
+
+        harness.coordinator._resume_sol = crash_after_handoff  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        preparation = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert preparation is not None
+        assert harness.store.directed_fable_answer_checkpoint(preparation) is None
+        assert harness.store.get_task("task-1", 1).pending is None
+        assert len(harness.fable.answer_sol_question_prompts) == 1
+        assert len([
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "clarification" and event.actor == "fable"
+        ]) == 1
+        harness.coordinator._resume_sol = original_resume  # type: ignore[method-assign]
+
+    asyncio.run(scenario())
+
+
+def test_directed_fable_answer_handoff_rolls_back_before_sol_runs(
+    harness: CoordinatorHarness,
+) -> None:
+    """A same-scope handoff write failure leaves the pre-handoff checkpoint intact."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which approved invariant applies?"))
+        original_insert = harness.store._insert_event_in_transaction  # noqa: SLF001
+
+        def fail_clarification(*args: object, **kwargs: object):
+            if len(args) >= 4 and args[3] == "clarification":
+                raise RuntimeError("controlled handoff transaction failure")
+            return original_insert(*args, **kwargs)
+
+        harness.store._insert_event_in_transaction = fail_clarification  # type: ignore[method-assign] # noqa: SLF001
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        preparation = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert preparation is not None
+        checkpoint = harness.store.directed_fable_answer_checkpoint(preparation)
+        task = harness.store.get_task("task-1", 1)
+        assert checkpoint is not None
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.SOL_RUNNING
+        assert task.pending is not None
+        assert harness.sol.resume_threads == []
+
+    asyncio.run(scenario())
+
+
+def test_directed_fable_scope_handoff_survives_post_handoff_crash(
+    harness: CoordinatorHarness,
+) -> None:
+    """A crash after N+1 handoff leaves only the durable exact approval path."""
+    async def scenario() -> None:
+        revised = replace(
+            harness.fable.brief, revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.queue(_directed_sol_question("May I add bridge-extra.txt?"))
+        harness.fable.next_clarifications.append(
+            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+        )
+        original_emit = harness.coordinator._emit_state
+
+        def crash_after_scope_handoff(task: TaskRecord) -> None:
+            if task.revision == 2:
+                raise RuntimeError("controlled post-scope handoff crash")
+            original_emit(task)
+
+        harness.coordinator._emit_state = crash_after_scope_handoff  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        latest = harness.store.latest_task("task-1")
+        assert latest is not None
+        assert (latest.revision, latest.state) == (2, TaskState.AWAITING_SCOPE_APPROVAL)
+        assert harness.store._connection.execute(  # noqa: SLF001 - durable handoff
+            "SELECT COUNT(*) FROM directed_fable_answer_checkpoints WHERE status = 'PENDING'",
+        ).fetchone()[0] == 0
+        assert len(harness.fable.answer_sol_question_prompts) == 1
+        harness.coordinator._emit_state = original_emit  # type: ignore[method-assign]
+        await harness.coordinator.approve_task("task-1", revision=2)
+        assert harness.sol.resume_threads == [THREAD_ID]
+
+    asyncio.run(scenario())
+
+
+def test_recovered_directed_fable_scope_checkpoint_hub_resume_consumes_once(
+    harness: CoordinatorHarness,
+) -> None:
+    """A pre-handoff scope crash recreates exactly one N+1 through Hub Resume."""
+    async def scenario() -> None:
+        revised = replace(
+            harness.fable.brief, revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.queue(_directed_sol_question("May I add bridge-extra.txt?"))
+        harness.fable.next_clarifications.append(
+            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+        )
+        original_route = harness.coordinator._route_directed_fable_answer
+
+        async def crash_before_scope_handoff(*_: object, **__: object) -> None:
+            raise RuntimeError("controlled pre-scope handoff crash")
+
+        harness.coordinator._route_directed_fable_answer = crash_before_scope_handoff  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        prior = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert prior is not None
+        assert harness.store.directed_fable_answer_checkpoint(prior) is not None
+        harness.tracker.close()
+        harness.store.close()
+        reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        reopened_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        resumed_fable = FakeFable(harness.fable.brief)
+        resumed_sol = FakeSol()
+        recreated = Coordinator(
+            store=reopened_store, repository=reopened_tracker, runner=RecordingRunner(),
+            fable=resumed_fable, sol=resumed_sol,
+            ids=DeterministicIds(task_number=1, run_number=80), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=recreated.project_id, store=reopened_store,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=ActiveAgentLease(),
+            usage_credits_acknowledged=lambda: True,
+        )
+        resumed = await workflows.prepare_resume(
+            project_id=recreated.project_id, session_id="session-1", task_id="task-1", revision=1,
+        )
+        await workflows.run(resumed)
+        completed = reopened_store.prepared_action(resumed.preparation_id)
+        assert completed is not None and completed.status == "COMPLETED"
+        latest = reopened_store.latest_task("task-1")
+        assert latest is not None and latest.revision == 2
+        assert latest.state is TaskState.AWAITING_SCOPE_APPROVAL
+        assert reopened_store.directed_fable_answer_checkpoint(prior) is None
+        assert resumed_fable.answer_sol_question_prompts == []
+        assert reopened_store.get_setting("agent_bridge.baseline.task-1.2") is not None
+        events = reopened_store.events_after("session-1", 0)
+        assert len([event for event in events if event.kind == "clarification" and event.actor == "fable"]) == 1
+        assert len([event for event in events if event.kind == "task_brief" and event.actor == "fable"]) == 2
+        reopened_tracker.close()
+        reopened_store.close()
+        harness.coordinator._route_directed_fable_answer = original_route  # type: ignore[method-assign]
+
+    asyncio.run(scenario())
+
+
+def test_directed_fable_scope_handoff_rolls_back_revision_setting_and_events(
+    harness: CoordinatorHarness,
+) -> None:
+    """A scope handoff transaction failure leaves neither N+1 nor consumed state."""
+    async def scenario() -> None:
+        revised = replace(
+            harness.fable.brief, revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.queue(_directed_sol_question("May I add bridge-extra.txt?"))
+        harness.fable.next_clarifications.append(
+            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+        )
+        original_insert = harness.store._insert_event_in_transaction  # noqa: SLF001
+
+        def fail_scope_clarification(*args: object, **kwargs: object):
+            if len(args) >= 4 and args[3] == "clarification":
+                raise RuntimeError("controlled scope transaction failure")
+            return original_insert(*args, **kwargs)
+
+        harness.store._insert_event_in_transaction = fail_scope_clarification  # type: ignore[method-assign] # noqa: SLF001
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        assert harness.store.latest_task("task-1").revision == 1  # type: ignore[union-attr]
+        preparation = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert preparation is not None
+        assert harness.store.directed_fable_answer_checkpoint(preparation) is not None
+        assert harness.store.get_setting("agent_bridge.baseline.task-1.2") is None
 
     asyncio.run(scenario())
 
@@ -3499,6 +4030,13 @@ def test_directed_fable_scope_change_requires_exact_new_approval_before_sol_resu
         assert awaiting.approved_at is None
         assert awaiting.baseline_id == revision_one.baseline_id
         assert harness.sol.resume_threads == []
+        assert harness.store._connection.execute(  # noqa: SLF001 - durable handoff
+            "SELECT COUNT(*) FROM directed_fable_answer_checkpoints WHERE status = 'PENDING'",
+        ).fetchone()[0] == 0
+        assert len([
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "clarification" and event.actor == "fable"
+        ]) == 1
 
         with pytest.raises(ValueError, match="revision"):
             await harness.coordinator.approve_task("task-1", revision=1)

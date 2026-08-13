@@ -255,6 +255,7 @@ class Coordinator:
         self._run_completions: dict[str, asyncio.Event] = {}
         self._terminal_retries: dict[str, PreparedActionOutcome] = {}
         self._compatibility_errors: dict[str, RuntimeError] = {}
+        self._claimed_preparation_id: str | None = None
         # A prepared row is never proof that a child is still alive after a
         # process restart.  Recover before this coordinator can be admitted to
         # a runtime registry or start another workflow.
@@ -265,6 +266,7 @@ class Coordinator:
         self._run_completions.clear()
         self._terminal_retries.clear()
         self._compatibility_errors.clear()
+        self._claimed_preparation_id = None
 
     @property
     def project_id(self) -> str:
@@ -682,6 +684,7 @@ class Coordinator:
         claimed = self._store.claim_prepared_action(
             record.preparation_id, generation=record.generation,
         )
+        self._claimed_preparation_id = claimed.preparation_id
         task = self._store.get_task(claimed.task_id, claimed.revision)
         try:
             if isinstance(claimed.payload, NewRequestPayload):
@@ -697,6 +700,40 @@ class Coordinator:
             elif isinstance(claimed.payload, AnswerPayload):
                 await self._run_context(task, claimed.payload.continuation, claimed.payload.answer)
             elif isinstance(claimed.payload, ResumePayload):
+                predecessor = (
+                    None if claimed.previous_preparation_id is None
+                    else self._store.prepared_action(claimed.previous_preparation_id)
+                )
+                if claimed.previous_preparation_id is not None and predecessor is None:
+                    raise RuntimeError("Fable answer checkpoint predecessor is missing")
+                checkpoint = (
+                    None if predecessor is None
+                    else self._store.directed_fable_answer_checkpoint(predecessor)
+                )
+                if checkpoint is not None:
+                    question = self._store.question(checkpoint.question_id)
+                    if (
+                        question is None
+                        or question.task_id != claimed.task_id
+                        or question.revision != claimed.revision
+                        or question.continuation_generation
+                        != checkpoint.continuation_generation
+                        or question.answer_text != checkpoint.clarification.answer
+                        or question.answered_by is not ConversationActor.FABLE
+                    ):
+                        raise RuntimeError("Fable answer checkpoint changed")
+                    if checkpoint.clarification.scope_changed:
+                        await self._route_directed_fable_answer(
+                            task, checkpoint.clarification, checkpoint_record=predecessor,
+                        )
+                    else:
+                        handed_off = self._store.handoff_directed_fable_answer_same_scope(
+                            predecessor,
+                        )
+                        await self._resume_sol(handed_off, checkpoint.clarification.answer or "")
+                    return self._persist_terminal_prepared_outcome(
+                        claimed, self._terminal_outcome_after_child(claimed),
+                    )
                 await self._run_context(task, claimed.payload.continuation, None)
             elif isinstance(claimed.payload, ContinuationMessagePayload):
                 self._validate_claimed_conversation_action(task, claimed)
@@ -790,6 +827,8 @@ class Coordinator:
             ):
                 raise error from None
             raise PreparedActionFailed() from None
+        finally:
+            self._claimed_preparation_id = None
         return self._persist_terminal_prepared_outcome(
             claimed, self._terminal_outcome_after_child(claimed),
         )
@@ -911,6 +950,11 @@ class Coordinator:
     def _terminal_outcome_after_error(
         self, claimed: PreparedActionRecord,
     ) -> PreparedActionOutcome:
+        if self._store.directed_fable_answer_checkpoint(claimed) is not None:
+            self._store.interrupt_claimed_fable_answer_checkpoint(
+                claimed.preparation_id, generation=claimed.generation,
+            )
+            return PreparedActionOutcome("adapter_interrupted")
         current = self._store.get_task(claimed.task_id, claimed.revision)
         if current.state is TaskState.INTERRUPTED:
             terminal = self._store.prepared_action(claimed.preparation_id)
@@ -1979,14 +2023,37 @@ class Coordinator:
                 continuation_generation=question.continuation_generation,
                 reply_to_question_id=question.question_id,
             ),
+            fable_checkpoint=(
+                clarification if self._claimed_preparation_id is not None else None
+            ),
+            checkpoint_preparation_id=self._claimed_preparation_id,
         )
         if answered.answered_by is not ConversationActor.FABLE:
             raise RuntimeError("directed Fable answer changed")
         resumed = self._store.get_task(task.task_id, task.revision)
-        await self._route_directed_fable_answer(resumed, clarification)
+        if self._claimed_preparation_id is not None and not clarification.scope_changed:
+            claimed = self._store.prepared_action(self._claimed_preparation_id)
+            if claimed is None:
+                raise RuntimeError("Fable answer checkpoint preparation is missing")
+            handed_off = self._store.handoff_directed_fable_answer_same_scope(claimed)
+            await self._resume_sol(handed_off, clarification.answer or "")
+            return
+        checkpoint_record = (
+            None if self._claimed_preparation_id is None
+            else self._store.prepared_action(self._claimed_preparation_id)
+        )
+        await self._route_directed_fable_answer(
+            resumed, clarification, checkpoint_record=checkpoint_record,
+        )
+        if self._claimed_preparation_id is not None and checkpoint_record is None:
+            claimed = self._store.prepared_action(self._claimed_preparation_id)
+            if claimed is None:
+                raise RuntimeError("Fable answer checkpoint preparation is missing")
+            self._store.consume_directed_fable_answer_checkpoint(claimed, question_id=question.question_id)
 
     async def _route_directed_fable_answer(
         self, task: TaskRecord, clarification: FableClarification,
+        *, checkpoint_record: PreparedActionRecord | None = None,
     ) -> None:
         current = self._store.get_task(task.task_id, task.revision)
         if current.state not in _SOL_STATES or current.approved_at is None:
@@ -2027,19 +2094,23 @@ class Coordinator:
                             current.task_id, revised.revision, widened_baseline,
                         ),
                     ),
+                    directed_checkpoint=checkpoint_record,
+                    clarification=(clarification if checkpoint_record is not None else None),
                 )
             except BaseException:
                 self._repository.discard_widening(original_baseline, widened_baseline)
                 raise
-            self._store.append_event(
-                saved.session_id,
-                saved.task_id,
-                "fable",
-                "task_brief",
-                {"brief": revised.to_dict()},
-            )
+            if checkpoint_record is None:
+                self._store.append_event(
+                    saved.session_id,
+                    saved.task_id,
+                    "fable",
+                    "task_brief",
+                    {"brief": revised.to_dict()},
+                )
             self._emit_state(saved)
-            self._emit_clarification(saved, clarification)
+            if checkpoint_record is None:
+                self._emit_clarification(saved, clarification)
             return
         resumed = self._store.clear_pending_context(
             current.task_id,
@@ -3350,13 +3421,32 @@ class Coordinator:
 
     def _original_user_message(self, session_id: str, task_id: str) -> str:
         for event in self._store.events_after(session_id, 0):
-            if (
-                event.task_id == task_id
-                and event.actor == "user"
-                and event.kind == "message"
-                and isinstance(event.payload.get("text"), str)
-            ):
+            if event.task_id != task_id or event.actor != "user":
+                continue
+            if event.kind == "message" and isinstance(event.payload.get("text"), str):
                 return str(event.payload["text"])
+            if event.kind != "conversation":
+                continue
+            try:
+                envelope = ConversationEnvelope.from_dict(event.payload)
+            except ValueError:
+                continue
+            if (
+                envelope.sender is ConversationActor.USER
+                and envelope.addressed_to in {
+                    ConversationTarget.FABLE,
+                    ConversationTarget.SOL,
+                    ConversationTarget.TEAM,
+                }
+                and envelope.routed_to is ConversationTarget.FABLE
+                and envelope.message_type is ConversationMessageType.STATEMENT
+                and envelope.task_id is None
+                and envelope.revision is None
+                and envelope.continuation_generation is None
+                and envelope.question_id is None
+                and envelope.reply_to_question_id is None
+            ):
+                return envelope.text
         raise RuntimeError("interrupted planning task has no original user message")
 
     @staticmethod

@@ -956,7 +956,8 @@ def _open_project_state(
 
 
 def _audit_project_state(opened: _OpenedProjectState, settings: Settings) -> None:
-    """Perform the exact legacy-root audit before any project may recover."""
+    """Perform recovery-state audits before any project may recover."""
+    opened.store.audit_directed_fable_answer_checkpoints(str(opened.spec.repo_root))
     if _is_legacy_state(opened.spec, settings):
         opened.store.audit_legacy_project_ownership(str(opened.spec.repo_root))
 

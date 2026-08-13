@@ -1354,6 +1354,46 @@ def test_invalid_legacy_state_aborts_before_recovery(
     assert recoveries == []
 
 
+def test_digest_checkpoint_tamper_aborts_before_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Digest state is checkpoint-audited before recovery can mutate it."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    database = settings.projects[0].state_dir / "bridge.sqlite3"
+    database.parent.mkdir(parents=True)
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        INSERT INTO directed_fable_answer_checkpoints (
+            preparation_id, project_id, session_id, task_id, revision, question_id,
+            continuation_generation, clarification_json, status
+        ) VALUES ('orphan-prep', 'foreign-project', 'session-1', 'task-1', 1,
+                  'question-1', 1, '{}', 'PENDING')
+        """
+    )
+    connection.commit()
+    connection.close()
+    recoveries: list[Path] = []
+    original_recover = SQLiteStore.recover_active_tasks
+
+    def recover(self: SQLiteStore):
+        recoveries.append(database)
+        return original_recover(self)
+
+    monkeypatch.setattr(SQLiteStore, "recover_active_tasks", recover)
+    with pytest.raises(RuntimeError, match="directed Fable answer checkpoint audit failed"):
+        main(_args(repo, tools), environ=environment, stdout=io.StringIO(),
+             uvicorn_run=lambda *args, **kwargs: None)
+    assert recoveries == []
+
+
 def test_legacy_and_digest_state_for_one_root_is_rejected_as_ambiguous(tmp_path: Path) -> None:
     tools = _fake_tools(tmp_path)
     repo = _repo(tmp_path)

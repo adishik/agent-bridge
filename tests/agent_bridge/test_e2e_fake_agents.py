@@ -36,7 +36,7 @@ from agent_bridge.app import (
     create_hub_app,
 )
 from agent_bridge.coordinator import Coordinator
-from agent_bridge.contracts import TaskBrief
+from agent_bridge.contracts import ConversationTarget, TaskBrief
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -115,12 +115,13 @@ class RecordingProcessRunner(ProcessRunner):
 def _brief(
     *,
     task_id: str = "task-1",
+    revision: int = 1,
     title: str = "Add the bounded bridge fixture",
     allowed_path: str = "bridge_work",
 ) -> dict[str, object]:
     return {
         "task_id": task_id,
-        "revision": 1,
+        "revision": revision,
         "title": title,
         "objective": "Create one file inside the approved bridge work directory.",
         "context": ["This is a controlled fake-agent integration run."],
@@ -177,6 +178,42 @@ def _question() -> dict[str, object]:
             "can_continue_safely": False,
         },
     }
+
+
+def _directed_question(
+    text: str,
+    *,
+    addressed_to: str = "fable",
+) -> dict[str, object]:
+    payload = _question()
+    question = payload["question"]
+    assert isinstance(question, dict)
+    question["directed_question"] = {
+        "addressed_to": addressed_to,
+        "text": text,
+        "reason": "The approved fake workflow needs one exact answer.",
+    }
+    return payload
+
+
+def _fable_answer(
+    text: str,
+    *,
+    directed_to_sol: str | None = None,
+    revised_brief: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = _clarification()
+    payload["answer"] = text
+    if revised_brief is not None:
+        payload["scope_changed"] = True
+        payload["revised_brief"] = revised_brief
+    if directed_to_sol is not None:
+        payload["directed_question"] = {
+            "addressed_to": "sol",
+            "text": directed_to_sol,
+            "reason": "Fable needs exact fake execution evidence.",
+        }
+    return payload
 
 
 def _clarification(*, escalate: bool = False) -> dict[str, object]:
@@ -1378,6 +1415,430 @@ def _event_documents(bridge: FakeBridge, session_id: str) -> list[dict[str, obje
     return [event.to_dict() for event in bridge.store.events_after(session_id, 0)]
 
 
+def _conversation_documents(
+    bridge: FakeBridge, session_id: str,
+) -> list[dict[str, object]]:
+    return [
+        document["payload"]
+        for document in _event_documents(bridge, session_id)
+        if document["kind"] == "conversation"
+    ]
+
+
+def _model_invocations(bridge: FakeBridge) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        item
+        for item in bridge.invocations
+        if item.get("kind") in {"claude", "codex"}
+        and item.get("argv") != ["auth", "status", "--json"]
+    )
+
+
+def test_directed_conversation_uses_exact_visible_fake_workflow_boundaries(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routing or authority regression must fail in the real hub/app stack."""
+    hub = FakeHub.create(
+        root=tmp_path / "directed-workflow",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    revised = _brief(
+        task_id="task-directed-one",
+        revision=2,
+        title="Expand the bounded fake scope",
+        allowed_path="expanded_work",
+    )
+    bridge.configure(
+        plans=[
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+        ],
+        outcomes=[
+            _directed_question("Which exact approved interpretation applies?"),
+            _completed(summary="The exact fake evidence is available."),
+            _directed_question("Which invariant still applies?"),
+            _directed_question("May the approved scope now expand?"),
+            _directed_question(
+                "Which exact user preference controls this task?",
+                addressed_to="user",
+            ),
+            _directed_question(
+                "Which exact user preference controls the next task?",
+                addressed_to="user",
+            ),
+            _completed(),
+        ],
+        clarifications=[
+            _fable_answer(
+                "Use the existing approved interpretation.",
+                directed_to_sol="Which fake check proves the interpretation?",
+            ),
+            _fable_answer("The fake evidence confirms the approved scope."),
+            _fable_answer("Keep the existing approved invariant."),
+            _fable_answer(
+                "The new path requires revision two approval.",
+                revised_brief=revised,
+            ),
+        ],
+        reviews=[_review()],
+    )
+    token_values = iter((
+        "chat-directed",
+        "directed-one",
+        "directed-two",
+        "directed-three",
+        "directed-four",
+    ))
+    preparation_number = 0
+
+    def deterministic_browser_ids(nbytes: int) -> str:
+        nonlocal preparation_number
+        if nbytes == 16:
+            return next(token_values)
+        if nbytes == 24:
+            preparation_number += 1
+            return f"prepared-{preparation_number:040x}"
+        raise AssertionError(f"unexpected test identifier width: {nbytes}")
+
+    try:
+        monkeypatch.setattr("agent_bridge.app.secrets.token_hex", deterministic_browser_ids)
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            chat = client.post(f"{project}/chats", headers=headers)
+            assert chat.status_code == 201
+            session_id = "chat-directed"
+            assert chat.json()["session_id"] == session_id
+
+            # A visible Sol address before approval still invokes only Fable.
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={
+                    "text": "Plan the bounded directed fake workflow.",
+                    "addressed_to": "sol",
+                },
+                headers=headers,
+            ).status_code == 202
+            first_task_id = "task-directed-one"
+            _wait_for(
+                lambda: bridge.store.latest_task(first_task_id).state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            initial_agents = _model_invocations(bridge)
+            assert [item["kind"] for item in initial_agents] == ["claude"]
+            initial_conversation = _conversation_documents(bridge, session_id)
+            assert initial_conversation[0] == {
+                "sender": "user",
+                "addressed_to": "sol",
+                "routed_to": "fable",
+                "message_type": "statement",
+                "text": "Plan the bounded directed fake workflow.",
+                "task_id": None,
+                "revision": None,
+                "continuation_generation": None,
+                "question_id": None,
+                "reply_to_question_id": None,
+            }
+
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{first_task_id}/approve",
+                json={"revision": 1}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_prepared_action_for_task(
+                    project_id=hub.specs["alpha"].project_id,
+                    session_id=session_id,
+                    task_id=first_task_id,
+                    revision=1,
+                ).status in {"COMPLETED", "FAILED", "INTERRUPTED"},  # type: ignore[union-attr]
+            )
+            assert bridge.store.latest_task(first_task_id).state is TaskState.AWAITING_USER_INPUT, (  # type: ignore[union-attr]
+                bridge.store.latest_task(first_task_id),
+                bridge.store.latest_prepared_action_for_task(
+                    project_id=hub.specs["alpha"].project_id,
+                    session_id=session_id,
+                    task_id=first_task_id,
+                    revision=1,
+                ),
+                hub.app.state.coroutine_observation_failures,
+            )
+            first_task = bridge.store.latest_task(first_task_id)
+            assert first_task is not None
+            assert (
+                first_task.continuation_state,
+                first_task.exchange_consumed,
+                first_task.exchange_allowance,
+            ) == (TaskState.SOL_RUNNING, 3, 0)
+            assert bridge.store._connection.execute(  # noqa: SLF001 - E2E durable count
+                "SELECT COUNT(*) FROM exchange_reservations WHERE task_id = ?",
+                (first_task_id,),
+            ).fetchone()[0] == 3
+            permission = bridge.store.current_exchange_permission(
+                session_id=session_id, task_id=first_task_id, revision=1,
+            )
+            assert permission is not None
+            first_conversation = _conversation_documents(bridge, session_id)
+            assert [
+                (entry["sender"], entry["addressed_to"], entry["routed_to"], entry["message_type"])
+                for entry in first_conversation[1:]
+            ] == [
+                ("sol", "fable", "fable", "question"),
+                ("fable", "sol", "sol", "question"),
+                ("sol", "fable", "fable", "answer"),
+                ("fable", "sol", "sol", "answer"),
+                ("sol", "fable", "fable", "question"),
+                ("fable", "sol", "sol", "answer"),
+                ("system", "user", "user", "status"),
+            ]
+            assert first_conversation[3]["reply_to_question_id"] == first_conversation[2]["question_id"]
+            assert first_conversation[4]["reply_to_question_id"] == first_conversation[1]["question_id"]
+            assert first_conversation[6]["reply_to_question_id"] == first_conversation[5]["question_id"]
+
+            # Permission is exactly +3; the saved fourth question resumes as N+1.
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{first_task_id}/exchanges/grant",
+                json=permission,
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task(first_task_id).revision == 2  # type: ignore[union-attr]
+                and bridge.store.latest_task(first_task_id).state
+                is TaskState.AWAITING_SCOPE_APPROVAL,  # type: ignore[union-attr]
+            )
+            revised_task = bridge.store.get_task(first_task_id, 2)
+            assert (revised_task.exchange_allowance, revised_task.exchange_consumed) == (3, 0)
+            assert revised_task.fable_session_id == bridge.fable_session_id
+            assert revised_task.sol_thread_id == bridge.sol_thread_id
+
+            # Two concurrent user questions must retain their exact question binding.
+            for task_id, text in (
+                ("task-directed-two", "Ask the user one bounded question."),
+                ("task-directed-three", "Ask the user another bounded question."),
+            ):
+                assert client.post(
+                    f"{project}/chats/{session_id}/messages",
+                    json={"text": text}, headers=headers,
+                ).status_code == 202
+                _wait_for(
+                    lambda task_id=task_id: bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+                )
+                assert client.post(
+                    f"{project}/chats/{session_id}/tasks/{task_id}/approve",
+                    json={"revision": 1}, headers=headers,
+                ).status_code == 202
+                _wait_for(
+                    lambda task_id=task_id: bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_INPUT,  # type: ignore[union-attr]
+                )
+
+            second_question = bridge.store.unanswered_question_for_task(
+                "task-directed-two", 1,
+            )
+            third_question = bridge.store.unanswered_question_for_task(
+                "task-directed-three", 1,
+            )
+            assert second_question is not None and third_question is not None
+            assert (
+                second_question.routed_to,
+                third_question.routed_to,
+            ) == (ConversationTarget.USER, ConversationTarget.USER)
+            model_invocations_before_rejected_answer = _model_invocations(bridge)
+            rejected = client.post(
+                f"{project}/chats/{session_id}/tasks/task-directed-three/answer",
+                json={
+                    "text": "This answer names the wrong pending question.",
+                    "revision": 1,
+                    "question_id": second_question.question_id,
+                    "continuation_generation": third_question.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert rejected.status_code == 409
+            assert bridge.store.question(second_question.question_id) == second_question
+            assert bridge.store.question(third_question.question_id) == third_question
+            assert _model_invocations(bridge) == model_invocations_before_rejected_answer
+
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/task-directed-three/answer",
+                json={
+                    "text": "Use the exact approved preference.",
+                    "revision": 1,
+                    "question_id": third_question.question_id,
+                    "continuation_generation": third_question.continuation_generation,
+                },
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task("task-directed-three").state
+                is TaskState.COMPLETED,  # type: ignore[union-attr]
+            )
+
+            # A terminal Sol address cannot reuse old approval and starts a Fable task.
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={
+                    "text": "Start a separate terminal follow-up.",
+                    "addressed_to": "sol",
+                },
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task("task-directed-four").state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            terminal_route = [
+                event for event in _event_documents(bridge, session_id)
+                if event["kind"] == "conversation"
+            ][-1]
+            assert (
+                terminal_route["payload"]["sender"],
+                terminal_route["payload"]["addressed_to"],
+                terminal_route["payload"]["routed_to"],
+                terminal_route["payload"]["task_id"],
+                terminal_route["task_id"],
+            ) == ("user", "sol", "fable", None, "task-directed-four")
+
+        assert bridge.live_call_count == 0
+        assert all(launch["sentinel"] is True for launch in bridge.runner.launches)
+        assert all(
+            entry["executable"] in {str(bridge.fake_claude), str(bridge.fake_codex)}
+            for entry in bridge.invocations
+            if entry.get("kind") in {"claude", "codex"}
+        )
+    finally:
+        hub.close()
+
+
+def test_directed_exchange_limit_restart_reuses_exact_durable_pause(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+) -> None:
+    """Restarting at the +3 boundary must not duplicate an exchange or provider call."""
+    hub = FakeHub.create(
+        root=tmp_path / "directed-restart",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[
+            _directed_question(f"Which exact fake constraint is #{ordinal}?")
+            for ordinal in range(1, 5)
+        ] + [_completed()],
+        clarifications=[
+            _fable_answer(f"Use exact fake constraint #{ordinal}.")
+            for ordinal in range(1, 5)
+        ],
+        reviews=[_review()],
+    )
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Reach the durable exchange limit."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: len(bridge.store.latest_task_overviews(session_id)) == 1,
+            )
+            task_id = bridge.store.latest_task_overviews(session_id)[0].task.task_id
+            _wait_for(
+                lambda: bridge.store.latest_task(task_id).state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task_id}/approve",
+                json={"revision": 1}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: (
+                    bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_INPUT  # type: ignore[union-attr]
+                    and bridge.store.latest_task(task_id).exchange_allowance == 0  # type: ignore[union-attr]
+                    and bridge.store.current_exchange_permission(
+                        session_id=session_id, task_id=task_id, revision=1,
+                    ) is not None
+                ),
+            )
+            paused = bridge.store.latest_task(task_id)
+            assert paused is not None
+            permission = bridge.store.current_exchange_permission(
+                session_id=session_id, task_id=task_id, revision=1,
+            )
+            assert permission is not None
+            before_events = _event_documents(bridge, session_id)
+            before_questions = bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+                "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+            assert len(before_questions) == 3
+            assert (paused.continuation_generation, paused.exchange_consumed) == (1, 3)
+
+        recovered = hub.restart()
+        assert recovered["alpha"] == store_module.RecoverySummary(0, 0, 0)
+        bridge = hub.bridges["alpha"]
+        resumed = bridge.store.latest_task(task_id)
+        assert resumed is not None
+        assert (
+            resumed.state,
+            resumed.continuation_state,
+            resumed.continuation_generation,
+            resumed.exchange_allowance,
+            resumed.exchange_consumed,
+            resumed.fable_session_id,
+            resumed.sol_thread_id,
+        ) == (
+            TaskState.AWAITING_USER_INPUT,
+            TaskState.SOL_RUNNING,
+            1,
+            0,
+            3,
+            bridge.fable_session_id,
+            bridge.sol_thread_id,
+        )
+        assert _event_documents(bridge, session_id) == before_events
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            (task_id,),
+        ).fetchall() == before_questions
+        assert bridge.store.current_exchange_permission(
+            session_id=session_id, task_id=task_id, revision=1,
+        ) == permission
+
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task_id}/exchanges/grant",
+                json=permission, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task(task_id).state
+                is TaskState.COMPLETED,  # type: ignore[union-attr]
+            )
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT COUNT(*) FROM exchange_reservations WHERE task_id = ?", (task_id,),
+        ).fetchone()[0] == 4
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT COUNT(*) FROM exchange_grants WHERE task_id = ?", (task_id,),
+        ).fetchone()[0] == 1
+        assert bridge.live_call_count == 0
+    finally:
+        hub.close()
+
+
 @dataclass(frozen=True)
 class ProjectProvenance:
     label: str
@@ -1890,13 +2351,22 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     "session_id": common_chat,
                     "task_id": common_task,
                     "actor": "user",
-                    "kind": "message",
+                    "kind": "conversation",
                     "payload": {
+                        "sender": "user",
+                        "addressed_to": "fable",
+                        "routed_to": "fable",
+                        "message_type": "statement",
                         "text": (
                             "Plan the first equal-ID project."
                             if label == "alpha"
                             else "Plan the second equal-ID project."
-                        )
+                        ),
+                        "task_id": None,
+                        "revision": None,
+                        "continuation_generation": None,
+                        "question_id": None,
+                        "reply_to_question_id": None,
                     },
                     "created_at": "2026-08-10T14:00:00Z",
                 }
@@ -2155,7 +2625,7 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     **({"json": body} if body is not None else {}),
                 )
                 assert _response_signature(foreign) == _response_signature(missing)
-                assert foreign.status_code in {404, 409}
+                assert foreign.status_code in {404, 409, 422}
             for session_id in ("beta-only-chat", "not-a-real-chat"):
                 with pytest.raises(WebSocketDisconnect) as rejected:
                     with client.websocket_connect(
@@ -2227,7 +2697,7 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     **({"json": body} if body is not None else {}),
                 )
                 assert _response_signature(removed) == _response_signature(missing)
-                assert removed.status_code == 404
+                assert removed.status_code in {404, 422}
             for project_id in (beta_project_id, missing_project_id):
                 with pytest.raises(WebSocketDisconnect) as rejected:
                     with client.websocket_connect(
