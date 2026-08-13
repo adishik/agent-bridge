@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
+import re
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 
 JsonPrimitive: TypeAlias = None | bool | int | float | str
@@ -65,6 +67,26 @@ def _string(value: object, name: str, *, non_empty: bool = False) -> str:
     if non_empty and not value.strip():
         raise ValueError(f"{name} must be non-empty")
     return value
+
+
+_MAX_CONVERSATION_TEXT_LENGTH = 16 * 1024
+_SAFE_CONVERSATION_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def _bounded_conversation_text(value: object, name: str) -> str:
+    text = _string(value, name, non_empty=True)
+    if len(text) > _MAX_CONVERSATION_TEXT_LENGTH:
+        raise ValueError(f"{name} is too long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise ValueError(f"{name} must not contain control characters")
+    return text
+
+
+def _conversation_identifier(value: object, name: str) -> str:
+    identifier = _string(value, name, non_empty=True)
+    if _SAFE_CONVERSATION_IDENTIFIER.fullmatch(identifier) is None:
+        raise ValueError(f"{name} must be a safe identifier")
+    return identifier
 
 
 def _string_tuple(value: object, name: str) -> tuple[str, ...]:
@@ -461,6 +483,234 @@ class ReviewVerdict:
             "corrections": list(self.corrections),
             "question_for_user": self.question_for_user,
         }
+
+
+class ConversationActor(str, Enum):
+    USER = "user"
+    FABLE = "fable"
+    SOL = "sol"
+    SYSTEM = "system"
+
+
+class ConversationTarget(str, Enum):
+    USER = "user"
+    FABLE = "fable"
+    SOL = "sol"
+    TEAM = "team"
+
+
+class ConversationMessageType(str, Enum):
+    STATEMENT = "statement"
+    QUESTION = "question"
+    ANSWER = "answer"
+    APPROVAL = "approval"
+    INTERVENTION = "intervention"
+    STATUS = "status"
+
+
+_CONVERSATION_ENVELOPE_FIELDS = (
+    "sender",
+    "addressed_to",
+    "routed_to",
+    "message_type",
+    "text",
+    "task_id",
+    "revision",
+    "continuation_generation",
+    "question_id",
+    "reply_to_question_id",
+)
+
+
+def _conversation_binding(
+    task_id: str | None,
+    revision: int | None,
+    continuation_generation: int | None,
+) -> tuple[str | None, int | None, int | None]:
+    if (task_id is None, revision is None, continuation_generation is None).count(True) not in (0, 3):
+        raise ValueError("task_id, revision, and continuation_generation binding must be all-or-none")
+    if task_id is not None:
+        task_id = _conversation_identifier(task_id, "task_id")
+        revision = _integer(revision, "revision")
+        continuation_generation = _integer(continuation_generation, "continuation_generation")
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        if continuation_generation < 1:
+            raise ValueError("continuation_generation must be >= 1")
+    return task_id, revision, continuation_generation
+
+
+def _conversation_question_pair(
+    message_type: ConversationMessageType,
+    task_id: str | None,
+    revision: int | None,
+    continuation_generation: int | None,
+    question_id: str | None,
+    reply_to_question_id: str | None,
+) -> tuple[str | None, str | None]:
+    if question_id is not None:
+        question_id = _conversation_identifier(question_id, "question_id")
+    if reply_to_question_id is not None:
+        reply_to_question_id = _conversation_identifier(reply_to_question_id, "reply_to_question_id")
+    if message_type is ConversationMessageType.QUESTION:
+        if question_id is None or reply_to_question_id is not None:
+            raise ValueError("questions require question_id and no reply_to_question_id")
+        if task_id is None or revision is None or continuation_generation is None:
+            raise ValueError("questions require task_id, revision, and continuation_generation")
+    elif message_type is ConversationMessageType.ANSWER:
+        if question_id is not None or reply_to_question_id is None:
+            raise ValueError("answers require reply_to_question_id and no question_id")
+        if task_id is None or revision is None or continuation_generation is None:
+            raise ValueError("answers require task_id, revision, and continuation_generation")
+    elif question_id is not None or reply_to_question_id is not None:
+        raise ValueError("only questions and answers may bind question identifiers")
+    return question_id, reply_to_question_id
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationEnvelope:
+    sender: ConversationActor
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    message_type: ConversationMessageType
+    text: str
+    task_id: str | None = None
+    revision: int | None = None
+    continuation_generation: int | None = None
+    question_id: str | None = None
+    reply_to_question_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sender, ConversationActor):
+            raise ValueError("sender must be a ConversationActor")
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.routed_to, ConversationTarget):
+            raise ValueError("routed_to must be a ConversationTarget")
+        if not isinstance(self.message_type, ConversationMessageType):
+            raise ValueError("message_type must be a ConversationMessageType")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        task_id, revision, continuation_generation = _conversation_binding(
+            self.task_id, self.revision, self.continuation_generation
+        )
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "continuation_generation", continuation_generation)
+        question_id, reply_to_question_id = _conversation_question_pair(
+            self.message_type,
+            task_id,
+            revision,
+            continuation_generation,
+            self.question_id,
+            self.reply_to_question_id,
+        )
+        object.__setattr__(self, "question_id", question_id)
+        object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
+        if self.message_type is ConversationMessageType.APPROVAL and (
+            task_id is None or revision is None
+        ):
+            raise ValueError("approvals require task_id and revision")
+        if self.message_type is ConversationMessageType.STATUS and self.sender is not ConversationActor.SYSTEM:
+            raise ValueError("status messages require sender=system")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ConversationEnvelope":
+        payload = _mapping(data, "ConversationEnvelope")
+        _require_fields(payload, "ConversationEnvelope", _CONVERSATION_ENVELOPE_FIELDS)
+        try:
+            sender = ConversationActor(payload["sender"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("sender must be a known conversation actor") from error
+        try:
+            addressed_to = ConversationTarget(payload["addressed_to"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("addressed_to must be a known conversation target") from error
+        try:
+            routed_to = ConversationTarget(payload["routed_to"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("routed_to must be a known conversation target") from error
+        try:
+            message_type = ConversationMessageType(payload["message_type"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("message_type must be a known conversation message type") from error
+        return cls(
+            sender=sender,
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            message_type=message_type,
+            text=payload["text"],
+            task_id=payload["task_id"],
+            revision=payload["revision"],
+            continuation_generation=payload["continuation_generation"],
+            question_id=payload["question_id"],
+            reply_to_question_id=payload["reply_to_question_id"],
+        )  # type: ignore[arg-type]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "sender": self.sender.value,
+            "addressed_to": self.addressed_to.value,
+            "routed_to": self.routed_to.value,
+            "message_type": self.message_type.value,
+            "text": self.text,
+            "task_id": self.task_id,
+            "revision": self.revision,
+            "continuation_generation": self.continuation_generation,
+            "question_id": self.question_id,
+            "reply_to_question_id": self.reply_to_question_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UserConversationInput:
+    addressed_to: ConversationTarget
+    message_type: ConversationMessageType
+    text: str
+    task_id: str | None = None
+    revision: int | None = None
+    question_id: str | None = None
+    reply_to_question_id: str | None = None
+    continuation_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.message_type, ConversationMessageType):
+            raise ValueError("message_type must be a ConversationMessageType")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        task_id, revision, continuation_generation = _conversation_binding(
+            self.task_id, self.revision, self.continuation_generation
+        )
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "continuation_generation", continuation_generation)
+        question_id, reply_to_question_id = _conversation_question_pair(
+            self.message_type,
+            task_id,
+            revision,
+            continuation_generation,
+            self.question_id,
+            self.reply_to_question_id,
+        )
+        object.__setattr__(self, "question_id", question_id)
+        object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
+        if self.message_type is ConversationMessageType.APPROVAL and (
+            task_id is None or revision is None
+        ):
+            raise ValueError("approvals require task_id and revision")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectedAgentQuestion:
+    addressed_to: Literal["user", "fable", "sol"]
+    text: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.addressed_to not in {"user", "fable", "sol"}:
+            raise ValueError("addressed_to must be user, fable, or sol")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        object.__setattr__(self, "reason", _bounded_conversation_text(self.reason, "reason"))
 
 
 @dataclass(frozen=True)
