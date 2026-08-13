@@ -21,7 +21,17 @@ import sqlite3
 import threading
 from typing import Literal, TypeAlias
 
-from agent_bridge.contracts import JsonValue, StreamEvent, TaskBrief, freeze_json
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    DirectedAgentQuestion,
+    JsonValue,
+    StreamEvent,
+    TaskBrief,
+    freeze_json,
+)
 from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState, require_transition
 
@@ -51,6 +61,8 @@ _MAX_PREPARED_TEXT_LENGTH = 16 * 1024
 _MAX_RESUME_DRIFT_SUMMARY_LENGTH = 1024
 _MAX_PREPARATION_ID_ATTEMPTS = 8
 _STARTUP_RECOVERY_BATCH_SIZE = 128
+INITIAL_INTERNAL_EXCHANGES = 3
+EXCHANGE_GRANT_SIZE = 3
 _PREPARED_ACTION_KINDS = frozenset({"new_request", "approval", "answer", "resume"})
 _PREPARED_ACTION_STATUSES = frozenset({
     "PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
@@ -79,6 +91,77 @@ class TaskRecord:
     correction_count: int
     continuation_state: TaskState | None
     pending: Mapping[str, JsonValue] | None
+    continuation_generation: int
+    exchange_allowance: int
+    exchange_consumed: int
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionRecord:
+    """One exact directed question and its optional single answer."""
+
+    question_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    continuation_generation: int
+    asked_by: ConversationActor
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    text: str
+    exchange_id: str | None
+    answer_text: str | None
+    answered_by: ConversationActor | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "question_id", _prepared_identifier(self.question_id, "question_id"))
+        object.__setattr__(self, "session_id", _require_string(self.session_id, "session_id"))
+        object.__setattr__(self, "task_id", _require_string(self.task_id, "task_id"))
+        revision = _require_integer(self.revision, "revision")
+        generation = _require_integer(self.continuation_generation, "continuation_generation")
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        if generation < 1:
+            raise ValueError("continuation_generation must be >= 1")
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "continuation_generation", generation)
+        if not isinstance(self.asked_by, ConversationActor):
+            raise ValueError("asked_by must be a ConversationActor")
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.routed_to, ConversationTarget):
+            raise ValueError("routed_to must be a ConversationTarget")
+        object.__setattr__(self, "text", _require_string(self.text, "text"))
+        if self.exchange_id is not None:
+            object.__setattr__(self, "exchange_id", _prepared_identifier(self.exchange_id, "exchange_id"))
+        if (self.answer_text is None) != (self.answered_by is None):
+            raise ValueError("answer_text and answered_by must both be present or absent")
+        if self.answer_text is not None:
+            object.__setattr__(self, "answer_text", _require_string(self.answer_text, "answer_text"))
+        if self.answered_by is not None and not isinstance(self.answered_by, ConversationActor):
+            raise ValueError("answered_by must be a ConversationActor")
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeReservation:
+    """One durable, idempotent reservation of an internal dialogue slot."""
+
+    exchange_id: str
+    question_id: str
+    ordinal: int
+    continuation_generation: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exchange_id", _prepared_identifier(self.exchange_id, "exchange_id"))
+        object.__setattr__(self, "question_id", _prepared_identifier(self.question_id, "question_id"))
+        ordinal = _require_integer(self.ordinal, "ordinal")
+        generation = _require_integer(self.continuation_generation, "continuation_generation")
+        if ordinal < 1:
+            raise ValueError("ordinal must be >= 1")
+        if generation < 1:
+            raise ValueError("continuation_generation must be >= 1")
+        object.__setattr__(self, "ordinal", ordinal)
+        object.__setattr__(self, "continuation_generation", generation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -745,6 +828,12 @@ _MIGRATION_STATEMENTS = (
         correction_count INTEGER NOT NULL DEFAULT 0,
         continuation_state TEXT,
         pending_json TEXT,
+        continuation_generation INTEGER NOT NULL DEFAULT 1
+            CHECK (continuation_generation >= 1),
+        exchange_allowance INTEGER NOT NULL DEFAULT 3
+            CHECK (exchange_allowance >= 0),
+        exchange_consumed INTEGER NOT NULL DEFAULT 0
+            CHECK (exchange_consumed >= 0),
         PRIMARY KEY (task_id, revision),
         FOREIGN KEY (session_id) REFERENCES sessions(session_id)
     )
@@ -804,6 +893,56 @@ _MIGRATION_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS questions (
+        question_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
+        asked_by TEXT NOT NULL,
+        addressed_to TEXT NOT NULL,
+        routed_to TEXT NOT NULL,
+        text TEXT NOT NULL,
+        exchange_id TEXT,
+        answer_text TEXT,
+        answered_by TEXT,
+        CHECK (
+            (answer_text IS NULL AND answered_by IS NULL)
+            OR (answer_text IS NOT NULL AND answered_by IS NOT NULL)
+        ),
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS exchange_reservations (
+        exchange_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        question_id TEXT NOT NULL UNIQUE,
+        request_key TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+        continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision),
+        FOREIGN KEY (question_id) REFERENCES questions(question_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS exchange_grants (
+        grant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        request_id TEXT NOT NULL,
+        continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
+        grant_size INTEGER NOT NULL CHECK (grant_size = 3),
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+    )
+    """,
+    """
     CREATE UNIQUE INDEX IF NOT EXISTS one_running_agent_run_per_task_revision
     ON agent_runs (task_id, revision)
     WHERE status = 'running'
@@ -827,6 +966,23 @@ _MIGRATION_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS prepared_actions_identity
     ON prepared_actions (project_id, session_id, task_id, revision, status)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS one_unanswered_question_per_task_revision
+    ON questions (task_id, revision)
+    WHERE answer_text IS NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS questions_session_task_revision
+    ON questions (session_id, task_id, revision)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS exchange_reservations_request_identity
+    ON exchange_reservations (session_id, task_id, revision, request_key)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS exchange_grants_request_identity
+    ON exchange_grants (session_id, task_id, revision, request_id)
     """,
 )
 
@@ -920,6 +1076,7 @@ class SQLiteStore:
             for statement in _MIGRATION_STATEMENTS:
                 self._connection.execute(statement)
             self._migrate_session_chat_metadata()
+            self._migrate_directed_conversation_schema()
         except BaseException:
             self._connection.rollback()
             raise
@@ -941,6 +1098,42 @@ class SQLiteStore:
         self._connection.execute(
             "UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL"
         )
+
+    def _migrate_directed_conversation_schema(self) -> None:
+        """Add directed-conversation task fields without rewriting legacy payloads."""
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(tasks)")
+        }
+        additions = (
+            (
+                "continuation_generation",
+                """
+                ALTER TABLE tasks
+                ADD COLUMN continuation_generation INTEGER NOT NULL DEFAULT 1
+                    CHECK (continuation_generation >= 1)
+                """,
+            ),
+            (
+                "exchange_allowance",
+                """
+                ALTER TABLE tasks
+                ADD COLUMN exchange_allowance INTEGER NOT NULL DEFAULT 3
+                    CHECK (exchange_allowance >= 0)
+                """,
+            ),
+            (
+                "exchange_consumed",
+                """
+                ALTER TABLE tasks
+                ADD COLUMN exchange_consumed INTEGER NOT NULL DEFAULT 0
+                    CHECK (exchange_consumed >= 0)
+                """,
+            ),
+        )
+        for column, statement in additions:
+            if column not in columns:
+                self._connection.execute(statement)
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[None]:
@@ -1126,6 +1319,915 @@ class SQLiteStore:
         if row is None:
             raise RuntimeError("task record not found")
         return self._task_from_row(row)
+
+    def question(self, question_id: str) -> QuestionRecord | None:
+        """Return one durable directed question without crossing store boundaries."""
+        row = self._connection.execute(
+            "SELECT * FROM questions WHERE question_id = ?",
+            (_prepared_identifier(question_id, "question_id"),),
+        ).fetchone()
+        return None if row is None else self._question_from_row(row)
+
+    def pause_for_question(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        asked_by: ConversationActor,
+        addressed_to: ConversationTarget,
+        routed_to: ConversationTarget,
+        text: str,
+        continuation_state: TaskState,
+        pending_action: Mapping[str, object],
+        event: ConversationEnvelope,
+    ) -> QuestionRecord:
+        """Pause one active task behind an exact question and visible event."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        question_id = _prepared_identifier(question_id, "question_id")
+        self._validate_question_inputs(
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+            question_id=question_id,
+            asked_by=asked_by,
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            text=text,
+            event=event,
+        )
+        frozen_pending = self._directed_pending_action(pending_action)
+        self._validate_pause_transition(continuation_state)
+        question = QuestionRecord(
+            question_id=question_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            continuation_generation=expected_generation,
+            asked_by=asked_by,
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            text=text,
+            exchange_id=None,
+            answer_text=None,
+            answered_by=None,
+        )
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                )
+                if self._unanswered_question_for_task(task_id, revision) is not None:
+                    raise RuntimeError("task revision already has an unanswered question")
+                self._require_task_can_pause(task, continuation_state)
+                if self.question(question_id) is not None:
+                    raise RuntimeError("question identifier already exists")
+                self._insert_question(question)
+                self._pause_task_for_directed_action(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                    continuation_state=continuation_state,
+                    pending_action=frozen_pending,
+                )
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return question
+
+    def answer_question_and_prepare_resume(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        question_id: str,
+        expected_generation: int,
+        answer_text: str,
+        answered_by: ConversationActor,
+        pending_action: Mapping[str, object],
+        event: ConversationEnvelope,
+    ) -> QuestionRecord:
+        """CAS one exact pending question, then durably prepare its continuation."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        question_id = _prepared_identifier(question_id, "question_id")
+        answer_text = _require_string(answer_text, "answer_text")
+        if not isinstance(answered_by, ConversationActor):
+            raise ValueError("answered_by must be a ConversationActor")
+        frozen_pending = self._directed_pending_action(pending_action)
+        self._validate_answer_event_binding(
+            event=event,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+            question_id=question_id,
+            answer_text=answer_text,
+            answered_by=answered_by,
+        )
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                )
+                question = self._question_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                    question_id=question_id,
+                )
+                if question.answer_text is not None:
+                    raise RuntimeError("question was already answered")
+                if task.state is not TaskState.AWAITING_USER_INPUT or task.continuation_state is None:
+                    raise RuntimeError("task has no pending question continuation")
+                continuation_state = task.continuation_state
+                self._validate_pause_transition(continuation_state)
+                expected_actor = self._answer_actor_for_routed_target(question.routed_to)
+                if answered_by is not expected_actor:
+                    raise RuntimeError("answer actor is not eligible for this routed question")
+                reply_target = self._target_for_question_asker(question.asked_by)
+                if event.addressed_to is not reply_target or event.routed_to is not reply_target:
+                    raise RuntimeError("answer event does not route to the question asker")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE questions SET answer_text = ?, answered_by = ?
+                    WHERE question_id = ? AND session_id = ? AND task_id = ?
+                      AND revision = ? AND continuation_generation = ?
+                      AND answer_text IS NULL AND answered_by IS NULL
+                    """,
+                    (
+                        answer_text,
+                        answered_by.value,
+                        question_id,
+                        session_id,
+                        task_id,
+                        revision,
+                        expected_generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("question changed concurrently")
+                if answered_by is ConversationActor.USER:
+                    next_generation = self._reset_internal_exchanges_for_human_direction_in_transaction(
+                        self._connection,
+                        session_id=session_id,
+                        task_id=task_id,
+                        revision=revision,
+                        expected_generation=expected_generation,
+                    )
+                else:
+                    next_generation = expected_generation
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND state = ? AND continuation_state = ?
+                      AND continuation_generation = ?
+                    """,
+                    (
+                        continuation_state.value,
+                        _encode_json(frozen_pending),
+                        task_id,
+                        revision,
+                        session_id,
+                        TaskState.AWAITING_USER_INPUT.value,
+                        continuation_state.value,
+                        next_generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("task question continuation changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return QuestionRecord(
+            question_id=question.question_id,
+            session_id=question.session_id,
+            task_id=question.task_id,
+            revision=question.revision,
+            continuation_generation=question.continuation_generation,
+            asked_by=question.asked_by,
+            addressed_to=question.addressed_to,
+            routed_to=question.routed_to,
+            text=question.text,
+            exchange_id=question.exchange_id,
+            answer_text=answer_text,
+            answered_by=answered_by,
+        )
+
+    def reserve_internal_question(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        request_key: str,
+        asked_by: ConversationActor,
+        addressed_to: ConversationTarget,
+        routed_to: ConversationTarget,
+        text: str,
+        continuation_state: TaskState,
+        pending_action: Mapping[str, object],
+        event: ConversationEnvelope,
+    ) -> tuple[ExchangeReservation, QuestionRecord]:
+        """Reserve exactly one finite agent-to-agent exchange before it is visible."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        question_id = _prepared_identifier(question_id, "question_id")
+        request_key = _prepared_identifier(request_key, "request_key")
+        self._validate_question_inputs(
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+            question_id=question_id,
+            asked_by=asked_by,
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            text=text,
+            event=event,
+        )
+        if asked_by not in {ConversationActor.FABLE, ConversationActor.SOL}:
+            raise ValueError("internal questions must be asked by an agent")
+        if routed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}:
+            raise ValueError("internal questions must route to an agent")
+        if routed_to.value == asked_by.value:
+            raise ValueError("internal questions must route to the other agent")
+        frozen_pending = self._directed_pending_action(pending_action)
+        self._validate_pause_transition(continuation_state)
+        emitted: list[StreamEvent] = []
+        result: tuple[ExchangeReservation, QuestionRecord]
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                )
+                existing = self._reservation_for_request_key(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    request_key=request_key,
+                )
+                if existing is not None:
+                    reservation, question = existing
+                    if (
+                        reservation.question_id != question_id
+                        or reservation.continuation_generation != expected_generation
+                        or question.continuation_generation != expected_generation
+                        or question.asked_by is not asked_by
+                        or question.addressed_to is not addressed_to
+                        or question.routed_to is not routed_to
+                        or question.text != text
+                        or question.answer_text is not None
+                        or task.state is not TaskState.AWAITING_USER_INPUT
+                        or task.continuation_state is not continuation_state
+                        or task.pending != frozen_pending
+                    ):
+                        raise RuntimeError("exchange request key does not match its reservation")
+                    result = existing
+                else:
+                    self._require_task_can_pause(task, continuation_state)
+                    if task.exchange_allowance <= 0:
+                        raise RuntimeError("internal exchange allowance is exhausted")
+                    if self._unanswered_question_for_task(task_id, revision) is not None:
+                        raise RuntimeError("task revision already has an unanswered question")
+                    if self.question(question_id) is not None:
+                        raise RuntimeError("question identifier already exists")
+                    exchange_id = self._new_exchange_id()
+                    reservation = ExchangeReservation(
+                        exchange_id=exchange_id,
+                        question_id=question_id,
+                        ordinal=task.exchange_consumed + 1,
+                        continuation_generation=expected_generation,
+                    )
+                    question = QuestionRecord(
+                        question_id=question_id,
+                        session_id=session_id,
+                        task_id=task_id,
+                        revision=revision,
+                        continuation_generation=expected_generation,
+                        asked_by=asked_by,
+                        addressed_to=addressed_to,
+                        routed_to=routed_to,
+                        text=text,
+                        exchange_id=exchange_id,
+                        answer_text=None,
+                        answered_by=None,
+                    )
+                    self._insert_question(QuestionRecord(
+                        question_id=question.question_id,
+                        session_id=question.session_id,
+                        task_id=question.task_id,
+                        revision=question.revision,
+                        continuation_generation=question.continuation_generation,
+                        asked_by=question.asked_by,
+                        addressed_to=question.addressed_to,
+                        routed_to=question.routed_to,
+                        text=question.text,
+                        exchange_id=None,
+                        answer_text=None,
+                        answered_by=None,
+                    ))
+                    self._connection.execute(
+                        """
+                        INSERT INTO exchange_reservations (
+                            exchange_id, session_id, task_id, revision, question_id,
+                            request_key, ordinal, continuation_generation
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            reservation.exchange_id,
+                            session_id,
+                            task_id,
+                            revision,
+                            question_id,
+                            request_key,
+                            reservation.ordinal,
+                            expected_generation,
+                        ),
+                    )
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE questions SET exchange_id = ?
+                        WHERE question_id = ? AND exchange_id IS NULL
+                        """,
+                        (exchange_id, question_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("exchange question changed concurrently")
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE tasks
+                        SET exchange_allowance = exchange_allowance - 1,
+                            exchange_consumed = exchange_consumed + 1,
+                            state = ?, continuation_state = ?, pending_json = ?
+                        WHERE task_id = ? AND revision = ? AND session_id = ?
+                          AND continuation_generation = ? AND state = ?
+                          AND continuation_state IS NULL AND exchange_allowance > 0
+                        """,
+                        (
+                            TaskState.AWAITING_USER_INPUT.value,
+                            continuation_state.value,
+                            _encode_json(frozen_pending),
+                            task_id,
+                            revision,
+                            session_id,
+                            expected_generation,
+                            continuation_state.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("internal exchange changed concurrently")
+                    emitted.append(self._insert_conversation_event_in_transaction(
+                        session_id=session_id,
+                        task_id=task_id,
+                        event=event,
+                    ))
+                    result = (reservation, question)
+            if emitted:
+                self._publish_committed_events(emitted)
+        return result
+
+    def pause_for_exchange_permission(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        attempted_question: DirectedAgentQuestion,
+        continuation_state: TaskState,
+        pending_action: Mapping[str, object],
+        event: ConversationEnvelope,
+    ) -> TaskRecord:
+        """Persist an exhausted-hop permission pause before a fourth question starts."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        if not isinstance(attempted_question, DirectedAgentQuestion):
+            raise ValueError("attempted_question must be a DirectedAgentQuestion")
+        if attempted_question.addressed_to not in {"fable", "sol"}:
+            raise ValueError("attempted internal question must target an agent")
+        self._validate_pause_transition(continuation_state)
+        self._validate_permission_event_binding(
+            event=event,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+        )
+        frozen_pending = self._directed_pending_action(pending_action)
+        if "attempted_question" in frozen_pending:
+            raise ValueError("pending_action must not replace attempted_question")
+        permission_pending = {
+            **frozen_pending,
+            "attempted_question": {
+                "addressed_to": attempted_question.addressed_to,
+                "text": attempted_question.text,
+                "reason": attempted_question.reason,
+            },
+        }
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                )
+                self._require_task_can_pause(task, continuation_state)
+                if task.exchange_allowance != 0:
+                    raise RuntimeError("internal exchange allowance is not exhausted")
+                self._pause_task_for_directed_action(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=expected_generation,
+                    continuation_state=continuation_state,
+                    pending_action=permission_pending,
+                )
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return self.get_task(task_id, revision)
+
+    def grant_internal_exchanges(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        request_id: str,
+    ) -> int:
+        """Add one fixed, idempotent three-exchange grant to an exhausted task."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        request_id = _prepared_identifier(request_id, "request_id")
+        with self._immediate_transaction():
+            task = self._directed_task_exact(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                expected_generation=expected_generation,
+            )
+            existing = self._connection.execute(
+                """
+                SELECT continuation_generation, grant_size FROM exchange_grants
+                WHERE session_id = ? AND task_id = ? AND revision = ? AND request_id = ?
+                """,
+                (session_id, task_id, revision, request_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    int(existing["continuation_generation"]) != expected_generation
+                    or int(existing["grant_size"]) != EXCHANGE_GRANT_SIZE
+                ):
+                    raise RuntimeError("exchange grant request changed")
+                return int(existing["grant_size"])
+            pending = task.pending or {}
+            if (
+                task.state is not TaskState.AWAITING_USER_INPUT
+                or task.continuation_state is None
+                or not isinstance(pending.get("attempted_question"), Mapping)
+            ):
+                raise RuntimeError("task is not awaiting exchange permission")
+            self._connection.execute(
+                """
+                INSERT INTO exchange_grants (
+                    session_id, task_id, revision, request_id,
+                    continuation_generation, grant_size
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    task_id,
+                    revision,
+                    request_id,
+                    expected_generation,
+                    EXCHANGE_GRANT_SIZE,
+                ),
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE tasks SET exchange_allowance = exchange_allowance + ?
+                WHERE task_id = ? AND revision = ? AND session_id = ?
+                  AND continuation_generation = ?
+                """,
+                (
+                    EXCHANGE_GRANT_SIZE,
+                    task_id,
+                    revision,
+                    session_id,
+                    expected_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("exchange grant changed concurrently")
+        return EXCHANGE_GRANT_SIZE
+
+    @staticmethod
+    def _directed_identity(
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> tuple[str, str, int, int]:
+        session_id = _require_string(session_id, "session_id")
+        task_id = _require_string(task_id, "task_id")
+        revision = _require_integer(revision, "revision")
+        expected_generation = _require_integer(
+            expected_generation, "expected_generation",
+        )
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        if expected_generation < 1:
+            raise ValueError("expected_generation must be >= 1")
+        return session_id, task_id, revision, expected_generation
+
+    @staticmethod
+    def _directed_pending_action(pending_action: Mapping[str, object]) -> Mapping[str, JsonValue]:
+        frozen = freeze_json(pending_action)
+        if not isinstance(frozen, Mapping):
+            raise ValueError("pending_action must be an object")
+        return frozen
+
+    @staticmethod
+    def _validate_pause_transition(continuation_state: TaskState) -> None:
+        if not isinstance(continuation_state, TaskState):
+            raise ValueError("continuation_state must be a TaskState")
+        require_transition(continuation_state, TaskState.AWAITING_USER_INPUT)
+        require_transition(TaskState.AWAITING_USER_INPUT, continuation_state)
+
+    @staticmethod
+    def _validate_conversation_binding(
+        *,
+        event: ConversationEnvelope,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> None:
+        if not isinstance(event, ConversationEnvelope):
+            raise ValueError("event must be a ConversationEnvelope")
+        if (
+            event.task_id != task_id
+            or event.revision != revision
+            or event.continuation_generation != expected_generation
+        ):
+            raise ValueError("event does not bind the exact task continuation")
+
+    def _validate_question_inputs(
+        self,
+        *,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        asked_by: ConversationActor,
+        addressed_to: ConversationTarget,
+        routed_to: ConversationTarget,
+        text: str,
+        event: ConversationEnvelope,
+    ) -> None:
+        if not isinstance(asked_by, ConversationActor):
+            raise ValueError("asked_by must be a ConversationActor")
+        if asked_by is ConversationActor.SYSTEM:
+            raise ValueError("questions must be asked by a user or agent")
+        if not isinstance(addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(routed_to, ConversationTarget):
+            raise ValueError("routed_to must be a ConversationTarget")
+        if routed_to is ConversationTarget.TEAM:
+            raise ValueError("questions must route to one exact recipient")
+        _require_string(text, "text")
+        self._validate_conversation_binding(
+            event=event,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+        )
+        if (
+            event.message_type is not ConversationMessageType.QUESTION
+            or event.question_id != question_id
+            or event.reply_to_question_id is not None
+            or event.sender is not asked_by
+            or event.addressed_to is not addressed_to
+            or event.routed_to is not routed_to
+            or event.text != text
+        ):
+            raise ValueError("question event does not match the exact question")
+
+    def _validate_answer_event_binding(
+        self,
+        *,
+        event: ConversationEnvelope,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        answer_text: str,
+        answered_by: ConversationActor,
+    ) -> None:
+        self._validate_conversation_binding(
+            event=event,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+        )
+        if (
+            event.message_type is not ConversationMessageType.ANSWER
+            or event.question_id is not None
+            or event.reply_to_question_id != question_id
+            or event.sender is not answered_by
+            or event.text != answer_text
+        ):
+            raise ValueError("answer event does not match the exact question answer")
+
+    def _validate_permission_event_binding(
+        self,
+        *,
+        event: ConversationEnvelope,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> None:
+        self._validate_conversation_binding(
+            event=event,
+            task_id=task_id,
+            revision=revision,
+            expected_generation=expected_generation,
+        )
+        if (
+            event.addressed_to is not ConversationTarget.USER
+            or event.routed_to is not ConversationTarget.USER
+        ):
+            raise ValueError("exchange permission event must route to the user")
+
+    def _directed_task_exact(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> TaskRecord:
+        row = self._connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE task_id = ? AND revision = ? AND session_id = ?
+              AND continuation_generation = ?
+            """,
+            (task_id, revision, session_id, expected_generation),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("task continuation identity changed")
+        return self._task_from_row(row)
+
+    def _require_task_can_pause(
+        self, task: TaskRecord, continuation_state: TaskState,
+    ) -> None:
+        if task.state is not continuation_state or task.continuation_state is not None:
+            raise RuntimeError("task continuation changed concurrently")
+
+    def _unanswered_question_for_task(
+        self, task_id: str, revision: int,
+    ) -> QuestionRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE task_id = ? AND revision = ? AND answer_text IS NULL
+            """,
+            (task_id, revision),
+        ).fetchone()
+        return None if row is None else self._question_from_row(row)
+
+    def _question_exact(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+    ) -> QuestionRecord:
+        row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE question_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND continuation_generation = ?
+            """,
+            (
+                question_id,
+                session_id,
+                task_id,
+                revision,
+                expected_generation,
+            ),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("question continuation identity changed")
+        return self._question_from_row(row)
+
+    def _reservation_for_request_key(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        request_key: str,
+    ) -> tuple[ExchangeReservation, QuestionRecord] | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM exchange_reservations
+            WHERE session_id = ? AND task_id = ? AND revision = ? AND request_key = ?
+            """,
+            (session_id, task_id, revision, request_key),
+        ).fetchone()
+        if row is None:
+            return None
+        reservation = self._exchange_reservation_from_row(row)
+        question = self.question(reservation.question_id)
+        if question is None:
+            raise RuntimeError("exchange reservation is missing its question")
+        if (
+            question.session_id != session_id
+            or question.task_id != task_id
+            or question.revision != revision
+            or question.exchange_id != reservation.exchange_id
+        ):
+            raise RuntimeError("exchange reservation identity is invalid")
+        return reservation, question
+
+    def _insert_question(self, question: QuestionRecord) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO questions (
+                question_id, session_id, task_id, revision, continuation_generation,
+                asked_by, addressed_to, routed_to, text, exchange_id,
+                answer_text, answered_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question.question_id,
+                question.session_id,
+                question.task_id,
+                question.revision,
+                question.continuation_generation,
+                question.asked_by.value,
+                question.addressed_to.value,
+                question.routed_to.value,
+                question.text,
+                question.exchange_id,
+                question.answer_text,
+                None if question.answered_by is None else question.answered_by.value,
+            ),
+        )
+
+    def _pause_task_for_directed_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        continuation_state: TaskState,
+        pending_action: Mapping[str, object],
+    ) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE tasks
+            SET state = ?, continuation_state = ?, pending_json = ?
+            WHERE task_id = ? AND revision = ? AND session_id = ?
+              AND continuation_generation = ? AND state = ?
+              AND continuation_state IS NULL
+            """,
+            (
+                TaskState.AWAITING_USER_INPUT.value,
+                continuation_state.value,
+                _encode_json(pending_action),
+                task_id,
+                revision,
+                session_id,
+                expected_generation,
+                continuation_state.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("task continuation changed concurrently")
+
+    def _insert_conversation_event_in_transaction(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        event: ConversationEnvelope,
+    ) -> StreamEvent:
+        return self._insert_event_in_transaction(
+            session_id,
+            task_id,
+            event.sender.value,
+            "conversation",
+            event.to_dict(),
+        )
+
+    @staticmethod
+    def _answer_actor_for_routed_target(
+        routed_to: ConversationTarget,
+    ) -> ConversationActor:
+        actors = {
+            ConversationTarget.USER: ConversationActor.USER,
+            ConversationTarget.FABLE: ConversationActor.FABLE,
+            ConversationTarget.SOL: ConversationActor.SOL,
+        }
+        try:
+            return actors[routed_to]
+        except KeyError as error:
+            raise RuntimeError("question has no exact answer recipient") from error
+
+    @staticmethod
+    def _target_for_question_asker(asked_by: ConversationActor) -> ConversationTarget:
+        targets = {
+            ConversationActor.USER: ConversationTarget.USER,
+            ConversationActor.FABLE: ConversationTarget.FABLE,
+            ConversationActor.SOL: ConversationTarget.SOL,
+        }
+        try:
+            return targets[asked_by]
+        except KeyError as error:
+            raise RuntimeError("question has no reply target") from error
+
+    def _new_exchange_id(self) -> str:
+        for _ in range(_MAX_PREPARATION_ID_ATTEMPTS):
+            exchange_id = secrets.token_hex(24)
+            row = self._connection.execute(
+                "SELECT 1 FROM exchange_reservations WHERE exchange_id = ?",
+                (exchange_id,),
+            ).fetchone()
+            if row is None:
+                return exchange_id
+        raise RuntimeError("could not allocate exchange identifier")
+
+    def _reset_internal_exchanges_for_human_direction_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+    ) -> int:
+        """Advance the exact generation and restore a finite budget in this transaction."""
+        cursor = connection.execute(
+            """
+            UPDATE tasks
+            SET continuation_generation = continuation_generation + ?,
+                exchange_allowance = ?, exchange_consumed = 0
+            WHERE task_id = ? AND revision = ? AND session_id = ?
+              AND continuation_generation = ?
+            """,
+            (
+                1,
+                INITIAL_INTERNAL_EXCHANGES,
+                task_id,
+                revision,
+                session_id,
+                expected_generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("task continuation generation changed concurrently")
+        return expected_generation + 1
 
     def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None:
         row = self._connection.execute(
@@ -3705,6 +4807,13 @@ class SQLiteStore:
             raw_pending = row["pending_json"]
             pending = None if raw_pending is None else _decode_mapping(raw_pending, "pending context")
             raw_continuation = row["continuation_state"]
+            continuation_generation = int(row["continuation_generation"])
+            exchange_allowance = int(row["exchange_allowance"])
+            exchange_consumed = int(row["exchange_consumed"])
+            if continuation_generation < 1:
+                raise RuntimeError("persisted task continuation generation is invalid")
+            if exchange_allowance < 0 or exchange_consumed < 0:
+                raise RuntimeError("persisted task exchange budget is invalid")
             return TaskRecord(
                 task_id=row["task_id"],
                 revision=revision,
@@ -3720,9 +4829,49 @@ class SQLiteStore:
                     None if raw_continuation is None else TaskState(raw_continuation)
                 ),
                 pending=pending,
+                continuation_generation=continuation_generation,
+                exchange_allowance=exchange_allowance,
+                exchange_consumed=exchange_consumed,
             )
         except (TypeError, ValueError, OverflowError) as error:
             raise RuntimeError("persisted task is invalid") from error
+
+    @staticmethod
+    def _question_from_row(row: sqlite3.Row) -> QuestionRecord:
+        try:
+            raw_answered_by = row["answered_by"]
+            return QuestionRecord(
+                question_id=row["question_id"],
+                session_id=row["session_id"],
+                task_id=row["task_id"],
+                revision=int(row["revision"]),
+                continuation_generation=int(row["continuation_generation"]),
+                asked_by=ConversationActor(row["asked_by"]),
+                addressed_to=ConversationTarget(row["addressed_to"]),
+                routed_to=ConversationTarget(row["routed_to"]),
+                text=row["text"],
+                exchange_id=row["exchange_id"],
+                answer_text=row["answer_text"],
+                answered_by=(
+                    None
+                    if raw_answered_by is None
+                    else ConversationActor(raw_answered_by)
+                ),
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("persisted question is invalid") from error
+
+    @staticmethod
+    def _exchange_reservation_from_row(row: sqlite3.Row) -> ExchangeReservation:
+        try:
+            return ExchangeReservation(
+                exchange_id=row["exchange_id"],
+                question_id=row["question_id"],
+                ordinal=int(row["ordinal"]),
+                continuation_generation=int(row["continuation_generation"]),
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("persisted exchange reservation is invalid") from error
 
     def _prepared_action_from_row(self, row: sqlite3.Row) -> PreparedActionRecord:
         try:

@@ -11,6 +11,13 @@ import tracemalloc
 import pytest
 
 import agent_bridge.store as store_module
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    DirectedAgentQuestion,
+)
 from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
@@ -19,8 +26,12 @@ from agent_bridge.store import (
     AnswerPayload,
     BaselineSetting,
     ClarificationContext,
+    ExchangeReservation,
+    EXCHANGE_GRANT_SIZE,
+    INITIAL_INTERNAL_EXCHANGES,
     MAX_TASK_OVERVIEWS,
     NewRequestPayload,
+    QuestionRecord,
     ResumeDriftProjection,
     ResumePayload,
     ReviewContext,
@@ -1066,7 +1077,14 @@ def _legacy_table_rows(connection: sqlite3.Connection) -> dict[str, tuple[tuple,
         "sessions": rows(
             "SELECT session_id, repo_root, created_at FROM sessions ORDER BY session_id"
         ),
-        "tasks": rows("SELECT * FROM tasks ORDER BY task_id, revision"),
+        "tasks": rows(
+            """
+            SELECT task_id, revision, session_id, state, brief_json, approved_at,
+                   fable_session_id, sol_thread_id, baseline_id, correction_count,
+                   continuation_state, pending_json
+            FROM tasks ORDER BY task_id, revision
+            """
+        ),
         "events": rows("SELECT * FROM events ORDER BY sequence"),
         "agent_runs": rows("SELECT * FROM agent_runs ORDER BY run_id"),
         "settings": rows("SELECT * FROM settings ORDER BY key"),
@@ -2945,3 +2963,1070 @@ def test_legacy_review_requires_an_actual_boolean_completion_guard(
     assert unchanged.pending == {
         "review_prompt": "Review the exact output.", "completion_allowed": 1,
     }
+
+
+def _create_pre_directed_conversation_schema(path) -> sqlite3.Connection:
+    """Create the exact Phase 1 schema before directed conversations."""
+    connection = _create_current_schema(path)
+    connection.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New chat';
+        ALTER TABLE sessions ADD COLUMN updated_at TEXT;
+        CREATE TABLE prepared_actions (
+            preparation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            source_state TEXT NOT NULL,
+            active_state TEXT NOT NULL,
+            continuation_state TEXT,
+            pending_context_json TEXT,
+            previous_preparation_id TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            generation INTEGER NOT NULL,
+            FOREIGN KEY (task_id, revision) REFERENCES tasks(task_id, revision)
+        );
+        CREATE UNIQUE INDEX one_running_agent_run_per_task_revision
+        ON agent_runs (task_id, revision) WHERE status = 'running';
+        CREATE INDEX events_session_sequence ON events (session_id, sequence);
+        CREATE INDEX events_session_task_sequence
+        ON events (session_id, task_id, sequence DESC);
+        CREATE INDEX events_session_task_kind_sequence
+        ON events (session_id, task_id, kind, sequence DESC);
+        CREATE INDEX events_session_sequence_desc ON events (session_id, sequence DESC);
+        CREATE INDEX prepared_actions_identity
+        ON prepared_actions (project_id, session_id, task_id, revision, status);
+        """
+    )
+    return connection
+
+
+def _pre_directed_rows(connection: sqlite3.Connection) -> dict[str, tuple[tuple, ...]]:
+    def rows(query: str) -> tuple[tuple, ...]:
+        return tuple(tuple(row) for row in connection.execute(query))
+
+    return {
+        "sessions": rows(
+            """
+            SELECT session_id, repo_root, created_at, title, updated_at
+            FROM sessions ORDER BY session_id
+            """
+        ),
+        "tasks": rows(
+            """
+            SELECT task_id, revision, session_id, state, brief_json, approved_at,
+                   fable_session_id, sol_thread_id, baseline_id, correction_count,
+                   continuation_state, pending_json
+            FROM tasks ORDER BY task_id, revision
+            """
+        ),
+        "events": rows("SELECT * FROM events ORDER BY sequence"),
+        "agent_runs": rows("SELECT * FROM agent_runs ORDER BY run_id"),
+        "settings": rows("SELECT * FROM settings ORDER BY key"),
+        "prepared_actions": rows("SELECT * FROM prepared_actions ORDER BY preparation_id"),
+    }
+
+
+def _seed_pre_directed_conversation_database(path) -> dict[str, tuple[tuple, ...]]:
+    connection = _create_pre_directed_conversation_schema(path)
+    connection.execute(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "session-legacy",
+            "/repo/legacy",
+            "2026-08-10T10:00:00Z",
+            "Existing chat",
+            "2026-08-10T10:01:00Z",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks (
+            task_id, revision, session_id, state, brief_json, approved_at,
+            fable_session_id, sol_thread_id, baseline_id, correction_count,
+            continuation_state, pending_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task.legacy",
+            1,
+            "session-legacy",
+            TaskState.SOL_RUNNING.value,
+            '{"raw":"brief bytes"}',
+            "2026-08-10T10:02:00Z",
+            "fable-session",
+            "sol-thread",
+            "baseline-legacy",
+            2,
+            None,
+            '{"raw":"pending bytes"}',
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "session-legacy",
+            "task.legacy",
+            "sol",
+            "outcome",
+            '{"raw":"event bytes"}',
+            "2026-08-10T10:03:00Z",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO prepared_actions (
+            preparation_id, project_id, session_id, task_id, revision, action,
+            payload_json, source_state, active_state, continuation_state,
+            pending_context_json, previous_preparation_id, status, reason, generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "prepared-legacy",
+            "a" * 32,
+            "session-legacy",
+            "task.legacy",
+            1,
+            "resume",
+            '{"raw":"prepared bytes"}',
+            TaskState.SOL_RUNNING.value,
+            TaskState.SOL_RUNNING.value,
+            None,
+            None,
+            None,
+            "COMPLETED",
+            None,
+            0,
+        ),
+    )
+    connection.commit()
+    seeded = _pre_directed_rows(connection)
+    connection.close()
+    return seeded
+
+
+def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_safe(
+    tmp_path,
+) -> None:
+    path = tmp_path / "pre-directed.sqlite3"
+    before = _seed_pre_directed_conversation_database(path)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    assert _pre_directed_rows(migrated._connection) == before
+    task_columns = tuple(
+        row["name"] for row in migrated._connection.execute("PRAGMA table_info(tasks)")
+    )
+    assert task_columns[-3:] == (
+        "continuation_generation",
+        "exchange_allowance",
+        "exchange_consumed",
+    )
+    assert tuple(migrated._connection.execute(
+        """
+        SELECT continuation_generation, exchange_allowance, exchange_consumed
+        FROM tasks WHERE task_id = ? AND revision = ?
+        """,
+        ("task.legacy", 1),
+    ).fetchone()) == (1, INITIAL_INTERNAL_EXCHANGES, 0)
+    tables = {
+        row["name"]
+        for row in migrated._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert {"questions", "exchange_reservations", "exchange_grants"} <= tables
+    indexes = {
+        row["name"]
+        for row in migrated._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    assert {
+        "one_unanswered_question_per_task_revision",
+        "exchange_reservations_request_identity",
+        "exchange_grants_request_identity",
+    } <= indexes
+    migrated.close()
+
+    first_migration_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert _pre_directed_rows(reopened._connection) == before
+    reopened.close()
+    assert path.read_bytes() == first_migration_bytes
+
+
+def test_directed_question_exchange_migration_rolls_back_all_ddl_on_injected_failure(
+    tmp_path, monkeypatch,
+) -> None:
+    path = tmp_path / "directed-rollback.sqlite3"
+    connection = _create_pre_directed_conversation_schema(path)
+    connection.execute(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("session-1", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+    )
+    connection.commit()
+    connection.close()
+
+    def fail_after_directed_ddl(self) -> None:
+        raise sqlite3.IntegrityError("injected directed migration failure")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_migrate_directed_conversation_schema",
+        fail_after_directed_ddl,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected directed migration failure"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    task_columns = tuple(row[1] for row in inspected.execute("PRAGMA table_info(tasks)"))
+    assert task_columns == (
+        "task_id", "revision", "session_id", "state", "brief_json", "approved_at",
+        "fable_session_id", "sol_thread_id", "baseline_id", "correction_count",
+        "continuation_state", "pending_json",
+    )
+    tables = {
+        row[0] for row in inspected.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "questions" not in tables
+    assert "exchange_reservations" not in tables
+    assert "exchange_grants" not in tables
+    inspected.close()
+
+
+def _conversation_question(
+    *,
+    sender: ConversationActor,
+    addressed_to: ConversationTarget,
+    routed_to: ConversationTarget,
+    task_id: str,
+    revision: int,
+    generation: int,
+    question_id: str,
+    text: str,
+) -> ConversationEnvelope:
+    return ConversationEnvelope(
+        sender=sender,
+        addressed_to=addressed_to,
+        routed_to=routed_to,
+        message_type=ConversationMessageType.QUESTION,
+        text=text,
+        task_id=task_id,
+        revision=revision,
+        continuation_generation=generation,
+        question_id=question_id,
+    )
+
+
+def _conversation_answer(
+    *,
+    sender: ConversationActor,
+    addressed_to: ConversationTarget,
+    routed_to: ConversationTarget,
+    task_id: str,
+    revision: int,
+    generation: int,
+    question_id: str,
+    text: str,
+) -> ConversationEnvelope:
+    return ConversationEnvelope(
+        sender=sender,
+        addressed_to=addressed_to,
+        routed_to=routed_to,
+        message_type=ConversationMessageType.ANSWER,
+        text=text,
+        task_id=task_id,
+        revision=revision,
+        continuation_generation=generation,
+        reply_to_question_id=question_id,
+    )
+
+
+def _conversation_permission(
+    *, task_id: str, revision: int, generation: int,
+) -> ConversationEnvelope:
+    return ConversationEnvelope(
+        sender=ConversationActor.SYSTEM,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        message_type=ConversationMessageType.STATUS,
+        text="The internal exchange limit was reached. Allow three more exchanges?",
+        task_id=task_id,
+        revision=revision,
+        continuation_generation=generation,
+    )
+
+
+def _save_active_directed_task(store, session_id: str, brief) -> None:
+    store.save_task(session_id, brief, TaskState.SOL_RUNNING)
+
+
+def test_question_answers_compare_and_swap_exact_identity_and_legal_recipient(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo-one")
+    store.create_session("session-2", "/repo-two")
+    first_brief = replace(valid_brief, task_id="task-one", revision=1)
+    other_brief = replace(valid_brief, task_id="task-two", revision=1)
+    second_revision = replace(first_brief, revision=2, title="Second exact revision")
+    _save_active_directed_task(store, "session-1", first_brief)
+    _save_active_directed_task(store, "session-1", other_brief)
+    _save_active_directed_task(store, "session-1", second_revision)
+    question = store.pause_for_question(
+        session_id="session-1",
+        task_id="task-one",
+        revision=1,
+        expected_generation=1,
+        question_id="question-one",
+        asked_by=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Which approved option should be used?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-sol"},
+        event=_conversation_question(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            task_id="task-one",
+            revision=1,
+            generation=1,
+            question_id="question-one",
+            text="Which approved option should be used?",
+        ),
+    )
+    assert question == QuestionRecord(
+        question_id="question-one",
+        session_id="session-1",
+        task_id="task-one",
+        revision=1,
+        continuation_generation=1,
+        asked_by=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Which approved option should be used?",
+        exchange_id=None,
+        answer_text=None,
+        answered_by=None,
+    )
+    assert store.question("question-one") == question
+    waiting = store.get_task("task-one", 1)
+    assert waiting.state is TaskState.AWAITING_USER_INPUT
+    assert waiting.continuation_state is TaskState.SOL_RUNNING
+    assert waiting.pending == {"next": "resume-sol"}
+    assert waiting.continuation_generation == 1
+    assert waiting.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert waiting.exchange_consumed == 0
+
+    other_question = store.pause_for_question(
+        session_id="session-1",
+        task_id="task-two",
+        revision=1,
+        expected_generation=1,
+        question_id="question-other-task",
+        asked_by=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Choose the separate task option.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-other"},
+        event=_conversation_question(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            task_id="task-two",
+            revision=1,
+            generation=1,
+            question_id="question-other-task",
+            text="Choose the separate task option.",
+        ),
+    )
+    assert other_question.question_id == "question-other-task"
+    with pytest.raises(RuntimeError, match="unanswered question"):
+        store.pause_for_question(
+            session_id="session-1",
+            task_id="task-one",
+            revision=1,
+            expected_generation=1,
+            question_id="second-question-one",
+            asked_by=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            text="A second question must wait.",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"next": "must-not-persist"},
+            event=_conversation_question(
+                sender=ConversationActor.FABLE,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                task_id="task-one",
+                revision=1,
+                generation=1,
+                question_id="second-question-one",
+                text="A second question must wait.",
+            ),
+        )
+
+    def assert_rejected(
+        *, session_id: str, revision: int, question_id: str, generation: int,
+    ) -> None:
+        before_task = store.get_task("task-one", 1)
+        before_events = store.events_after("session-1", 0)
+        before_runs = tuple(store._connection.execute("SELECT * FROM agent_runs"))
+        with pytest.raises(RuntimeError):
+            store.answer_question_and_prepare_resume(
+                session_id=session_id,
+                task_id="task-one",
+                revision=revision,
+                question_id=question_id,
+                expected_generation=generation,
+                answer_text="Use option A.",
+                answered_by=ConversationActor.USER,
+                pending_action={"next": "must-not-prepare"},
+                event=_conversation_answer(
+                    sender=ConversationActor.USER,
+                    addressed_to=ConversationTarget.FABLE,
+                    routed_to=ConversationTarget.FABLE,
+                    task_id="task-one",
+                    revision=revision,
+                    generation=generation,
+                    question_id=question_id,
+                    text="Use option A.",
+                ),
+            )
+        assert store.get_task("task-one", 1) == before_task
+        assert store.events_after("session-1", 0) == before_events
+        assert tuple(store._connection.execute("SELECT * FROM agent_runs")) == before_runs
+        assert store.question("question-one") == question
+
+    assert_rejected(
+        session_id="session-1", revision=1, question_id="question-one", generation=2,
+    )
+    assert_rejected(
+        session_id="session-1", revision=1, question_id="wrong-question", generation=1,
+    )
+    assert_rejected(
+        session_id="session-2", revision=1, question_id="question-one", generation=1,
+    )
+    assert_rejected(
+        session_id="session-1", revision=2, question_id="question-one", generation=1,
+    )
+    answered = store.answer_question_and_prepare_resume(
+        session_id="session-1",
+        task_id="task-one",
+        revision=1,
+        question_id="question-one",
+        expected_generation=1,
+        answer_text="Use option A.",
+        answered_by=ConversationActor.USER,
+        pending_action={"next": "resume-with-user-answer"},
+        event=_conversation_answer(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id="task-one",
+            revision=1,
+            generation=1,
+            question_id="question-one",
+            text="Use option A.",
+        ),
+    )
+    assert answered.answer_text == "Use option A."
+    assert answered.answered_by is ConversationActor.USER
+    resumed = store.get_task("task-one", 1)
+    assert resumed.state is TaskState.SOL_RUNNING
+    assert resumed.continuation_state is None
+    assert resumed.pending == {"next": "resume-with-user-answer"}
+    assert resumed.continuation_generation == 2
+    assert resumed.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert resumed.exchange_consumed == 0
+
+    with pytest.raises(RuntimeError):
+        store.answer_question_and_prepare_resume(
+            session_id="session-1",
+            task_id="task-one",
+            revision=1,
+            question_id="question-one",
+            expected_generation=1,
+            answer_text="Duplicate answer.",
+            answered_by=ConversationActor.USER,
+            pending_action={"next": "must-not-prepare"},
+            event=_conversation_answer(
+                sender=ConversationActor.USER,
+                addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                task_id="task-one",
+                revision=1,
+                generation=1,
+                question_id="question-one",
+                text="Duplicate answer.",
+            ),
+        )
+
+    agent_question = store.pause_for_question(
+        session_id="session-1",
+        task_id="task-one",
+        revision=1,
+        expected_generation=2,
+        question_id="question-for-fable",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="What does the approved brief mean here?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-sol-after-fable"},
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id="task-one",
+            revision=1,
+            generation=2,
+            question_id="question-for-fable",
+            text="What does the approved brief mean here?",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="answer actor"):
+        store.answer_question_and_prepare_resume(
+            session_id="session-1",
+            task_id="task-one",
+            revision=1,
+            question_id=agent_question.question_id,
+            expected_generation=2,
+            answer_text="Sol cannot answer its own routed question.",
+            answered_by=ConversationActor.SOL,
+            pending_action={"next": "must-not-prepare"},
+            event=_conversation_answer(
+                sender=ConversationActor.SOL,
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                task_id="task-one",
+                revision=1,
+                generation=2,
+                question_id=agent_question.question_id,
+                text="Sol cannot answer its own routed question.",
+            ),
+        )
+    agent_answered = store.answer_question_and_prepare_resume(
+        session_id="session-1",
+        task_id="task-one",
+        revision=1,
+        question_id=agent_question.question_id,
+        expected_generation=2,
+        answer_text="Follow the approved brief exactly.",
+        answered_by=ConversationActor.FABLE,
+        pending_action={"next": "resume-sol-after-fable-answer"},
+        event=_conversation_answer(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id="task-one",
+            revision=1,
+            generation=2,
+            question_id=agent_question.question_id,
+            text="Follow the approved brief exactly.",
+        ),
+    )
+    assert agent_answered.answered_by is ConversationActor.FABLE
+    assert store.get_task("task-one", 1).continuation_generation == 2
+
+    foreign = SQLiteStore(tmp_path / "foreign-project.sqlite3", clock=lambda: "2026-08-10T12:00:00Z")
+    foreign.create_session("session-1", "/other-project")
+    _save_active_directed_task(foreign, "session-1", first_brief)
+    assert foreign.question("question-one") is None
+    foreign.close()
+
+
+def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="exchange-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+
+    def reserve(question_id: str, request_key: str):
+        return store.reserve_internal_question(
+            session_id="session-1",
+            task_id="exchange-task",
+            revision=1,
+            expected_generation=1,
+            question_id=question_id,
+            request_key=request_key,
+            asked_by=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            text=f"Question {question_id} for Fable.",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"next": f"resume-{question_id}"},
+            event=_conversation_question(
+                sender=ConversationActor.SOL,
+                addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                task_id="exchange-task",
+                revision=1,
+                generation=1,
+                question_id=question_id,
+                text=f"Question {question_id} for Fable.",
+            ),
+        )
+
+    def answer(question_id: str):
+        return store.answer_question_and_prepare_resume(
+            session_id="session-1",
+            task_id="exchange-task",
+            revision=1,
+            question_id=question_id,
+            expected_generation=1,
+            answer_text=f"Answer {question_id} from Fable.",
+            answered_by=ConversationActor.FABLE,
+            pending_action={"next": f"resume-after-{question_id}"},
+            event=_conversation_answer(
+                sender=ConversationActor.FABLE,
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                task_id="exchange-task",
+                revision=1,
+                generation=1,
+                question_id=question_id,
+                text=f"Answer {question_id} from Fable.",
+            ),
+        )
+
+    first_reservation, first_question = reserve("exchange-question-1", "request-1")
+    assert first_reservation == ExchangeReservation(
+        exchange_id=first_question.exchange_id,
+        question_id="exchange-question-1",
+        ordinal=1,
+        continuation_generation=1,
+    )
+    assert first_question.exchange_id == first_reservation.exchange_id
+    assert store.get_task("exchange-task", 1).exchange_allowance == 2
+    assert store.get_task("exchange-task", 1).exchange_consumed == 1
+    answer("exchange-question-1")
+
+    second_reservation, _ = reserve("exchange-question-2", "request-2")
+    answer("exchange-question-2")
+    third_reservation, third_question = reserve("exchange-question-3", "request-3")
+    assert (first_reservation.ordinal, second_reservation.ordinal, third_reservation.ordinal) == (1, 2, 3)
+    exhausted = store.get_task("exchange-task", 1)
+    assert exhausted.exchange_allowance == 0
+    assert exhausted.exchange_consumed == 3
+    assert third_question.answer_text is None
+    answered_third = answer("exchange-question-3")
+    assert answered_third.answered_by is ConversationActor.FABLE
+    assert store.get_task("exchange-task", 1).exchange_allowance == 0
+
+    paused = store.pause_for_exchange_permission(
+        session_id="session-1",
+        task_id="exchange-task",
+        revision=1,
+        expected_generation=1,
+        attempted_question=DirectedAgentQuestion(
+            addressed_to="fable",
+            text="A fourth question needs permission.",
+            reason="The initial exchange allowance is exhausted.",
+        ),
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "retry-fourth-question"},
+        event=_conversation_permission(task_id="exchange-task", revision=1, generation=1),
+    )
+    assert paused.state is TaskState.AWAITING_USER_INPUT
+    assert paused.continuation_state is TaskState.SOL_RUNNING
+    assert paused.pending == {
+        "next": "retry-fourth-question",
+        "attempted_question": {
+            "addressed_to": "fable",
+            "text": "A fourth question needs permission.",
+            "reason": "The initial exchange allowance is exhausted.",
+        },
+    }
+    assert store._connection.execute("SELECT COUNT(*) FROM exchange_reservations").fetchone()[0] == 3
+    assert store._connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 3
+
+    assert store.grant_internal_exchanges(
+        session_id="session-1",
+        task_id="exchange-task",
+        revision=1,
+        expected_generation=1,
+        request_id="grant-1",
+    ) == EXCHANGE_GRANT_SIZE
+    assert store.grant_internal_exchanges(
+        session_id="session-1",
+        task_id="exchange-task",
+        revision=1,
+        expected_generation=1,
+        request_id="grant-1",
+    ) == EXCHANGE_GRANT_SIZE
+    granted = store.get_task("exchange-task", 1)
+    assert granted.exchange_allowance == EXCHANGE_GRANT_SIZE
+    assert granted.exchange_consumed == 3
+    assert store._connection.execute("SELECT COUNT(*) FROM exchange_grants").fetchone()[0] == 1
+    assert store._connection.execute(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE exchange_allowance IS NULL OR exchange_consumed IS NULL
+        """
+    ).fetchone()[0] == 0
+
+    store.resume_continuation(
+        "exchange-task", 1, expected=TaskState.AWAITING_USER_INPUT,
+    )
+    fourth_reservation, _ = reserve("exchange-question-4", "request-4")
+    assert fourth_reservation.ordinal == 4
+    assert store.get_task("exchange-task", 1).exchange_allowance == 2
+
+
+def test_internal_exchange_request_key_is_concurrent_idempotent_and_transactional(
+    tmp_path, valid_brief,
+) -> None:
+    path = tmp_path / "concurrent-exchanges.sqlite3"
+    initial = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    initial.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="concurrent-task", revision=1)
+    _save_active_directed_task(initial, "session-1", brief)
+    initial.close()
+
+    first = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z", check_same_thread=False)
+    second = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z", check_same_thread=False)
+    barrier = threading.Barrier(2)
+    results: list[tuple[ExchangeReservation, QuestionRecord]] = []
+    failures: list[BaseException] = []
+
+    def reserve_once(store) -> None:
+        try:
+            barrier.wait(timeout=2)
+            results.append(store.reserve_internal_question(
+                session_id="session-1",
+                task_id="concurrent-task",
+                revision=1,
+                expected_generation=1,
+                question_id="concurrent-question",
+                request_key="concurrent-request",
+                asked_by=ConversationActor.SOL,
+                addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                text="One concurrent question.",
+                continuation_state=TaskState.SOL_RUNNING,
+                pending_action={"next": "resume-concurrent"},
+                event=_conversation_question(
+                    sender=ConversationActor.SOL,
+                    addressed_to=ConversationTarget.FABLE,
+                    routed_to=ConversationTarget.FABLE,
+                    task_id="concurrent-task",
+                    revision=1,
+                    generation=1,
+                    question_id="concurrent-question",
+                    text="One concurrent question.",
+                ),
+            ))
+        except BaseException as error:
+            failures.append(error)
+
+    workers = [threading.Thread(target=reserve_once, args=(store,)) for store in (first, second)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+    assert all(worker.is_alive() is False for worker in workers)
+    assert failures == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert first._connection.execute("SELECT COUNT(*) FROM exchange_reservations").fetchone()[0] == 1
+    assert first._connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 1
+    assert len(first.events_after("session-1", 0)) == 1
+    persisted = first.get_task("concurrent-task", 1)
+    assert persisted.exchange_allowance == 2
+    assert persisted.exchange_consumed == 1
+    assert persisted.pending == {"next": "resume-concurrent"}
+    first.close()
+    second.close()
+
+    rollback = _store(tmp_path)
+    rollback.create_session("rollback-session", "/repo")
+    rollback_brief = replace(valid_brief, task_id="rollback-task", revision=1)
+    _save_active_directed_task(rollback, "rollback-session", rollback_brief)
+    seen = []
+    rollback.add_event_listener(seen.append)
+    rollback._connection.execute(
+        """
+        CREATE TRIGGER fail_conversation_event
+        BEFORE INSERT ON events WHEN NEW.kind = 'conversation'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected conversation event failure');
+        END
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected conversation event failure"):
+        rollback.reserve_internal_question(
+            session_id="rollback-session",
+            task_id="rollback-task",
+            revision=1,
+            expected_generation=1,
+            question_id="rollback-question",
+            request_key="rollback-request",
+            asked_by=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            text="This transaction must roll back.",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"next": "must-not-persist"},
+            event=_conversation_question(
+                sender=ConversationActor.SOL,
+                addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                task_id="rollback-task",
+                revision=1,
+                generation=1,
+                question_id="rollback-question",
+                text="This transaction must roll back.",
+            ),
+        )
+    assert rollback.get_task("rollback-task", 1).state is TaskState.SOL_RUNNING
+    assert rollback._connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 0
+    assert rollback._connection.execute("SELECT COUNT(*) FROM exchange_reservations").fetchone()[0] == 0
+    assert rollback.events_after("rollback-session", 0) == ()
+    assert seen == []
+
+
+def test_internal_exchange_request_key_rejects_substituted_pending_action(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="request-key-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    event = _conversation_question(
+        sender=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        task_id="request-key-task",
+        revision=1,
+        generation=1,
+        question_id="request-key-question",
+        text="One exact durable question.",
+    )
+    first = store.reserve_internal_question(
+        session_id="session-1",
+        task_id="request-key-task",
+        revision=1,
+        expected_generation=1,
+        question_id="request-key-question",
+        request_key="request-key",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="One exact durable question.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-original"},
+        event=event,
+    )
+    before_task = store.get_task("request-key-task", 1)
+    before_events = store.events_after("session-1", 0)
+
+    with pytest.raises(RuntimeError, match="request key"):
+        store.reserve_internal_question(
+            session_id="session-1",
+            task_id="request-key-task",
+            revision=1,
+            expected_generation=1,
+            question_id="request-key-question",
+            request_key="request-key",
+            asked_by=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            text="One exact durable question.",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"next": "substituted-resume"},
+            event=event,
+        )
+
+    assert store.get_task("request-key-task", 1) == before_task
+    assert store.events_after("session-1", 0) == before_events
+    assert store.reserve_internal_question(
+        session_id="session-1",
+        task_id="request-key-task",
+        revision=1,
+        expected_generation=1,
+        question_id="request-key-question",
+        request_key="request-key",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="One exact durable question.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-original"},
+        event=event,
+    ) == first
+
+
+def test_question_generation_reset_and_non_question_work_do_not_consume_exchanges(
+    tmp_path, valid_brief,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _store(tmp_path)
+    store.create_session("session-1", str(repo))
+    first = replace(valid_brief, task_id="generation-task", revision=1)
+    _save_active_directed_task(store, "session-1", first)
+    store.set_fable_session("generation-task", 1, "fable-session")
+    store.set_sol_thread("generation-task", 1, "sol-thread")
+    store.increment_correction_count("generation-task", 1)
+    unchanged = store.get_task("generation-task", 1)
+    assert unchanged.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert unchanged.exchange_consumed == 0
+    assert unchanged.continuation_generation == 1
+
+    reservation, _ = store.reserve_internal_question(
+        session_id="session-1",
+        task_id="generation-task",
+        revision=1,
+        expected_generation=1,
+        question_id="generation-question",
+        request_key="generation-request",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="Please resolve this internal ambiguity.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-after-internal-answer"},
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id="generation-task",
+            revision=1,
+            generation=1,
+            question_id="generation-question",
+            text="Please resolve this internal ambiguity.",
+        ),
+    )
+    assert reservation.ordinal == 1
+    assert store.get_task("generation-task", 1).exchange_allowance == 2
+    store.answer_question_and_prepare_resume(
+        session_id="session-1",
+        task_id="generation-task",
+        revision=1,
+        question_id="generation-question",
+        expected_generation=1,
+        answer_text="The approved brief controls the ambiguity.",
+        answered_by=ConversationActor.FABLE,
+        pending_action={"next": "resume-after-internal-answer"},
+        event=_conversation_answer(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id="generation-task",
+            revision=1,
+            generation=1,
+            question_id="generation-question",
+            text="The approved brief controls the ambiguity.",
+        ),
+    )
+    store.pause_for_question(
+        session_id="session-1",
+        task_id="generation-task",
+        revision=1,
+        expected_generation=1,
+        question_id="generation-user-question",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Please provide new human direction.",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "resume-after-human-direction"},
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            task_id="generation-task",
+            revision=1,
+            generation=1,
+            question_id="generation-user-question",
+            text="Please provide new human direction.",
+        ),
+    )
+    user_answer = store.answer_question_and_prepare_resume(
+        session_id="session-1",
+        task_id="generation-task",
+        revision=1,
+        question_id="generation-user-question",
+        expected_generation=1,
+        answer_text="Use the approved option.",
+        answered_by=ConversationActor.USER,
+        pending_action={"next": "resume-with-new-direction"},
+        event=_conversation_answer(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id="generation-task",
+            revision=1,
+            generation=1,
+            question_id="generation-user-question",
+            text="Use the approved option.",
+        ),
+    )
+    assert user_answer.answered_by is ConversationActor.USER
+    reset = store.get_task("generation-task", 1)
+    assert reset.continuation_generation == 2
+    assert reset.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert reset.exchange_consumed == 0
+    with pytest.raises(RuntimeError):
+        store.grant_internal_exchanges(
+            session_id="session-1",
+            task_id="generation-task",
+            revision=1,
+            expected_generation=1,
+            request_id="stale-generation-grant",
+        )
+
+    store.transition_task(
+        "generation-task", 1,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.FABLE_REVIEWING,
+    )
+    after_review_transition = store.get_task("generation-task", 1)
+    assert after_review_transition.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert after_review_transition.exchange_consumed == 0
+
+    approved = replace(valid_brief, task_id="approval-budget-task", revision=1)
+    store.save_task("session-1", approved, TaskState.AWAITING_USER_APPROVAL)
+    store.prepare_approval_action(
+        project_id=project_id_for_root(repo),
+        session_id="session-1",
+        task_id="approval-budget-task",
+        revision=1,
+        generation=1,
+        payload=ApprovalPayload(baseline_id="baseline-one", baseline_setting=None, scope=None),
+    )
+    next_revision = replace(approved, revision=2, title="Approved second revision")
+    store.save_task("session-1", next_revision, TaskState.AWAITING_USER_APPROVAL)
+    store.prepare_approval_action(
+        project_id=project_id_for_root(repo),
+        session_id="session-1",
+        task_id="approval-budget-task",
+        revision=2,
+        generation=1,
+        payload=ApprovalPayload(baseline_id="baseline-two", baseline_setting=None, scope=None),
+    )
+    separate = store.get_task("approval-budget-task", 2)
+    assert separate.continuation_generation == 1
+    assert separate.exchange_allowance == INITIAL_INTERNAL_EXCHANGES
+    assert separate.exchange_consumed == 0
