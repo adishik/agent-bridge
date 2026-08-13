@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
 import sqlite3
 import threading
 import tracemalloc
@@ -14,8 +15,10 @@ from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
     ApprovalPayload,
+    AnswerContext,
     AnswerPayload,
     BaselineSetting,
+    ClarificationContext,
     MAX_TASK_OVERVIEWS,
     NewRequestPayload,
     ResumeDriftProjection,
@@ -1567,6 +1570,307 @@ def test_legacy_audit_rejects_a_prepared_scope_for_a_different_baseline(
 
     with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
         store.audit_legacy_project_ownership(str(repo.resolve()))
+
+
+def _prepared_answer_for_legacy_audit(
+    tmp_path,
+    valid_brief,
+    *,
+    active_state: TaskState,
+    continuation,
+) -> tuple[SQLiteStore, str, object]:
+    """Persist one real Answer row for the supplied valid continuation family."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    canonical_root = str(repo.resolve())
+    store = _store(tmp_path)
+    store.create_session("session-1", canonical_root)
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    store.approve_task_with_setting(
+        valid_brief.task_id,
+        valid_brief.revision,
+        brief=valid_brief,
+        baseline_id="baseline-1",
+        expected=TaskState.AWAITING_USER_APPROVAL,
+        setting=(
+            "agent_bridge.baseline.task-1.1",
+            {
+                "task_id": "task-1",
+                "revision": 1,
+                "baseline_id": "baseline-1",
+                "manifest": {"baseline_id": "baseline-1", "repo_root": canonical_root},
+            },
+        ),
+    )
+    store.transition_task(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=TaskState.AWAITING_USER_APPROVAL,
+        target=TaskState.SOL_RUNNING,
+    )
+    store.set_sol_thread(
+        valid_brief.task_id,
+        valid_brief.revision,
+        "11111111-1111-4111-8111-111111111111",
+    )
+    if active_state is TaskState.FABLE_REVIEWING:
+        store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session")
+        store.transition_task(
+            valid_brief.task_id,
+            valid_brief.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=active_state,
+        )
+    elif active_state is TaskState.SOL_CORRECTING:
+        store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session")
+        store.transition_task(
+            valid_brief.task_id,
+            valid_brief.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=TaskState.FABLE_REVIEWING,
+        )
+        store.transition_task(
+            valid_brief.task_id,
+            valid_brief.revision,
+            expected=TaskState.FABLE_REVIEWING,
+            target=TaskState.SOL_CORRECTING,
+        )
+
+    pending = {
+        TaskState.SOL_RUNNING: {"prompt": "continue exact work", "sol_run_id": "run-sol"},
+        TaskState.SOL_CORRECTING: {"prompt": "continue exact work", "sol_run_id": "run-sol"},
+        TaskState.FABLE_REVIEWING: {
+            "review_prompt": "review exact work", "completion_allowed": False,
+        },
+    }[active_state]
+    waiting = store.pause_for_continuation(
+        valid_brief.task_id,
+        valid_brief.revision,
+        expected=active_state,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=active_state,
+        pending=pending,
+    )
+    prepared = store.prepare_answer_action(
+        project_id=project_id_for_root(repo.resolve()),
+        session_id=waiting.session_id,
+        task_id=waiting.task_id,
+        revision=waiting.revision,
+        generation=1,
+        payload=AnswerPayload(answer="continue", continuation=continuation),
+    )
+    return store, canonical_root, prepared
+
+
+@pytest.mark.parametrize(
+    ("prepared_active_state", "corrupt_active_state", "corrupt_context"),
+    (
+        pytest.param(
+            TaskState.FABLE_REVIEWING,
+            TaskState.FABLE_REVIEWING,
+            SolResumeContext(
+                sol_thread_id="11111111-1111-4111-8111-111111111111",
+                sol_run_id="run-sol",
+                prompt="continue exact work",
+            ),
+            id="reviewing_with_sol_context",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            TaskState.FABLE_CLARIFYING,
+            ReviewContext(
+                fable_session_id="fable-session",
+                review_prompt="review exact work",
+                completion_allowed=False,
+                underlying_continuation=ScopeApprovalContext(
+                    baseline_id="baseline-1",
+                    approved_revision=1,
+                    underlying_continuation=SolResumeContext(
+                        sol_thread_id="11111111-1111-4111-8111-111111111111",
+                        sol_run_id="run-sol",
+                        prompt="continue exact work",
+                    ),
+                ),
+            ),
+            id="clarifying_with_review_context",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            TaskState.SOL_RUNNING,
+            ClarificationContext(
+                fable_session_id="fable-session",
+                clarification_prompt="clarify exact work",
+                underlying_continuation=ScopeApprovalContext(
+                    baseline_id="baseline-1",
+                    approved_revision=1,
+                    underlying_continuation=SolResumeContext(
+                        sol_thread_id="11111111-1111-4111-8111-111111111111",
+                        sol_run_id="run-sol",
+                        prompt="continue exact work",
+                    ),
+                ),
+            ),
+            id="sol_with_clarification_context",
+        ),
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            TaskState.SOL_RUNNING,
+            AnswerContext(
+                answer="nested persisted answer",
+                underlying_continuation=SolResumeContext(
+                    sol_thread_id="11111111-1111-4111-8111-111111111111",
+                    sol_run_id="run-sol",
+                    prompt="continue exact work",
+                ),
+            ),
+            id="sol_with_nested_answer_context",
+        ),
+    ),
+)
+def test_legacy_audit_rejects_answer_context_incompatible_with_active_state(
+    tmp_path,
+    valid_brief,
+    prepared_active_state: TaskState,
+    corrupt_active_state: TaskState,
+    corrupt_context,
+) -> None:
+    """Recovery must not adopt an Answer row with a substituted typed context."""
+    valid_scope = ScopeApprovalContext("baseline-1", 1, None)
+    valid_continuation = {
+        TaskState.SOL_RUNNING: SolResumeContext(
+            "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+        ),
+        TaskState.FABLE_REVIEWING: ReviewContext(
+            "fable-session", "review exact work", False, valid_scope,
+        ),
+    }[prepared_active_state]
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=prepared_active_state,
+        continuation=valid_continuation,
+    )
+    corrupt_data = store_module._context_to_data(corrupt_context)
+    payload = json.loads(store._connection.execute(
+        "SELECT payload_json FROM prepared_actions WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()["payload_json"])
+    payload["continuation"] = corrupt_data
+    store._connection.execute(
+        """
+        UPDATE prepared_actions
+        SET payload_json = ?, pending_context_json = ?, active_state = ?, continuation_state = ?
+        WHERE preparation_id = ?
+        """,
+        (
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            json.dumps(corrupt_data, separators=(",", ":"), sort_keys=True),
+            corrupt_active_state.value,
+            corrupt_active_state.value,
+            prepared.preparation_id,
+        ),
+    )
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(canonical_root)
+
+    assert _legacy_table_rows(store._connection) == before
+    assert (
+        store.get_task(valid_brief.task_id, valid_brief.revision).state
+        is prepared_active_state
+    )
+
+
+@pytest.mark.parametrize(
+    ("active_state", "continuation"),
+    (
+        pytest.param(
+            TaskState.SOL_RUNNING,
+            SolResumeContext(
+                "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+            ),
+            id="sol_running",
+        ),
+        pytest.param(
+            TaskState.SOL_CORRECTING,
+            SolResumeContext(
+                "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+            ),
+            id="sol_correcting_without_agent_run",
+        ),
+        pytest.param(
+            TaskState.FABLE_REVIEWING,
+            ReviewContext(
+                "fable-session", "review exact work", False,
+                ScopeApprovalContext("baseline-1", 1, None),
+            ),
+            id="reviewing",
+        ),
+    ),
+)
+def test_legacy_audit_accepts_each_valid_prepared_answer_context_family(
+    tmp_path,
+    valid_brief,
+    active_state: TaskState,
+    continuation,
+) -> None:
+    """Every continuation family accepted by normal Answer preparation remains auditable."""
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path, valid_brief, active_state=active_state, continuation=continuation,
+    )
+
+    assert store.audit_legacy_project_ownership(canonical_root) is None
+    assert store.prepared_action(prepared.preparation_id) == prepared
+
+
+def test_legacy_audit_rejects_answer_context_with_foreign_existing_sol_run(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A persisted Sol run id is authoritative only for its exact task and CLI thread."""
+    continuation = SolResumeContext(
+        "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+    )
+    store, canonical_root, _ = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=TaskState.SOL_RUNNING,
+        continuation=continuation,
+    )
+    store.prepare_new_request_action(
+        project_id=project_id_for_root(Path(canonical_root)),
+        session_id="session-1",
+        task_id="other-task",
+        generation=1,
+        payload=NewRequestPayload("other task"),
+    )
+    store.start_agent_run("run-sol", "other-task", 0, "sol")
+    store.set_agent_run_session("run-sol", "foreign-thread")
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(canonical_root)
+
+
+def test_legacy_audit_accepts_answer_context_with_matching_existing_sol_run(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """An existing Sol run may authenticate the same task/revision/thread binding."""
+    continuation = SolResumeContext(
+        "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+    )
+    store, canonical_root, _ = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=TaskState.SOL_RUNNING,
+        continuation=continuation,
+    )
+    store.start_agent_run("run-sol", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("run-sol", continuation.sol_thread_id)
+
+    assert store.audit_legacy_project_ownership(canonical_root) is None
 
 
 def test_startup_audit_and_recovery_do_not_materialize_large_unrelated_history(

@@ -3401,14 +3401,17 @@ class SQLiteStore:
         self, record: PreparedActionRecord, rowid: int,
     ) -> bool:
         """Authenticate one recovery-capable row without retaining history."""
-        task = self._connection.execute(
-            """
-            SELECT session_id, baseline_id FROM tasks
-            WHERE task_id = ? AND revision = ?
-            """,
+        task_row = self._connection.execute(
+            "SELECT * FROM tasks WHERE task_id = ? AND revision = ?",
             (record.task_id, record.revision),
         ).fetchone()
-        if task is None or task["session_id"] != record.session_id:
+        if task_row is None:
+            return False
+        try:
+            task = self._task_from_row(task_row)
+        except RuntimeError:
+            return False
+        if task.session_id != record.session_id:
             return False
         if record.action == "new_request":
             if (
@@ -3422,7 +3425,7 @@ class SQLiteStore:
                 return False
         elif record.action == "approval":
             payload = record.payload
-            if not isinstance(payload, ApprovalPayload) or task["baseline_id"] != payload.baseline_id:
+            if not isinstance(payload, ApprovalPayload) or task.baseline_id != payload.baseline_id:
                 return False
             if payload.scope is not None and (
                 payload.scope.baseline_id != payload.baseline_id
@@ -3464,6 +3467,22 @@ class SQLiteStore:
                 or record.previous_preparation_id is not None
             ):
                 return False
+            payload = record.payload
+            if (
+                not isinstance(payload, AnswerPayload)
+                or payload.continuation != record.pending_context
+                or not self._legacy_prepared_context_matches_task(
+                    task=task,
+                    active_state=record.active_state,
+                    context=payload.continuation,
+                )
+                or not self._legacy_prepared_context_matches_task(
+                    task=task,
+                    active_state=record.active_state,
+                    context=record.pending_context,
+                )
+            ):
+                return False
         elif record.action == "resume":
             if (
                 record.source_state is not TaskState.INTERRUPTED
@@ -3481,6 +3500,68 @@ class SQLiteStore:
             except ValueError:
                 return False
         return True
+
+    def _legacy_prepared_context_matches_task(
+        self,
+        *,
+        task: TaskRecord,
+        active_state: TaskState,
+        context: PreparedContinuationContext,
+    ) -> bool:
+        if active_state is TaskState.FABLE_REVIEWING:
+            return (
+                isinstance(context, ReviewContext)
+                and context.fable_session_id == task.fable_session_id
+                and self._legacy_continuation_identifiers_match_task(
+                    task, context.underlying_continuation,
+                )
+            )
+        return (
+            active_state in _SOL_TASK_STATES
+            and isinstance(context, (ScopeApprovalContext, SolResumeContext))
+            and self._legacy_continuation_identifiers_match_task(task, context)
+        )
+
+    def _legacy_continuation_identifiers_match_task(
+        self,
+        task: TaskRecord,
+        context: PreparedContinuationContext,
+    ) -> bool:
+        if isinstance(context, SolResumeContext):
+            run = self._connection.execute(
+                """
+                SELECT task_id, revision, cli_session_id FROM agent_runs
+                WHERE run_id = ?
+                """,
+                (context.sol_run_id,),
+            ).fetchone()
+            return context.sol_thread_id == task.sol_thread_id and (
+                run is None
+                or (
+                    run["task_id"] == task.task_id
+                    and run["revision"] == task.revision
+                    and run["cli_session_id"] == context.sol_thread_id
+                )
+            )
+        if isinstance(context, ScopeApprovalContext):
+            return (
+                context.baseline_id == task.baseline_id
+                and context.approved_revision == task.revision
+                and (
+                    context.underlying_continuation is None
+                    or self._legacy_continuation_identifiers_match_task(
+                        task, context.underlying_continuation,
+                    )
+                )
+            )
+        if isinstance(context, ReviewContext):
+            return (
+                context.fable_session_id == task.fable_session_id
+                and self._legacy_continuation_identifiers_match_task(
+                    task, context.underlying_continuation,
+                )
+            )
+        return False
 
     def _legacy_baseline_setting_matches(
         self,
