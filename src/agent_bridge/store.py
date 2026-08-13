@@ -249,9 +249,14 @@ class PreparedActionOutcome:
 @dataclass(frozen=True, slots=True)
 class NewRequestPayload:
     text: str
+    addressed_to: ConversationTarget | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "text", _prepared_text(self.text, "text"))
+        if self.addressed_to is not None and not isinstance(
+            self.addressed_to, ConversationTarget,
+        ):
+            raise ValueError("addressed_to must be a ConversationTarget")
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,7 +754,10 @@ def _context_from_data(
 
 def _payload_to_data(payload: PreparedActionPayload) -> dict[str, object]:
     if isinstance(payload, NewRequestPayload):
-        return {"kind": "new_request", "text": payload.text}
+        data: dict[str, object] = {"kind": "new_request", "text": payload.text}
+        if payload.addressed_to is not None:
+            data["addressed_to"] = payload.addressed_to.value
+        return data
     if isinstance(payload, ApprovalPayload):
         return {
             "kind": "approval",
@@ -811,8 +819,16 @@ def _payload_from_data(value: object) -> PreparedActionPayload:
         raise RuntimeError("persisted prepared payload is invalid")
     kind = value.get("kind")
     try:
-        if kind == "new_request" and set(value) == {"kind", "text"}:
-            return NewRequestPayload(text=value["text"])
+        if kind == "new_request" and set(value) in (
+            {"kind", "text"}, {"kind", "text", "addressed_to"},
+        ):
+            addressed_to = value.get("addressed_to")
+            return NewRequestPayload(
+                text=value["text"],
+                addressed_to=(
+                    None if addressed_to is None else ConversationTarget(addressed_to)
+                ),
+            )
         if kind == "approval" and set(value) == {
             "kind", "baseline_id", "baseline_setting", "scope",
         }:
@@ -1035,6 +1051,8 @@ _MIGRATION_STATEMENTS = (
         repo_root TEXT NOT NULL,
         created_at TEXT NOT NULL,
         title TEXT NOT NULL DEFAULT 'New chat',
+        title_initialized INTEGER NOT NULL DEFAULT 0
+            CHECK (title_initialized IN (0, 1)),
         updated_at TEXT
     )
     """,
@@ -1330,7 +1348,7 @@ class SQLiteStore:
             self._connection.commit()
 
     def _migrate_session_chat_metadata(self) -> None:
-        """Add the chat projection fields without rewriting legacy records."""
+        """Add chat projection fields and one-time title markers for legacy chats."""
         columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(sessions)")
@@ -1344,6 +1362,53 @@ class SQLiteStore:
         self._connection.execute(
             "UPDATE sessions SET updated_at = created_at WHERE updated_at IS NULL"
         )
+        if "title_initialized" not in columns:
+            self._connection.execute(
+                """
+                ALTER TABLE sessions
+                ADD COLUMN title_initialized INTEGER NOT NULL DEFAULT 0
+                    CHECK (title_initialized IN (0, 1))
+                """
+            )
+            self._connection.execute(
+                "UPDATE sessions SET title_initialized = 1 WHERE title <> ?",
+                (_NEW_CHAT_TITLE,),
+            )
+            self._backfill_legacy_title_initialization_markers()
+
+    def _backfill_legacy_title_initialization_markers(self) -> None:
+        """Mark historical first-message chats in bounded pages during this migration."""
+        last_sequence = 0
+        while True:
+            rows = self._connection.execute(
+                """
+                SELECT sequence, session_id, actor, kind, payload_json
+                FROM events
+                WHERE sequence > ?
+                ORDER BY sequence
+                LIMIT ?
+                """,
+                (last_sequence, _STARTUP_RECOVERY_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                last_sequence = int(row["sequence"])
+                try:
+                    payload = _decode_mapping(str(row["payload_json"]), "event payload")
+                except RuntimeError:
+                    continue
+                if not self._is_title_eligible_user_message(
+                    str(row["actor"]), str(row["kind"]), payload,
+                ):
+                    continue
+                self._connection.execute(
+                    """
+                    UPDATE sessions SET title_initialized = 1
+                    WHERE session_id = ? AND title_initialized = 0
+                    """,
+                    (str(row["session_id"]),),
+                )
 
     def _migrate_directed_conversation_schema(self) -> None:
         """Add directed-conversation task fields without rewriting legacy payloads."""
@@ -1481,10 +1546,11 @@ class SQLiteStore:
         timestamp = self._timestamp()
         self._connection.execute(
             """
-            INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions (
+                session_id, repo_root, created_at, title, title_initialized, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (session_id, repo_root, timestamp, _NEW_CHAT_TITLE, timestamp),
+            (session_id, repo_root, timestamp, _NEW_CHAT_TITLE, 0, timestamp),
         )
         chat = self.chat(session_id)
         if chat is None:
@@ -3428,9 +3494,22 @@ class SQLiteStore:
                     """,
                     (task_id, session_id, TaskState.FABLE_PLANNING.value),
                 )
-                emitted.append(self._insert_event_in_transaction(
-                    session_id, task_id, "user", "message", {"text": payload.text}
-                ))
+                if payload.addressed_to is None:
+                    emitted.append(self._insert_event_in_transaction(
+                        session_id, task_id, "user", "message", {"text": payload.text},
+                    ))
+                else:
+                    emitted.append(self._insert_conversation_event_in_transaction(
+                        session_id=session_id,
+                        task_id=task_id,
+                        event=ConversationEnvelope(
+                            sender=ConversationActor.USER,
+                            addressed_to=payload.addressed_to,
+                            routed_to=ConversationTarget.FABLE,
+                            message_type=ConversationMessageType.STATEMENT,
+                            text=payload.text,
+                        ),
+                    ))
                 record = self._insert_prepared_action(
                     project_id=project_id,
                     session_id=session_id,
@@ -4974,22 +5053,22 @@ class SQLiteStore:
         if row is None:
             raise RuntimeError("inserted event could not be read")
         event = self._event_from_row(row)
-        title = self._first_user_message_title(
-            session_id=session_id,
-            sequence=event.sequence,
-            actor=actor,
-            kind=kind,
-            payload=frozen_payload,
-        )
+        title = self._current_user_message_title(actor, kind, frozen_payload)
         if title is None:
             self._connection.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                 (created_at, session_id),
             )
-        else:
+        elif self._connection.execute(
+            """
+            UPDATE sessions SET title = ?, updated_at = ?, title_initialized = 1
+            WHERE session_id = ? AND title_initialized = 0
+            """,
+            (title, created_at, session_id),
+        ).rowcount != 1:
             self._connection.execute(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
-                (title, created_at, session_id),
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (created_at, session_id),
             )
         return event
 
@@ -5877,26 +5956,22 @@ class SQLiteStore:
                 if row is None:
                     raise RuntimeError("inserted event could not be read")
                 event = self._event_from_row(row)
-                title = self._first_user_message_title(
-                    session_id=session_id,
-                    sequence=event.sequence,
-                    actor=actor,
-                    kind=kind,
-                    payload=frozen_payload,
-                )
+                title = self._current_user_message_title(actor, kind, frozen_payload)
                 if title is None:
                     self._connection.execute(
                         "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                         (created_at, session_id),
                     )
-                else:
+                elif self._connection.execute(
+                    """
+                    UPDATE sessions SET title = ?, updated_at = ?, title_initialized = 1
+                    WHERE session_id = ? AND title_initialized = 0
+                    """,
+                    (title, created_at, session_id),
+                ).rowcount != 1:
                     self._connection.execute(
-                        """
-                        UPDATE sessions
-                        SET title = ?, updated_at = ?
-                        WHERE session_id = ?
-                        """,
-                        (title, created_at, session_id),
+                        "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                        (created_at, session_id),
                     )
             self._pending_listener_events.append(event)
             if self._dispatching_listener_events:
@@ -5905,35 +5980,41 @@ class SQLiteStore:
         self._drain_event_listeners()
         return event
 
-    def _first_user_message_title(
+    def _current_user_message_title(
         self,
-        *,
-        session_id: str,
-        sequence: int,
         actor: str,
         kind: str,
         payload: Mapping[str, JsonValue],
     ) -> str | None:
-        if actor != "user" or kind != "message":
-            return None
-        earlier = self._connection.execute(
-            """
-            SELECT 1 FROM events
-            WHERE session_id = ?
-              AND actor = 'user'
-              AND kind = 'message'
-              AND sequence < ?
-            LIMIT 1
-            """,
-            (session_id, sequence),
-        ).fetchone()
-        if earlier is not None:
+        if not self._is_title_eligible_user_message(actor, kind, payload):
             return None
         raw_text = payload.get("text")
         if not isinstance(raw_text, str):
             return _NEW_CHAT_TITLE
         title = " ".join(raw_text.split())
         return _NEW_CHAT_TITLE if not title else title[:MAX_CHAT_TITLE_LENGTH]
+
+    @staticmethod
+    def _is_title_eligible_user_message(
+        actor: str,
+        kind: str,
+        payload: Mapping[str, JsonValue],
+    ) -> bool:
+        if actor != ConversationActor.USER.value:
+            return False
+        if kind == "message":
+            return isinstance(payload.get("text"), str)
+        if kind != "conversation":
+            return False
+        try:
+            envelope = ConversationEnvelope.from_dict(payload)
+        except ValueError:
+            return False
+        return (
+            envelope.sender is ConversationActor.USER
+            and envelope.message_type is ConversationMessageType.STATEMENT
+        )
+
 
     def events_after(
         self,

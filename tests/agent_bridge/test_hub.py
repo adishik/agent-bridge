@@ -213,8 +213,15 @@ class _RuntimeCoordinator:
         return record
 
     def prepare_new_request(
-        self, *, session_id: str, task_id: str, text: str, generation: int,
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        text: str,
+        generation: int,
+        addressed_to: ConversationTarget = ConversationTarget.FABLE,
     ) -> PreparedActionRecord:
+        assert isinstance(addressed_to, ConversationTarget)
         self.prepared.append((session_id, text, task_id))
         return self._record(
             session_id=session_id, task_id=task_id, revision=0,

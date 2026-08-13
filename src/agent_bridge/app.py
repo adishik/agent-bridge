@@ -31,10 +31,11 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
-from agent_bridge.contracts import StreamEvent, TaskBrief
+from agent_bridge.contracts import ConversationTarget, StreamEvent, TaskBrief
 from agent_bridge.coordinator import Coordinator
 from agent_bridge.store import (
     EVENT_REPLAY_PAGE_SIZE,
@@ -56,6 +57,7 @@ USAGE_CREDITS_SETTING = "usage_credits_acknowledged"
 _SAFE_ID_BODY = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
 _SAFE_ID_PATTERN = f"^{_SAFE_ID_BODY}$"
 _SAFE_ID = re.compile(f"{_SAFE_ID_BODY}\\Z")
+_MAX_BROWSER_TEXT_BYTES = 16 * 1024
 
 
 class EventSubscription(Protocol):
@@ -199,14 +201,84 @@ class _StrictRequest(BaseModel):
 
 
 class MessageRequest(_StrictRequest):
-    text: str
+    text: StrictStr
+    addressed_to: Literal["fable", "sol", "team"] = "fable"
 
     @field_validator("text")
     @classmethod
     def _text_must_be_non_empty(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("text must be non-empty")
-        return value
+        return _non_empty_browser_text(value, "text")
+
+
+class ContinuationMessageRequest(_StrictRequest):
+    text: StrictStr
+    addressed_to: Literal["fable", "sol"]
+    revision: StrictInt = Field(ge=1)
+    continuation_generation: StrictInt = Field(ge=1)
+
+    @field_validator("text")
+    @classmethod
+    def _text_must_be_non_empty(cls, value: str) -> str:
+        return _non_empty_browser_text(value, "text")
+
+
+class QuestionAnswerRequest(_StrictRequest):
+    text: StrictStr
+    revision: StrictInt = Field(ge=1)
+    question_id: StrictStr
+    continuation_generation: StrictInt = Field(ge=1)
+
+    @field_validator("text")
+    @classmethod
+    def _text_must_be_non_empty(cls, value: str) -> str:
+        return _non_empty_browser_text(value, "text")
+
+    @field_validator("question_id")
+    @classmethod
+    def _question_id_is_safe(cls, value: str) -> str:
+        return _safe_browser_identifier(value, "question_id")
+
+
+class ExchangeGrantRequest(_StrictRequest):
+    revision: StrictInt = Field(ge=1)
+    continuation_generation: StrictInt = Field(ge=1)
+    request_id: StrictStr
+
+    @field_validator("request_id")
+    @classmethod
+    def _request_id_is_safe(cls, value: str) -> str:
+        return _safe_browser_identifier(value, "request_id")
+
+
+def _non_empty_browser_text(value: str, name: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{name} must be non-empty")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8") from error
+    if encoded_length > _MAX_BROWSER_TEXT_BYTES:
+        raise ValueError(f"{name} must be at most 16384 bytes")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{name} must not contain control characters")
+    return value
+
+
+def _safe_browser_identifier(value: str, name: str) -> str:
+    if _SAFE_ID.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a safe identifier")
+    return value
+
+
+async def _bounded_request_validation_error(
+    _request: Request,
+    _error: RequestValidationError,
+) -> JSONResponse:
+    """Never reflect untrusted request values in browser validation responses."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": "invalid request"},
+    )
 
 
 class AnswerRequest(_StrictRequest):
@@ -378,8 +450,21 @@ def create_hub_app(
             return [thaw_projection(item) for item in value]
         return value
 
-    def task_snapshot(overview: TaskOverview) -> Mapping[str, object]:
+    def task_snapshot(runtime: object, overview: TaskOverview) -> Mapping[str, object]:
         task = overview.task
+        store = getattr(runtime, "store")
+        question = store.unanswered_question_for_task(task.task_id, task.revision)
+        pending_question: Mapping[str, object] | None = None
+        if question is not None and question.routed_to is ConversationTarget.USER:
+            pending_question = {
+                "question_id": question.question_id,
+                "asked_by": question.asked_by.value,
+                "addressed_to": question.addressed_to.value,
+                "routed_to": question.routed_to.value,
+                "text": question.text,
+                "revision": question.revision,
+                "continuation_generation": question.continuation_generation,
+            }
         return {
             "task_id": task.task_id,
             "revision": task.revision,
@@ -390,6 +475,10 @@ def create_hub_app(
             "continuation_state": (
                 None if task.continuation_state is None else task.continuation_state.value
             ),
+            "continuation_generation": task.continuation_generation,
+            "exchange_allowance": task.exchange_allowance,
+            "exchange_consumed": task.exchange_consumed,
+            "pending_question": pending_question,
             "updated_at": overview.updated_at,
             "active_agent": overview.active_agent,
             "active_started_at": overview.active_started_at,
@@ -425,6 +514,7 @@ def create_hub_app(
                 lifespan_app.state.active_coroutines.difference_update(active)
 
     app = FastAPI(title="Agent Bridge", version="0.1.0", lifespan=lifespan)
+    app.add_exception_handler(RequestValidationError, _bounded_request_validation_error)
     app.state.active_coroutines = set()
     app.state.coroutine_observation_failures = []
     app.state.shutting_down = False
@@ -800,7 +890,7 @@ def create_hub_app(
             "branch": runtime.branch,
             "replay_after": runtime.store.browser_replay_floor(session_id),
             "tasks": [
-                task_snapshot(overview)
+                task_snapshot(runtime, overview)
                 for overview in runtime.store.latest_task_overviews(session_id)
             ],
         }
@@ -837,6 +927,40 @@ def create_hub_app(
                 session_id=session_id,
                 text=body.text,
                 ids=browser_ids,
+                addressed_to=ConversationTarget(body.addressed_to),
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/messages",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def send_continuation_message(
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: TaskId,
+        body: ContinuationMessageRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        try:
+            prepared = await workflows.prepare_continuation_message(
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=body.revision,
+                continuation_generation=body.continuation_generation,
+                text=body.text,
+                addressed_to=ConversationTarget(body.addressed_to),
             )
         except BaseException as error:
             workflow_http_error(error)
@@ -964,22 +1088,51 @@ def create_hub_app(
         project_id: ProjectId,
         session_id: SessionId,
         task_id: TaskId,
-        body: AnswerRequest,
+        body: QuestionAnswerRequest,
     ) -> Response:
         runtime = selected_runtime(project_id)
-        try:
-            workflows.require_no_active_lease()
-        except BaseException as error:
-            workflow_http_error(error)
         selected_chat(runtime, session_id)
-        task = selected_task(runtime, session_id, task_id)
         try:
-            prepared = await workflows.prepare_answer(
+            prepared = await workflows.prepare_question_answer(
                 project_id=project_id,
                 session_id=session_id,
                 task_id=task_id,
-                revision=task.revision,
-                answer=body.answer,
+                revision=body.revision,
+                continuation_generation=body.continuation_generation,
+                question_id=body.question_id,
+                answer=body.text,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/exchanges/grant",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def grant_task_exchanges(
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: TaskId,
+        body: ExchangeGrantRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        try:
+            prepared = await workflows.prepare_exchange_grant(
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=body.revision,
+                continuation_generation=body.continuation_generation,
+                request_id=body.request_id,
             )
         except BaseException as error:
             workflow_http_error(error)
@@ -1232,6 +1385,7 @@ def create_app(
                 lifespan_app.state.active_coroutines.difference_update(active)
 
     app = FastAPI(title="Agent Bridge", version="0.1.0", lifespan=lifespan)
+    app.add_exception_handler(RequestValidationError, _bounded_request_validation_error)
     app.state.active_coroutines = set()
     app.state.coroutine_observation_failures = []
     app.state.event_broadcaster = event_broadcaster

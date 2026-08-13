@@ -22,7 +22,14 @@ from agent_bridge.app import (
     create_app,
     create_hub_app,
 )
-from agent_bridge.contracts import StreamEvent, TaskBrief
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    StreamEvent,
+    TaskBrief,
+)
 from agent_bridge.coordinator import Coordinator
 from agent_bridge.hub import (
     ActiveAgentLease,
@@ -1712,6 +1719,7 @@ class _HubWorkflows:
     def __init__(self, runtimes: dict[str, _HubRuntime]) -> None:
         self.runtimes = runtimes
         self.prepared: list[_Prepared] = []
+        self.preparation_calls: list[tuple[str, dict[str, object]]] = []
         self.runs: list[str] = []
         self.aborts: list[tuple[str, str]] = []
         self.stops: list[tuple[str, str, str]] = []
@@ -1816,6 +1824,48 @@ class _HubWorkflows:
             session_id=str(kwargs["session_id"]),
             task_id=str(kwargs["task_id"]),
         )
+
+    async def prepare_continuation_message(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("continuation", dict(kwargs)))
+        return self._prepare(
+            action="continuation",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_question_answer(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("question_answer", dict(kwargs)))
+        return self._prepare(
+            action="question_answer",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_exchange_grant(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("exchange_grant", dict(kwargs)))
+        return self._prepare(
+            action="exchange_grant",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    def _require_task(self, kwargs: object) -> None:
+        if not isinstance(kwargs, dict):
+            raise ValueError("typed preparation arguments are invalid")
+        try:
+            task = self.runtimes[str(kwargs["project_id"])].store.get_task(
+                str(kwargs["task_id"]), int(kwargs["revision"]),
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError) as error:
+            raise LookupError("task not found") from error
+        if task.session_id != kwargs["session_id"]:
+            raise LookupError("task not found")
 
     async def run(self, prepared: _Prepared) -> None:
         self.runs.append(prepared.preparation_id)
@@ -2098,7 +2148,7 @@ def test_hub_routes_resolve_project_before_any_foreign_chat_or_task_lookup(
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/edit", edited),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/reject", None),
-        ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
     )
@@ -2152,6 +2202,456 @@ def test_hub_duplicate_chat_and_task_ids_remain_bound_to_the_route_project(
     assert hub_harness.workflows.prepared[0].session_id == "shared-chat"
 
 
+def test_hub_directed_routes_require_exact_bound_request_shapes(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    """Directed browser input must use its dedicated exact-bound endpoints."""
+    runtime = hub_harness.runtimes["project-a"]
+    task = replace(valid_brief, task_id="directed-task")
+    runtime.store.save_task("chat-a", task, TaskState.AWAITING_USER_INPUT)
+    headers = {"X-CSRF-Token": CSRF_TOKEN}
+    base = "/api/projects/project-a/chats/chat-a/tasks/directed-task"
+    with _authenticated_hub_client(hub_harness) as client:
+        ordinary = client.post(
+            "/api/projects/project-a/chats/chat-a/messages",
+            json={"text": "please plan this", "addressed_to": "sol"},
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        continuation = client.post(
+            f"{base}/messages",
+            json={
+                "text": "continue exactly this task",
+                "addressed_to": "fable",
+                "revision": 1,
+                "continuation_generation": 1,
+            },
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        answer = client.post(
+            f"{base}/answer",
+            json={
+                "text": "the exact answer",
+                "revision": 1,
+                "question_id": "question-1",
+                "continuation_generation": 1,
+            },
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        grant = client.post(
+            f"{base}/exchanges/grant",
+            json={
+                "revision": 1,
+                "continuation_generation": 1,
+                "request_id": "grant-1",
+            },
+            headers=headers,
+        )
+    assert ordinary.status_code == 202
+    assert continuation.status_code == 202
+    assert answer.status_code == 202
+    assert grant.status_code == 202
+    assert hub_harness.workflows.preparation_calls == [
+        ("continuation", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "text": "continue exactly this task", "addressed_to": ConversationTarget.FABLE}),
+        ("question_answer", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "question_id": "question-1", "answer": "the exact answer"}),
+        ("exchange_grant", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "request_id": "grant-1"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "payload"),
+    (
+        ("messages", {"text": " ", "addressed_to": "fable", "revision": 1, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "team", "revision": 1, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "fable", "revision": True, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "fable", "revision": 1, "continuation_generation": 1, "routed_to": "sol"}),
+        ("answer", {"text": "x", "revision": 1, "question_id": "question-1", "continuation_generation": 1, "sender": "user"}),
+        ("answer", {"text": "x", "revision": 1}),
+        ("answer", {"text": "x", "revision": 1, "question_id": "bad/id", "continuation_generation": 1}),
+        ("exchanges/grant", {"revision": 1, "continuation_generation": 1, "request_id": "grant-1", "continuation": "forbidden"}),
+        ("exchanges/grant", {"revision": 1, "continuation_generation": "1", "request_id": "grant-1"}),
+    ),
+)
+def test_hub_directed_requests_reject_untrusted_or_nonexact_browser_fields(
+    hub_harness: _HubHarness,
+    suffix: str,
+    payload: dict[str, object],
+) -> None:
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            f"/api/projects/project-a/chats/chat-a/tasks/task-1/{suffix}",
+            json=payload,
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert hub_harness.workflows.preparation_calls == []
+    assert hub_harness.workflows.prepared == []
+
+
+def test_hub_ordinary_message_rejects_directed_control_fields_and_oversized_text(
+    hub_harness: _HubHarness,
+) -> None:
+    payloads = (
+        {"text": "plan", "routed_to": "fable"},
+        {"text": "plan", "sender": "user"},
+        {"text": "plan", "continuation_generation": 1},
+        {"text": "plan\nwith control"},
+        {"text": "x" * (16 * 1024 + 1)},
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        for payload in payloads:
+            response = client.post(
+                "/api/projects/project-a/chats/chat-a/messages",
+                json=payload,
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 422
+    assert hub_harness.workflows.prepared == []
+
+
+@pytest.mark.parametrize("route", ("messages", "messages-bound", "answer"))
+@pytest.mark.parametrize("invalid_text", ("secret /private/repository/token", "bad\x00control"))
+def test_hub_task5_text_validation_never_reflects_untrusted_values_or_schedules(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    route: str,
+    invalid_text: str,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_INPUT)
+    if route == "messages":
+        path = "/api/projects/project-a/chats/chat-a/messages"
+        payload = {"text": invalid_text, "addressed_to": "fable", "sender": "user"}
+    elif route == "messages-bound":
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/messages"
+        payload = {
+            "text": invalid_text, "addressed_to": "fable", "revision": 1,
+            "continuation_generation": 1, "routed_to": "fable",
+        }
+    else:
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/answer"
+        payload = {
+            "text": invalid_text, "revision": 1, "question_id": "question-1",
+            "continuation_generation": 1, "sender": "user",
+        }
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            path, json=payload, headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert invalid_text not in response.text
+    assert "/private/repository/token" not in response.text
+    assert hub_harness.workflows.prepared == []
+    assert hub_harness.workflows.preparation_calls == []
+    assert runtime.store.events_after("chat-a", 0) == ()
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+@pytest.mark.parametrize("route", ("messages", "messages-bound", "answer"))
+def test_hub_task5_text_validation_rejects_lone_surrogates_without_reflection(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    route: str,
+) -> None:
+    hub_harness.runtimes["project-a"].store.save_task(
+        "chat-a", valid_brief, TaskState.AWAITING_USER_INPUT,
+    )
+    if route == "messages":
+        path = "/api/projects/project-a/chats/chat-a/messages"
+        body = b'{"text":"\\ud800","addressed_to":"fable"}'
+    elif route == "messages-bound":
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/messages"
+        body = b'{"text":"\\ud800","addressed_to":"fable","revision":1,"continuation_generation":1}'
+    else:
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/answer"
+        body = b'{"text":"\\ud800","revision":1,"question_id":"question-1","continuation_generation":1}'
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            path,
+            content=body,
+            headers={"X-CSRF-Token": CSRF_TOKEN, "content-type": "application/json"},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert "ud800" not in response.text
+    assert hub_harness.workflows.prepared == []
+    assert hub_harness.workflows.preparation_calls == []
+    assert hub_harness.runtimes["project-a"].store.events_after("chat-a", 0) == ()
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+def test_hub_directed_duplicate_identifiers_stay_in_the_route_project(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 2's deferred route harness covers all directed bound endpoints."""
+    foreign = hub_harness.runtimes["project-b"].store
+    for runtime in hub_harness.runtimes.values():
+        runtime.store.create_session("shared-directed-chat", runtime.repository)
+        for task_id in ("shared-continuation", "shared-question", "shared-grant"):
+            runtime.store.save_task(
+                "shared-directed-chat", replace(valid_brief, task_id=task_id),
+                TaskState.AWAITING_USER_INPUT,
+            )
+
+    def foreign_access(*args: object, **kwargs: object) -> object:
+        raise AssertionError("directed route must not probe the foreign project")
+
+    for name in ("session_exists", "get_task", "latest_task", "chat", "append_event"):
+        monkeypatch.setattr(foreign, name, foreign_access)
+
+    base = "/api/projects/project-a/chats/shared-directed-chat/tasks"
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        responses = []
+        for suffix, payload in (
+            ("shared-continuation/messages", {"text": "continue", "addressed_to": "fable", "revision": 1, "continuation_generation": 1}),
+            ("shared-question/answer", {"text": "answer", "revision": 1, "question_id": "shared-question-id", "continuation_generation": 1}),
+            ("shared-grant/exchanges/grant", {"revision": 1, "continuation_generation": 1, "request_id": "shared-grant-id"}),
+        ):
+            responses.append(client.post(f"{base}/{suffix}", json=payload, headers=headers))
+            _wait_until(lambda: hub_harness.workflows.active_lease is None)
+    assert [response.status_code for response in responses] == [202, 202, 202]
+    assert [call[1]["project_id"] for call in hub_harness.workflows.preparation_calls] == [
+        "project-a", "project-a", "project-a",
+    ]
+    assert all(
+        prepared.project_id == "project-a" for prepared in hub_harness.workflows.prepared
+    )
+
+
+def test_hub_bootstrap_projects_only_safe_exact_user_question_projection(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    task = replace(valid_brief, task_id="question-card-task")
+    runtime.store.save_task("chat-a", task, TaskState.SOL_RUNNING)
+    runtime.store.pause_for_question(
+        session_id="chat-a",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_generation=1,
+        question_id="question-card-1",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Which exact approved option should Sol use?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "secret-run", "prompt": "private prompt"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact approved option should Sol use?",
+            task_id=task.task_id,
+            revision=task.revision,
+            continuation_generation=1,
+            question_id="question-card-1",
+        ),
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        payload = client.get(
+            "/api/projects/project-a/chats/chat-a/bootstrap"
+        ).json()
+    projected = next(item for item in payload["tasks"] if item["task_id"] == "question-card-task")
+    assert projected["continuation_generation"] == 1
+    assert projected["exchange_allowance"] == 3
+    assert projected["exchange_consumed"] == 0
+    assert projected["pending_question"] == {
+        "question_id": "question-card-1",
+        "asked_by": "sol",
+        "addressed_to": "user",
+        "routed_to": "user",
+        "text": "Which exact approved option should Sol use?",
+        "revision": 1,
+        "continuation_generation": 1,
+    }
+    assert "secret-run" not in json.dumps(payload)
+    assert "private prompt" not in json.dumps(payload)
+
+
+def test_hub_directed_scheduler_rejection_aborts_the_exact_preparation(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub_harness.runtimes["project-a"].store.save_task(
+        "chat-a", valid_brief, TaskState.AWAITING_USER_INPUT,
+    )
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/messages",
+            json={
+                "text": "continue exactly this task", "addressed_to": "fable",
+                "revision": 1, "continuation_generation": 1,
+            },
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 503
+    assert hub_harness.workflows.aborts == [("continuation-1", "scheduler_unavailable")]
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+@pytest.mark.parametrize(
+    ("addressed_to", "expected_target"),
+    (("sol", ConversationTarget.SOL), ("team", ConversationTarget.TEAM)),
+)
+def test_real_ordinary_recipient_is_persisted_but_always_routed_to_fable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    addressed_to: str,
+    expected_target: ConversationTarget,
+) -> None:
+    harness = _real_hub_harness(tmp_path)
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    runtime = harness.runtimes["a"]
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "Plan this exact request", "addressed_to": addressed_to},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 503
+        event = next(
+            event for event in runtime.store.events_after("shared-chat", 0)
+            if event.actor == "user"
+        )
+        assert event.actor == "user"
+        assert event.kind == "conversation"
+        assert event.payload == ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=expected_target,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Plan this exact request",
+        ).to_dict()
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("addressed_to", ("fable", "sol", "team"))
+def test_real_hub_first_ordinary_recipient_message_titles_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    addressed_to: str,
+) -> None:
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((True, "subscription_ready"),) * 2,
+        sol_results=("ready",) * 2,
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    runtime = harness.runtimes["a"]
+    path = f"/api/projects/{runtime.project_id}/chats/shared-chat/messages"
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            first = client.post(
+                path,
+                json={"text": "  First directed chat title.  ", "addressed_to": addressed_to},
+                headers=headers,
+            )
+            second = client.post(
+                path,
+                json={"text": "Later request cannot rename this chat.", "addressed_to": "fable"},
+                headers=headers,
+            )
+        assert (first.status_code, second.status_code) == (503, 503)
+        chat = runtime.store.chat("shared-chat")
+        assert chat is not None
+        assert chat.title == "First directed chat title."
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("acknowledged", "fable_results", "sol_results", "expected_probes"),
+    (
+        (False, ((True, "subscription_ready"),), ("ready",), (0, 0)),
+        (True, ((False, "subscription_unavailable"),), ("ready",), (1, 1)),
+        (True, ((True, "subscription_ready"),), ("unavailable",), (1, 1)),
+    ),
+)
+def test_real_directed_preparation_runs_the_complete_gate_before_store_or_scheduler(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    acknowledged: bool,
+    fable_results: tuple[object, ...],
+    sol_results: tuple[object, ...],
+    expected_probes: tuple[int, int],
+) -> None:
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=fable_results,
+        sol_results=sol_results,
+    )
+    runtime = harness.runtimes["a"]
+    task = replace(valid_brief, task_id="gated-directed-task")
+    runtime.store.save_task("shared-chat", task, TaskState.SOL_RUNNING)
+    runtime.store.set_sol_thread(task.task_id, task.revision, "gated-sol-thread")
+    runtime.store.pause_for_continuation(
+        task.task_id,
+        task.revision,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "gated-sol-run", "prompt": "Continue exactly."},
+    )
+    runtime.store._connection.execute(  # noqa: SLF001 - seed exact approved route state
+        "UPDATE tasks SET approved_at = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", task.task_id, task.revision),
+    )
+    if not acknowledged:
+        harness.hub_store.acknowledged = False
+    before_events = runtime.store.events_after("shared-chat", 0)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/tasks/{task.task_id}/messages",
+                json={
+                    "text": "continue exactly", "addressed_to": "sol",
+                    "revision": 1, "continuation_generation": 1,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 409
+        assert (harness.probes["a"].fable_calls, harness.probes["a"].sol_calls) == expected_probes
+        assert runtime.store.events_after("shared-chat", 0) == before_events
+        assert runtime.store.latest_prepared_action_for_task(
+            project_id=runtime.project_id, session_id="shared-chat",
+            task_id=task.task_id, revision=1,
+        ) is None
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
 def test_every_duplicate_identifier_route_stays_inside_project_a(
     hub_harness: _HubHarness,
     valid_brief: TaskBrief,
@@ -2190,7 +2690,7 @@ def test_every_duplicate_identifier_route_stays_inside_project_a(
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/approve", {"revision": 1}),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/edit", _edited_brief(shared_brief)),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/reject", None),
-            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/resume", None),
         ):
             assert client.post(path, json=body, headers=headers).status_code == 202
@@ -2265,6 +2765,10 @@ def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
             continuation_state=TaskState.SOL_RUNNING,
             pending={"prompt": "Answer exactly.", "sol_run_id": "sol-answer-run"},
         )
+        store._connection.execute(  # noqa: SLF001 - seed exact approved routing state
+            "UPDATE tasks SET approved_at = ? WHERE task_id = ? AND revision = ?",
+            ("2026-08-10T12:00:00Z", answer.task_id, answer.revision),
+        )
         store.save_task("shared-chat", resume, TaskState.FABLE_PLANNING)
         store.mark_interrupted(
             resume.task_id, resume.revision, continuation=TaskState.FABLE_PLANNING,
@@ -2325,7 +2829,7 @@ def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
             for path, body in (
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "only A message"}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['approval']}/approve", {"revision": 1}),
-                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['answer']}/answer", {"answer": "only A answer"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['answer']}/messages", {"text": "only A continuation", "addressed_to": "sol", "revision": 1, "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['resume']}/resume", None),
             ):
                 assert client.post(path, json=body, headers=headers).status_code == 503
@@ -2408,7 +2912,7 @@ def test_real_b_only_identifiers_cannot_change_selected_project_or_foreign_store
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/approve", {"revision": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/edit", _edited_brief(replace(valid_brief, task_id="b-only-task"))),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/reject", None),
-                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/answer", {"answer": "never"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/answer", {"text": "never", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/resume", None),
             ):
                 assert client.post(path, json=body, headers=headers).status_code == 404
@@ -2586,7 +3090,7 @@ def test_active_lease_synchronously_gates_navigation_model_mutations_and_exact_s
         for path, body in (
             ("/api/projects/project-a/chats/chat-a/messages", {"text": "plan"}),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
-            ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
         ):
@@ -2988,7 +3492,8 @@ def test_real_foreign_lease_rejects_navigation_and_model_preparation_before_stor
             for path, body in (
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "plan"}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/approval-task/approve", {"revision": 1}),
-                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/answer", {"answer": "yes"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/messages", {"text": "continue", "addressed_to": "sol", "revision": 1, "continuation_generation": 1}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/resume-task/resume", None),
             ):
                 route_before = hub_inventory()
@@ -3141,7 +3646,7 @@ def test_real_http_preparation_refreshes_fable_readiness_after_each_lease_acquis
         assert harness.lease.snapshot() is None
         assert harness.app.state.active_coroutines == set()
         assert [event.kind for event in runtime.store.events_after("shared-chat", 0)] == [
-            "message", "task_state",
+            "conversation", "task_state",
         ]
     finally:
         harness.close()
@@ -3381,7 +3886,7 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert workflows.active_lease_snapshot() is None
         assert app.state.active_coroutines == set()
         assert [event.kind for event in store.events_after("chat-real", 0)] == [
-            "message", "task_state",
+            "conversation", "task_state",
         ]
 
         with TestClient(app) as client:
@@ -3403,7 +3908,18 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert existing.previous_preparation_id == original.preparation_id
         assert workflows.active_lease_snapshot() is None
         assert app.state.active_coroutines == set()
-        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+        conversations = [
+            event for event in store.events_after("chat-real", 0)
+            if event.actor == "user" and event.kind == "conversation"
+        ]
+        assert len(conversations) == 1
+        assert conversations[0].payload == ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="make exactly one durable plan",
+        ).to_dict()
 
         monkeypatch.undo()
         with TestClient(app) as client:
@@ -3423,7 +3939,10 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert retry is not None
         assert retry.action == "resume"
         assert retry.previous_preparation_id == existing.preparation_id
-        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+        assert len([
+            event for event in store.events_after("chat-real", 0)
+            if event.actor == "user" and event.kind == "conversation"
+        ]) == 1
     finally:
         coordinator.close()
         store.close()

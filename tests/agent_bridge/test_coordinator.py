@@ -2799,6 +2799,23 @@ def test_prepare_new_request_creates_a_durable_action_with_derived_project_ident
     assert harness.fable.plan_calls == []
 
 
+def test_prepare_new_request_retains_the_validated_recipient_intent(
+    harness,
+) -> None:
+    prepared = harness.coordinator.prepare_new_request(
+        session_id="session-1",
+        task_id="prepared-team-task",
+        text="Build the bridge with the team",
+        generation=1,
+        addressed_to=ConversationTarget.TEAM,
+    )
+
+    assert prepared.payload == NewRequestPayload(
+        text="Build the bridge with the team", addressed_to=ConversationTarget.TEAM,
+    )
+    assert harness.fable.plan_calls == []
+
+
 def test_run_prepared_action_persists_only_a_fixed_failure_category(
     harness, monkeypatch,
 ) -> None:

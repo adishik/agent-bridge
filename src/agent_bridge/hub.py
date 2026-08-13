@@ -494,9 +494,12 @@ class HubWorkflowOrchestrator:
         session_id: str,
         text: str,
         ids: IdFactory,
+        addressed_to: ConversationTarget = ConversationTarget.FABLE,
     ) -> PreparedWorkflow:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be non-empty")
+        if not isinstance(addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
         runtime = self._runtime_for_session(project_id, session_id)
         self._require_acknowledgement()
         token = self._lease.acquire_new(
@@ -511,6 +514,7 @@ class HubWorkflowOrchestrator:
                 task_id=token.task_id,
                 text=text,
                 generation=token.generation,
+                addressed_to=addressed_to,
             )
             record = self._bound_record(runtime, record.preparation_id, token)
             return PreparedWorkflow(

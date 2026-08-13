@@ -1285,6 +1285,312 @@ def test_first_user_message_derives_the_only_bounded_unicode_chat_title(tmp_path
     assert store.chat("chat-1").title == titled.title  # type: ignore[union-attr]
 
 
+def test_first_validated_user_conversation_statement_derives_the_only_chat_title(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    store.create_chat("/repo", session_id="chat-1")
+    statement = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="  Plan this directed conversation.  ",
+    )
+    status = ConversationEnvelope(
+        sender=ConversationActor.SYSTEM,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        message_type=ConversationMessageType.STATUS,
+        text="A bounded status.",
+    )
+    store.append_event("chat-1", None, "user", "conversation", status.to_dict())
+    store.append_event("chat-1", None, "user", "conversation", statement.to_dict())
+    titled = store.chat("chat-1")
+    store.append_event(
+        "chat-1", None, "user", "conversation", ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Later user text cannot rename this chat.",
+        ).to_dict(),
+    )
+
+    assert titled is not None
+    assert titled.title == "Plan this directed conversation."
+    assert store.chat("chat-1").title == titled.title  # type: ignore[union-attr]
+
+
+def test_first_legacy_user_text_equal_to_default_title_still_locks_chat_title(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create_chat("/repo", session_id="chat-1")
+
+    store.append_event("chat-1", None, "user", "message", {"text": "New chat"})
+    store.append_event(
+        "chat-1", None, "user", "message", {"text": "Later text cannot rename this."},
+    )
+
+    assert store.chat("chat-1").title == "New chat"  # type: ignore[union-attr]
+    assert store._connection.execute(  # noqa: SLF001 - durable title marker contract
+        "SELECT title_initialized FROM sessions WHERE session_id = ?", ("chat-1",)
+    ).fetchone()[0] == 1
+
+
+def test_first_conversation_text_equal_to_default_title_still_locks_chat_title(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create_chat("/repo", session_id="chat-1")
+    first = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="New chat",
+    )
+    later = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Later text cannot rename this.",
+    )
+
+    store.append_event("chat-1", None, "user", "conversation", first.to_dict())
+    store.append_event("chat-1", None, "user", "conversation", later.to_dict())
+
+    assert store.chat("chat-1").title == "New chat"  # type: ignore[union-attr]
+    assert store._connection.execute(  # noqa: SLF001 - durable title marker contract
+        "SELECT title_initialized FROM sessions WHERE session_id = ?", ("chat-1",)
+    ).fetchone()[0] == 1
+
+
+def test_concurrent_first_eligible_titles_commit_one_durable_title_marker(tmp_path) -> None:
+    path = tmp_path / "concurrent-title.sqlite3"
+    initial = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    initial.create_chat("/repo", session_id="chat-1")
+    initial.close()
+
+    first = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z", check_same_thread=False)
+    second = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z", check_same_thread=False)
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def append_first_title(store: SQLiteStore, text: str) -> None:
+        try:
+            barrier.wait(timeout=2)
+            store.append_event("chat-1", None, "user", "message", {"text": text})
+        except BaseException as error:
+            failures.append(error)
+
+    workers = [
+        threading.Thread(target=append_first_title, args=(first, "First one")),
+        threading.Thread(target=append_first_title, args=(second, "First two")),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(worker.is_alive() is False for worker in workers)
+    assert failures == []
+    assert first.chat("chat-1").title in {"First one", "First two"}  # type: ignore[union-attr]
+    assert first._connection.execute(  # noqa: SLF001 - durable title marker contract
+        "SELECT title_initialized FROM sessions WHERE session_id = ?", ("chat-1",)
+    ).fetchone()[0] == 1
+    first.close()
+    second.close()
+
+
+def test_title_marker_migration_preserves_existing_first_titles_across_reopen(tmp_path) -> None:
+    path = tmp_path / "pre-title-marker.sqlite3"
+    connection = _create_current_schema(path)
+    connection.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New chat';
+        ALTER TABLE sessions ADD COLUMN updated_at TEXT;
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            ("named", "/repo", "2026-08-10T10:00:00Z", "Existing title", "2026-08-10T10:00:00Z"),
+            ("legacy", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+            ("conversation", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+            ("empty", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+        ),
+    )
+    statement = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.TEAM,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="New chat",
+    )
+    connection.executemany(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ("legacy", None, "user", "message", '{"text":"New chat"}', "2026-08-10T10:01:00Z"),
+            ("conversation", None, "user", "conversation", json.dumps(statement.to_dict()), "2026-08-10T10:01:00Z"),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert tuple(tuple(row) for row in migrated._connection.execute(  # noqa: SLF001 - schema migration contract
+        "SELECT session_id, title_initialized FROM sessions ORDER BY session_id"
+    )) == (("conversation", 1), ("empty", 0), ("legacy", 1), ("named", 1))
+    migrated.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    reopened.append_event("legacy", None, "user", "message", {"text": "Do not rename"})
+    reopened.append_event(
+        "conversation", None, "user", "message", {"text": "Do not rename either"},
+    )
+    reopened.append_event("empty", None, "user", "message", {"text": "First later title"})
+
+    assert reopened.chat("legacy").title == "New chat"  # type: ignore[union-attr]
+    assert reopened.chat("conversation").title == "New chat"  # type: ignore[union-attr]
+    assert reopened.chat("empty").title == "First later title"  # type: ignore[union-attr]
+    assert tuple(tuple(row) for row in reopened._connection.execute(  # noqa: SLF001 - migration idempotency contract
+        "SELECT session_id, title_initialized FROM sessions ORDER BY session_id"
+    )) == (("conversation", 1), ("empty", 1), ("legacy", 1), ("named", 1))
+    reopened.close()
+
+
+def test_title_marker_migration_reads_legacy_history_in_bounded_pages(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "bounded-title-marker.sqlite3"
+    connection = _create_current_schema(path)
+    connection.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New chat';
+        ALTER TABLE sessions ADD COLUMN updated_at TEXT;
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("chat-1", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+    )
+    connection.executemany(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        tuple(
+            ("chat-1", None, "fable", "status", '{"index":%d}' % index, "2026-08-10T10:01:00Z")
+            for index in range(257)
+        ),
+    )
+    connection.commit()
+    statements: list[str] = []
+    connection.close()
+
+    original_connect = store_module.sqlite3.connect
+
+    def observed_connect(*args, **kwargs):
+        observed = original_connect(*args, **kwargs)
+        observed.set_trace_callback(statements.append)
+        return observed
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", observed_connect)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    history_reads = [
+        statement for statement in statements
+        if "FROM events" in statement and "WHERE sequence >" in statement
+    ]
+    assert len(history_reads) == 4
+    assert all("LIMIT 128" in statement for statement in history_reads)
+    assert migrated._connection.execute(  # noqa: SLF001 - migration behavior contract
+        "SELECT title_initialized FROM sessions WHERE session_id = ?", ("chat-1",)
+    ).fetchone()[0] == 0
+    migrated.close()
+
+
+def test_title_marker_migration_rolls_back_its_additive_column_on_backfill_failure(tmp_path) -> None:
+    path = tmp_path / "title-marker-rollback.sqlite3"
+    connection = _create_current_schema(path)
+    connection.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT 'New chat';
+        ALTER TABLE sessions ADD COLUMN updated_at TEXT;
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO sessions (session_id, repo_root, created_at, title, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("chat-1", "/repo", "2026-08-10T10:00:00Z", "New chat", "2026-08-10T10:00:00Z"),
+    )
+    connection.execute(
+        """
+        INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("chat-1", None, "user", "message", '{"text":"first"}', "2026-08-10T10:01:00Z"),
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER fail_title_marker_backfill
+        BEFORE UPDATE OF title_initialized ON sessions
+        BEGIN
+            SELECT RAISE(ABORT, 'injected title marker migration failure');
+        END
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected title marker migration failure"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    assert "title_initialized" not in tuple(
+        row[1] for row in inspected.execute("PRAGMA table_info(sessions)")
+    )
+    inspected.close()
+
+
+def test_first_conversation_title_never_scans_prior_event_history(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.create_chat("/repo", session_id="chat-1")
+    for index in range(256):
+        store.append_event(
+            "chat-1", None, "fable", "message", {"text": f"agent {index}"},
+        )
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)  # noqa: SLF001 - query budget evidence
+    try:
+        store.append_event(
+            "chat-1", None, "user", "conversation", ConversationEnvelope(
+                sender=ConversationActor.USER,
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.FABLE,
+                message_type=ConversationMessageType.STATEMENT,
+                text="Constant-time title.",
+            ).to_dict(),
+        )
+    finally:
+        store._connection.set_trace_callback(None)  # noqa: SLF001 - test cleanup
+
+    assert store.chat("chat-1").title == "Constant-time title."  # type: ignore[union-attr]
+    assert not any(
+        "SELECT actor, kind, payload_json FROM events" in statement
+        for statement in statements
+    )
+
+
 def test_chat_lists_use_event_sequence_recency_and_stable_cursor_pagination(tmp_path) -> None:
     store = _store(tmp_path)
     for session_id in ("active-a", "active-b", *(f"empty-{index:03d}" for index in range(103))):
@@ -2259,6 +2565,33 @@ def test_prepared_action_new_request_is_store_owned_and_has_no_task_pending_cont
     assert task.state is TaskState.FABLE_PLANNING
     assert task.pending is None
     assert [event.payload for event in observed] == [{"text": "Build the bridge"}]
+
+
+def test_prepared_new_request_persists_requested_recipient_with_fable_owned_route(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+
+    store.prepare_new_request_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id="task-directed",
+        generation=1,
+        payload=NewRequestPayload(
+            text="Plan it with the team.", addressed_to=ConversationTarget.TEAM,
+        ),
+    )
+
+    event = store.events_after("session-1", 0)[0]
+    assert event.kind == "conversation"
+    assert event.payload == ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.TEAM,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Plan it with the team.",
+    ).to_dict()
 
 
 def test_prepared_action_claim_abort_and_recovery_are_exact_and_durable(tmp_path) -> None:

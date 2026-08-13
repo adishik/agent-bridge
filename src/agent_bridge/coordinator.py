@@ -276,14 +276,24 @@ class Coordinator:
         return task_id
 
     def prepare_new_request(
-        self, *, session_id: str, task_id: str, text: str, generation: int,
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        text: str,
+        generation: int,
+        addressed_to: ConversationTarget | None = None,
     ) -> PreparedActionRecord:
+        if addressed_to is not None and not isinstance(
+            addressed_to, ConversationTarget,
+        ):
+            raise ValueError("addressed_to must be a ConversationTarget")
         return self._store.prepare_new_request_action(
             project_id=self.project_id,
             session_id=session_id,
             task_id=task_id,
             generation=generation,
-            payload=NewRequestPayload(text=text),
+            payload=NewRequestPayload(text=text, addressed_to=addressed_to),
         )
 
     def prepare_user_request(
