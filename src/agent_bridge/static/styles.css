@@ -422,6 +422,50 @@ dialog h2 {
   letter-spacing: 0.03em;
 }
 
+.message-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-right: 0.45rem;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  background: var(--coordinator);
+  border-radius: 50%;
+}
+
+.message-user .message-avatar { background: var(--user); }
+.message-fable .message-avatar { background: var(--fable); }
+.message-sol .message-avatar { background: var(--sol); }
+
+.message-route {
+  display: inline;
+}
+
+.conversation-action-card {
+  max-width: min(46rem, 92%);
+  margin: 0 0 0.85rem;
+  padding: 0.8rem 0.95rem;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-left: 5px solid var(--brand);
+  border-radius: 0.75rem;
+  box-shadow: 0 5px 18px rgb(20 40 30 / 5%);
+}
+
+.conversation-action-card p {
+  margin: 0.35rem 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.conversation-action-card .button + .button {
+  margin-left: 0.45rem;
+}
+
 .message p {
   margin: 0;
   line-height: 1.55;
@@ -579,7 +623,8 @@ dialog h2 {
 
 .field-group textarea,
 .field-group input,
-#message-input {
+#message-input,
+#composer-recipient {
   width: 100%;
   padding: 0.7rem;
   color: var(--ink);
@@ -608,6 +653,34 @@ dialog h2 {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: end;
   gap: 0.65rem;
+}
+
+.composer-recipient {
+  display: grid;
+  gap: 0.2rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 740;
+}
+
+#composer-recipient {
+  min-height: 2.45rem;
+  padding: 0.45rem;
+}
+
+.composer-binding {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.composer-binding .button {
+  min-height: 2rem;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.72rem;
 }
 
 #message-input {

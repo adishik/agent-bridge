@@ -27,6 +27,7 @@ from agent_bridge.contracts import (
     ConversationEnvelope,
     ConversationMessageType,
     ConversationTarget,
+    DirectedAgentQuestion,
     StreamEvent,
     TaskBrief,
 )
@@ -2475,6 +2476,82 @@ def test_hub_bootstrap_projects_only_safe_exact_user_question_projection(
     }
     assert "secret-run" not in json.dumps(payload)
     assert "private prompt" not in json.dumps(payload)
+
+
+def test_hub_bootstrap_projects_only_current_ungranted_exchange_permission(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    def pause_permission(runtime: _HubRuntime, session_id: str) -> tuple[TaskBrief, str]:
+        task = replace(valid_brief, task_id="permission-card-task")
+        runtime.store.save_task(session_id, task, TaskState.SOL_RUNNING)
+        runtime.store._connection.execute(  # noqa: SLF001 - exact exhausted fixture
+            "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+            (task.task_id, task.revision),
+        )
+        runtime.store.pause_for_exchange_permission(
+            session_id=session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_generation=1,
+            attempted_question=DirectedAgentQuestion(
+                addressed_to="fable",
+                text="A fourth question needs permission.",
+                reason="The exchange allowance is exhausted.",
+            ),
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"provider_id": "must-not-project"},
+            event=ConversationEnvelope(
+                sender=ConversationActor.SYSTEM,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                message_type=ConversationMessageType.STATUS,
+                text="Automatic exchange limit reached. Allow three more internal exchanges to continue.",
+                task_id=task.task_id,
+                revision=task.revision,
+                continuation_generation=1,
+            ),
+        )
+        permission_id = runtime.store._connection.execute(  # noqa: SLF001 - fixture identity
+            "SELECT permission_id FROM exchange_permissions"
+        ).fetchone()[0]
+        return task, permission_id
+
+    project_a = hub_harness.runtimes["project-a"]
+    project_b = hub_harness.runtimes["project-b"]
+    task_a, permission_a = pause_permission(project_a, "chat-a")
+    _task_b, permission_b = pause_permission(project_b, "chat-b")
+
+    with _authenticated_hub_client(hub_harness) as client:
+        first = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    projected = next(item for item in first["tasks"] if item["task_id"] == task_a.task_id)
+    assert projected["exchange_permission"] == {
+        "request_id": permission_a,
+        "revision": 1,
+        "continuation_generation": 1,
+    }
+    assert permission_b not in json.dumps(first)
+    assert "provider_id" not in json.dumps(first)
+
+    project_a.store._connection.execute(  # noqa: SLF001 - stale pause must not project
+        "UPDATE tasks SET continuation_generation = 2 WHERE task_id = ? AND revision = ?",
+        (task_a.task_id, task_a.revision),
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        stale = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    assert next(item for item in stale["tasks"] if item["task_id"] == task_a.task_id)["exchange_permission"] is None
+
+    project_a.store._connection.execute(  # noqa: SLF001 - restore exact paused fixture
+        "UPDATE tasks SET continuation_generation = 1 WHERE task_id = ? AND revision = ?",
+        (task_a.task_id, task_a.revision),
+    )
+    assert project_a.store.grant_internal_exchanges(
+        session_id="chat-a", task_id=task_a.task_id, revision=1,
+        expected_generation=1, request_id=permission_a,
+    ) == 3
+    with _authenticated_hub_client(hub_harness) as client:
+        granted = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    assert next(item for item in granted["tasks"] if item["task_id"] == task_a.task_id)["exchange_permission"] is None
 
 
 def test_hub_directed_scheduler_rejection_aborts_the_exact_preparation(

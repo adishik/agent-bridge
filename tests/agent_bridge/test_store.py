@@ -4069,6 +4069,70 @@ def test_internal_exchange_reservations_are_bounded_and_grants_are_idempotent(
     assert store.get_task("exchange-task", 1).exchange_allowance == 2
 
 
+def test_current_exchange_permission_projects_only_the_exact_ungranted_pause(
+    tmp_path, valid_brief,
+) -> None:
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="permission-projection-task", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store._connection.execute(
+        "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+        (brief.task_id, brief.revision),
+    )
+    paused = store.pause_for_exchange_permission(
+        session_id="session-1",
+        task_id=brief.task_id,
+        revision=brief.revision,
+        expected_generation=1,
+        attempted_question=DirectedAgentQuestion(
+            addressed_to="fable",
+            text="A fourth question needs permission.",
+            reason="The exchange allowance is exhausted.",
+        ),
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"next": "retry-fourth-question", "provider_id": "must-not-project"},
+        event=_conversation_permission(task_id=brief.task_id, revision=1, generation=1),
+    )
+    permission_id = store._connection.execute(  # noqa: SLF001 - exact persisted fixture
+        "SELECT permission_id FROM exchange_permissions"
+    ).fetchone()[0]
+
+    assert store.current_exchange_permission(
+        session_id="session-1",
+        task_id=brief.task_id,
+        revision=brief.revision,
+    ) == {
+        "request_id": permission_id,
+        "revision": brief.revision,
+        "continuation_generation": paused.continuation_generation,
+    }
+
+    store._connection.execute(  # noqa: SLF001 - stale generation must not project
+        "UPDATE tasks SET continuation_generation = continuation_generation + 1 "
+        "WHERE task_id = ? AND revision = ?",
+        (brief.task_id, brief.revision),
+    )
+    assert store.current_exchange_permission(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+    ) is None
+
+    store._connection.execute(  # noqa: SLF001 - restore exact fixture before grant
+        "UPDATE tasks SET continuation_generation = ? WHERE task_id = ? AND revision = ?",
+        (paused.continuation_generation, brief.task_id, brief.revision),
+    )
+    assert store.grant_internal_exchanges(
+        session_id="session-1",
+        task_id=brief.task_id,
+        revision=brief.revision,
+        expected_generation=paused.continuation_generation,
+        request_id=permission_id,
+    ) == EXCHANGE_GRANT_SIZE
+    assert store.current_exchange_permission(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+    ) is None
+
+
 def test_internal_exchange_request_key_is_concurrent_idempotent_and_transactional(
     tmp_path, valid_brief,
 ) -> None:

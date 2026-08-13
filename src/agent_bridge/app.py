@@ -465,6 +465,11 @@ def create_hub_app(
                 "revision": question.revision,
                 "continuation_generation": question.continuation_generation,
             }
+        exchange_permission = store.current_exchange_permission(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+        )
         return {
             "task_id": task.task_id,
             "revision": task.revision,
@@ -479,6 +484,7 @@ def create_hub_app(
             "exchange_allowance": task.exchange_allowance,
             "exchange_consumed": task.exchange_consumed,
             "pending_question": pending_question,
+            "exchange_permission": exchange_permission,
             "updated_at": overview.updated_at,
             "active_agent": overview.active_agent,
             "active_started_at": overview.active_started_at,

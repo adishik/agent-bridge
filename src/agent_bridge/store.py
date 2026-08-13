@@ -1709,6 +1709,45 @@ class SQLiteStore:
             _require_string(task_id, "task_id"), _require_integer(revision, "revision"),
         )
 
+    def current_exchange_permission(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+    ) -> Mapping[str, str | int] | None:
+        """Project only one current, ungranted exchange permission for the browser."""
+        session_id = _require_string(session_id, "session_id")
+        task_id = _require_string(task_id, "task_id")
+        revision = _require_integer(revision, "revision")
+        row = self._connection.execute(
+            """
+            SELECT permission.permission_id, permission.revision,
+                   permission.continuation_generation
+            FROM exchange_permissions AS permission
+            JOIN tasks AS task
+              ON task.task_id = permission.task_id
+             AND task.revision = permission.revision
+             AND task.session_id = permission.session_id
+            WHERE permission.session_id = ? AND permission.task_id = ?
+              AND permission.revision = ? AND permission.grant_request_id IS NULL
+              AND task.state = ? AND task.exchange_allowance = 0
+              AND task.continuation_generation = permission.continuation_generation
+              AND task.continuation_pause_id = permission.continuation_pause_id
+            """,
+            (session_id, task_id, revision, TaskState.AWAITING_USER_INPUT.value),
+        ).fetchone()
+        if row is None:
+            return None
+        permission_id = row["permission_id"]
+        if not isinstance(permission_id, str) or not _SAFE_PREPARED_IDENTIFIER.fullmatch(permission_id):
+            raise RuntimeError("exchange permission identifier is invalid")
+        return {
+            "request_id": permission_id,
+            "revision": int(row["revision"]),
+            "continuation_generation": int(row["continuation_generation"]),
+        }
+
     def pause_for_question(
         self,
         *,

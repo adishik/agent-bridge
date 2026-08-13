@@ -5,6 +5,29 @@ const ACTOR_LABELS = Object.freeze({
   coordinator: "Coordinator",
 });
 
+const DIRECTED_ACTORS = Object.freeze({
+  user: Object.freeze({label: "User", avatar: "U", className: "user"}),
+  fable: Object.freeze({label: "Fable", avatar: "F", className: "fable"}),
+  sol: Object.freeze({label: "Sol", avatar: "S", className: "sol"}),
+  system: Object.freeze({label: "System", avatar: "•", className: "coordinator"}),
+});
+
+const DIRECTED_TARGETS = Object.freeze({
+  user: Object.freeze({label: "You", className: "user"}),
+  fable: Object.freeze({label: "Fable", className: "fable"}),
+  sol: Object.freeze({label: "Sol", className: "sol"}),
+  team: Object.freeze({label: "Team", className: "coordinator"}),
+});
+
+const DIRECTED_MESSAGE_TYPES = new Set([
+  "statement",
+  "question",
+  "answer",
+  "approval",
+  "intervention",
+  "status",
+]);
+
 const ACTIVE_STATES = new Set([
   "fable_planning",
   "sol_running",
@@ -210,10 +233,139 @@ function appendConversationNode(documentRoot, conversation, node) {
 }
 
 
+function safeConversationText(value) {
+  if (typeof value !== "string" || /^\p{White_Space}*$/u.test(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  const TextEncoderCtor = globalThis.TextEncoder;
+  if (typeof TextEncoderCtor !== "function") {
+    return false;
+  }
+  try {
+    const encoded = new TextEncoderCtor().encode(value);
+    return encoded instanceof Uint8Array && encoded.length <= 16 * 1024;
+  } catch (_error) {
+    return false;
+  }
+}
+
+
 export function conversationPresentation(event) {
+  if (event?.kind === "conversation") {
+    const envelope = directedEnvelope(event);
+    return envelope === null ? "hidden" : (envelope.messageType === "status" ? "status" : "message");
+  }
   if (event?.kind === "task_state") return "status";
   if (MESSAGE_EVENT_KINDS.has(event?.kind)) return "message";
   return "hidden";
+}
+
+
+function directedEnvelope(event) {
+  const payload = asObject(event?.payload);
+  const envelopeFields = [
+    "sender", "addressed_to", "routed_to", "message_type", "text", "task_id",
+    "revision", "continuation_generation", "question_id", "reply_to_question_id",
+  ];
+  const sender = typeof payload.sender === "string" ? DIRECTED_ACTORS[payload.sender] : null;
+  const addressedTo = typeof payload.addressed_to === "string"
+    ? DIRECTED_TARGETS[payload.addressed_to]
+    : null;
+  const routedTo = typeof payload.routed_to === "string"
+    ? DIRECTED_TARGETS[payload.routed_to]
+    : null;
+  if (
+    event?.kind !== "conversation"
+    || Object.keys(payload).length !== envelopeFields.length
+    || !envelopeFields.every((field) => Object.hasOwn(payload, field))
+    || sender === undefined || sender === null
+    || addressedTo === undefined || addressedTo === null
+    || routedTo === undefined || routedTo === null
+    || !DIRECTED_MESSAGE_TYPES.has(payload.message_type)
+    || typeof payload.text !== "string"
+    || typeof event?.actor !== "string"
+    || event.actor !== payload.sender
+  ) {
+    return null;
+  }
+  const taskId = typeof payload.task_id === "string" && SAFE_ID.test(payload.task_id)
+    ? payload.task_id
+    : null;
+  const outerTaskId = event?.task_id === null
+    ? null
+    : (typeof event?.task_id === "string" && SAFE_ID.test(event.task_id)
+      ? event.task_id
+      : undefined);
+  if (outerTaskId === undefined) {
+    return null;
+  }
+  const revision = Number.isInteger(payload.revision) && payload.revision >= 1
+    ? payload.revision
+    : null;
+  const generation = Number.isInteger(payload.continuation_generation)
+    && payload.continuation_generation >= 1
+    ? payload.continuation_generation
+    : null;
+  const questionId = typeof payload.question_id === "string" && SAFE_ID.test(payload.question_id)
+    ? payload.question_id
+    : null;
+  const replyToQuestionId = typeof payload.reply_to_question_id === "string"
+    && SAFE_ID.test(payload.reply_to_question_id)
+    ? payload.reply_to_question_id
+    : null;
+  const textIsSafe = safeConversationText(payload.text);
+  const hasUnboundFields = payload.task_id === null
+    && payload.revision === null
+    && payload.continuation_generation === null;
+  const hasBoundFields = taskId !== null && revision !== null && generation !== null;
+  const hasApprovalBinding = taskId !== null && revision !== null
+    && payload.continuation_generation === null;
+  const hasBoundBinding = payload.message_type === "approval"
+    ? hasApprovalBinding
+    : hasBoundFields;
+  if (
+    (payload.question_id !== undefined && payload.question_id !== null && questionId === null)
+    || (payload.reply_to_question_id !== undefined && payload.reply_to_question_id !== null && replyToQuestionId === null)
+    || !textIsSafe
+    || (payload.message_type === "question" && (questionId === null || replyToQuestionId !== null))
+    || (payload.message_type === "answer" && (questionId !== null || replyToQuestionId === null))
+    || (!["question", "answer"].includes(payload.message_type)
+      && (questionId !== null || replyToQuestionId !== null))
+    || (payload.message_type === "approval" && !hasApprovalBinding)
+    || (payload.message_type !== "approval" && !hasUnboundFields && !hasBoundFields)
+    || ((payload.message_type === "question" || payload.message_type === "answer") && !hasBoundFields)
+    || (hasBoundBinding && outerTaskId !== taskId)
+    || (payload.message_type === "status" && payload.sender !== "system")
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    sender,
+    addressedTo,
+    routedTo,
+    messageType: payload.message_type,
+    text: payload.text,
+    taskId,
+    revision,
+    generation,
+    questionId,
+    replyToQuestionId,
+  });
 }
 
 
@@ -273,6 +425,57 @@ export function renderMessage(documentRoot, event, associatedRevision = null) {
 }
 
 
+function renderDirectedMessage(documentRoot, event, envelope) {
+  const conversation = documentRoot.querySelector("#conversation");
+  if (!conversation) {
+    throw new Error("conversation region is missing");
+  }
+  const article = element(
+    documentRoot,
+    "article",
+    undefined,
+    `message message-${envelope.sender.className} target-${envelope.routedTo.className}`,
+  );
+  article.setAttribute("aria-label", `${envelope.sender.label} to ${envelope.routedTo.label}`);
+  const avatar = element(documentRoot, "span", envelope.sender.avatar, "message-avatar");
+  avatar.setAttribute("aria-hidden", "true");
+  const heading = element(
+    documentRoot,
+    "strong",
+    `${envelope.sender.label} → ${envelope.routedTo.label}`,
+    "message-route",
+  );
+  const text = element(documentRoot, "p", envelope.text);
+  const context = [];
+  if (envelope.taskId !== null) {
+    context.push(`Task ${envelope.taskId}`);
+  }
+  if (envelope.revision !== null) {
+    context.push(`r${envelope.revision}`);
+  }
+  if (envelope.questionId !== null) {
+    context.push(`Question ${envelope.questionId}`);
+  }
+  if (envelope.replyToQuestionId !== null) {
+    context.push(`Reply to question ${envelope.replyToQuestionId}`);
+  }
+  if (envelope.generation !== null) {
+    context.push(`generation ${envelope.generation}`);
+  }
+  if (envelope.addressedTo !== envelope.routedTo) {
+    context.push(`Addressed to ${envelope.addressedTo.label} · routed to ${envelope.routedTo.label} before approval`);
+  }
+  const metadata = element(
+    documentRoot,
+    "p",
+    context.length > 0 ? context.join(" · ") : "Conversation message",
+    "message-metadata",
+  );
+  article.append(avatar, heading, text, metadata);
+  return appendConversationNode(documentRoot, conversation, article);
+}
+
+
 function renderConversationStatus(documentRoot, event, associatedRevision) {
   const conversation = documentRoot.querySelector("#conversation");
   if (!conversation) {
@@ -296,6 +499,14 @@ function renderConversationStatus(documentRoot, event, associatedRevision) {
 
 
 export function renderConversationEvent(documentRoot, event, associatedRevision = null) {
+  if (event?.kind === "conversation") {
+    const envelope = directedEnvelope(event);
+    if (envelope === null) return null;
+    if (envelope.messageType === "status") {
+      return renderConversationStatus(documentRoot, event, associatedRevision);
+    }
+    return renderDirectedMessage(documentRoot, event, envelope);
+  }
   const presentation = conversationPresentation(event);
   if (presentation === "hidden") return null;
   if (presentation === "status") {
@@ -745,26 +956,6 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
     }
   }
 
-  if (controls.answer.visible) {
-    const answerForm = element(documentRoot, "form", undefined, "task-section");
-    const answerLabel = element(documentRoot, "label", "Answer the agents");
-    const answer = element(documentRoot, "textarea");
-    answer.id = `task-answer-${taskIdentity(task)}`;
-    answerLabel.setAttribute("for", answer.id);
-    answer.name = "answer";
-    answer.required = true;
-    answer.disabled = !controls.answer.enabled;
-    const send = element(documentRoot, "button", "Send answer", "button button-primary");
-    send.type = "submit";
-    send.disabled = !controls.answer.enabled;
-    answerForm.append(answerLabel, answer, send);
-    answerForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      onAction("answer", task, {answer: String(answer.value ?? "")});
-    });
-    card.append(answerForm);
-  }
-
   card.append(actions);
   container.replaceChildren(card);
   return container;
@@ -981,6 +1172,14 @@ export function projectChatMessagePath(projectId, sessionId) {
 }
 
 
+export function projectTaskMessagePath(projectId, sessionId, taskId) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  requireSafeId(taskId, "task_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/messages`;
+}
+
+
 export function projectTaskActionPath(projectId, sessionId, taskId, action) {
   requireSafeId(projectId, "project_id");
   requireSafeId(sessionId, "session_id");
@@ -989,6 +1188,271 @@ export function projectTaskActionPath(projectId, sessionId, taskId, action) {
     throw new Error("unsupported task action");
   }
   return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/${action}`;
+}
+
+
+function composerIdentity(state) {
+  const current = asObject(state);
+  return {
+    projectId: requireSafeId(current.projectId, "project_id"),
+    sessionId: requireSafeId(current.sessionId, "session_id"),
+  };
+}
+
+
+function userRecipient(value, allowTeam = true) {
+  if (value !== "fable" && value !== "sol" && (value !== "team" || !allowTeam)) {
+    throw new Error("recipient is unavailable");
+  }
+  return value;
+}
+
+
+function exactBinding(state, binding) {
+  const current = composerIdentity(state);
+  const candidate = asObject(binding);
+  if (
+    candidate.projectId !== current.projectId
+    || candidate.sessionId !== current.sessionId
+    || typeof candidate.taskId !== "string"
+    || !SAFE_ID.test(candidate.taskId)
+    || !Number.isInteger(candidate.revision)
+    || candidate.revision < 1
+    || !Number.isInteger(candidate.continuationGeneration)
+    || candidate.continuationGeneration < 1
+  ) {
+    throw new Error("bound reply is stale");
+  }
+  return {current, candidate};
+}
+
+
+export function composerRequest(state, binding, text, recipient = "fable") {
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw new Error("message text is required");
+  }
+  if (binding === null || binding === undefined) {
+    const current = composerIdentity(state);
+    return {
+      path: projectChatMessagePath(current.projectId, current.sessionId),
+      payload: {text, addressed_to: userRecipient(recipient)},
+    };
+  }
+  const {current, candidate} = exactBinding(state, binding);
+  if (candidate.kind === "question") {
+    requireSafeId(candidate.questionId, "question_id");
+    return {
+      path: projectTaskActionPath(current.projectId, current.sessionId, candidate.taskId, "answer"),
+      payload: {
+        text,
+        revision: candidate.revision,
+        question_id: candidate.questionId,
+        continuation_generation: candidate.continuationGeneration,
+      },
+    };
+  }
+  if (candidate.kind === "continuation") {
+    return {
+      path: projectTaskMessagePath(current.projectId, current.sessionId, candidate.taskId),
+      payload: {
+        text,
+        addressed_to: userRecipient(recipient, false),
+        revision: candidate.revision,
+        continuation_generation: candidate.continuationGeneration,
+      },
+    };
+  }
+  throw new Error("bound reply is unavailable");
+}
+
+
+export function exchangeGrantRequest(state, binding) {
+  const {current, candidate} = exactBinding(state, binding);
+  if (candidate.kind !== "exchange_permission") {
+    throw new Error("exchange permission is unavailable");
+  }
+  requireSafeId(candidate.requestId, "request_id");
+  return {
+    path: `/api/projects/${encodeURIComponent(current.projectId)}/chats/${encodeURIComponent(current.sessionId)}/tasks/${encodeURIComponent(candidate.taskId)}/exchanges/grant`,
+    payload: {
+      revision: candidate.revision,
+      continuation_generation: candidate.continuationGeneration,
+      request_id: candidate.requestId,
+    },
+  };
+}
+
+
+export function composerGuidance(state, binding, recipient = "fable") {
+  const current = asObject(state);
+  const gate = asObject(current.gate);
+  const readiness = typeof gate.guidance === "string" ? gate.guidance : "Actions are unavailable.";
+  if (binding !== null && binding !== undefined) {
+    return `${readiness} This reply remains bound to its exact task and continuation.`;
+  }
+  const route = recipient === "sol"
+    ? "Before approval, messages addressed to Sol are visibly routed through Fable."
+    : (recipient === "team"
+      ? "Before approval, messages addressed to Team are visibly routed through Fable."
+      : "Fable is the direct planner for new tasks.");
+  if (current.activeLease !== null && current.activeLease !== undefined) {
+    return `An agent is active. Select an exact Reply card to answer its bound question. ${route}`;
+  }
+  return `${readiness} ${route}`;
+}
+
+
+export function composerPresentation(state, binding, recipient = "fable") {
+  const current = asObject(state);
+  const gate = asObject(current.gate);
+  const boundReply = binding !== null && binding !== undefined;
+  const ordinaryLeaseLocked = current.activeLease !== null
+    && current.activeLease !== undefined
+    && !boundReply;
+  const selectedRecipient = recipient === "sol"
+    ? "Sol"
+    : (recipient === "team" ? "Team" : "Fable");
+  const disabled = gate.canCompose !== true
+    || current.sessionId === null
+    || current.sessionId === undefined
+    || ordinaryLeaseLocked;
+  return Object.freeze({
+    disabled,
+    recipientDisabled: disabled || binding?.kind === "question",
+    label: boundReply ? "Bound reply" : `Message ${selectedRecipient}`,
+    submit: boundReply ? "Send reply" : `Send to ${selectedRecipient}`,
+    guidance: composerGuidance(current, binding, recipient),
+  });
+}
+
+
+function pendingQuestionBinding(state, task) {
+  const snapshot = asObject(task);
+  const question = asObject(snapshot.pending_question);
+  const identity = composerIdentity(state);
+  if (
+    typeof snapshot.task_id !== "string"
+    || !SAFE_ID.test(snapshot.task_id)
+    || !Number.isInteger(snapshot.revision)
+    || snapshot.revision < 1
+    || !Number.isInteger(snapshot.continuation_generation)
+    || snapshot.continuation_generation < 1
+    || typeof question.question_id !== "string"
+    || !SAFE_ID.test(question.question_id)
+    || question.addressed_to !== "user"
+    || question.routed_to !== "user"
+    || !["fable", "sol"].includes(question.asked_by)
+    || typeof question.text !== "string"
+    || question.revision !== snapshot.revision
+    || question.continuation_generation !== snapshot.continuation_generation
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    kind: "question",
+    ...identity,
+    taskId: snapshot.task_id,
+    revision: snapshot.revision,
+    questionId: question.question_id,
+    continuationGeneration: snapshot.continuation_generation,
+    askedBy: question.asked_by,
+    text: question.text,
+  });
+}
+
+
+function exchangePermissionBinding(state, task) {
+  const snapshot = asObject(task);
+  const permission = asObject(snapshot.exchange_permission);
+  const identity = composerIdentity(state);
+  if (
+    typeof snapshot.task_id !== "string"
+    || !SAFE_ID.test(snapshot.task_id)
+    || !Number.isInteger(snapshot.revision)
+    || snapshot.revision < 1
+    || !Number.isInteger(snapshot.continuation_generation)
+    || snapshot.continuation_generation < 1
+    || typeof permission.request_id !== "string"
+    || !SAFE_ID.test(permission.request_id)
+    || permission.revision !== snapshot.revision
+    || permission.continuation_generation !== snapshot.continuation_generation
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    kind: "exchange_permission",
+    ...identity,
+    taskId: snapshot.task_id,
+    revision: snapshot.revision,
+    continuationGeneration: snapshot.continuation_generation,
+    requestId: permission.request_id,
+  });
+}
+
+
+function clearConversationActionCards(conversation) {
+  for (const node of Array.from(conversation?.children ?? [])) {
+    if (node.className !== "conversation-action-card") {
+      continue;
+    }
+    if (typeof node.remove === "function") {
+      node.remove();
+    } else if (typeof conversation.removeChild === "function") {
+      conversation.removeChild(node);
+    }
+  }
+}
+
+
+export function renderPendingConversationCards(documentRoot, tasks, handlers = {}, state = {}) {
+  const conversation = documentRoot.querySelector("#conversation");
+  if (!conversation) {
+    throw new Error("conversation region is missing");
+  }
+  clearConversationActionCards(conversation);
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const question = pendingQuestionBinding(state, task);
+    if (question !== null) {
+      const card = element(documentRoot, "article", undefined, "conversation-action-card");
+      card.setAttribute("aria-label", `${actorLabel(question.askedBy)} question for you`);
+      card.append(
+        element(documentRoot, "strong", `${actorLabel(question.askedBy)} → You`, "message-route"),
+        element(documentRoot, "p", question.text),
+        element(documentRoot, "p", `Task ${question.taskId} · r${question.revision} · question ${question.questionId} · generation ${question.continuationGeneration}`, "message-metadata"),
+      );
+      const reply = element(documentRoot, "button", "Reply", "button button-primary");
+      reply.type = "button";
+      reply.addEventListener("click", () => handlers.onReply?.(question));
+      card.append(reply);
+      appendConversationNode(documentRoot, conversation, card);
+    }
+    const permission = exchangePermissionBinding(state, task);
+    if (permission !== null) {
+      const card = element(documentRoot, "article", undefined, "conversation-action-card");
+      card.setAttribute("aria-label", "Exchange permission for you");
+      card.append(
+        element(documentRoot, "strong", "System → You", "message-route"),
+        element(documentRoot, "p", "Automatic exchange limit reached. Your direction is needed."),
+        element(documentRoot, "p", `Task ${permission.taskId} · r${permission.revision} · generation ${permission.continuationGeneration}`, "message-metadata"),
+      );
+      const reply = element(documentRoot, "button", "Reply", "button");
+      reply.type = "button";
+      reply.addEventListener("click", () => handlers.onReply?.(Object.freeze({
+        kind: "continuation",
+        projectId: permission.projectId,
+        sessionId: permission.sessionId,
+        taskId: permission.taskId,
+        revision: permission.revision,
+        continuationGeneration: permission.continuationGeneration,
+      })));
+      const grant = element(documentRoot, "button", "Allow 3 more exchanges", "button button-primary");
+      grant.type = "button";
+      grant.addEventListener("click", () => handlers.onGrant?.(permission));
+      card.append(reply, grant);
+      appendConversationNode(documentRoot, conversation, card);
+    }
+  }
+  return conversation;
 }
 
 
@@ -1545,6 +2009,10 @@ export function createProjectChatController({
   let projectRefreshPending = false;
   let selectionPending = false;
   let projectRefreshBlocksNavigation = false;
+  let selectedBootstrapRefreshTimer = null;
+  let selectedBootstrapRefreshInFlight = null;
+  let selectedBootstrapRefreshPending = false;
+  let selectedBootstrapRefreshGeneration = 0;
 
   function publish(nextState) {
     state = nextState;
@@ -1571,6 +2039,7 @@ export function createProjectChatController({
   function stopStream() {
     stream?.stop();
     stream = null;
+    invalidateSelectedBootstrapRefresh();
   }
 
   function navigationPending() {
@@ -1582,6 +2051,113 @@ export function createProjectChatController({
     if (projectRefreshInFlight !== null) {
       projectRefreshPending = true;
       projectRefreshBlocksNavigation = true;
+    }
+  }
+
+  function invalidateSelectedBootstrapRefresh() {
+    selectedBootstrapRefreshGeneration += 1;
+    if (selectedBootstrapRefreshTimer !== null) {
+      cancelSchedule(selectedBootstrapRefreshTimer);
+      selectedBootstrapRefreshTimer = null;
+    }
+    selectedBootstrapRefreshInFlight = null;
+    selectedBootstrapRefreshPending = false;
+  }
+
+  function scheduleSelectedBootstrapRefresh(projectId, sessionId, generation) {
+    if (selectedBootstrapRefreshInFlight !== null) {
+      selectedBootstrapRefreshPending = true;
+      return;
+    }
+    if (selectedBootstrapRefreshTimer !== null) {
+      return;
+    }
+    const refreshGeneration = selectedBootstrapRefreshGeneration;
+    selectedBootstrapRefreshTimer = schedule(() => {
+      selectedBootstrapRefreshTimer = null;
+      if (
+        refreshGeneration !== selectedBootstrapRefreshGeneration
+        || !selected(projectId, sessionId, generation)
+      ) {
+        return;
+      }
+      void requestSelectedBootstrapRefresh(
+        projectId,
+        sessionId,
+        generation,
+        false,
+      ).catch(() => {});
+    }, BOOTSTRAP_REFRESH_DELAY);
+  }
+
+  function requestSelectedBootstrapRefresh(projectId, sessionId, generation, explicit) {
+    if (!selected(projectId, sessionId, generation)) {
+      return Promise.resolve(false);
+    }
+    if (selectedBootstrapRefreshInFlight !== null || selectedBootstrapRefreshTimer !== null) {
+      if (explicit || selectedBootstrapRefreshInFlight !== null) {
+        selectedBootstrapRefreshPending = true;
+      }
+      return Promise.resolve(false);
+    }
+    return refreshSelectedBootstrapSingleFlight(
+      projectId,
+      sessionId,
+      generation,
+      selectedBootstrapRefreshGeneration,
+    );
+  }
+
+  async function refreshSelectedBootstrapSingleFlight(
+    projectId, sessionId, generation, refreshGeneration,
+  ) {
+    if (
+      refreshGeneration !== selectedBootstrapRefreshGeneration
+      || !selected(projectId, sessionId, generation)
+      || selectedBootstrapRefreshInFlight !== null
+    ) {
+      return false;
+    }
+    const cursor = state.lastSequence;
+    const flight = Object.freeze({projectId, sessionId, generation, refreshGeneration, cursor});
+    selectedBootstrapRefreshInFlight = flight;
+    let shouldFollowUp = false;
+    try {
+      const bootstrapData = await getJson(projectChatBootstrapPath(projectId, sessionId));
+      const stillSelected = refreshGeneration === selectedBootstrapRefreshGeneration
+        && selected(projectId, sessionId, generation);
+      if (!stillSelected) {
+        return false;
+      }
+      if (state.lastSequence !== cursor) {
+        shouldFollowUp = true;
+        return false;
+      }
+      const applied = applyBootstrap(state, bootstrapData);
+      if (applied.projectId !== projectId || applied.sessionId !== sessionId) {
+        throw new Error("bootstrap selection did not match the requested project chat");
+      }
+      publish({
+        ...applied,
+        projectLabel: projectLabelFor(applied, projectId),
+        navigationPending: navigationPending(),
+      });
+      startStream(projectId, sessionId);
+      return true;
+    } finally {
+      if (selectedBootstrapRefreshInFlight !== flight) {
+        return;
+      }
+      selectedBootstrapRefreshInFlight = null;
+      if (shouldFollowUp || selectedBootstrapRefreshPending) {
+        selectedBootstrapRefreshPending = false;
+        if (
+          refreshGeneration === selectedBootstrapRefreshGeneration
+          && selected(projectId, sessionId, generation)
+        ) {
+          scheduleSelectedBootstrapRefresh(projectId, sessionId, generation);
+        }
+      }
     }
   }
 
@@ -1612,6 +2188,7 @@ export function createProjectChatController({
     if (stream || !selected(projectId, sessionId, selectionGeneration)) {
       return;
     }
+    const streamSelectionGeneration = selectionGeneration;
     stream = createEventStream({
       sessionId,
       initialSequence: state.lastSequence,
@@ -1625,7 +2202,7 @@ export function createProjectChatController({
       bootstrap: (isCurrent) => bootstrapSelected(
         projectId,
         sessionId,
-        selectionGeneration,
+        streamSelectionGeneration,
         isCurrent,
       ),
       onEvent: (event) => {
@@ -1638,6 +2215,17 @@ export function createProjectChatController({
         publish({...state, tasks, selectedTaskId, lastSequence: sequence});
         const associatedTask = tasks.find((task) => taskIdentity(task) === event?.task_id);
         onEvent(event, associatedTask);
+        if (selectedBootstrapRefreshInFlight !== null) {
+          selectedBootstrapRefreshPending = true;
+        }
+        const taskState = asObject(event?.payload).state;
+        if (
+          event?.kind === "conversation"
+          || (event?.kind === "task_state"
+            && ["awaiting_user_input", "awaiting_scope_approval"].includes(taskState))
+        ) {
+          scheduleSelectedBootstrapRefresh(projectId, sessionId, streamSelectionGeneration);
+        }
         void refreshProjects().catch(() => {});
       },
       onStatus: (status) => {
@@ -1797,7 +2385,12 @@ export function createProjectChatController({
     if (typeof state.projectId !== "string" || typeof state.sessionId !== "string") {
       return false;
     }
-    return bootstrapSelected(state.projectId, state.sessionId, selectionGeneration);
+    return requestSelectedBootstrapRefresh(
+      state.projectId,
+      state.sessionId,
+      selectionGeneration,
+      true,
+    );
   }
 
   async function createChat() {
@@ -2169,10 +2762,16 @@ export function startBrowserApp(documentRoot, windowRoot) {
   };
   let controller = null;
   let ready = Promise.resolve(false);
+  let composerBinding = null;
 
   const composer = documentRoot.querySelector("#composer");
   const messageInput = documentRoot.querySelector("#message-input");
   const composerSubmit = documentRoot.querySelector("#composer-submit");
+  const composerLabel = documentRoot.querySelector("#composer-label");
+  const composerRecipient = documentRoot.querySelector("#composer-recipient");
+  const composerBindingNode = documentRoot.querySelector("#composer-binding");
+  const composerBindingText = documentRoot.querySelector("#composer-binding-text");
+  const composerClearBinding = documentRoot.querySelector("#composer-clear-binding");
   const guidance = documentRoot.querySelector("#composer-guidance");
   const usageModal = documentRoot.querySelector("#usage-modal");
   const usageForm = documentRoot.querySelector("#usage-credits-form");
@@ -2193,6 +2792,24 @@ export function startBrowserApp(documentRoot, windowRoot) {
 
   function selectedTask() {
     return state.tasks.find((task) => taskIdentity(task) === state.selectedTaskId) ?? null;
+  }
+
+  function bindingText(binding) {
+    if (binding?.kind === "question") {
+      return `Replying to ${actorLabel(binding.askedBy)} · task ${binding.taskId} · r${binding.revision} · question ${binding.questionId} · generation ${binding.continuationGeneration}`;
+    }
+    if (binding?.kind === "continuation") {
+      return `Replying on task ${binding.taskId} · r${binding.revision} · generation ${binding.continuationGeneration}`;
+    }
+    return "";
+  }
+
+  function setComposerBinding(binding) {
+    composerBinding = binding;
+    renderStatus();
+    if (binding !== null) {
+      messageInput.focus();
+    }
   }
 
   function renderStatus() {
@@ -2221,11 +2838,30 @@ export function startBrowserApp(documentRoot, windowRoot) {
       const branch = typeof state.branch === "string" ? state.branch : "checking";
       repoNode.textContent = `Project: ${project} · Branch: ${branch}`;
     }
-    messageInput.disabled = !state.gate.canCompose || state.sessionId === null;
-    composerSubmit.disabled = messageInput.disabled;
+    const boundReply = composerBinding !== null;
+    const selectedRecipient = composerRecipient?.value ?? "fable";
+    const presentation = composerPresentation(state, composerBinding, selectedRecipient);
+    messageInput.disabled = presentation.disabled;
+    composerSubmit.disabled = presentation.disabled;
+    if (composerRecipient) {
+      composerRecipient.disabled = presentation.recipientDisabled;
+    }
+    if (composerLabel) {
+      composerLabel.textContent = presentation.label;
+    }
+    composerSubmit.textContent = presentation.submit;
+    if (composerBindingNode) {
+      composerBindingNode.hidden = !boundReply;
+    }
+    if (composerBindingText) {
+      composerBindingText.textContent = boundReply ? bindingText(composerBinding) : "";
+    }
+    if (composerClearBinding) {
+      composerClearBinding.disabled = !boundReply;
+    }
     guidance.textContent = state.sessionId === null
-      ? `${state.gate.guidance} Waiting for the server session identifier.`
-      : state.gate.guidance;
+      ? `${presentation.guidance} Waiting for the server session identifier.`
+      : presentation.guidance;
   }
 
   function renderWorkspace() {
@@ -2261,6 +2897,20 @@ export function startBrowserApp(documentRoot, windowRoot) {
       gate: state.gate,
       onAction: handleTaskAction,
     });
+    renderPendingConversationCards(documentRoot, state.tasks, {
+      onReply: (binding) => setComposerBinding(binding),
+      onGrant: (binding) => {
+        void (async () => {
+          try {
+            const request = exchangeGrantRequest(state, binding);
+            await postJson(windowRoot.fetch.bind(windowRoot), request.path, request.payload, state.csrfToken);
+            await controller?.refreshSelectedBootstrap();
+          } catch (error) {
+            showToast(documentRoot, String(error.message ?? error), true);
+          }
+        })();
+      },
+    }, state);
   }
 
   function syncUsageModal() {
@@ -2366,7 +3016,20 @@ export function startBrowserApp(documentRoot, windowRoot) {
   composer.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = String(messageInput.value ?? "");
-    if (!state.gate.canCompose || !state.projectId || !state.sessionId || !text.trim()) {
+    if (
+      !state.gate.canCompose
+      || !state.projectId
+      || !state.sessionId
+      || !text.trim()
+      || (composerBinding === null && state.activeLease !== null)
+    ) {
+      return;
+    }
+    let request;
+    try {
+      request = composerRequest(state, composerBinding, text, composerRecipient?.value ?? "fable");
+    } catch (error) {
+      showToast(documentRoot, String(error.message ?? error), true);
       return;
     }
     messageInput.disabled = true;
@@ -2374,17 +3037,24 @@ export function startBrowserApp(documentRoot, windowRoot) {
     try {
       await postJson(
         windowRoot.fetch.bind(windowRoot),
-        projectChatMessagePath(state.projectId, state.sessionId),
-        {text},
+        request.path,
+        request.payload,
         state.csrfToken,
       );
       messageInput.value = "";
+      if (composerBinding !== null) {
+        composerBinding = null;
+        void controller?.refreshSelectedBootstrap().catch(() => {});
+      }
     } catch (error) {
       showToast(documentRoot, String(error.message ?? error), true);
     } finally {
       renderStatus();
     }
   });
+
+  composerRecipient?.addEventListener("change", renderStatus);
+  composerClearBinding?.addEventListener("click", () => setComposerBinding(null));
 
   usageCheckbox.addEventListener("change", () => {
     usageSubmit.disabled = !usageCheckbox.checked;

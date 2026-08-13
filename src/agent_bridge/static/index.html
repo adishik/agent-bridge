@@ -108,8 +108,16 @@
     </main>
 
     <form id="composer" aria-label="Message Fable">
-      <label for="message-input">Message Fable</label>
+      <label for="message-input" id="composer-label">Message Fable</label>
       <div class="composer-row">
+        <label class="composer-recipient" for="composer-recipient">
+          To
+          <select id="composer-recipient" name="addressed_to" disabled>
+            <option value="fable" selected>Fable</option>
+            <option value="sol">Sol</option>
+            <option value="team">Team</option>
+          </select>
+        </label>
         <textarea
           id="message-input"
           name="message"
@@ -122,8 +130,14 @@
           Send to Fable
         </button>
       </div>
+      <div id="composer-binding" class="composer-binding" hidden>
+        <span id="composer-binding-text"></span>
+        <button id="composer-clear-binding" class="button button-quiet" type="button">
+          Send a new task instead
+        </button>
+      </div>
       <p id="composer-guidance" class="form-guidance" role="status">
-        Checking Fable subscription authentication…
+        Fable receives planning messages. Before approval, messages addressed to Sol are visibly routed through Fable.
       </p>
     </form>
 

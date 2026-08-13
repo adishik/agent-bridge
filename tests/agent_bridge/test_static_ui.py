@@ -6,6 +6,14 @@ import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+)
+from agent_bridge.store import NewRequestPayload, SQLiteStore
+
 
 STATIC = Path("src/agent_bridge/static")
 
@@ -737,6 +745,393 @@ def test_conversation_is_bounded_and_metadata_classes_fail_closed() -> None:
       }
       if (replayTasks.length !== bridge.MAX_TASK_OVERVIEWS) process.exit(9);
       if (replayTasks[0].task_id !== `replay-${String(bridge.MAX_TASK_OVERVIEWS + 4).padStart(3, "0")}`) process.exit(10);
+    """
+    _run_module_harness(harness)
+
+
+def test_directed_conversation_cards_use_safe_envelopes_and_exact_bindings() -> None:
+    harness = r"""
+      class Node {
+        constructor(tag) {
+          this.tag = tag; this.children = []; this.attributes = {}; this.dataset = {};
+          this.className = ""; this._text = ""; this.listeners = {}; this.disabled = false;
+        }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        replaceChildren(...children) { this.children = [...children]; this._text = ""; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener(name, listener) { this.listeners[name] = listener; }
+        remove() { this.removed = true; }
+      }
+      const conversation = new Node("section");
+      const roots = {"#conversation": conversation, "#conversation-empty": null};
+      const documentRoot = {
+        createElement(tag) { return new Node(tag); },
+        querySelector(selector) { return roots[selector] ?? null; },
+      };
+      const solQuestion = {
+        kind: "conversation", actor: "sol", task_id: "task-a", sequence: 8,
+        payload: {
+              sender: "sol", addressed_to: "fable", routed_to: "fable", message_type: "question",
+              text: "Need the exact test evidence.", task_id: "task-a", revision: 2,
+              continuation_generation: 3, question_id: "question-a", reply_to_question_id: null,
+        },
+      };
+      const card = bridge.renderConversationEvent(documentRoot, solQuestion);
+      if (!card || !card.className.includes("message-sol") || !card.className.includes("target-fable")) process.exit(2);
+      const cardText = card.children.map((node) => node.textContent).join("\n");
+      if (!cardText.includes("Sol → Fable") || !cardText.includes("Task task-a · r2") || !cardText.includes("Question question-a")) process.exit(3);
+      if (!cardText.includes("S")) process.exit(4);
+      const routed = bridge.renderConversationEvent(documentRoot, {
+        kind: "conversation", actor: "user", task_id: null, payload: {
+              sender: "user", addressed_to: "sol", routed_to: "fable", message_type: "statement",
+              text: "Please plan this.", task_id: null, revision: null,
+              continuation_generation: null, question_id: null, reply_to_question_id: null,
+        },
+      });
+      if (!routed || !routed.children.map((node) => node.textContent).join("\n").includes("User → Fable")) process.exit(14);
+      if (!routed.children.map((node) => node.textContent).join("\n").includes("Addressed to Sol · routed to Fable before approval")) process.exit(15);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "conversation", payload: {sender: "<img>", text: "unsafe"}}) !== null) process.exit(5);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "conversation", actor: "sol", payload: {sender: "fable", addressed_to: "user", routed_to: "user", message_type: "statement", text: "ambiguous"}}) !== null) process.exit(16);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "agent_event", payload: {type: "command"}}) !== null) process.exit(6);
+
+      const bindings = [];
+      bridge.renderPendingConversationCards(documentRoot, [
+        {task_id: "task-a", revision: 2, continuation_generation: 3, pending_question: {
+          question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user",
+          text: "Which test?", revision: 2, continuation_generation: 3,
+        }},
+        {task_id: "task-b", revision: 5, continuation_generation: 7, pending_question: {
+          question_id: "question-b", asked_by: "fable", addressed_to: "user", routed_to: "user",
+          text: "Which scope?", revision: 5, continuation_generation: 7,
+        }},
+        {task_id: "task-c", revision: 1, continuation_generation: 4, exchange_permission: {
+          request_id: "permission-c", revision: 1, continuation_generation: 4,
+        }},
+      ], {
+        onReply(binding) { bindings.push(binding); },
+        onGrant(binding) { bindings.push(binding); },
+      }, {projectId: "project-a", sessionId: "chat-a"});
+      const actionCards = conversation.children.filter((node) => node.className === "conversation-action-card");
+      if (actionCards.length !== 3) process.exit(7);
+      const buttons = actionCards.flatMap((card) => card.children).filter((node) => node.tag === "button");
+      buttons.find((button) => button.textContent === "Reply").listeners.click();
+      buttons.find((button) => button.textContent === "Allow 3 more exchanges").listeners.click();
+      if (bindings.length !== 2 || bindings[0].taskId !== "task-a" || bindings[0].questionId !== "question-a") process.exit(8);
+      if (bindings[1].requestId !== "permission-c" || bindings[1].continuationGeneration !== 4) process.exit(9);
+
+      const state = {projectId: "project-a", sessionId: "chat-a"};
+      const ordinary = bridge.composerRequest(state, null, "Plan this", "sol");
+      if (ordinary.path !== "/api/projects/project-a/chats/chat-a/messages" || JSON.stringify(ordinary.payload) !== '{"text":"Plan this","addressed_to":"sol"}') process.exit(10);
+      const answer = bridge.composerRequest(state, bindings[0], "Use the focused lane.", "fable");
+      if (answer.path !== "/api/projects/project-a/chats/chat-a/tasks/task-a/answer" || JSON.stringify(answer.payload) !== '{"text":"Use the focused lane.","revision":2,"question_id":"question-a","continuation_generation":3}') process.exit(11);
+      const grant = bridge.exchangeGrantRequest(state, bindings[1]);
+      if (grant.path !== "/api/projects/project-a/chats/chat-a/tasks/task-c/exchanges/grant" || JSON.stringify(grant.payload) !== '{"revision":1,"continuation_generation":4,"request_id":"permission-c"}') process.exit(12);
+      let staleFailedClosed = false;
+      try { bridge.composerRequest({...state, sessionId: "other-chat"}, bindings[0], "wrong", "fable"); }
+      catch { staleFailedClosed = true; }
+      if (!staleFailedClosed) process.exit(13);
+    """
+    _run_module_harness(harness)
+
+
+def test_directed_envelope_schema_matrix_matches_all_six_contract_types() -> None:
+    harness = r"""
+      class Node {
+        constructor(tag) { this.tag = tag; this.children = []; this.attributes = {}; this.dataset = {}; this.className = ""; this._text = ""; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener() {}
+      }
+      const conversation = new Node("section");
+      const documentRoot = {createElement(tag) { return new Node(tag); }, querySelector(selector) { return selector === "#conversation" ? conversation : null; }};
+      const base = {sender: "user", addressed_to: "team", routed_to: "fable", text: "safe", task_id: null, revision: null, continuation_generation: null, question_id: null, reply_to_question_id: null};
+      const valid = [
+        {...base, message_type: "statement"},
+        {...base, message_type: "intervention", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "approval", text: "Allowed 3 more exchanges.", task_id: "task-1", revision: 1},
+        {...base, sender: "system", addressed_to: "user", routed_to: "user", message_type: "status", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, sender: "sol", addressed_to: "fable", routed_to: "fable", message_type: "question", task_id: "task-1", revision: 1, continuation_generation: 2, question_id: "question-1"},
+        {...base, sender: "fable", addressed_to: "sol", routed_to: "sol", message_type: "answer", task_id: "task-1", revision: 1, continuation_generation: 2, reply_to_question_id: "question-1"},
+      ];
+      for (const payload of valid) {
+        const event = {kind: "conversation", actor: payload.sender, task_id: payload.task_id, payload};
+        const card = bridge.renderConversationEvent(documentRoot, event);
+        if (bridge.conversationPresentation(event) === "hidden" || card === null) process.exit(2);
+        if (payload.message_type === "approval" && !card.children.map((node) => node.textContent).join("\n").includes("Allowed 3 more exchanges.")) process.exit(4);
+      }
+      const invalid = [
+        {...base, message_type: "approval", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "question", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "answer", task_id: "task-1", revision: 1, continuation_generation: 2, question_id: "question-1"},
+        {...base, message_type: "approval", task_id: "task-1", revision: 1, question_id: "question-1"},
+        {...base, sender: "fable", message_type: "status"},
+        {...base, message_type: "statement", task_id: "task-1", revision: null, continuation_generation: null},
+        {...base, message_type: "statement", text: "unsafe\ncontrol"},
+        {...base, message_type: "statement", unexpected: "audit only"},
+      ];
+      for (const payload of invalid) {
+        const event = {kind: "conversation", actor: payload.sender, task_id: payload.task_id, payload};
+        if (bridge.conversationPresentation(event) !== "hidden" || bridge.renderConversationEvent(documentRoot, event) !== null) process.exit(3);
+      }
+    """
+    _run_module_harness(harness)
+
+
+def test_directed_envelopes_match_real_store_outer_associations_and_text_contract(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "directed-events.sqlite3", clock=lambda: "2026-08-12T00:00:00Z")
+    store.create_session("chat-real", "/not-a-real-repository")
+    store.prepare_new_request_action(
+        project_id="project-real",
+        session_id="chat-real",
+        task_id="new-task",
+        generation=1,
+        payload=NewRequestPayload("Route this through the team.", ConversationTarget.TEAM),
+    )
+    store.append_event(
+        "chat-real", "bound-task", "sol", "conversation", ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact task contract applies?",
+            task_id="bound-task",
+            revision=2,
+            continuation_generation=3,
+            question_id="question-real",
+        ).to_dict(),
+    )
+    store.append_event(
+        "chat-real", "bound-task", "fable", "conversation", ConversationEnvelope(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.ANSWER,
+            text="Use the persisted task contract.",
+            task_id="bound-task",
+            revision=2,
+            continuation_generation=3,
+            reply_to_question_id="question-real",
+        ).to_dict(),
+    )
+    produced = [event.to_dict() for event in store.events_after("chat-real", 0)]
+    store.close()
+    harness = f"""
+      const produced = {json.dumps(produced)};
+      for (const event of produced) {{
+        if (bridge.conversationPresentation(event) === "hidden") process.exit(2);
+      }}
+      const unbound = produced[0];
+      if (unbound.task_id !== "new-task" || unbound.payload.task_id !== null) process.exit(3);
+      const mismatchedOuter = {{...produced[1], task_id: "other-task"}};
+      if (bridge.conversationPresentation(mismatchedOuter) !== "hidden") process.exit(4);
+      const unsafeOuter = {{...produced[1], task_id: "bad/task"}};
+      if (bridge.conversationPresentation(unsafeOuter) !== "hidden") process.exit(5);
+      const base = {{...unbound.payload, message_type: "statement"}};
+      const valid = [
+        "x".repeat(16384),
+        "é".repeat(8192),
+        "😀".repeat(4096),
+      ];
+      for (const text of valid) {{
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text}}}}) === "hidden") process.exit(6);
+      }}
+      const originalTextEncoder = globalThis.TextEncoder;
+      try {{
+        delete globalThis.TextEncoder;
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(8);
+        globalThis.TextEncoder = {{}};
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(9);
+        globalThis.TextEncoder = class {{ encode() {{ throw new Error("encoder failed"); }} }};
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(10);
+      }} finally {{
+        globalThis.TextEncoder = originalTextEncoder;
+      }}
+      const invalid = [
+        "   ", "\\u0085", "\\u2003", "x".repeat(16385), "é".repeat(8193), "😀".repeat(4097),
+        "line\\nfeed", "bad\\u007fdelete", "high\\ud800", "low\\udc00",
+      ];
+      for (const text of invalid) {{
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text}}}}) !== "hidden") process.exit(7);
+      }}
+    """
+    _run_module_harness(harness)
+
+
+def test_composer_guidance_preserves_recipient_routing_through_lease_and_binding() -> None:
+    harness = r"""
+      const ready = {sessionId: "chat-a", gate: {canCompose: true, guidance: "Ready for a new Fable plan."}, activeLease: null};
+      if (!bridge.composerGuidance(ready, null, "fable").includes("Fable is the direct planner")) process.exit(2);
+      if (!bridge.composerGuidance(ready, null, "sol").includes("addressed to Sol are visibly routed through Fable")) process.exit(3);
+      if (!bridge.composerGuidance(ready, null, "team").includes("addressed to Team are visibly routed through Fable")) process.exit(4);
+      const leased = {...ready, activeLease: {projectId: "project-a"}};
+      const leasedGuidance = bridge.composerGuidance(leased, null, "sol");
+      if (!leasedGuidance.includes("An agent is active") || !leasedGuidance.includes("routed through Fable")) process.exit(5);
+      const boundGuidance = bridge.composerGuidance(leased, {kind: "question"}, "sol");
+      if (!boundGuidance.includes("exact task and continuation") || boundGuidance.includes("An agent is active")) process.exit(6);
+      const sol = bridge.composerPresentation(ready, null, "sol");
+      if (sol.disabled || sol.recipientDisabled || sol.label !== "Message Sol" || sol.submit !== "Send to Sol" || !sol.guidance.includes("routed through Fable")) process.exit(7);
+      const lease = bridge.composerPresentation(leased, null, "team");
+      if (!lease.disabled || !lease.recipientDisabled || !lease.guidance.includes("routed through Fable")) process.exit(8);
+      const bound = bridge.composerPresentation(leased, {kind: "question"}, "sol");
+      if (bound.disabled || !bound.recipientDisabled || bound.label !== "Bound reply" || bound.submit !== "Send reply") process.exit(9);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_events_coalesce_selected_bootstrap_refresh_and_drop_stale_switch() -> None:
+    harness = r"""
+      const scheduled = [];
+      const sockets = [];
+      class Socket {
+        constructor() { this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const pendingTask = {
+        task_id: "task-a", revision: 1, state: "awaiting_user_input", continuation_generation: 2,
+        exchange_allowance: 0, exchange_consumed: 3, pending_question: {
+          question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user",
+          text: "Which exact option?", revision: 1, continuation_generation: 2,
+        }, exchange_permission: {request_id: "permission-a", revision: 1, continuation_generation: 2},
+      };
+      let alphaBootstraps = 0;
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, projects: [
+          {project_id: "alpha", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "beta", label: "Beta", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ], active_lease: null})});
+        if (url === "/api/projects/alpha/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "A", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "B", latest_sequence: 0}]})});
+        if (url === "/api/projects/alpha/chats/chat-a/bootstrap") {
+          alphaBootstraps += 1;
+          return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "alpha", session_id: "chat-a", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: alphaBootstraps === 1 ? [{task_id: "task-a", revision: 1, state: "sol_running"}] : [pendingTask]})});
+        }
+        if (url === "/api/projects/beta/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "beta", session_id: "chat-b", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []})});
+        throw new Error(`unexpected ${url}`);
+      };
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket,
+        schedule(callback) { scheduled.push(callback); return scheduled.length; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 1, kind: "conversation", actor: "sol", task_id: "task-a", payload: {}})});
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 2, kind: "task_state", actor: "coordinator", task_id: "task-a", payload: {state: "awaiting_user_input", revision: 1}})});
+      if (scheduled.length !== 1) process.exit(2);
+      scheduled.shift()();
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+      if (alphaBootstraps !== 2 || controller.state.tasks[0].pending_question?.question_id !== "question-a" || controller.state.tasks[0].exchange_permission?.request_id !== "permission-a") process.exit(3);
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 3, kind: "task_state", actor: "coordinator", task_id: "task-a", payload: {state: "awaiting_user_input", revision: 1}})});
+      if (scheduled.length !== 1) process.exit(4);
+      await controller.selectProject("beta");
+      scheduled.shift()();
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+      if (controller.state.projectId !== "beta" || controller.state.sessionId !== "chat-b" || alphaBootstraps !== 2) process.exit(5);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_refresh_is_single_flight_cursor_guarded_and_cancellable() -> None:
+    harness = r"""
+      const scheduled = [];
+      const sockets = [];
+      const deferred = [];
+      class Socket {
+        constructor() { this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const bootstrap = (projectId, sessionId, tasks = []) => ({
+        csrf_token: "csrf", usage_credits_acknowledged: true, project_id: projectId, session_id: sessionId,
+        fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", replay_after: 0, tasks,
+      });
+      const baseTask = {task_id: "task-a", revision: 1, state: "sol_running"};
+      const freshTask = {task_id: "task-a", revision: 1, state: "awaiting_user_input", continuation_generation: 2,
+        pending_question: {question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user", text: "Which option?", revision: 1, continuation_generation: 2},
+        exchange_permission: {request_id: "permission-a", revision: 1, continuation_generation: 2}};
+      let alphaCalls = 0;
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, projects: [
+          {project_id: "alpha", label: "Alpha", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "beta", label: "Beta", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ], active_lease: null})});
+        if (url === "/api/projects/alpha/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "A", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "B", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => bootstrap("beta", "chat-b")});
+        if (url === "/api/projects/alpha/chats/chat-a/bootstrap") {
+          alphaCalls += 1;
+          if (alphaCalls === 1 || alphaCalls === 4 || alphaCalls === 6 || alphaCalls === 8) return Promise.resolve({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+          return new Promise((resolve) => deferred.push(resolve));
+        }
+        throw new Error(`unexpected ${url}`);
+      };
+      const flush = async () => { for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); };
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket,
+        schedule(callback) { scheduled.push(callback); return scheduled.length; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      const emit = (socket, sequence) => socket.listeners.message({data: JSON.stringify({sequence, kind: "conversation", actor: "sol", task_id: "task-a", payload: {}})});
+      emit(sockets[0], 2);
+      emit(sockets[0], 1);
+      if (scheduled.length !== 1 || controller.state.lastSequence !== 2) process.exit(2);
+      void controller.refreshSelectedBootstrap();
+      if (alphaCalls !== 1 || scheduled.length !== 1) process.exit(14);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 2 || deferred.length !== 1) process.exit(3);
+      emit(sockets[0], 3);
+      emit(sockets[0], 4);
+      if (scheduled.length !== 0) process.exit(4);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (controller.state.lastSequence !== 4 || scheduled.length !== 1) process.exit(5);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 3 || deferred.length !== 1) process.exit(6);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [freshTask])});
+      await flush();
+      if (controller.state.tasks[0].pending_question?.question_id !== "question-a") process.exit(7);
+      emit(sockets[0], 5);
+      if (scheduled.length !== 1) process.exit(8);
+      controller.stop();
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 3) process.exit(9);
+      await controller.selectChat("alpha", "chat-a");
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 5 || deferred.length !== 1) process.exit(10);
+      emit(sockets[1], 1);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (scheduled.length !== 1 || controller.state.lastSequence !== 1) process.exit(11);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 6) process.exit(15);
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 7 || deferred.length !== 1) process.exit(16);
+      controller.stop();
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (scheduled.length !== 0 || controller.state.lastSequence !== 1) process.exit(17);
+      await controller.selectChat("alpha", "chat-a");
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 9 || deferred.length !== 1) process.exit(12);
+      const switchPromise = controller.selectProject("beta");
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [freshTask])});
+      await switchPromise;
+      await flush();
+      if (controller.state.projectId !== "beta" || controller.state.sessionId !== "chat-b" || scheduled.length !== 0) process.exit(13);
     """
     _run_module_harness(harness)
 
