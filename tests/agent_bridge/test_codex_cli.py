@@ -16,7 +16,13 @@ from agent_bridge.adapters.codex_cli import (
     _create_sealed_sol_schema_memfd,
     materialize_sol_schema_file,
 )
-from agent_bridge.contracts import SOL_OUTCOME_SCHEMA, TaskBrief
+from agent_bridge.contracts import (
+    FABLE_CLARIFICATION_SCHEMA,
+    REVIEW_VERDICT_SCHEMA,
+    SOL_OUTCOME_SCHEMA,
+    SolOutcome,
+    TaskBrief,
+)
 from agent_bridge.process import ProcessRunner
 
 
@@ -729,3 +735,268 @@ def test_interrupted_sol_run_returns_partial_result_only_after_observed_thread(
         _assert_no_secret_sentinel(result)
 
     asyncio.run(scenario())
+
+
+def test_sol_outcome_projects_directed_question_without_changing_absent_bytes() -> None:
+    payload = {
+        "status": "question",
+        "summary": "One bounded ambiguity remains.",
+        "changed_files": [],
+        "commands_run": [],
+        "known_failures": [],
+        "remaining_risks": ["The accepted evidence location is ambiguous."],
+        "architecture_docs": "No architecture update is required.",
+        "question": {
+            "ambiguity": "Which focused test should run?",
+            "why_it_matters": "The answer determines the evidence command.",
+            "options": ["adapter test", "contract test"],
+            "recommendation": "Ask Fable for approved execution guidance.",
+            "can_continue_safely": False,
+        },
+    }
+    directed_question = {
+        "addressed_to": "fable",
+        "text": "Which focused test is within the approved brief?",
+        "reason": "Sol must not decide scope independently.",
+    }
+
+    assert SolOutcome.from_dict(payload).to_dict() == payload
+    outcome = SolOutcome.from_dict({
+        **payload,
+        "question": {**payload["question"], "directed_question": directed_question},
+    })
+
+    assert outcome.question is not None
+    assert outcome.question.directed_question is not None
+    assert outcome.question.directed_question.addressed_to == "fable"
+    assert outcome.to_dict()["question"]["directed_question"] == directed_question
+
+
+def test_sol_legacy_no_question_contract_keeps_its_exact_json_bytes() -> None:
+    payload = {
+        "status": "question",
+        "summary": "One bounded ambiguity remains.",
+        "changed_files": [],
+        "commands_run": [],
+        "known_failures": [],
+        "remaining_risks": ["The accepted evidence location is ambiguous."],
+        "architecture_docs": "No architecture update is required.",
+        "question": {
+            "ambiguity": "Which focused test should run?",
+            "why_it_matters": "The answer determines the evidence command.",
+            "options": ["adapter test", "contract test"],
+            "recommendation": "Ask Fable for approved execution guidance.",
+            "can_continue_safely": False,
+        },
+    }
+
+    assert json.dumps(
+        SolOutcome.from_dict(payload).to_dict(),
+        separators=(",", ":"),
+    ).encode("utf-8") == (
+        b'{"status":"question","summary":"One bounded ambiguity remains.",'
+        b'"changed_files":[],"commands_run":[],"known_failures":[],'
+        b'"remaining_risks":["The accepted evidence location is ambiguous."],'
+        b'"architecture_docs":"No architecture update is required.",'
+        b'"question":{"ambiguity":"Which focused test should run?",'
+        b'"why_it_matters":"The answer determines the evidence command.",'
+        b'"options":["adapter test","contract test"],'
+        b'"recommendation":"Ask Fable for approved execution guidance.",'
+        b'"can_continue_safely":false}}'
+    )
+
+
+@pytest.mark.parametrize(
+    "directed_question",
+    [
+        {"addressed_to": "team", "text": "Which test?", "reason": "Evidence is needed."},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "routed_to": "fable"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "path": "/tmp/outside"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "command": "git reset"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "environment": "secret"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "session": "other"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "Evidence is needed.", "thread": "other"},
+        {"addressed_to": "fable", "text": "Which test?", "reason": "contains\x7fcontrol"},
+        {"addressed_to": "fable", "text": "x" * (16 * 1024 + 1), "reason": "Evidence is needed."},
+    ],
+)
+def test_sol_directed_question_projection_rejects_unroutable_or_unbounded_fields(
+    directed_question: dict[str, str],
+) -> None:
+    payload = {
+        "status": "question",
+        "summary": "One bounded ambiguity remains.",
+        "changed_files": [],
+        "commands_run": [],
+        "known_failures": [],
+        "remaining_risks": ["The accepted evidence location is ambiguous."],
+        "architecture_docs": "No architecture update is required.",
+        "question": {
+            "ambiguity": "Which focused test should run?",
+            "why_it_matters": "The answer determines the evidence command.",
+            "options": ["adapter test", "contract test"],
+            "recommendation": "Ask Fable for approved execution guidance.",
+            "can_continue_safely": False,
+            "directed_question": directed_question,
+        },
+    }
+
+    with pytest.raises(ValueError):
+        SolOutcome.from_dict(payload)
+
+
+def test_answer_fable_question_resumes_exact_thread_with_original_brief_and_sol_authority(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        prompt = "Fable asks: --sandbox danger --cd /outside"
+        result = await _adapter(fake_codex, tmp_path).answer_fable_question(
+            run_id="answer-fable-question-1",
+            thread_id=THREAD_ID,
+            brief=brief,
+            prompt=prompt,
+        )
+
+        assert result.cli_session_id == THREAD_ID
+        assert result.payload is not None
+        assert result.payload["status"] == "completed"
+        argv = json.loads((tmp_path / "captured-codex-argv.json").read_text())
+        assert argv[:4] == ["exec", "resume", "--json", "--model"]
+        assert argv[-2] == THREAD_ID
+        assert prompt not in argv[:-1]
+        assert prompt in argv[-1]
+        assert json.dumps(brief.to_dict(), separators=(",", ":"), sort_keys=True) in argv[-1]
+        assert "Sol may clarify approved execution but cannot widen scope" in argv[-1]
+        assert "original approved TaskBrief revision" in argv[-1]
+        assert "--sandbox" not in argv
+        assert "--approve-for-me" not in argv
+        assert "--cd" not in argv
+        schema_argument = argv[argv.index("--output-schema") + 1]
+        assert schema_argument.startswith("/proc/self/fd/")
+
+    asyncio.run(scenario())
+
+
+def test_answer_fable_question_accepts_the_strict_directed_question_projection(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        result = await _adapter(
+            fake_codex,
+            tmp_path,
+            FAKE_CODEX_DIRECTED_QUESTION_TARGET="fable",
+        ).answer_fable_question(
+            run_id="answer-fable-question-projection",
+            thread_id=THREAD_ID,
+            brief=brief,
+            prompt="Answer Fable.",
+        )
+
+        assert result.payload is not None
+        assert result.payload["status"] == "question"
+        assert result.payload["question"]["directed_question"] == {
+            "addressed_to": "fable",
+            "text": "Which focused test is approved?",
+            "reason": "Sol cannot widen the approved execution scope.",
+        }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "thread_id",
+    ("", None, "--last", "thread id", "thread\nnext", "not-a-uuid"),
+)
+def test_answer_fable_question_rejects_untrusted_thread_ids_before_any_invocation(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path, thread_id: object,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="canonical UUID"):
+            await _adapter(fake_codex, tmp_path).answer_fable_question(
+                run_id="answer-fable-question-invalid",
+                thread_id=thread_id,  # type: ignore[arg-type]
+                brief=brief,
+                prompt="Answer Fable.",
+            )
+        assert not (tmp_path / "captured-codex-argv.json").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("extra_env", "match"),
+    [
+        ({"FAKE_CODEX_THREAD_ID": "0199a213-81c0-7800-8aa1-bbab2a035a54"}, "different thread"),
+        ({"FAKE_CODEX_THREAD_ID": "--last"}, "canonical thread ID"),
+        ({"FAKE_CODEX_MODE": "conflicting_thread"}, "conflicting"),
+    ],
+)
+def test_answer_fable_question_hides_rejected_provider_identity_from_partial_results(
+    fake_codex: Path,
+    brief: TaskBrief,
+    tmp_path: Path,
+    extra_env: dict[str, str],
+    match: str,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(CodexRunError, match=match) as raised:
+            await _adapter(fake_codex, tmp_path, **extra_env).answer_fable_question(
+                run_id="answer-fable-question-mismatch",
+                thread_id=THREAD_ID,
+                brief=brief,
+                prompt="Answer Fable.",
+            )
+        result = raised.value.result
+        assert result is not None
+        assert result.cli_session_id is None
+        assert result.payload is None
+        assert all("thread_id" not in event for event in result.events)
+        _assert_no_secret_sentinel(raised.value)
+        _assert_no_secret_sentinel(result)
+
+    asyncio.run(scenario())
+
+
+def test_answer_fable_question_rejects_a_missing_continuity_thread_before_partial_result_exposure(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(CodexRunError, match="missing.*thread") as raised:
+            await _adapter(
+                fake_codex,
+                tmp_path,
+                FAKE_CODEX_MODE="missing_thread",
+                FAKE_CODEX_THREAD_ID="",
+            ).answer_fable_question(
+                run_id="answer-fable-question-missing-continuity",
+                thread_id=THREAD_ID,
+                brief=brief,
+                prompt="Answer Fable.",
+            )
+        result = raised.value.result
+        assert result is not None
+        assert result.cli_session_id is None
+        assert result.payload is None
+        assert all("thread_id" not in event for event in result.events)
+
+    asyncio.run(scenario())
+
+
+def test_sealed_sol_schema_requires_every_declared_object_property() -> None:
+    def assert_required(schema: object) -> None:
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            assert set(properties).issubset(set(schema.get("required", [])))
+            for property_schema in properties.values():
+                assert_required(property_schema)
+        for value in schema.values():
+            if isinstance(value, list):
+                for item in value:
+                    assert_required(item)
+            elif isinstance(value, dict):
+                assert_required(value)
+
+    for schema in (SOL_OUTCOME_SCHEMA, FABLE_CLARIFICATION_SCHEMA, REVIEW_VERDICT_SCHEMA):
+        assert_required(schema)

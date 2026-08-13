@@ -213,6 +213,7 @@ def _question_outcome() -> dict[str, object]:
             "options": ["src/agent_bridge", "tests/agent_bridge"],
             "recommendation": "Use src/agent_bridge.",
             "can_continue_safely": False,
+            "directed_question": None,
         },
     }
 
@@ -299,6 +300,19 @@ def _main() -> int:
     is_resume = len(argv) > 1 and argv[1] == "resume"
     fallback = _completed_outcome() if is_resume else _question_outcome()
     payload, scenario_mode = _scenario_outcome(fallback)
+    directed_question_target = os.environ.get("FAKE_CODEX_DIRECTED_QUESTION_TARGET")
+    if directed_question_target is not None:
+        if directed_question_target not in {"user", "fable", "sol"}:
+            raise _FakeConfigurationError("directed question target is invalid")
+        payload = _question_outcome()
+        question = payload["question"]
+        if not isinstance(question, dict):
+            raise _FakeConfigurationError("directed question fixture is invalid")
+        question["directed_question"] = {
+            "addressed_to": directed_question_target,
+            "text": "Which focused test is approved?",
+            "reason": "Sol cannot widen the approved execution scope.",
+        }
     mode = scenario_mode or os.environ.get("FAKE_CODEX_MODE", "success")
     if mode == "slow_before_thread":
         time.sleep(60)

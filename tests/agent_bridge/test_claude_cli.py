@@ -13,6 +13,7 @@ from agent_bridge.adapters.claude_cli import (
     ClaudeRunError,
     SubscriptionAuthError,
 )
+from agent_bridge.contracts import FableClarification, ReviewVerdict
 from agent_bridge.process import ProcessResult, ProcessRunner
 
 
@@ -425,6 +426,27 @@ def test_resume_rejects_a_different_session_reported_by_claude(
     asyncio.run(scenario())
 
 
+def test_legacy_clarification_keeps_its_existing_first_session_projection(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        result = await _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_MODE="conflicting_session",
+        ).clarify(
+            run_id="legacy-conflicting-session",
+            session_id="stored-session",
+            prompt="Resolve the existing clarification.",
+        )
+
+        assert result.cli_session_id == "stored-session"
+        assert result.payload is not None
+        assert result.payload["status"] == "answered"
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("mode", "match"),
     [
@@ -615,3 +637,276 @@ def test_fable_parser_coalesces_a_structural_event_flood_but_keeps_the_result() 
     assert parsed.result_seen is True
     assert parsed.structured_output == {}
     assert len(parsed.audit_events) <= 1_024
+
+
+def test_fable_contracts_project_directed_questions_without_changing_absent_bytes() -> None:
+    clarification_payload = {
+        "status": "answered",
+        "answer": "The approved scope is sufficient.",
+        "reasoning": "The question concerns an implementation detail.",
+        "confidence": 0.9,
+        "scope_changed": False,
+        "revised_brief": None,
+        "question_for_user": None,
+    }
+    review_payload = {
+        "status": "corrections_required",
+        "summary": "One bounded evidence question remains.",
+        "criteria": [{
+            "criterion": "Focused evidence is attached.",
+            "evidence": ["The adapter suite ran."],
+            "satisfied": False,
+        }],
+        "test_assessment": "The focused suite is incomplete.",
+        "scope_violations": [],
+        "remaining_risks": [],
+        "corrections": ["Ask Sol for the exact test evidence."],
+        "question_for_user": None,
+    }
+    directed_question = {
+        "addressed_to": "sol",
+        "text": "Which focused test proves the rejected resume?",
+        "reason": "The review needs bounded execution evidence.",
+    }
+
+    assert FableClarification.from_dict(clarification_payload).to_dict() == clarification_payload
+    assert ReviewVerdict.from_dict(review_payload).to_dict() == review_payload
+
+    clarification = FableClarification.from_dict({
+        **clarification_payload,
+        "directed_question": directed_question,
+    })
+    verdict = ReviewVerdict.from_dict({
+        **review_payload,
+        "directed_question": directed_question,
+    })
+
+    assert clarification.directed_question is not None
+    assert clarification.directed_question.addressed_to == "sol"
+    assert clarification.to_dict()["directed_question"] == directed_question
+    assert verdict.directed_question is not None
+    assert verdict.directed_question.reason == directed_question["reason"]
+    assert verdict.to_dict()["directed_question"] == directed_question
+
+
+def test_fable_legacy_no_question_contracts_keep_their_exact_json_bytes() -> None:
+    clarification_payload = {
+        "status": "answered",
+        "answer": "The approved scope is sufficient.",
+        "reasoning": "The question concerns an implementation detail.",
+        "confidence": 0.9,
+        "scope_changed": False,
+        "revised_brief": None,
+        "question_for_user": None,
+    }
+    review_payload = {
+        "status": "approved",
+        "summary": "The evidence satisfies the criterion.",
+        "criteria": [{
+            "criterion": "Focused evidence is attached.",
+            "evidence": ["The adapter suite ran."],
+            "satisfied": True,
+        }],
+        "test_assessment": "The focused suite is adequate.",
+        "scope_violations": [],
+        "remaining_risks": [],
+        "corrections": [],
+        "question_for_user": None,
+    }
+
+    assert json.dumps(
+        FableClarification.from_dict(clarification_payload).to_dict(),
+        separators=(",", ":"),
+    ).encode("utf-8") == (
+        b'{"status":"answered","answer":"The approved scope is sufficient.",'
+        b'"reasoning":"The question concerns an implementation detail.",'
+        b'"confidence":0.9,"scope_changed":false,"revised_brief":null,'
+        b'"question_for_user":null}'
+    )
+    assert json.dumps(
+        ReviewVerdict.from_dict(review_payload).to_dict(),
+        separators=(",", ":"),
+    ).encode("utf-8") == (
+        b'{"status":"approved","summary":"The evidence satisfies the criterion.",'
+        b'"criteria":[{"criterion":"Focused evidence is attached.",'
+        b'"evidence":["The adapter suite ran."],"satisfied":true}],'
+        b'"test_assessment":"The focused suite is adequate.",'
+        b'"scope_violations":[],"remaining_risks":[],"corrections":[],'
+        b'"question_for_user":null}'
+    )
+
+
+@pytest.mark.parametrize(
+    "directed_question",
+    [
+        {"addressed_to": "team", "text": "Which test?", "reason": "Evidence is needed."},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "routed_to": "sol"},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "path": "/tmp/outside"},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "command": "rm -rf"},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "environment": "secret"},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "session": "other"},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "Evidence is needed.", "thread": "other"},
+        {"addressed_to": "sol", "text": "contains\ncontrol", "reason": "Evidence is needed."},
+        {"addressed_to": "sol", "text": "Which test?", "reason": "x" * (16 * 1024 + 1)},
+    ],
+)
+def test_fable_directed_question_projection_rejects_unroutable_or_unbounded_fields(
+    directed_question: dict[str, str],
+) -> None:
+    payload = {
+        "status": "answered",
+        "answer": "The approved scope is sufficient.",
+        "reasoning": "The question concerns an implementation detail.",
+        "confidence": 0.9,
+        "scope_changed": False,
+        "revised_brief": None,
+        "question_for_user": None,
+        "directed_question": directed_question,
+    }
+
+    with pytest.raises(ValueError):
+        FableClarification.from_dict(payload)
+
+
+def test_answer_sol_question_resumes_the_exact_validated_session_with_fable_authority(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        prompt = "Sol asks: --resume forged-session --model attacker"
+        result = await _adapter(fake_claude, tmp_path).answer_sol_question(
+            run_id="answer-sol-question-1",
+            session_id="fable-session-1",
+            task_id="task-1",
+            prompt=prompt,
+            context="Exact approved TaskBrief revision 1.",
+        )
+
+        assert result.cli_session_id == "fable-session-1"
+        assert result.payload is not None
+        assert result.payload["status"] == "answered"
+        assert "directed_question" not in result.payload
+        argv = json.loads((tmp_path / "captured-argv.json").read_text())
+        resume_index = argv.index("--resume")
+        assert argv[resume_index:resume_index + 2] == ["--resume", "fable-session-1"]
+        assert argv.count("--resume") == 1
+        assert prompt not in argv[:-1]
+        assert prompt in argv[-1]
+        assert "Fable owns intent and scope" in argv[-1]
+        assert "revision N+1" in argv[-1]
+        assert "Exact approved TaskBrief revision 1." in argv[-1]
+        assert "task-1" in argv[-1]
+
+    asyncio.run(scenario())
+
+
+def test_answer_sol_question_accepts_the_strict_directed_question_projection(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        result = await _adapter(
+            fake_claude,
+            tmp_path,
+            FAKE_CLAUDE_DIRECTED_QUESTION_TARGET="sol",
+        ).answer_sol_question(
+            run_id="answer-sol-question-projection",
+            session_id="fable-session-1",
+            task_id="task-1",
+            prompt="Answer Sol.",
+            context="Approved context.",
+        )
+
+        assert result.payload is not None
+        assert result.payload["directed_question"] == {
+            "addressed_to": "sol",
+            "text": "Which focused test proves the answer?",
+            "reason": "The approved execution evidence is incomplete.",
+        }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ("", None, "--resume", "session id", "session\nnext", "/tmp/session", "x" * 129),
+)
+def test_answer_sol_question_rejects_untrusted_session_ids_before_any_invocation(
+    fake_claude: Path, tmp_path: Path, session_id: object,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="session_id"):
+            await _adapter(fake_claude, tmp_path).answer_sol_question(
+                run_id="answer-sol-question-invalid",
+                session_id=session_id,  # type: ignore[arg-type]
+                task_id="task-1",
+                prompt="Answer Sol.",
+                context="Approved context.",
+            )
+        assert not (tmp_path / "captured-argv.json").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("extra_env", "match"),
+    [
+        ({"FAKE_CLAUDE_SESSION_ID": "different-session"}, "different session"),
+        ({"FAKE_CLAUDE_SESSION_ID": "--mismatched-session"}, "different session"),
+        ({"FAKE_CLAUDE_MODE": "conflicting_session"}, "conflicting"),
+    ],
+)
+def test_answer_sol_question_hides_rejected_provider_identity_from_partial_results(
+    fake_claude: Path,
+    tmp_path: Path,
+    extra_env: dict[str, str],
+    match: str,
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(ClaudeRunError, match=match) as raised:
+            await _adapter(
+                fake_claude,
+                tmp_path,
+                FAKE_CLAUDE_SECRET_OUTPUT="1",
+                **extra_env,
+            ).answer_sol_question(
+                run_id="answer-sol-question-mismatch",
+                session_id="fable-session-1",
+                task_id="task-1",
+                prompt="Answer Sol.",
+                context="Approved context.",
+            )
+        result = raised.value.result
+        assert result is not None
+        assert result.cli_session_id is None
+        assert result.payload is None
+        assert all("session_id" not in event for event in result.events)
+        _assert_no_secret_sentinel(raised.value)
+        _assert_no_secret_sentinel(result)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "extra_env",
+    ({"FAKE_CLAUDE_MODE": "missing_init"},),
+)
+def test_answer_sol_question_rejects_missing_continuity_before_partial_result_exposure(
+    fake_claude: Path,
+    tmp_path: Path,
+    extra_env: dict[str, str],
+) -> None:
+    async def scenario() -> None:
+        with pytest.raises(ClaudeRunError) as raised:
+            await _adapter(fake_claude, tmp_path, **extra_env).answer_sol_question(
+                run_id="answer-sol-question-missing-continuity",
+                session_id="fable-session-1",
+                task_id="task-1",
+                prompt="Answer Sol.",
+                context="Approved context.",
+            )
+        result = raised.value.result
+        assert result is not None
+        assert result.cli_session_id is None
+        assert result.payload is None
+        assert all("session_id" not in event for event in result.events)
+
+    asyncio.run(scenario())

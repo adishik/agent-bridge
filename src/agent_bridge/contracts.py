@@ -61,6 +61,22 @@ def _require_fields(data: Mapping[str, object], name: str, fields: tuple[str, ..
         raise ValueError(f"{name} has unexpected fields: {', '.join(sorted(unexpected))}")
 
 
+def _require_fields_with_optional(
+    data: Mapping[str, object],
+    name: str,
+    required_fields: tuple[str, ...],
+    optional_fields: tuple[str, ...],
+) -> None:
+    expected = set(required_fields) | set(optional_fields)
+    actual = set(data)
+    missing = set(required_fields) - actual
+    unexpected = actual - expected
+    if missing:
+        raise ValueError(f"{name} missing required fields: {', '.join(sorted(missing))}")
+    if unexpected:
+        raise ValueError(f"{name} has unexpected fields: {', '.join(sorted(unexpected))}")
+
+
 def _string(value: object, name: str, *, non_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
@@ -224,6 +240,7 @@ class SolQuestion:
     options: tuple[str, ...]
     recommendation: str
     can_continue_safely: bool
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ambiguity", _string(self.ambiguity, "ambiguity"))
@@ -235,22 +252,41 @@ class SolQuestion:
             "can_continue_safely",
             _boolean(self.can_continue_safely, "can_continue_safely"),
         )
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "SolQuestion":
         payload = _mapping(data, "SolQuestion")
         fields = ("ambiguity", "why_it_matters", "options", "recommendation", "can_continue_safely")
-        _require_fields(payload, "SolQuestion", fields)
-        return cls(**{field: payload[field] for field in fields})  # type: ignore[arg-type]
+        _require_fields_with_optional(payload, "SolQuestion", fields, ("directed_question",))
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
+        return cls(
+            ambiguity=payload["ambiguity"],
+            why_it_matters=payload["why_it_matters"],
+            options=payload["options"],
+            recommendation=payload["recommendation"],
+            can_continue_safely=payload["can_continue_safely"],
+            directed_question=directed_question,
+        )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "ambiguity": self.ambiguity,
             "why_it_matters": self.why_it_matters,
             "options": list(self.options),
             "recommendation": self.recommendation,
             "can_continue_safely": self.can_continue_safely,
         }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
 
 
 _SOL_OUTCOME_FIELDS = (
@@ -340,6 +376,7 @@ class FableClarification:
     scope_changed: bool
     revised_brief: TaskBrief | None
     question_for_user: str | None
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _string(self.status, "status"))
@@ -352,6 +389,10 @@ class FableClarification:
             raise ValueError("revised_brief must be a TaskBrief or null")
         if self.question_for_user is not None:
             object.__setattr__(self, "question_for_user", _string(self.question_for_user, "question_for_user"))
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
         if self.status not in _FABLE_CLARIFICATION_STATUSES:
             raise ValueError("status must be answered or escalate_to_user")
         if self.status == "answered" and (self.answer is None or not self.answer.strip()):
@@ -366,8 +407,18 @@ class FableClarification:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "FableClarification":
         payload = _mapping(data, "FableClarification")
-        _require_fields(payload, "FableClarification", _FABLE_CLARIFICATION_FIELDS)
+        _require_fields_with_optional(
+            payload,
+            "FableClarification",
+            _FABLE_CLARIFICATION_FIELDS,
+            ("directed_question",),
+        )
         revised_data = payload["revised_brief"]
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
         return cls(
             status=payload["status"],
             answer=payload["answer"],
@@ -378,10 +429,11 @@ class FableClarification:
                 None if revised_data is None else TaskBrief.from_dict(_mapping(revised_data, "revised_brief"))
             ),
             question_for_user=payload["question_for_user"],
+            directed_question=directed_question,
         )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "status": self.status,
             "answer": self.answer,
             "reasoning": self.reasoning,
@@ -390,6 +442,9 @@ class FableClarification:
             "revised_brief": None if self.revised_brief is None else self.revised_brief.to_dict(),
             "question_for_user": self.question_for_user,
         }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -431,6 +486,7 @@ class ReviewVerdict:
     remaining_risks: tuple[str, ...]
     corrections: tuple[str, ...]
     question_for_user: str | None
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _string(self.status, "status"))
@@ -447,6 +503,10 @@ class ReviewVerdict:
         object.__setattr__(self, "corrections", _string_tuple(self.corrections, "corrections"))
         if self.question_for_user is not None:
             object.__setattr__(self, "question_for_user", _string(self.question_for_user, "question_for_user"))
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
         if self.status not in _REVIEW_VERDICT_STATUSES:
             raise ValueError("status must be approved, corrections_required, or escalate_to_user")
         if self.status == "corrections_required" and not self.corrections:
@@ -461,10 +521,20 @@ class ReviewVerdict:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "ReviewVerdict":
         payload = _mapping(data, "ReviewVerdict")
-        _require_fields(payload, "ReviewVerdict", _REVIEW_VERDICT_FIELDS)
+        _require_fields_with_optional(
+            payload,
+            "ReviewVerdict",
+            _REVIEW_VERDICT_FIELDS,
+            ("directed_question",),
+        )
         criteria_data = payload["criteria"]
         if not isinstance(criteria_data, Sequence) or isinstance(criteria_data, str):
             raise ValueError("criteria must be an array")
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
         return cls(
             status=payload["status"],
             summary=payload["summary"],
@@ -474,10 +544,11 @@ class ReviewVerdict:
             remaining_risks=payload["remaining_risks"],
             corrections=payload["corrections"],
             question_for_user=payload["question_for_user"],
+            directed_question=directed_question,
         )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "status": self.status,
             "summary": self.summary,
             "criteria": [criterion.to_dict() for criterion in self.criteria],
@@ -487,6 +558,9 @@ class ReviewVerdict:
             "corrections": list(self.corrections),
             "question_for_user": self.question_for_user,
         }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
 
 
 class ConversationActor(str, Enum):
@@ -719,6 +793,20 @@ class DirectedAgentQuestion:
         object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
         object.__setattr__(self, "reason", _bounded_conversation_text(self.reason, "reason"))
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "DirectedAgentQuestion":
+        payload = _mapping(data, "DirectedAgentQuestion")
+        fields = ("addressed_to", "text", "reason")
+        _require_fields(payload, "DirectedAgentQuestion", fields)
+        return cls(**{field: payload[field] for field in fields})  # type: ignore[arg-type]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "addressed_to": self.addressed_to,
+            "text": self.text,
+            "reason": self.reason,
+        }
+
 
 @dataclass(frozen=True)
 class StreamEvent:
@@ -759,11 +847,15 @@ def _array_schema(items: dict[str, object]) -> dict[str, object]:
     return {"type": "array", "items": items}
 
 
-def _object_schema(properties: dict[str, object]) -> dict[str, object]:
+def _object_schema(
+    properties: dict[str, object],
+    *,
+    required: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     return {
         "type": "object",
         "properties": properties,
-        "required": list(properties),
+        "required": list(properties) if required is None else list(required),
         "additionalProperties": False,
     }
 
@@ -775,13 +867,29 @@ _COMMAND_REPORT_SCHEMA = _object_schema({
     "exit_code": {"type": "integer"},
     "result": _STRING_SCHEMA,
 })
+_DIRECTED_AGENT_QUESTION_SCHEMA = _object_schema({
+    "addressed_to": {"type": "string", "enum": ["user", "fable", "sol"]},
+    "text": _STRING_SCHEMA,
+    "reason": _STRING_SCHEMA,
+})
+_DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA = {
+    "anyOf": [_DIRECTED_AGENT_QUESTION_SCHEMA, {"type": "null"}],
+}
 _SOL_QUESTION_SCHEMA = _object_schema({
     "ambiguity": _STRING_SCHEMA,
     "why_it_matters": _STRING_SCHEMA,
     "options": _STRING_ARRAY_SCHEMA,
     "recommendation": _STRING_SCHEMA,
     "can_continue_safely": {"type": "boolean"},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(
+    "ambiguity",
+    "why_it_matters",
+    "options",
+    "recommendation",
+    "can_continue_safely",
+    "directed_question",
+))
 _CRITERION_EVIDENCE_SCHEMA = _object_schema({
     "criterion": _STRING_SCHEMA,
     "evidence": _STRING_ARRAY_SCHEMA,
@@ -824,7 +932,8 @@ FABLE_CLARIFICATION_SCHEMA = _object_schema({
     "scope_changed": {"type": "boolean"},
     "revised_brief": {"anyOf": [TASK_BRIEF_SCHEMA, {"type": "null"}]},
     "question_for_user": {"type": ["string", "null"]},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(*_FABLE_CLARIFICATION_FIELDS, "directed_question"))
 
 REVIEW_VERDICT_SCHEMA = _object_schema({
     "status": {"type": "string", "enum": sorted(_REVIEW_VERDICT_STATUSES)},
@@ -835,4 +944,5 @@ REVIEW_VERDICT_SCHEMA = _object_schema({
     "remaining_risks": _STRING_ARRAY_SCHEMA,
     "corrections": _STRING_ARRAY_SCHEMA,
     "question_for_user": {"type": ["string", "null"]},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(*_REVIEW_VERDICT_FIELDS, "directed_question"))
