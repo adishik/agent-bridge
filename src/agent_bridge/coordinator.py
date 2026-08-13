@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import shlex
 import sys
+from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
@@ -17,10 +19,12 @@ from agent_bridge.adapters.base import AgentRunResult, FableAdapter, SolAdapter
 from agent_bridge.adapters.claude_cli import ClaudeCLI, ClaudeRunError, SubscriptionAuthError
 from agent_bridge.adapters.codex_cli import CodexCLI, CodexRunError
 from agent_bridge.contracts import (
+    ConversationTarget,
     FableClarification,
     ReviewVerdict,
     SolOutcome,
     TaskBrief,
+    UserConversationInput,
 )
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import project_id_for_root
@@ -87,6 +91,87 @@ _MAX_AUDIT_COUNT = 2**63 - 1
 MAX_AGENT_STRUCTURAL_EVENTS = 1_024
 _MIN_EXIT_CODE = -(2**31)
 _MAX_EXIT_CODE = 2**31 - 1
+_TERMINAL_ROUTING_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED})
+
+
+class RoutingMode(str, Enum):
+    """The only two user-message routing outcomes."""
+
+    NEW_FABLE_TASK = "new_fable_task"
+    BOUND_CONTINUATION = "bound_continuation"
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingDecision:
+    """A deterministic route derived solely from authenticated task state."""
+
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    mode: RoutingMode
+    task_id: str | None
+    revision: int | None
+    continuation_generation: int | None
+
+
+class RoutingError(RuntimeError):
+    """One bounded failure category for invalid or stale conversation routes."""
+
+    def __init__(self) -> None:
+        super().__init__("conversation routing is unavailable")
+
+
+def route_user_intent(
+    authenticated_task: TaskRecord | None,
+    intent: UserConversationInput,
+) -> RoutingDecision:
+    """Route an authenticated user intent without touching a lease or adapter.
+
+    An unbound message is always a new Fable-planned task.  A bound message
+    must match every persisted identity coordinate; stale or unknown bindings
+    fail closed rather than selecting another task.  Before exact approval,
+    an apparent Sol address remains visible but is routed to Fable.
+    """
+    if not isinstance(intent, UserConversationInput):
+        raise RoutingError()
+    if intent.task_id is None:
+        return RoutingDecision(
+            addressed_to=intent.addressed_to,
+            routed_to=ConversationTarget.FABLE,
+            mode=RoutingMode.NEW_FABLE_TASK,
+            task_id=None,
+            revision=None,
+            continuation_generation=None,
+        )
+    if not isinstance(authenticated_task, TaskRecord):
+        raise RoutingError()
+    if (
+        intent.task_id != authenticated_task.task_id
+        or intent.revision != authenticated_task.revision
+        or intent.continuation_generation != authenticated_task.continuation_generation
+    ):
+        raise RoutingError()
+    if authenticated_task.state in _TERMINAL_ROUTING_STATES:
+        return RoutingDecision(
+            addressed_to=intent.addressed_to,
+            routed_to=ConversationTarget.FABLE,
+            mode=RoutingMode.NEW_FABLE_TASK,
+            task_id=None,
+            revision=None,
+            continuation_generation=None,
+        )
+    routed_to = intent.addressed_to
+    if routed_to in {ConversationTarget.TEAM, ConversationTarget.USER}:
+        routed_to = ConversationTarget.FABLE
+    if routed_to is ConversationTarget.SOL and authenticated_task.approved_at is None:
+        routed_to = ConversationTarget.FABLE
+    return RoutingDecision(
+        addressed_to=intent.addressed_to,
+        routed_to=routed_to,
+        mode=RoutingMode.BOUND_CONTINUATION,
+        task_id=authenticated_task.task_id,
+        revision=authenticated_task.revision,
+        continuation_generation=authenticated_task.continuation_generation,
+    )
 
 
 class ResumeDriftBlocked(RuntimeError):

@@ -18,15 +18,22 @@ from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.adapters.claude_cli import ClaudeRunError
 from agent_bridge.adapters.codex_cli import CodexRunError
 from agent_bridge.contracts import (
+    ConversationMessageType,
+    ConversationTarget,
     FableClarification,
     ReviewVerdict,
     SolOutcome,
     TaskBrief,
+    UserConversationInput,
 )
 from agent_bridge.coordinator import (
     Coordinator,
     PreparedActionFailed,
     ResumeDriftBlocked,
+    RoutingDecision,
+    RoutingError,
+    RoutingMode,
+    route_user_intent,
 )
 from agent_bridge.process import ProcessRunner
 from agent_bridge.repository import RepositoryTracker
@@ -38,6 +45,7 @@ from agent_bridge.store import (
     ResumePayload,
     ScopeApprovalContext,
     SQLiteStore,
+    TaskRecord,
 )
 
 
@@ -3009,3 +3017,182 @@ def test_compatibility_answer_rejects_missing_legacy_sol_run_without_starting_so
         assert harness.sol.resume_threads == []
 
     asyncio.run(scenario())
+
+
+def _routing_task(
+    *,
+    state: TaskState,
+    approved_at: str | None,
+    task_id: str = "routing-task",
+    revision: int = 2,
+    continuation_generation: int = 7,
+) -> TaskRecord:
+    """Hand-built authenticated state for the side-effect-free selector."""
+    return TaskRecord(
+        task_id=task_id,
+        revision=revision,
+        session_id="session-1",
+        state=state,
+        brief=None,
+        approved_at=approved_at,
+        fable_session_id="fable-session-1",
+        sol_thread_id=THREAD_ID,
+        baseline_id="baseline-1" if approved_at is not None else None,
+        correction_count=0,
+        continuation_state=None,
+        pending=None,
+        continuation_generation=continuation_generation,
+        exchange_allowance=3,
+        exchange_consumed=0,
+    )
+
+
+def _bound_user_intent(
+    *,
+    addressed_to: ConversationTarget,
+    task_id: str = "routing-task",
+    revision: int = 2,
+    continuation_generation: int = 7,
+) -> UserConversationInput:
+    return UserConversationInput(
+        addressed_to=addressed_to,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Continue with the recorded direction.",
+        task_id=task_id,
+        revision=revision,
+        continuation_generation=continuation_generation,
+    )
+
+
+@pytest.mark.parametrize(
+    "addressed_to",
+    (ConversationTarget.FABLE, ConversationTarget.SOL, ConversationTarget.TEAM),
+)
+def test_routing_matrix_unbound_user_message_starts_a_new_fable_task(
+    addressed_to: ConversationTarget,
+) -> None:
+    """A missing binding must not select an existing task or agent continuation."""
+    intent = UserConversationInput(
+        addressed_to=addressed_to,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Start a separate task.",
+    )
+
+    decision = route_user_intent(None, intent)
+
+    assert decision == RoutingDecision(
+        addressed_to=addressed_to,
+        routed_to=ConversationTarget.FABLE,
+        mode=RoutingMode.NEW_FABLE_TASK,
+        task_id=None,
+        revision=None,
+        continuation_generation=None,
+    )
+
+
+def test_routing_matrix_preapproval_sol_address_is_persisted_but_routes_to_fable() -> None:
+    """Removing the approval guard would incorrectly send a pre-approval request to Sol."""
+    task = _routing_task(
+        state=TaskState.AWAITING_USER_APPROVAL,
+        approved_at=None,
+    )
+    intent = _bound_user_intent(addressed_to=ConversationTarget.SOL)
+
+    decision = route_user_intent(task, intent)
+
+    assert decision == RoutingDecision(
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        mode=RoutingMode.BOUND_CONTINUATION,
+        task_id="routing-task",
+        revision=2,
+        continuation_generation=7,
+    )
+
+
+def test_routing_matrix_approved_nonterminal_sol_continuation_keeps_exact_binding() -> None:
+    """A wrong route or stale binding would resume the wrong provider thread."""
+    task = _routing_task(
+        state=TaskState.SOL_RUNNING,
+        approved_at="2026-08-11T12:00:00Z",
+    )
+    intent = _bound_user_intent(addressed_to=ConversationTarget.SOL)
+
+    decision = route_user_intent(task, intent)
+
+    assert decision == RoutingDecision(
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        mode=RoutingMode.BOUND_CONTINUATION,
+        task_id="routing-task",
+        revision=2,
+        continuation_generation=7,
+    )
+
+
+@pytest.mark.parametrize("state", (TaskState.COMPLETED, TaskState.FAILED))
+def test_routing_matrix_terminal_bound_message_creates_a_new_fable_task(
+    state: TaskState,
+) -> None:
+    """A terminal task must never be resumed merely because its old ID was supplied."""
+    task = _routing_task(state=state, approved_at="2026-08-11T12:00:00Z")
+    intent = _bound_user_intent(addressed_to=ConversationTarget.SOL)
+
+    decision = route_user_intent(task, intent)
+
+    assert decision == RoutingDecision(
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.FABLE,
+        mode=RoutingMode.NEW_FABLE_TASK,
+        task_id=None,
+        revision=None,
+        continuation_generation=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "authenticated_task,intent",
+    (
+        (
+            None,
+            _bound_user_intent(addressed_to=ConversationTarget.SOL),
+        ),
+        (
+            _routing_task(
+                state=TaskState.SOL_RUNNING,
+                approved_at="2026-08-11T12:00:00Z",
+            ),
+            _bound_user_intent(
+                addressed_to=ConversationTarget.SOL,
+                task_id="another-task",
+            ),
+        ),
+        (
+            _routing_task(
+                state=TaskState.SOL_RUNNING,
+                approved_at="2026-08-11T12:00:00Z",
+            ),
+            _bound_user_intent(
+                addressed_to=ConversationTarget.SOL,
+                revision=3,
+            ),
+        ),
+        (
+            _routing_task(
+                state=TaskState.SOL_RUNNING,
+                approved_at="2026-08-11T12:00:00Z",
+            ),
+            _bound_user_intent(
+                addressed_to=ConversationTarget.SOL,
+                continuation_generation=8,
+            ),
+        ),
+    ),
+)
+def test_routing_matrix_unknown_or_stale_binding_never_falls_back(
+    authenticated_task: TaskRecord | None,
+    intent: UserConversationInput,
+) -> None:
+    """Changing any authenticated identity coordinate must reject rather than reroute."""
+    with pytest.raises(RoutingError, match="conversation routing is unavailable"):
+        route_user_intent(authenticated_task, intent)
