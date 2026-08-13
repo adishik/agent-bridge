@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from agent_bridge.contracts import ConversationTarget, DirectedAgentQuestion
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -24,9 +25,12 @@ from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
     AnswerPayload,
     ApprovalPayload,
+    ContinuationMessagePayload,
+    ExchangeGrantPayload,
     NewRequestPayload,
     PreparedActionOutcome,
     PreparedActionRecord,
+    QuestionAnswerPayload,
     ResumeDriftProjection,
     ResumePayload,
     SolResumeContext,
@@ -115,6 +119,10 @@ class _RuntimeCoordinator:
     store: _RuntimeStore
     project_id: str
     prepared_actions: list[str] = field(default_factory=list)
+    conversation_runs: list[tuple[str, str]] = field(default_factory=list)
+    directed_preparations: list[tuple[str, tuple[object, ...]]] = field(
+        default_factory=list,
+    )
 
     def _record(
         self, *, session_id: str, task_id: str, revision: int, action: str,
@@ -140,6 +148,39 @@ class _RuntimeCoordinator:
             )
             source = TaskState.INTERRUPTED
             active = TaskState.SOL_RUNNING
+        elif action == "continuation_message":
+            payload = ContinuationMessagePayload(
+                text="Continue the exact persisted work.",
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                continuation_generation=7,
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
+        elif action == "question_answer":
+            payload = QuestionAnswerPayload(
+                question_id="question-7",
+                answer="Use the existing seam.",
+                continuation_generation=7,
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
+        elif action == "exchange_grant":
+            payload = ExchangeGrantPayload(
+                request_id="grant-7",
+                continuation_generation=7,
+                attempted_question=DirectedAgentQuestion(
+                    addressed_to="fable",
+                    text="Which exact rule applies?",
+                    reason="The agent needs a bounded clarification.",
+                ),
+                parent_mode="top_level",
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
         else:
             raise AssertionError("unexpected route")
         self.prepared_actions.append(action)
@@ -156,7 +197,9 @@ class _RuntimeCoordinator:
             payload=payload,
             source_state=source,
             active_state=active,
-            continuation_state=None,
+            continuation_state=(
+                None if action in {"new_request", "approval"} else active
+            ),
             pending_context=pending_context,
             previous_preparation_id=None,
             status="PREPARED",
@@ -207,6 +250,65 @@ class _RuntimeCoordinator:
             action="resume", generation=generation,
         )
 
+    def _prepare_continuation_message_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "continuation_message",
+            (session_id, task_id, revision, continuation_generation, text, addressed_to, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="continuation_message", generation=generation,
+        )
+
+    def _prepare_question_answer_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "question_answer",
+            (session_id, task_id, revision, continuation_generation, question_id, answer, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="question_answer", generation=generation,
+        )
+
+    def _prepare_exchange_grant_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "exchange_grant",
+            (session_id, task_id, revision, continuation_generation, request_id, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="exchange_grant", generation=generation,
+        )
+
     async def run_prepared_request(self, task_id: str) -> None:
         self.run_task_ids.append(task_id)
 
@@ -216,6 +318,16 @@ class _RuntimeCoordinator:
         self.run_task_ids.append(record.task_id)
         self.store.prepared_rows[preparation_id] = replace(record, status="COMPLETED")
         return PreparedActionOutcome("completed")
+
+    async def run_prepared_conversation_action(self, task_id: str, action: str) -> None:
+        self.conversation_runs.append((task_id, action))
+        record = next(
+            record for record in self.store.prepared_rows.values()
+            if record.task_id == task_id and record.action == action
+        )
+        self.store.prepared_rows[record.preparation_id] = replace(
+            record, status="COMPLETED",
+        )
 
     def abort_prepared_action(
         self, preparation_id: str, *, generation: int, reason: str,
@@ -704,6 +816,36 @@ def test_workflow_preparation_holds_one_lease_for_fresh_readiness_and_releases_o
     asyncio.run(exercise())
 
 
+def test_hub_prepare_answer_releases_its_lease_when_the_directed_answer_guard_rejects(
+) -> None:
+    """The hub must not retain authority after Store rejects an unbound legacy answer."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        runtime.store.task_rows[("task-existing", 1)] = SimpleNamespace(
+            session_id="chat-1", revision=1, state=TaskState.AWAITING_USER_INPUT,
+        )
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        def reject_legacy_answer(**_: object) -> PreparedActionRecord:
+            raise RuntimeError("exact directed question answer is required")
+
+        runtime.coordinator.prepare_answer = reject_legacy_answer  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="exact directed question"):
+            await workflows.prepare_answer(
+                project_id="project-a", session_id="chat-1",
+                task_id="task-existing", revision=1, answer="Do not bypass the question.",
+            )
+
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("action", ("approval", "resume", "answer"))
 def test_held_lease_rejects_other_model_starting_routes_without_new_probes(
     action: str,
@@ -895,6 +1037,92 @@ def test_hub_route_specific_preparations_run_the_matching_durable_action(
         await workflows.run(prepared)
 
         assert runtime.coordinator.prepared_actions == [route]
+        assert runtime.store.prepared_action(prepared.preparation_id).status == "COMPLETED"  # type: ignore[union-attr]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "route",
+    ("continuation_message", "question_answer", "exchange_grant"),
+)
+def test_hub_directed_preparations_keep_one_lease_and_run_only_the_durable_kind(
+    route: str,
+) -> None:
+    """The hub must pass exact values into one typed Store preparation."""
+    async def exercise() -> None:
+        fable_calls: list[None] = []
+        sol_calls: list[None] = []
+        runtime = _runtime("project-a")
+        runtime.readiness = _readiness(
+            fable_calls=fable_calls,
+            sol_calls=sol_calls,
+        )
+        runtime.store.task_rows[("task-existing", 1)] = SimpleNamespace(
+            session_id="chat-1", revision=1, state=TaskState.AWAITING_USER_INPUT,
+        )
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        if route == "continuation_message":
+            prepared = await workflows.prepare_continuation_message(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                text="Continue the exact persisted work.",
+                addressed_to=ConversationTarget.SOL,
+            )
+        elif route == "question_answer":
+            prepared = await workflows.prepare_question_answer(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                question_id="question-7",
+                answer="Use the existing seam.",
+            )
+        else:
+            prepared = await workflows.prepare_exchange_grant(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                request_id="grant-7",
+            )
+
+        assert lease.snapshot() == prepared.token
+        assert fable_calls == [None]
+        assert sol_calls == [None]
+        expected_values = {
+            "continuation_message": (
+                "chat-1", "task-existing", 1, 7,
+                "Continue the exact persisted work.", ConversationTarget.SOL, 1,
+            ),
+            "question_answer": (
+                "chat-1", "task-existing", 1, 7, "question-7",
+                "Use the existing seam.", 1,
+            ),
+            "exchange_grant": (
+                "chat-1", "task-existing", 1, 7, "grant-7", 1,
+            ),
+        }
+        assert runtime.coordinator.directed_preparations == [
+            (route, expected_values[route]),
+        ]
+        await workflows.run(prepared)
+
+        assert runtime.coordinator.prepared_actions == [route]
+        assert runtime.coordinator.conversation_runs == [("task-existing", route)]
+        assert runtime.coordinator.run_task_ids == []
         assert runtime.store.prepared_action(prepared.preparation_id).status == "COMPLETED"  # type: ignore[union-attr]
         assert lease.snapshot() is None
 

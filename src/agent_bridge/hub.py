@@ -13,6 +13,7 @@ from typing import Protocol
 
 from agent_bridge.adapters.base import FableAdapter, SolAdapter
 from agent_bridge.app import EventBroadcaster
+from agent_bridge.contracts import ConversationTarget
 from agent_bridge.coordinator import Coordinator, IdFactory
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import ProjectSpec
@@ -565,15 +566,113 @@ class HubWorkflowOrchestrator:
             ),
         )
 
+    async def prepare_continuation_message(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare one exact routed user statement."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_continuation_message_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                text=text,
+                addressed_to=addressed_to,
+                generation=token.generation,
+            ),
+        )
+
+    async def prepare_question_answer(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare an exact user question answer."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_question_answer_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                question_id=question_id,
+                answer=answer,
+                generation=token.generation,
+            ),
+        )
+
+    async def prepare_exchange_grant(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare one fixed exchange grant."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_exchange_grant_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                request_id=request_id,
+                generation=token.generation,
+            ),
+        )
+
     async def run(self, prepared: PreparedWorkflow) -> None:
         if not isinstance(prepared, PreparedWorkflow):
             raise ValueError("prepared must be a PreparedWorkflow")
         if self._lease.snapshot() != prepared.token:
             raise RuntimeError("prepared workflow no longer owns the active lease")
         runtime = self._registry.runtime(prepared.token.project_id)
-        self._bound_record(runtime, prepared.preparation_id, prepared.token)
+        record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
         try:
-            await runtime.coordinator.run_prepared_action(prepared.preparation_id)
+            if record.action in {
+                "continuation_message", "question_answer", "exchange_grant",
+            }:
+                await runtime.coordinator.run_prepared_conversation_action(
+                    record.task_id, record.action,
+                )
+            else:
+                await runtime.coordinator.run_prepared_action(prepared.preparation_id)
         except BaseException:
             record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
             if record.status in _TERMINAL_PREPARED_STATUSES:
@@ -716,3 +815,8 @@ class HubWorkflowOrchestrator:
     def _require_non_negative_integer(value: object, name: str) -> None:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+
+    @staticmethod
+    def _require_positive_integer(value: object, name: str) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")

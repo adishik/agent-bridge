@@ -26,12 +26,15 @@ from agent_bridge.store import (
     AnswerPayload,
     BaselineSetting,
     ClarificationContext,
+    ContinuationMessagePayload,
     ExchangeReservation,
+    ExchangeGrantPayload,
     EXCHANGE_GRANT_SIZE,
     INITIAL_INTERNAL_EXCHANGES,
     MAX_TASK_OVERVIEWS,
     NewRequestPayload,
     QuestionRecord,
+    QuestionAnswerPayload,
     ResumeDriftProjection,
     ResumePayload,
     ReviewContext,
@@ -3157,6 +3160,9 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
     assert "continuation_state" in question_columns
     assert "pending_action_json" in question_columns
     assert "continuation_pause_id" in question_columns
+    assert {
+        "nested_parent_kind", "parent_question_id", "parent_continuation_pause_id",
+    } <= set(question_columns)
     grant_columns = tuple(
         row["name"]
         for row in migrated._connection.execute("PRAGMA table_info(exchange_grants)")
@@ -3169,7 +3175,8 @@ def test_directed_question_exchange_migration_is_additive_idempotent_and_byte_sa
         )
     }
     assert {
-        "one_unanswered_question_per_task_revision",
+        "one_unanswered_top_level_question_per_task_revision",
+        "one_unanswered_nested_question_per_task_revision",
         "exchange_reservations_request_identity",
         "exchange_grants_request_identity",
         "exchange_grants_permission_identity",
@@ -4251,3 +4258,599 @@ def test_exchange_permission_requires_a_system_status_card(tmp_path, valid_brief
 
     assert store.get_task("permission-card-task", 1) == before_invalid_card
     assert store.events_after("session-1", 0) == before_events
+
+
+def test_nested_fable_clarification_evidence_pauses_and_restores_exact_context(
+    tmp_path, valid_brief,
+) -> None:
+    """A nested evidence answer must restore Fable, never resume Sol directly."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="nested-clarification", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    pending = {
+        "clarification_prompt": "Resolve the exact approved ambiguity.",
+        "sol_run_id": "sol-run-1",
+        "prompt": "Resume only the approved work.",
+    }
+    store._connection.execute(
+        """
+        UPDATE tasks SET state = ?, approved_at = ?, fable_session_id = ?, sol_thread_id = ?,
+            baseline_id = ?, pending_json = ? WHERE task_id = ? AND revision = ?
+        """,
+        (
+            TaskState.FABLE_CLARIFYING.value, "2026-08-10T12:00:00Z", "fable-session-1", "sol-thread-1",
+            "baseline-1", json.dumps(pending, separators=(",", ":"), sort_keys=True),
+            brief.task_id, brief.revision,
+        ),
+    )
+
+    reservation, nested = store.reserve_fable_clarification_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, question_id="nested-clarification-question",
+        request_key="nested-clarification-request",
+        text="Which approved rule is already exercised?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL, task_id=brief.task_id,
+            revision=brief.revision, generation=1,
+            question_id="nested-clarification-question",
+            text="Which approved rule is already exercised?",
+        ),
+    )
+
+    assert reservation.ordinal == 1
+    assert nested.nested_parent_kind == "clarification"
+    assert nested.parent_question_id is None
+    paused = store.get_task(brief.task_id, brief.revision)
+    assert (paused.state, paused.continuation_state, paused.pending) == (
+        TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING, pending,
+    )
+    assert (paused.exchange_allowance, paused.exchange_consumed) == (2, 1)
+
+    with pytest.raises(RuntimeError, match="nested"):
+        store.answer_question_and_prepare_resume(
+            session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+            question_id=nested.question_id, expected_generation=1,
+            answer_text="The existing focused test proves it.",
+            answered_by=ConversationActor.SOL, pending_action={"must": "not resume"},
+            event=_conversation_answer(
+                sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE, task_id=brief.task_id,
+                revision=brief.revision, generation=1, question_id=nested.question_id,
+                text="The existing focused test proves it.",
+            ),
+        )
+
+    answered = store.answer_fable_clarification_evidence_question_and_resume(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        question_id=nested.question_id, expected_generation=1,
+        answer_text="The existing focused test proves it.",
+        event=_conversation_answer(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id=nested.question_id,
+            text="The existing focused test proves it.",
+        ),
+    )
+
+    assert answered.answered_by is ConversationActor.SOL
+    resumed = store.get_task(brief.task_id, brief.revision)
+    assert (resumed.state, resumed.continuation_state, resumed.pending) == (
+        TaskState.FABLE_CLARIFYING, None, pending,
+    )
+    assert (resumed.exchange_allowance, resumed.exchange_consumed) == (2, 1)
+    assert [event.payload["message_type"] for event in store.events_after("session-1", 0)] == [
+        "question", "answer",
+    ]
+
+
+def test_nested_fable_answer_evidence_binds_outer_question_and_reopens_idempotently(
+    tmp_path, valid_brief,
+) -> None:
+    """A nested child must not close or double-charge the durable outer question."""
+    path = tmp_path / "nested-outer.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="nested-outer", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store._connection.execute(
+        """
+        UPDATE tasks SET approved_at = ?, fable_session_id = ?, sol_thread_id = ?, baseline_id = ?
+        WHERE task_id = ? AND revision = ?
+        """,
+        ("2026-08-10T12:00:00Z", "fable-session-1", "sol-thread-1", "baseline-1", brief.task_id, brief.revision),
+    )
+    _, outer = store.reserve_internal_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, question_id="outer-sol-question",
+        request_key="outer-sol-request", asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        text="Which exact approved constraint resolves this?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "Resume exactly."},
+        event=_conversation_question(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id="outer-sol-question",
+            text="Which exact approved constraint resolves this?",
+        ),
+    )
+    _, nested = store.reserve_fable_answer_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, outer_question_id=outer.question_id,
+        question_id="nested-sol-evidence", request_key="nested-sol-evidence-request",
+        text="Which focused test already proves that constraint?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id="nested-sol-evidence",
+            text="Which focused test already proves that constraint?",
+        ),
+    )
+
+    assert nested.nested_parent_kind == "question"
+    assert nested.parent_question_id == outer.question_id
+    assert store.question(outer.question_id) == outer
+    assert store.get_task(brief.task_id, brief.revision).exchange_consumed == 2
+    with pytest.raises(RuntimeError, match="nested"):
+        store.answer_question_and_prepare_resume(
+            session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+            question_id=outer.question_id, expected_generation=1,
+            answer_text="This must wait for nested evidence.",
+            answered_by=ConversationActor.FABLE, pending_action={"must": "not resume"},
+            event=_conversation_answer(
+                sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL, task_id=brief.task_id,
+                revision=brief.revision, generation=1, question_id=outer.question_id,
+                text="This must wait for nested evidence.",
+            ),
+        )
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    replayed, replayed_nested = reopened.reserve_fable_answer_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, outer_question_id=outer.question_id,
+        question_id=nested.question_id, request_key="nested-sol-evidence-request",
+        text="Which focused test already proves that constraint?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id=nested.question_id,
+            text="Which focused test already proves that constraint?",
+        ),
+    )
+    assert (replayed.question_id, replayed_nested) == (nested.question_id, nested)
+    assert reopened.get_task(brief.task_id, brief.revision).exchange_consumed == 2
+    assert len(reopened.events_after("session-1", 0)) == 2
+
+    answered = reopened.answer_fable_answer_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        outer_question_id=outer.question_id, question_id=nested.question_id,
+        expected_generation=1, answer_text="test_store.py proves the exact pause contract.",
+        event=_conversation_answer(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id=nested.question_id,
+            text="test_store.py proves the exact pause contract.",
+        ),
+    )
+    assert answered.answered_by is ConversationActor.SOL
+    assert reopened.question(outer.question_id) == outer
+    assert reopened.get_task(brief.task_id, brief.revision).state is TaskState.AWAITING_USER_INPUT
+    reopened.close()
+
+
+def test_nested_question_migration_audit_and_recovery_reject_mixed_parent_identity(
+    tmp_path, valid_brief,
+) -> None:
+    """A malformed child marker must fail closed before audit or recovery acts."""
+    path = tmp_path / "nested-invalid.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="nested-invalid", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    store.pause_for_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, question_id="top-level-question",
+        asked_by=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, text="Which exact fact applies?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "Resume exactly."},
+        event=_conversation_question(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, task_id=brief.task_id,
+            revision=brief.revision, generation=1, question_id="top-level-question",
+            text="Which exact fact applies?",
+        ),
+    )
+    store._connection.execute(
+        "UPDATE questions SET parent_question_id = ? WHERE question_id = ?",
+        ("forged-parent", "top-level-question"),
+    )
+
+    with pytest.raises(RuntimeError, match="question_integrity"):
+        store.audit_legacy_project_ownership("/repo")
+    with pytest.raises(RuntimeError, match="nested question"):
+        store.recover_active_tasks()
+    store.close()
+
+    with pytest.raises(RuntimeError, match="nested question"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+
+def test_zero_allowance_nested_clarification_persists_permission_without_losing_parent(
+    tmp_path, valid_brief,
+) -> None:
+    """Removing the nested permission branch would drop a grantable Fable parent."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="nested-limit", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    pending = {
+        "clarification_prompt": "Keep this exact Fable clarification.",
+        "sol_run_id": "sol-run-1",
+        "prompt": "Resume exactly.",
+    }
+    store._connection.execute(
+        """
+        UPDATE tasks SET state = ?, approved_at = ?, fable_session_id = ?, sol_thread_id = ?,
+            baseline_id = ?, exchange_allowance = 0, pending_json = ?
+        WHERE task_id = ? AND revision = ?
+        """,
+        (
+            TaskState.FABLE_CLARIFYING.value, "2026-08-10T12:00:00Z",
+            "fable-session-1", "sol-thread-1", "baseline-1",
+            json.dumps(pending, separators=(",", ":"), sort_keys=True),
+            brief.task_id, brief.revision,
+        ),
+    )
+
+    paused = store.pause_fable_clarification_evidence_permission(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1,
+        attempted_question=DirectedAgentQuestion(
+            addressed_to="sol", text="Which exact evidence is missing?",
+            reason="Fable needs one bounded execution fact.",
+        ),
+        event=_conversation_permission(task_id=brief.task_id, revision=brief.revision, generation=1),
+    )
+
+    assert (paused.state, paused.continuation_state, paused.pending) == (
+        TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING,
+        {**pending, "attempted_question": {
+            "addressed_to": "sol", "text": "Which exact evidence is missing?",
+            "reason": "Fable needs one bounded execution fact.",
+        }},
+    )
+    assert store.grant_internal_exchanges(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, request_id="nested-limit-grant",
+    ) == EXCHANGE_GRANT_SIZE
+
+
+def test_typed_conversation_preparations_are_atomic_and_survive_reload(
+    tmp_path, valid_brief,
+) -> None:
+    """Removing any typed row, CAS, or event must make this workflow fail closed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _store(tmp_path)
+    store.create_session("session-1", str(repo))
+    project_id = project_id_for_root(repo)
+    context = SolResumeContext(
+        sol_thread_id="sol-thread-1",
+        sol_run_id="sol-run-1",
+        prompt="Continue the exact approved work.",
+    )
+
+    continuation_brief = replace(
+        valid_brief, task_id="typed-continuation-task", revision=1,
+    )
+    _save_active_directed_task(store, "session-1", continuation_brief)
+    store.pause_for_continuation(
+        "typed-continuation-task",
+        1,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": context.sol_run_id, "prompt": context.prompt},
+    )
+    store.set_sol_thread("typed-continuation-task", 1, context.sol_thread_id)
+    continuation_payload = ContinuationMessagePayload(
+        text="Continue with the documented approach.",
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        continuation_generation=1,
+        continuation=context,
+    )
+
+    continuation = store.prepare_continuation_message_action(
+        project_id=project_id,
+        session_id="session-1",
+        task_id="typed-continuation-task",
+        revision=1,
+        generation=41,
+        payload=continuation_payload,
+    )
+
+    assert continuation.action == "continuation_message"
+    assert continuation.payload == continuation_payload
+    assert continuation.source_state is TaskState.AWAITING_USER_INPUT
+    assert continuation.active_state is TaskState.SOL_RUNNING
+    assert store.get_task("typed-continuation-task", 1).state is TaskState.SOL_RUNNING
+    assert store.events_after("session-1", 0)[-1].payload == ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        message_type=ConversationMessageType.STATEMENT,
+        text="Continue with the documented approach.",
+        task_id="typed-continuation-task",
+        revision=1,
+        continuation_generation=1,
+    ).to_dict()
+
+    answer_brief = replace(valid_brief, task_id="typed-answer-task", revision=1)
+    _save_active_directed_task(store, "session-1", answer_brief)
+    store.pause_for_question(
+        session_id="session-1",
+        task_id="typed-answer-task",
+        revision=1,
+        expected_generation=1,
+        question_id="typed-user-question",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Which approved option should Sol use?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": context.sol_run_id, "prompt": context.prompt},
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            task_id="typed-answer-task",
+            revision=1,
+            generation=1,
+            question_id="typed-user-question",
+            text="Which approved option should Sol use?",
+        ),
+    )
+    store.set_sol_thread("typed-answer-task", 1, context.sol_thread_id)
+    answer_payload = QuestionAnswerPayload(
+        question_id="typed-user-question",
+        answer="Use the documented option.",
+        continuation_generation=1,
+        continuation=context,
+    )
+
+    answer = store.prepare_question_answer_action(
+        project_id=project_id,
+        session_id="session-1",
+        task_id="typed-answer-task",
+        revision=1,
+        generation=42,
+        payload=answer_payload,
+    )
+
+    assert answer.action == "question_answer"
+    assert answer.payload == answer_payload
+    assert store.question("typed-user-question").answer_text == "Use the documented option."
+    answered_task = store.get_task("typed-answer-task", 1)
+    assert answered_task.state is TaskState.SOL_RUNNING
+    assert answered_task.continuation_generation == 2
+    assert store.events_after("session-1", 0)[-1].payload == _conversation_answer(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        task_id="typed-answer-task",
+        revision=1,
+        generation=1,
+        question_id="typed-user-question",
+        text="Use the documented option.",
+    ).to_dict()
+
+    grant_brief = replace(valid_brief, task_id="typed-grant-task", revision=1)
+    _save_active_directed_task(store, "session-1", grant_brief)
+    store._connection.execute(
+        "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+        ("typed-grant-task", 1),
+    )
+    attempted = DirectedAgentQuestion(
+        addressed_to="fable",
+        text="Please resolve the fourth exact ambiguity.",
+        reason="The initial finite allowance is exhausted.",
+    )
+    store.pause_for_exchange_permission(
+        session_id="session-1",
+        task_id="typed-grant-task",
+        revision=1,
+        expected_generation=1,
+        attempted_question=attempted,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": context.sol_run_id, "prompt": context.prompt},
+        event=_conversation_permission(
+            task_id="typed-grant-task", revision=1, generation=1,
+        ),
+    )
+    store.set_sol_thread("typed-grant-task", 1, context.sol_thread_id)
+    grant_payload = ExchangeGrantPayload(
+        request_id="typed-grant-request",
+        continuation_generation=1,
+        attempted_question=attempted,
+        continuation=context,
+        parent_mode="top_level",
+    )
+
+    grant = store.prepare_exchange_grant_action(
+        project_id=project_id,
+        session_id="session-1",
+        task_id="typed-grant-task",
+        revision=1,
+        generation=43,
+        payload=grant_payload,
+    )
+
+    assert grant.action == "exchange_grant"
+    assert grant.payload == grant_payload
+    granted_task = store.get_task("typed-grant-task", 1)
+    assert granted_task.state is TaskState.SOL_RUNNING
+    assert granted_task.exchange_allowance == EXCHANGE_GRANT_SIZE
+    assert store.events_after("session-1", 0)[-1].payload == ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.TEAM,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.APPROVAL,
+        text="Allow three more internal exchanges.",
+        task_id="typed-grant-task",
+        revision=1,
+    ).to_dict()
+
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    reloaded = SQLiteStore(
+        tmp_path / "bridge.sqlite3", clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    assert reloaded.prepared_action(continuation.preparation_id) == continuation
+    assert reloaded.prepared_action(answer.preparation_id) == answer
+    assert reloaded.prepared_action(grant.preparation_id) == grant
+    reloaded.audit_legacy_project_ownership(str(repo.resolve()))
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("mode", "outer", "task", "revision", "generation", "answer", "identity"),
+)
+def test_claimed_question_grant_checkpoint_rejects_each_tampered_authority_link(
+    tmp_path, valid_brief, tamper: str,
+) -> None:
+    """Changing any persisted parent checkpoint link must fail before another agent starts."""
+    store = _store(tmp_path)
+    (tmp_path / "repo").mkdir()
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="checkpoint-tamper", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    context = SolResumeContext("sol-thread-1", "sol-run-1", "Resume exactly.")
+    pending = {"sol_run_id": context.sol_run_id, "prompt": context.prompt}
+    store._connection.execute(
+        """UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?,
+        continuation_pause_id = ?, fable_session_id = ?, sol_thread_id = ?,
+        approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?""",
+        (TaskState.AWAITING_USER_INPUT.value, TaskState.SOL_RUNNING.value,
+         json.dumps(pending, separators=(",", ":"), sort_keys=True), "outer-pause",
+         "fable-session-1", context.sol_thread_id, "2026-08-10T12:00:00Z", "baseline-1",
+         brief.task_id, brief.revision),
+    )
+    outer = QuestionRecord(
+        "outer-question", "session-1", brief.task_id, brief.revision, 1,
+        ConversationActor.SOL, ConversationTarget.FABLE, ConversationTarget.FABLE,
+        "Which exact rule applies?", "outer-exchange", None, None,
+    )
+    store._insert_question(
+        outer, continuation_state=TaskState.SOL_RUNNING, pending_action=pending,
+        continuation_pause_id="outer-pause",
+    )
+    payload = ExchangeGrantPayload(
+        request_id="checkpoint-grant", continuation_generation=1,
+        attempted_question=DirectedAgentQuestion(
+            addressed_to="sol", text="Which exact test proves it?", reason="Need one fact.",
+        ),
+        continuation=context, parent_mode="question", outer_question_id=outer.question_id,
+    )
+    record = store._insert_prepared_action(
+        project_id=project_id_for_root(tmp_path / "repo"), session_id="session-1",
+        task_id=brief.task_id, revision=brief.revision, action="exchange_grant",
+        payload=payload, source_state=TaskState.AWAITING_USER_INPUT,
+        active_state=TaskState.SOL_RUNNING, continuation_state=TaskState.SOL_RUNNING,
+        pending_context=context, previous_preparation_id=None, generation=9,
+    )
+    store._connection.execute(
+        "UPDATE prepared_actions SET status = 'CLAIMED' WHERE preparation_id = ?",
+        (record.preparation_id,),
+    )
+    if tamper == "mode":
+        store._connection.execute("UPDATE prepared_actions SET payload_json = json_set(payload_json, '$.parent_mode', 'clarification') WHERE preparation_id = ?", (record.preparation_id,))
+    elif tamper == "outer":
+        store._connection.execute("UPDATE prepared_actions SET payload_json = json_set(payload_json, '$.outer_question_id', 'forged-outer') WHERE preparation_id = ?", (record.preparation_id,))
+    elif tamper == "task":
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute("UPDATE prepared_actions SET task_id = 'forged-task' WHERE preparation_id = ?", (record.preparation_id,))
+        return
+    elif tamper == "revision":
+        with pytest.raises(sqlite3.IntegrityError):
+            store._connection.execute("UPDATE prepared_actions SET revision = 2 WHERE preparation_id = ?", (record.preparation_id,))
+        return
+    elif tamper == "generation":
+        store._connection.execute("UPDATE tasks SET continuation_generation = 2 WHERE task_id = ?", (brief.task_id,))
+    elif tamper == "answer":
+        store._connection.execute("UPDATE questions SET answer_text = 'forged', answered_by = 'fable' WHERE question_id = ?", (outer.question_id,))
+    else:
+        store._connection.execute("UPDATE questions SET asked_by = 'fable' WHERE question_id = ?", (outer.question_id,))
+
+    with pytest.raises(RuntimeError):
+        store.resume_claimed_exchange_grant_checkpoint(record.preparation_id, generation=9)
+
+
+def test_recovered_question_grant_checkpoint_rebinds_only_one_fresh_lease_generation(
+    tmp_path, valid_brief,
+) -> None:
+    """Removing the CAS would let a stale Hub lease run a recovered checkpoint."""
+    store = _store(tmp_path)
+    (tmp_path / "repo").mkdir()
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="checkpoint-rebind", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    context = SolResumeContext("sol-thread-1", "sol-run-1", "Resume exactly.")
+    pending = {"sol_run_id": context.sol_run_id, "prompt": context.prompt}
+    store._connection.execute(
+        """UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?,
+        continuation_pause_id = ?, fable_session_id = ?, sol_thread_id = ?,
+        approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?""",
+        (TaskState.AWAITING_USER_INPUT.value, TaskState.SOL_RUNNING.value,
+         json.dumps(pending, separators=(",", ":"), sort_keys=True), "rebind-pause",
+         "fable-session-1", context.sol_thread_id, "2026-08-10T12:00:00Z", "baseline-1",
+         brief.task_id, brief.revision),
+    )
+    outer = QuestionRecord(
+        "rebind-outer", "session-1", brief.task_id, brief.revision, 1,
+        ConversationActor.SOL, ConversationTarget.FABLE, ConversationTarget.FABLE,
+        "Which exact rule applies?", "rebind-exchange", None, None,
+    )
+    store._insert_question(
+        outer, continuation_state=TaskState.SOL_RUNNING, pending_action=pending,
+        continuation_pause_id="rebind-pause",
+    )
+    record = store._insert_prepared_action(
+        project_id=project_id_for_root(tmp_path / "repo"), session_id="session-1",
+        task_id=brief.task_id, revision=brief.revision, action="exchange_grant",
+        payload=ExchangeGrantPayload(
+            request_id="rebind-grant", continuation_generation=1,
+            attempted_question=DirectedAgentQuestion(
+                addressed_to="sol", text="Which exact test proves it?", reason="Need one fact.",
+            ),
+            continuation=context, parent_mode="question", outer_question_id=outer.question_id,
+        ),
+        source_state=TaskState.AWAITING_USER_INPUT, active_state=TaskState.SOL_RUNNING,
+        continuation_state=TaskState.SOL_RUNNING, pending_context=context,
+        previous_preparation_id=None, generation=9,
+    )
+    store._connection.execute(
+        "UPDATE prepared_actions SET status = 'RECOVERED' WHERE preparation_id = ?",
+        (record.preparation_id,),
+    )
+
+    rebound = store.rebind_recovered_exchange_grant_checkpoint(
+        record.preparation_id, old_generation=9, generation=14,
+        project_id=record.project_id, session_id=record.session_id,
+        task_id=record.task_id, revision=record.revision,
+    )
+
+    assert (rebound.generation, rebound.status) == (14, "CLAIMED")
+    assert store.get_task(brief.task_id, brief.revision).continuation_generation == 1
+    assert store.question(outer.question_id) == outer
+    with pytest.raises(RuntimeError):
+        store.rebind_recovered_exchange_grant_checkpoint(
+            record.preparation_id, old_generation=9, generation=15,
+            project_id=record.project_id, session_id=record.session_id,
+            task_id=record.task_id, revision=record.revision,
+        )

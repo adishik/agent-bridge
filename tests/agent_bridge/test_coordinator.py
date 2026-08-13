@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,8 +19,10 @@ from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.adapters.claude_cli import ClaudeRunError
 from agent_bridge.adapters.codex_cli import CodexRunError
 from agent_bridge.contracts import (
+    ConversationActor,
     ConversationMessageType,
     ConversationTarget,
+    DirectedAgentQuestion,
     FableClarification,
     ReviewVerdict,
     SolOutcome,
@@ -36,6 +39,14 @@ from agent_bridge.coordinator import (
     route_user_intent,
 )
 from agent_bridge.process import ProcessRunner
+from agent_bridge.hub import (
+    ActiveAgentLease,
+    HubWorkflowOrchestrator,
+    PreparedWorkflow,
+    ProjectRegistry,
+    RuntimeReadiness,
+    RuntimeStatus,
+)
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
@@ -102,10 +113,11 @@ def _completed(
     *,
     command: str = TEST_COMMAND,
     claimed_exit_code: int = 0,
+    summary: str = "Implemented and verified the approved change.",
 ) -> SolOutcome:
     return SolOutcome.from_dict({
         "status": "completed",
-        "summary": "Implemented and verified the approved change.",
+        "summary": summary,
         "changed_files": [],
         "commands_run": [{
             "command": command,
@@ -138,13 +150,42 @@ def _question(text: str) -> SolOutcome:
     })
 
 
+def _directed_sol_question(
+    text: str,
+    *,
+    addressed_to: str = "fable",
+) -> SolOutcome:
+    return SolOutcome.from_dict({
+        "status": "question",
+        "summary": "Implementation needs one directed clarification.",
+        "changed_files": [],
+        "commands_run": [],
+        "known_failures": [],
+        "remaining_risks": [],
+        "architecture_docs": "No durable architecture change.",
+        "question": {
+            "ambiguity": text,
+            "why_it_matters": "The answer controls the approved implementation.",
+            "options": ["Keep the current scope", "Revise the scope"],
+            "recommendation": "Keep the current scope",
+            "can_continue_safely": False,
+            "directed_question": {
+                "addressed_to": addressed_to,
+                "text": text,
+                "reason": "The approved implementation needs an exact answer.",
+            },
+        },
+    })
+
+
 def _answer(
     text: str,
     scope_changed: bool,
     *,
     revised_brief: TaskBrief | None = None,
+    directed_question: DirectedAgentQuestion | None = None,
 ) -> FableClarification:
-    return FableClarification.from_dict({
+    payload: dict[str, object] = {
         "status": "answered",
         "answer": text,
         "reasoning": "The repository rules resolve the ambiguity.",
@@ -152,7 +193,10 @@ def _answer(
         "scope_changed": scope_changed,
         "revised_brief": None if revised_brief is None else revised_brief.to_dict(),
         "question_for_user": None,
-    })
+    }
+    if directed_question is not None:
+        payload["directed_question"] = directed_question.to_dict()
+    return FableClarification.from_dict(payload)
 
 
 def _escalation(question: str, *, reasoning: str) -> FableClarification:
@@ -173,8 +217,9 @@ def _verdict(
     *,
     correction: str = "Add the missing focused evidence.",
     question: str = "Should Sol continue despite the disagreement?",
+    directed_question: DirectedAgentQuestion | None = None,
 ) -> ReviewVerdict:
-    return ReviewVerdict.from_dict({
+    payload: dict[str, object] = {
         "status": status,
         "summary": "Review completed.",
         "criteria": [{
@@ -187,7 +232,10 @@ def _verdict(
         "remaining_risks": [],
         "corrections": [correction] if status == "corrections_required" else [],
         "question_for_user": question if status == "escalate_to_user" else None,
-    })
+    }
+    if directed_question is not None:
+        payload["directed_question"] = directed_question.to_dict()
+    return ReviewVerdict.from_dict(payload)
 
 
 @dataclass
@@ -195,6 +243,7 @@ class FakeFable:
     brief: TaskBrief
     clarification_prompts: list[str] = field(default_factory=list)
     review_prompts: list[str] = field(default_factory=list)
+    answer_sol_question_prompts: list[tuple[str, str, str]] = field(default_factory=list)
     plan_calls: list[tuple[str, str, str]] = field(default_factory=list)
     resume_plan_sessions: list[str] = field(default_factory=list)
     next_clarifications: deque[FableClarification] = field(default_factory=deque)
@@ -202,6 +251,8 @@ class FakeFable:
     hold_plan: asyncio.Event | None = None
     hold_clarification: asyncio.Event | None = None
     hold_review: asyncio.Event | None = None
+    hold_answer_sol_question: asyncio.Event | None = None
+    on_answer_sol_question: Callable[[], None] | None = None
     plan_events: tuple[Mapping[str, object], ...] = ()
     plan_error_result: AgentRunResult | None = None
 
@@ -251,6 +302,30 @@ class FakeFable:
         )
         return _result(run_id, clarification.to_dict(), session_id=session_id)
 
+    async def answer_sol_question(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        task_id: str,
+        prompt: str,
+        context: str,
+    ) -> AgentRunResult:
+        self.answer_sol_question_prompts.append((task_id, prompt, context))
+        if self.on_answer_sol_question is not None:
+            self.on_answer_sol_question()
+        if self.hold_answer_sol_question is not None:
+            await self.hold_answer_sol_question.wait()
+            return _result(
+                run_id, None, session_id=session_id, interrupted=True, exit_code=-15,
+            )
+        clarification = (
+            self.next_clarifications.popleft()
+            if self.next_clarifications
+            else _answer("Use the existing approved scope.", False)
+        )
+        return _result(run_id, clarification.to_dict(), session_id=session_id)
+
     async def review(
         self, *, run_id: str, session_id: str, prompt: str,
     ) -> AgentRunResult:
@@ -273,11 +348,13 @@ class FakeSol:
     starts: list[TaskBrief] = field(default_factory=list)
     resume_prompts: list[str] = field(default_factory=list)
     resume_threads: list[str] = field(default_factory=list)
+    answer_fable_question_calls: list[tuple[str, TaskBrief, str]] = field(default_factory=list)
     next_outcomes: deque[tuple[SolOutcome, tuple[Mapping[str, object], ...]]] = field(
         default_factory=deque
     )
     hold_start: asyncio.Event | None = None
     on_start: Callable[[], None] | None = None
+    on_resume: Callable[[], None] | None = None
     returned_run_id: str | None = None
     returned_session_id: str = THREAD_ID
     start_error_result: AgentRunResult | None = None
@@ -325,6 +402,20 @@ class FakeSol:
     ) -> AgentRunResult:
         self.resume_threads.append(thread_id)
         self.resume_prompts.append(prompt)
+        if self.on_resume is not None:
+            self.on_resume()
+        outcome, events = self._next()
+        return _result(run_id, outcome.to_dict(), session_id=thread_id, events=events)
+
+    async def answer_fable_question(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        brief: TaskBrief,
+        prompt: str,
+    ) -> AgentRunResult:
+        self.answer_fable_question_calls.append((thread_id, brief, prompt))
         outcome, events = self._next()
         return _result(run_id, outcome.to_dict(), session_id=thread_id, events=events)
 
@@ -678,7 +769,13 @@ def test_scope_change_requires_new_exact_revision_approval(harness) -> None:
         )
         harness.sol.queue(_question("May I add bridge-extra.txt?"))
         harness.fable.next_clarifications.append(
-            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+            _answer(
+                "Add the explicitly scoped file.", True, revised_brief=revised,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol", text="This must not spend an exchange.",
+                    reason="Scope approval takes precedence.",
+                ),
+            )
         )
         await harness.run_approved_task()
 
@@ -2893,6 +2990,7 @@ def test_initial_approval_resume_reconstructs_the_durable_start_context_before_a
         await coordinator.run_prepared_action(resumed.preparation_id)
         assert len(harness.sol.starts) == 1
         assert harness.sol.resume_threads == []
+        assert harness.sol.answer_fable_question_calls == []
 
     asyncio.run(scenario())
 
@@ -3015,6 +3113,873 @@ def test_compatibility_answer_rejects_missing_legacy_sol_run_without_starting_so
         assert unchanged.state is TaskState.AWAITING_USER_INPUT
         assert unchanged.pending == {"prompt": "Use the exact persisted continuation."}
         assert harness.sol.resume_threads == []
+
+    asyncio.run(scenario())
+
+
+def test_directed_sol_question_is_visible_before_fable_starts_and_answer_before_sol_resumes(
+    harness: CoordinatorHarness,
+) -> None:
+    """A missing transactional event boundary would let a child run ahead of chat."""
+    async def scenario() -> None:
+        seen = []
+        harness.store.add_event_listener(seen.append)
+        harness.sol.queue(
+            _directed_sol_question("Which exact interpretation should be used?"),
+            events=(_command_event(TEST_COMMAND),),
+        )
+
+        def assert_question_is_committed() -> None:
+            questions = [
+                event for event in seen
+                if event.kind == "conversation"
+                and event.payload["message_type"] == "question"
+            ]
+            assert len(questions) == 1
+            question = questions[0]
+            assert question.payload["sender"] == "sol"
+            assert question.payload["addressed_to"] == "fable"
+            assert question.payload["routed_to"] == "fable"
+            assert harness.store.question(question.payload["question_id"]) is not None
+
+        def assert_answer_is_committed() -> None:
+            answers = [
+                event for event in seen
+                if event.kind == "conversation"
+                and event.payload["message_type"] == "answer"
+            ]
+            assert len(answers) == 1
+            assert answers[0].payload["sender"] == "fable"
+            assert answers[0].payload["routed_to"] == "sol"
+
+        harness.fable.on_answer_sol_question = assert_question_is_committed
+        harness.sol.on_resume = assert_answer_is_committed
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert len(harness.fable.answer_sol_question_prompts) == 1
+        assert harness.sol.resume_threads == [THREAD_ID]
+        conversation = [event for event in seen if event.kind == "conversation"]
+        assert [event.payload["message_type"] for event in conversation] == [
+            "question", "answer",
+        ]
+        assert any(event.kind == "agent_event" for event in seen)
+
+    asyncio.run(scenario())
+
+
+def test_directed_answer_post_provider_state_change_cannot_resume_sol(
+    harness: CoordinatorHarness,
+) -> None:
+    """The exact Store CAS rechecks state after Fable returns, before Sol resumes."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which exact rule applies?"))
+        original = harness.fable.answer_sol_question
+
+        async def return_after_terminalizing(**kwargs: object) -> AgentRunResult:
+            result = await original(**kwargs)  # type: ignore[arg-type]
+            waiting = harness.store.get_task("task-1", 1)
+            harness.store.transition_task(
+                waiting.task_id,
+                waiting.revision,
+                expected=TaskState.AWAITING_USER_INPUT,
+                target=TaskState.FAILED,
+            )
+            return result
+
+        harness.fable.answer_sol_question = return_after_terminalizing  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+
+        terminal = harness.store.get_task("task-1", 1)
+        assert terminal.state is TaskState.FAILED
+        assert harness.sol.resume_threads == []
+        assert not [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload["message_type"] == "answer"
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_directed_user_question_pauses_and_agents_cannot_answer_it(
+    harness: CoordinatorHarness,
+) -> None:
+    """Changing the recipient must not let an agent bypass the user answer CAS."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question(
+            "Which deployment window does the user approve?", addressed_to="user",
+        ))
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        task = harness.store.get_task("task-1", 1)
+        assert task.state is TaskState.AWAITING_USER_INPUT
+        question = harness.store._unanswered_question_for_task("task-1", 1)
+        assert question is not None
+        assert question.routed_to is ConversationTarget.USER
+
+        with pytest.raises(RuntimeError, match="user-routed"):
+            await harness.coordinator.answer_directed_question(question)
+
+        persisted = harness.store.question(question.question_id)
+        assert persisted is not None
+        assert persisted.answer_text is None
+        assert harness.fable.answer_sol_question_prompts == []
+        assert harness.sol.resume_threads == []
+
+    asyncio.run(scenario())
+
+
+def test_directed_exchanges_pause_at_three_then_a_grant_allows_only_three_more(
+    harness: CoordinatorHarness,
+) -> None:
+    """The fourth automatic hop must be a durable user permission boundary."""
+    async def scenario() -> None:
+        for ordinal in range(1, 8):
+            harness.sol.queue(_directed_sol_question(
+                f"Fable clarification {ordinal}?",
+            ))
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        exhausted = harness.store.get_task("task-1", 1)
+        assert exhausted.state is TaskState.AWAITING_USER_INPUT
+        assert (exhausted.exchange_allowance, exhausted.exchange_consumed) == (0, 3)
+        assert len(harness.fable.answer_sol_question_prompts) == 3
+        permission = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload["message_type"] == "status"
+        ]
+        assert len(permission) == 1
+        assert permission[0].payload["sender"] == "system"
+        assert permission[0].payload["addressed_to"] == "user"
+        assert permission[0].payload["routed_to"] == "user"
+
+        prepared_task = harness.coordinator.prepare_exchange_grant(
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+            continuation_generation=1,
+            request_id="grant-after-three",
+        )
+        assert prepared_task.state is TaskState.SOL_RUNNING
+        prepared = harness.store.latest_prepared_action_for_task(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+        )
+        assert prepared is not None and prepared.action == "exchange_grant"
+
+        await harness.coordinator.run_prepared_conversation_action(
+            "task-1", "exchange_grant",
+        )
+
+        exhausted_again = harness.store.get_task("task-1", 1)
+        assert exhausted_again.state is TaskState.AWAITING_USER_INPUT
+        assert (exhausted_again.exchange_allowance, exhausted_again.exchange_consumed) == (0, 6)
+        assert len(harness.fable.answer_sol_question_prompts) == 6
+        permission_cards = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload["message_type"] == "status"
+        ]
+        assert len(permission_cards) == 2
+
+    asyncio.run(scenario())
+
+
+def test_directed_exchange_retry_after_visible_reservation_reuses_one_charge_and_question(
+    harness: CoordinatorHarness,
+) -> None:
+    """A crash after publication must not make retry reserve a second hop."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which invariant applies?"))
+        original = harness.coordinator.answer_directed_question
+        captured: list[object] = []
+
+        async def crash_after_reservation(question: object) -> None:
+            captured.append(question)
+            raise RuntimeError("controlled crash after visible reservation")
+
+        harness.coordinator.answer_directed_question = crash_after_reservation  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        with pytest.raises(PreparedActionFailed):
+            await harness.coordinator.approve_task("task-1", revision=1)
+
+        paused = harness.store.get_task("task-1", 1)
+        assert (paused.exchange_allowance, paused.exchange_consumed) == (2, 1)
+        assert len(captured) == 1
+        question = captured[0]
+        assert isinstance(question, store_module.QuestionRecord)
+        conversation = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload["message_type"] == "question"
+        ]
+        assert len(conversation) == 1
+
+        harness.coordinator.answer_directed_question = original  # type: ignore[method-assign]
+        await harness.coordinator.answer_directed_question(question)
+
+        retried = harness.store.get_task("task-1", 1)
+        assert (retried.exchange_allowance, retried.exchange_consumed) == (2, 1)
+        conversation_after = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload["message_type"] == "question"
+        ]
+        assert len(conversation_after) == 1
+        assert len(harness.fable.answer_sol_question_prompts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_directed_fable_scope_change_requires_exact_new_approval_before_sol_resumes(
+    harness: CoordinatorHarness,
+) -> None:
+    """Fable keeps scope authority even while answering Sol's directed question."""
+    async def scenario() -> None:
+        revised = replace(
+            harness.fable.brief,
+            revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.queue(_directed_sol_question("May I add bridge-extra.txt?"))
+        harness.fable.next_clarifications.append(
+            _answer("Add the explicitly scoped file.", True, revised_brief=revised)
+        )
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        revision_one = harness.store.get_task("task-1", 1)
+        awaiting = harness.store.latest_task("task-1")
+        assert awaiting is not None
+        assert awaiting.revision == 2
+        assert awaiting.state is TaskState.AWAITING_SCOPE_APPROVAL
+        assert awaiting.approved_at is None
+        assert awaiting.baseline_id == revision_one.baseline_id
+        assert harness.sol.resume_threads == []
+
+        with pytest.raises(ValueError, match="revision"):
+            await harness.coordinator.approve_task("task-1", revision=1)
+        assert harness.sol.resume_threads == []
+
+        await harness.coordinator.approve_task("task-1", revision=2)
+        assert harness.sol.resume_threads == [THREAD_ID]
+
+    asyncio.run(scenario())
+
+
+def test_fable_directed_evidence_request_uses_exact_approved_sol_thread(
+    harness: CoordinatorHarness,
+) -> None:
+    """Fable may ask Sol only inside the approved revision and exact thread."""
+    async def scenario() -> None:
+        harness.sol.queue(_completed())
+        harness.sol.queue(_completed())
+        harness.fable.next_verdicts.extend((
+            _verdict(
+                harness.fable.brief,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text="Which approved seam is already exercised?",
+                    reason="Fable needs evidence before final review.",
+                ),
+            ),
+            _verdict(harness.fable.brief),
+        ))
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert len(harness.sol.answer_fable_question_calls) == 1
+        thread_id, brief, prompt = harness.sol.answer_fable_question_calls[0]
+        assert thread_id == THREAD_ID
+        assert brief.revision == 1
+        assert prompt == "Which approved seam is already exercised?"
+        assert harness.sol.resume_threads == []
+        conversation = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+        ]
+        assert [event.payload["message_type"] for event in conversation] == [
+            "question", "answer",
+        ]
+        assert conversation[0].payload["sender"] == "fable"
+        assert conversation[0].payload["routed_to"] == "sol"
+        assert conversation[1].payload["sender"] == "sol"
+        assert conversation[1].payload["routed_to"] == "fable"
+        assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_fable_clarification_directed_evidence_request_resumes_its_exact_context(
+    harness: CoordinatorHarness,
+) -> None:
+    """A contract-backed Fable evidence request must not be rejected as nested."""
+    async def scenario() -> None:
+        harness.sol.queue(_question("Which existing rule resolves this ambiguity?"))
+        harness.sol.queue(_completed())
+        harness.sol.queue(_completed())
+        harness.fable.next_clarifications.extend((
+            _answer(
+                "I need one exact execution fact before answering.",
+                False,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text="Which approved rule is already exercised?",
+                    reason="Fable needs exact execution evidence.",
+                ),
+            ),
+            _answer("Use the confirmed approved rule.", False),
+        ))
+        harness.coordinator._bounded_compatibility_error = lambda error: error  # type: ignore[method-assign,return-value]
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert harness.sol.answer_fable_question_calls == [
+            (
+                THREAD_ID,
+                harness.fable.brief,
+                "Which approved rule is already exercised?",
+            ),
+        ]
+        assert len(harness.fable.clarification_prompts) == 2
+        assert "Sol evidence: Implemented and verified the approved change." in harness.fable.clarification_prompts[1]
+        assert "User answer:" not in harness.fable.clarification_prompts[1]
+        assert harness.sol.resume_threads == [THREAD_ID]
+        conversation = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+        ]
+        assert [event.payload["message_type"] for event in conversation] == [
+            "question", "answer",
+        ]
+        assert conversation[0].payload["sender"] == "fable"
+        assert conversation[0].payload["routed_to"] == "sol"
+        assert conversation[1].payload["sender"] == "sol"
+        assert conversation[1].payload["routed_to"] == "fable"
+        assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_fable_answer_evidence_keeps_outer_sol_question_open_until_final_answer(
+    harness: CoordinatorHarness,
+) -> None:
+    """A nested evidence reply must restore the outer Fable answer, not resume Sol."""
+    async def scenario() -> None:
+        harness.sol.queue(_directed_sol_question("Which approved constraint applies?"))
+        harness.sol.queue(_completed(summary="Sol's persisted evidence only."))
+        harness.sol.queue(_completed())
+        harness.fable.next_clarifications.extend((
+            _answer(
+                "I need one execution fact before the final answer.",
+                False,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text="Which focused test proves the approved constraint?",
+                    reason="Fable needs exact evidence before answering Sol.",
+                ),
+            ),
+            _answer("Use the already-proven approved constraint.", False),
+        ))
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        assert harness.sol.answer_fable_question_calls == [
+            (
+                THREAD_ID,
+                harness.fable.brief,
+                "Which focused test proves the approved constraint?",
+            ),
+        ]
+        assert [entry[:2] for entry in harness.fable.answer_sol_question_prompts] == [
+            ("task-1", "Which approved constraint applies?"),
+            (
+                "task-1",
+                "Which approved constraint applies?\nSol evidence: Sol's persisted evidence only.",
+            ),
+        ]
+        assert harness.sol.resume_threads == [THREAD_ID]
+        conversation = [
+            event.payload for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+        ]
+        assert [event["message_type"] for event in conversation] == [
+            "question", "question", "answer", "answer",
+        ]
+        assert conversation[1]["reply_to_question_id"] is None
+        assert conversation[2]["reply_to_question_id"] == conversation[1]["question_id"]
+        assert conversation[3]["reply_to_question_id"] == conversation[0]["question_id"]
+        assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("claim_before_recovery", (False, True))
+def test_exhausted_fable_answer_evidence_pauses_then_retries_the_exact_outer_question(
+    harness: CoordinatorHarness,
+    claim_before_recovery: bool,
+) -> None:
+    """A +3 grant must retry the persisted Sol-question parent, not reroute it."""
+    async def scenario() -> None:
+        outer_text = "Which approved constraint applies?"
+        harness.sol.queue(_directed_sol_question(outer_text))
+        harness.sol.queue(_completed())
+        harness.fable.next_clarifications.extend((
+            _answer(
+                "I need one execution fact before the final answer.",
+                False,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text="Which focused test proves the approved constraint?",
+                    reason="Fable needs exact evidence before answering Sol.",
+                ),
+            ),
+            _answer(
+                "I need one execution fact before the final answer.",
+                False,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text="Which focused test proves the approved constraint?",
+                    reason="Fable needs exact evidence before answering Sol.",
+                ),
+            ),
+            _answer("Use the already-proven approved constraint.", False),
+        ))
+
+        def exhaust_before_nested_evidence() -> None:
+            harness.store._connection.execute(
+                "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+                ("task-1", 1),
+            )
+
+        harness.fable.on_answer_sol_question = exhaust_before_nested_evidence
+        harness.coordinator._bounded_compatibility_error = lambda error: error  # type: ignore[method-assign,return-value]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        paused = harness.store.get_task("task-1", 1)
+        assert (paused.state, paused.continuation_state, paused.exchange_allowance) == (
+            TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING, 0,
+        )
+        outer = harness.store.unanswered_question_for_task("task-1", 1)
+        assert outer is not None and outer.text == outer_text
+        harness.fable.on_answer_sol_question = None
+
+        prepared = harness.coordinator._prepare_exchange_grant_action(
+            session_id="session-1", task_id="task-1", revision=1,
+            continuation_generation=paused.continuation_generation,
+            request_id="retry-nested-answer-evidence",
+            generation=17,
+        )
+        assert prepared.payload.outer_question_id == outer.question_id
+        duplicate = harness.store.prepare_exchange_grant_action(
+            project_id=harness.coordinator.project_id,
+            session_id="session-1", task_id="task-1", revision=1,
+            generation=17, payload=prepared.payload,
+        )
+        assert duplicate.preparation_id == prepared.preparation_id
+        if claim_before_recovery:
+            harness.store.claim_prepared_action(prepared.preparation_id, generation=17)
+        assert harness.coordinator.recover_unfinished_prepared_actions().prepared_actions_recovered == 1
+        resumed = harness.coordinator.prepare_resume(
+            session_id="session-1", task_id="task-1", revision=1, generation=18,
+        )
+        assert resumed.preparation_id == prepared.preparation_id
+        await harness.coordinator.run_prepared_action(resumed.preparation_id)
+
+        assert [entry[:2] for entry in harness.fable.answer_sol_question_prompts] == [
+            ("task-1", outer_text),
+            ("task-1", outer_text),
+            (
+                "task-1",
+                f"{outer_text}\nSol evidence: Implemented and verified the approved change.",
+            ),
+        ]
+        assert len(harness.sol.answer_fable_question_calls) == 1
+        assert harness.store._connection.execute(
+            "SELECT COUNT(*) FROM exchange_grants WHERE request_id = ?",
+            ("retry-nested-answer-evidence",),
+        ).fetchone()[0] == 1
+        assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_legacy_user_answer_cannot_consume_a_durable_directed_question(
+    harness: CoordinatorHarness,
+) -> None:
+    """Removing this guard would let an unbound legacy reply resume an exact question."""
+    async def scenario() -> None:
+        fable_started = asyncio.Event()
+        release_fable = asyncio.Event()
+        harness.sol.queue(_directed_sol_question("Which exact approved rule applies?"))
+        harness.fable.hold_answer_sol_question = release_fable
+        harness.fable.on_answer_sol_question = fable_started.set
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(
+            harness.coordinator.approve_task("task-1", revision=1),
+        )
+        await fable_started.wait()
+        task = harness.store.get_task("task-1", 1)
+        before_events = harness.store.events_after("session-1", 0)
+
+        with pytest.raises(ValueError, match="exact directed question"):
+            await harness.coordinator.answer_user_question(
+                "task-1", "An unbound legacy answer must not route.",
+            )
+
+        assert harness.store.get_task("task-1", 1) == task
+        assert harness.store.events_after("session-1", 0) == before_events
+        release_fable.set()
+        await approval
+
+    asyncio.run(scenario())
+
+
+def test_clarification_grant_checkpoint_recovers_and_reuses_the_reserved_sol_question(
+    harness: CoordinatorHarness,
+) -> None:
+    """A post-reservation crash must resume the exact child without another grant."""
+    async def scenario() -> None:
+        directed = DirectedAgentQuestion(
+            addressed_to="sol",
+            text="Which focused check proves the implementation?",
+            reason="Fable needs one bounded execution fact.",
+        )
+        harness.sol.queue(_question("Which rule needs clarification?"))
+        harness.fable.next_clarifications.append(
+            _answer("I need one execution fact.", False, directed_question=directed)
+        )
+        original_clarify = harness.fable.clarify
+
+        async def exhaust_before_fable_requests_evidence(**kwargs: object) -> AgentRunResult:
+            harness.store._connection.execute(
+                "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+                ("task-1", 1),
+            )
+            return await original_clarify(**kwargs)  # type: ignore[arg-type]
+
+        harness.fable.clarify = exhaust_before_fable_requests_evidence  # type: ignore[method-assign]
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        paused = harness.store.get_task("task-1", 1)
+        assert (paused.state, paused.continuation_state, paused.exchange_allowance) == (
+            TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING, 0,
+        )
+        prepared = harness.coordinator._prepare_exchange_grant_action(
+            session_id="session-1", task_id="task-1", revision=1,
+            continuation_generation=paused.continuation_generation,
+            request_id="clarification-checkpoint", generation=51,
+        )
+        claimed = harness.store.claim_prepared_action(
+            prepared.preparation_id, generation=prepared.generation,
+        )
+        question_id, request_key = harness.coordinator._directed_question_identifiers(
+            harness.store.get_task("task-1", 1), ConversationActor.FABLE, directed,
+        )
+        _, child = harness.store.reserve_fable_clarification_evidence_question(
+            session_id="session-1", task_id="task-1", revision=1,
+            expected_generation=claimed.payload.continuation_generation,
+            question_id=question_id, request_key=request_key, text=directed.text,
+            event=store_module.ConversationEnvelope(
+                sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                message_type=ConversationMessageType.QUESTION, text=directed.text,
+                task_id="task-1", revision=1,
+                continuation_generation=claimed.payload.continuation_generation,
+                question_id=question_id,
+            ),
+        )
+        checkpoint = harness.store.get_task("task-1", 1)
+        assert (checkpoint.state, checkpoint.continuation_state) == (
+            TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING,
+        )
+        assert harness.store.question(child.question_id) == child
+        harness.fable.clarify = original_clarify  # type: ignore[method-assign]
+
+        harness.tracker.close()
+        harness.store.close()
+        reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        reopened_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        resumed_sol = FakeSol()
+        resumed_sol.queue(_completed(summary="The focused check passed."))
+        resumed_sol.queue(_completed())
+        recreated = Coordinator(
+            store=reopened_store, repository=reopened_tracker, runner=RecordingRunner(),
+            fable=harness.fable, sol=resumed_sol,
+            ids=DeterministicIds(task_number=1, run_number=20), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+
+        assert reopened_store.prepared_action(prepared.preparation_id).status == "RECOVERED"  # type: ignore[union-attr]
+        assert recreated.recover_unfinished_prepared_actions().prepared_actions_recovered == 0
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=recreated.project_id,
+            store=reopened_store,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        stale = lease.acquire(
+            project_id=recreated.project_id, session_id="session-1", task_id="task-1",
+        )
+        lease.release(stale)
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        first_resume = await workflows.prepare_resume(
+            project_id=recreated.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert (first_resume.preparation_id, first_resume.token.generation) == (
+            prepared.preparation_id, 2,
+        )
+        with pytest.raises(RuntimeError, match="another workflow"):
+            await workflows.prepare_resume(
+                project_id=recreated.project_id, session_id="session-1",
+                task_id="task-1", revision=1,
+            )
+        await workflows.run(first_resume)
+        assert workflows.active_lease_snapshot() is None
+
+        assert len(resumed_sol.answer_fable_question_calls) == 1
+        assert resumed_sol.answer_fable_question_calls[0][2] == directed.text
+        assert len(harness.fable.clarification_prompts) == 2
+        assert "Sol evidence: The focused check passed." in harness.fable.clarification_prompts[1]
+        assert "User answer:" not in harness.fable.clarification_prompts[1]
+        assert reopened_store._connection.execute(
+            "SELECT COUNT(*) FROM exchange_grants WHERE request_id = ?",
+            ("clarification-checkpoint",),
+        ).fetchone()[0] == 1
+        conversation = [
+            event.payload for event in reopened_store.events_after("session-1", 0)
+            if event.kind == "conversation"
+        ]
+        assert [event["message_type"] for event in conversation].count("question") == 1
+        assert [event["message_type"] for event in conversation].count("answer") == 1
+        reopened_tracker.close()
+        reopened_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_question_grant_checkpoint_recovers_the_restored_outer_fable_pause(
+    harness: CoordinatorHarness,
+) -> None:
+    """A crash after restoring Sol's parent question must not reroute or recharge it."""
+    async def scenario() -> None:
+        outer_text = "Which approved constraint applies?"
+        directed = DirectedAgentQuestion(
+            addressed_to="sol",
+            text="Which focused test proves that constraint?",
+            reason="Fable needs one exact execution fact.",
+        )
+        harness.sol.queue(_directed_sol_question(outer_text))
+        harness.fable.next_clarifications.append(
+            _answer("I need evidence first.", False, directed_question=directed)
+        )
+        harness.fable.on_answer_sol_question = lambda: harness.store._connection.execute(
+            "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+            ("task-1", 1),
+        )
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        paused = harness.store.get_task("task-1", 1)
+        outer = harness.store.unanswered_question_for_task("task-1", 1)
+        assert outer is not None
+        assert (paused.state, paused.continuation_state, paused.exchange_allowance) == (
+            TaskState.AWAITING_USER_INPUT, TaskState.FABLE_CLARIFYING, 0,
+        )
+        prepared = harness.coordinator._prepare_exchange_grant_action(
+            session_id="session-1", task_id="task-1", revision=1,
+            continuation_generation=paused.continuation_generation,
+            request_id="question-checkpoint", generation=61,
+        )
+        claimed = harness.store.claim_prepared_action(
+            prepared.preparation_id, generation=prepared.generation,
+        )
+        harness.store.restore_fable_answer_parent_for_retry(
+            session_id="session-1", task_id="task-1", revision=1,
+            expected_generation=claimed.payload.continuation_generation,
+            outer_question_id=outer.question_id,
+        )
+        checkpoint = harness.store.get_task("task-1", 1)
+        assert (checkpoint.state, checkpoint.continuation_state) == (
+            TaskState.AWAITING_USER_INPUT, TaskState.SOL_RUNNING,
+        )
+        harness.fable.on_answer_sol_question = None
+
+        harness.tracker.close()
+        harness.store.close()
+        reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        reopened_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        resumed_sol = FakeSol()
+        resumed_sol.queue(_completed(summary="The focused test passed."))
+        resumed_sol.queue(_completed())
+        harness.fable.next_clarifications.append(
+            _answer("I need evidence first.", False, directed_question=directed)
+        )
+        harness.fable.next_clarifications.append(
+            _answer("Use the verified constraint.", False)
+        )
+        recreated = Coordinator(
+            store=reopened_store, repository=reopened_tracker, runner=RecordingRunner(),
+            fable=harness.fable, sol=resumed_sol,
+            ids=DeterministicIds(task_number=1, run_number=30), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+
+        assert reopened_store.prepared_action(prepared.preparation_id).status == "RECOVERED"  # type: ignore[union-attr]
+        assert recreated.recover_unfinished_prepared_actions().prepared_actions_recovered == 0
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=recreated.project_id,
+            store=reopened_store,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        stale = lease.acquire(
+            project_id=recreated.project_id, session_id="session-1", task_id="task-1",
+        )
+        lease.release(stale)
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        resumed = await workflows.prepare_resume(
+            project_id=recreated.project_id, session_id="session-1",
+            task_id="task-1", revision=1,
+        )
+        assert (resumed.preparation_id, resumed.token.generation) == (
+            prepared.preparation_id, 2,
+        )
+        assert reopened_store.prepared_action(prepared.preparation_id).generation == 2  # type: ignore[union-attr]
+        with pytest.raises(RuntimeError, match="no longer owns"):
+            await workflows.run(PreparedWorkflow(prepared.preparation_id, stale, revision=1))
+        with pytest.raises(RuntimeError, match="another workflow"):
+            await workflows.prepare_resume(
+                project_id=recreated.project_id, session_id="session-1",
+                task_id="task-1", revision=1,
+            )
+        await workflows.run(resumed)
+        assert workflows.active_lease_snapshot() is None
+
+        assert [entry[:2] for entry in harness.fable.answer_sol_question_prompts] == [
+            ("task-1", outer_text),
+            ("task-1", outer_text),
+            ("task-1", f"{outer_text}\nSol evidence: The focused test passed."),
+        ]
+        assert len(resumed_sol.answer_fable_question_calls) == 1
+        assert reopened_store._connection.execute(
+            "SELECT COUNT(*) FROM exchange_grants WHERE request_id = ?",
+            ("question-checkpoint",),
+        ).fetchone()[0] == 1
+        conversation = [
+            event.payload for event in reopened_store.events_after("session-1", 0)
+            if event.kind == "conversation"
+        ]
+        assert [event["message_type"] for event in conversation].count("question") == 2
+        assert [event["message_type"] for event in conversation].count("answer") == 2
+        reopened_tracker.close()
+        reopened_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("parent_mode", ("clarification", "question"))
+def test_fable_scope_change_wins_over_a_simultaneous_directed_question(
+    harness: CoordinatorHarness,
+    parent_mode: str,
+) -> None:
+    """A scope revision is N+1 authority; its ignored question cannot spend a hop."""
+    async def scenario() -> None:
+        directed = DirectedAgentQuestion(
+            addressed_to="sol",
+            text="Which exact fact should I use before widening scope?",
+            reason="This must not run when Fable widens the revision.",
+        )
+        revised = replace(
+            harness.fable.brief,
+            revision=2,
+            allowed_paths=("bridge-output.txt", "additional-output.txt"),
+        )
+        if parent_mode == "clarification":
+            harness.sol.queue(_question("Which approved ambiguity needs a wider scope?"))
+            harness.fable.next_clarifications.append(
+                _answer(
+                    "The revised scope is required.", True,
+                    revised_brief=revised, directed_question=directed,
+                )
+            )
+        else:
+            harness.sol.queue(_directed_sol_question("Which approved constraint applies?"))
+            harness.fable.next_clarifications.append(
+                _answer(
+                    "The revised scope is required.", True,
+                    revised_brief=revised, directed_question=directed,
+                )
+            )
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+
+        latest = harness.store.latest_task("task-1")
+        assert latest is not None
+        assert (latest.revision, latest.state) == (2, TaskState.AWAITING_SCOPE_APPROVAL)
+        assert harness.sol.answer_fable_question_calls == []
+        assert harness.store.get_task("task-1", 1).exchange_consumed == (
+            0 if parent_mode == "clarification" else 1
+        )
+        questions = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation" and event.payload["message_type"] == "question"
+        ]
+        assert len(questions) == (0 if parent_mode == "clarification" else 1)
 
     asyncio.run(scenario())
 

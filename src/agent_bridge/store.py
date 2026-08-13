@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -63,13 +63,29 @@ _MAX_PREPARATION_ID_ATTEMPTS = 8
 _STARTUP_RECOVERY_BATCH_SIZE = 128
 INITIAL_INTERNAL_EXCHANGES = 3
 EXCHANGE_GRANT_SIZE = 3
-_PREPARED_ACTION_KINDS = frozenset({"new_request", "approval", "answer", "resume"})
+_PREPARED_ACTION_KINDS = frozenset({
+    "new_request",
+    "approval",
+    "answer",
+    "resume",
+    "continuation_message",
+    "question_answer",
+    "exchange_grant",
+})
 _PREPARED_ACTION_STATUSES = frozenset({
     "PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
 })
 _SAFE_PREPARED_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
-PreparedActionKind: TypeAlias = Literal["new_request", "approval", "answer", "resume"]
+PreparedActionKind: TypeAlias = Literal[
+    "new_request",
+    "approval",
+    "answer",
+    "resume",
+    "continuation_message",
+    "question_answer",
+    "exchange_grant",
+]
 PreparedActionFailureReason: TypeAlias = Literal["nonresumable_failure"]
 PreparedActionInterruptionReason: TypeAlias = Literal["stop", "adapter_interrupted"]
 COMPATIBILITY_PREPARATION_GENERATION = 0
@@ -112,6 +128,9 @@ class QuestionRecord:
     exchange_id: str | None
     answer_text: str | None
     answered_by: ConversationActor | None
+    nested_parent_kind: Literal["clarification", "question"] | None = None
+    parent_question_id: str | None = None
+    parent_continuation_pause_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "question_id", _prepared_identifier(self.question_id, "question_id"))
@@ -140,6 +159,19 @@ class QuestionRecord:
             object.__setattr__(self, "answer_text", _require_string(self.answer_text, "answer_text"))
         if self.answered_by is not None and not isinstance(self.answered_by, ConversationActor):
             raise ValueError("answered_by must be a ConversationActor")
+        if self.nested_parent_kind not in {None, "clarification", "question"}:
+            raise ValueError("nested_parent_kind is invalid")
+        if self.nested_parent_kind == "question":
+            if self.parent_question_id is None or self.parent_continuation_pause_id is None:
+                raise ValueError("nested question parent identity is required")
+            object.__setattr__(self, "parent_question_id", _prepared_identifier(
+                self.parent_question_id, "parent_question_id",
+            ))
+            object.__setattr__(self, "parent_continuation_pause_id", _prepared_identifier(
+                self.parent_continuation_pause_id, "parent_continuation_pause_id",
+            ))
+        elif self.parent_question_id is not None or self.parent_continuation_pause_id is not None:
+            raise ValueError("nested parent identity is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +227,12 @@ def _prepared_identifier(value: object, name: str) -> str:
     if _SAFE_PREPARED_IDENTIFIER.fullmatch(identifier) is None:
         raise ValueError(f"{name} must be a safe identifier")
     return identifier
+
+
+def _prepared_mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,7 +427,114 @@ class ResumePayload:
             raise ValueError("drift_event is invalid")
 
 
-PreparedActionPayload: TypeAlias = NewRequestPayload | ApprovalPayload | AnswerPayload | ResumePayload
+@dataclass(frozen=True, slots=True)
+class ContinuationMessagePayload:
+    """One exact user-authored continuation routed to one persisted agent."""
+
+    text: str
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    continuation_generation: int
+    continuation: PreparedContinuationContext
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", _prepared_text(self.text, "text"))
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.routed_to, ConversationTarget):
+            raise ValueError("routed_to must be a ConversationTarget")
+        if self.routed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}:
+            raise ValueError("continuations must route to one agent")
+        generation = _require_integer(
+            self.continuation_generation, "continuation_generation",
+        )
+        if generation < 1:
+            raise ValueError("continuation_generation must be positive")
+        object.__setattr__(self, "continuation_generation", generation)
+        if self.continuation is not None and not isinstance(
+            self.continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext, AnswerContext),
+        ):
+            raise ValueError("continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionAnswerPayload:
+    """A user answer bound to one persisted directed-question pause."""
+
+    question_id: str
+    answer: str
+    continuation_generation: int
+    continuation: PreparedContinuationContext
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "question_id", _prepared_identifier(self.question_id, "question_id"))
+        object.__setattr__(self, "answer", _prepared_text(self.answer, "answer"))
+        generation = _require_integer(
+            self.continuation_generation, "continuation_generation",
+        )
+        if generation < 1:
+            raise ValueError("continuation_generation must be positive")
+        object.__setattr__(self, "continuation_generation", generation)
+        if self.continuation is not None and not isinstance(
+            self.continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext, AnswerContext),
+        ):
+            raise ValueError("continuation is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeGrantPayload:
+    """One fixed +3 grant and its Store-authenticated attempted question."""
+
+    request_id: str
+    continuation_generation: int
+    attempted_question: DirectedAgentQuestion
+    continuation: PreparedContinuationContext
+    parent_mode: Literal["top_level", "clarification", "question"]
+    outer_question_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "request_id", _prepared_identifier(self.request_id, "request_id"))
+        generation = _require_integer(
+            self.continuation_generation, "continuation_generation",
+        )
+        if generation < 1:
+            raise ValueError("continuation_generation must be positive")
+        object.__setattr__(self, "continuation_generation", generation)
+        if not isinstance(self.attempted_question, DirectedAgentQuestion):
+            raise ValueError("attempted_question must be a DirectedAgentQuestion")
+        if self.continuation is not None and not isinstance(
+            self.continuation,
+            (ScopeApprovalContext, ReviewContext, ClarificationContext, SolResumeContext, AnswerContext),
+        ):
+            raise ValueError("continuation is invalid")
+        if self.outer_question_id is not None:
+            object.__setattr__(
+                self, "outer_question_id",
+                _prepared_identifier(self.outer_question_id, "outer_question_id"),
+            )
+        if self.parent_mode not in {"top_level", "clarification", "question"}:
+            raise ValueError("exchange grant parent_mode is invalid")
+        if (self.parent_mode == "question") != (self.outer_question_id is not None):
+            raise ValueError("exchange grant parent identity is invalid")
+        if self.parent_mode == "clarification" and not isinstance(self.continuation, ClarificationContext):
+            raise ValueError("exchange grant clarification continuation is invalid")
+        if self.parent_mode == "question" and not isinstance(self.continuation, SolResumeContext):
+            raise ValueError("exchange grant question continuation is invalid")
+        if self.parent_mode == "top_level" and isinstance(self.continuation, ClarificationContext):
+            raise ValueError("exchange grant top-level continuation is invalid")
+
+
+PreparedActionPayload: TypeAlias = (
+    NewRequestPayload
+    | ApprovalPayload
+    | AnswerPayload
+    | ResumePayload
+    | ContinuationMessagePayload
+    | QuestionAnswerPayload
+    | ExchangeGrantPayload
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +571,9 @@ class PreparedActionRecord:
             "approval": ApprovalPayload,
             "answer": AnswerPayload,
             "resume": ResumePayload,
+            "continuation_message": ContinuationMessagePayload,
+            "question_answer": QuestionAnswerPayload,
+            "exchange_grant": ExchangeGrantPayload,
         }
         if not isinstance(self.payload, payload_types[self.action]):
             raise ValueError("prepared action payload does not match action")
@@ -448,6 +596,8 @@ class PreparedActionRecord:
             expected_context = None
         elif self.action == "approval":
             expected_context = self.payload.scope
+        elif self.action in {"answer", "resume"}:
+            expected_context = self.payload.continuation
         else:
             expected_context = self.payload.continuation
         if self.pending_context != expected_context:
@@ -626,6 +776,33 @@ def _payload_to_data(payload: PreparedActionPayload) -> dict[str, object]:
                 "evidence_hashes": list(payload.drift_event.evidence_hashes),
             },
         }
+    if isinstance(payload, ContinuationMessagePayload):
+        return {
+            "kind": "continuation_message",
+            "text": payload.text,
+            "addressed_to": payload.addressed_to.value,
+            "routed_to": payload.routed_to.value,
+            "continuation_generation": payload.continuation_generation,
+            "continuation": _context_to_data(payload.continuation),
+        }
+    if isinstance(payload, QuestionAnswerPayload):
+        return {
+            "kind": "question_answer",
+            "question_id": payload.question_id,
+            "answer": payload.answer,
+            "continuation_generation": payload.continuation_generation,
+            "continuation": _context_to_data(payload.continuation),
+        }
+    if isinstance(payload, ExchangeGrantPayload):
+        return {
+            "kind": "exchange_grant",
+            "request_id": payload.request_id,
+            "continuation_generation": payload.continuation_generation,
+            "attempted_question": payload.attempted_question.to_dict(),
+            "continuation": _context_to_data(payload.continuation),
+            "parent_mode": payload.parent_mode,
+            "outer_question_id": payload.outer_question_id,
+        }
     raise ValueError("prepared action payload is invalid")
 
 
@@ -676,6 +853,53 @@ def _payload_from_data(value: object) -> PreparedActionPayload:
                     status=drift["status"], summary=drift["summary"],
                     evidence_hashes=tuple(hashes),
                 ),
+            )
+        if kind == "continuation_message" and set(value) == {
+            "kind",
+            "text",
+            "addressed_to",
+            "routed_to",
+            "continuation_generation",
+            "continuation",
+        }:
+            return ContinuationMessagePayload(
+                text=value["text"],
+                addressed_to=ConversationTarget(value["addressed_to"]),
+                routed_to=ConversationTarget(value["routed_to"]),
+                continuation_generation=value["continuation_generation"],
+                continuation=_context_from_data(value["continuation"]),
+            )
+        if kind == "question_answer" and set(value) == {
+            "kind",
+            "question_id",
+            "answer",
+            "continuation_generation",
+            "continuation",
+        }:
+            return QuestionAnswerPayload(
+                question_id=value["question_id"],
+                answer=value["answer"],
+                continuation_generation=value["continuation_generation"],
+                continuation=_context_from_data(value["continuation"]),
+            )
+        if kind == "exchange_grant" and set(value) == {
+            "kind",
+            "request_id",
+            "continuation_generation",
+            "attempted_question",
+            "continuation",
+            "parent_mode",
+            "outer_question_id",
+        }:
+            return ExchangeGrantPayload(
+                request_id=value["request_id"],
+                continuation_generation=value["continuation_generation"],
+                attempted_question=DirectedAgentQuestion.from_dict(
+                    _prepared_mapping(value["attempted_question"], "attempted_question")
+                ),
+                continuation=_context_from_data(value["continuation"]),
+                parent_mode=value["parent_mode"],
+                outer_question_id=value["outer_question_id"],
             )
     except ValueError as error:
         raise RuntimeError("persisted prepared payload is invalid") from error
@@ -908,6 +1132,9 @@ _MIGRATION_STATEMENTS = (
         continuation_state TEXT NOT NULL,
         pending_action_json TEXT NOT NULL,
         continuation_pause_id TEXT NOT NULL,
+        nested_parent_kind TEXT,
+        parent_question_id TEXT,
+        parent_continuation_pause_id TEXT,
         answer_text TEXT,
         answered_by TEXT,
         CHECK (
@@ -984,11 +1211,6 @@ _MIGRATION_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS prepared_actions_identity
     ON prepared_actions (project_id, session_id, task_id, revision, status)
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS one_unanswered_question_per_task_revision
-    ON questions (task_id, revision)
-    WHERE answer_text IS NULL
     """,
     """
     CREATE INDEX IF NOT EXISTS questions_session_task_revision
@@ -1186,6 +1408,34 @@ class SQLiteStore:
             self._connection.execute(
                 "ALTER TABLE questions ADD COLUMN continuation_pause_id TEXT"
             )
+        if "nested_parent_kind" not in question_columns:
+            self._connection.execute(
+                "ALTER TABLE questions ADD COLUMN nested_parent_kind TEXT"
+            )
+        if "parent_question_id" not in question_columns:
+            self._connection.execute(
+                "ALTER TABLE questions ADD COLUMN parent_question_id TEXT"
+            )
+        if "parent_continuation_pause_id" not in question_columns:
+            self._connection.execute(
+                "ALTER TABLE questions ADD COLUMN parent_continuation_pause_id TEXT"
+            )
+        self._validate_nested_question_rows_in_transaction()
+        self._connection.execute("DROP INDEX IF EXISTS one_unanswered_question_per_task_revision")
+        self._connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS one_unanswered_top_level_question_per_task_revision
+            ON questions (task_id, revision)
+            WHERE answer_text IS NULL AND nested_parent_kind IS NULL
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS one_unanswered_nested_question_per_task_revision
+            ON questions (task_id, revision)
+            WHERE answer_text IS NULL AND nested_parent_kind IS NOT NULL
+            """
+        )
         self._connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS exchange_grants_permission_identity
@@ -1387,6 +1637,12 @@ class SQLiteStore:
         ).fetchone()
         return None if row is None else self._question_from_row(row)
 
+    def unanswered_question_for_task(self, task_id: str, revision: int) -> QuestionRecord | None:
+        """Expose the exact durable-question guard for legacy compatibility routes."""
+        return self._unanswered_question_for_task(
+            _require_string(task_id, "task_id"), _require_integer(revision, "revision"),
+        )
+
     def pause_for_question(
         self,
         *,
@@ -1525,6 +1781,10 @@ class SQLiteStore:
                     expected_generation=expected_generation,
                     question_id=question_id,
                 )
+                if question.nested_parent_kind is not None:
+                    raise RuntimeError("nested questions require their exact nested answer path")
+                if self._active_nested_child(question.question_id) is not None:
+                    raise RuntimeError("nested question is still active")
                 if question.answer_text is not None:
                     raise RuntimeError("question was already answered")
                 task_pause_id = self._directed_pause_id(
@@ -1622,6 +1882,315 @@ class SQLiteStore:
             answer_text=answer_text,
             answered_by=answered_by,
         )
+
+    def reserve_fable_clarification_evidence_question(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        request_key: str,
+        text: str,
+        event: ConversationEnvelope,
+    ) -> tuple[ExchangeReservation, QuestionRecord]:
+        """Reserve Fable's one Sol evidence question from an active clarification."""
+        return self._reserve_nested_fable_evidence_question(
+            session_id=session_id, task_id=task_id, revision=revision,
+            expected_generation=expected_generation, question_id=question_id,
+            request_key=request_key, text=text, event=event,
+            parent_kind="clarification", outer_question_id=None,
+        )
+
+    def reserve_fable_answer_evidence_question(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        outer_question_id: str,
+        question_id: str,
+        request_key: str,
+        text: str,
+        event: ConversationEnvelope,
+    ) -> tuple[ExchangeReservation, QuestionRecord]:
+        """Reserve Fable's one Sol evidence question under one paused Sol question."""
+        return self._reserve_nested_fable_evidence_question(
+            session_id=session_id, task_id=task_id, revision=revision,
+            expected_generation=expected_generation, question_id=question_id,
+            request_key=request_key, text=text, event=event,
+            parent_kind="question", outer_question_id=outer_question_id,
+        )
+
+    def _reserve_nested_fable_evidence_question(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        question_id: str,
+        request_key: str,
+        text: str,
+        event: ConversationEnvelope,
+        parent_kind: Literal["clarification", "question"],
+        outer_question_id: str | None,
+    ) -> tuple[ExchangeReservation, QuestionRecord]:
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        question_id = _prepared_identifier(question_id, "question_id")
+        request_key = _prepared_identifier(request_key, "request_key")
+        if outer_question_id is not None:
+            outer_question_id = _prepared_identifier(outer_question_id, "outer_question_id")
+        self._validate_question_inputs(
+            task_id=task_id, revision=revision, expected_generation=expected_generation,
+            question_id=question_id, asked_by=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL, routed_to=ConversationTarget.SOL,
+            text=text, event=event,
+        )
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    expected_generation=expected_generation,
+                )
+                self._require_nested_agent_identity(task)
+                existing = self._reservation_for_request_key(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    request_key=request_key,
+                )
+                if existing is not None:
+                    reservation, question = existing
+                    if (
+                        question.question_id != question_id
+                        or question.nested_parent_kind != parent_kind
+                        or question.parent_question_id != outer_question_id
+                        or question.asked_by is not ConversationActor.FABLE
+                        or question.routed_to is not ConversationTarget.SOL
+                        or question.text != text
+                        or question.answer_text is not None
+                        or task.state is not TaskState.AWAITING_USER_INPUT
+                        or task.continuation_state is not TaskState.FABLE_CLARIFYING
+                        or self._directed_pause_id(
+                            session_id=session_id, task_id=task_id, revision=revision,
+                            expected_generation=expected_generation,
+                        ) != self._question_pause_id(question.question_id)
+                    ):
+                        raise RuntimeError("nested evidence reservation changed")
+                    return existing
+                if task.exchange_allowance <= 0:
+                    raise RuntimeError("internal exchange allowance is exhausted")
+                active_nested = self._connection.execute(
+                    """
+                    SELECT 1 FROM questions WHERE task_id = ? AND revision = ?
+                      AND answer_text IS NULL AND nested_parent_kind IS NOT NULL
+                    """,
+                    (task_id, revision),
+                ).fetchone()
+                if active_nested is not None:
+                    raise RuntimeError("nested evidence question is already active")
+                parent_pause_id: str | None = None
+                if parent_kind == "clarification":
+                    if (
+                        task.state is not TaskState.FABLE_CLARIFYING
+                        or task.continuation_state not in {None, TaskState.SOL_RUNNING}
+                        or self._directed_pause_id(
+                            session_id=session_id, task_id=task_id, revision=revision,
+                            expected_generation=expected_generation,
+                        ) is not None
+                        or outer_question_id is not None
+                    ):
+                        raise RuntimeError("nested clarification parent changed")
+                    parent_pending = task.pending
+                else:
+                    if outer_question_id is None:
+                        raise RuntimeError("nested outer question identity is missing")
+                    outer, outer_state, parent_pending, parent_pause_id = self._question_exact(
+                        session_id=session_id, task_id=task_id, revision=revision,
+                        expected_generation=expected_generation, question_id=outer_question_id,
+                    )
+                    if (
+                        outer.nested_parent_kind is not None
+                        or outer.asked_by is not ConversationActor.SOL
+                        or outer.routed_to is not ConversationTarget.FABLE
+                        or outer.answer_text is not None
+                        or outer_state not in _SOL_TASK_STATES
+                        or task.state is not TaskState.AWAITING_USER_INPUT
+                        or task.continuation_state is not outer_state
+                        or task.pending != parent_pending
+                        or self._directed_pause_id(
+                            session_id=session_id, task_id=task_id, revision=revision,
+                            expected_generation=expected_generation,
+                        ) != parent_pause_id
+                    ):
+                        raise RuntimeError("nested outer question parent changed")
+                if parent_pending is None:
+                    raise RuntimeError("nested Fable continuation is missing")
+                pause_id = self._new_continuation_pause_id()
+                exchange_id = self._new_exchange_id()
+                reservation = ExchangeReservation(
+                    exchange_id=exchange_id, question_id=question_id,
+                    ordinal=task.exchange_consumed + 1,
+                    continuation_generation=expected_generation,
+                )
+                question = QuestionRecord(
+                    question_id=question_id, session_id=session_id, task_id=task_id,
+                    revision=revision, continuation_generation=expected_generation,
+                    asked_by=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                    routed_to=ConversationTarget.SOL, text=text, exchange_id=exchange_id,
+                    answer_text=None, answered_by=None, nested_parent_kind=parent_kind,
+                    parent_question_id=outer_question_id,
+                    parent_continuation_pause_id=parent_pause_id,
+                )
+                self._insert_question(
+                    question, continuation_state=TaskState.FABLE_CLARIFYING,
+                    pending_action=parent_pending, continuation_pause_id=pause_id,
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO exchange_reservations (
+                        exchange_id, session_id, task_id, revision, question_id,
+                        request_key, ordinal, continuation_generation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (exchange_id, session_id, task_id, revision, question_id,
+                     request_key, reservation.ordinal, expected_generation),
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET exchange_allowance = exchange_allowance - 1,
+                        exchange_consumed = exchange_consumed + 1, state = ?,
+                        continuation_state = ?, pending_json = ?, continuation_pause_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND continuation_generation = ? AND exchange_allowance > 0
+                    """,
+                    (TaskState.AWAITING_USER_INPUT.value, TaskState.FABLE_CLARIFYING.value,
+                     _encode_json(parent_pending), pause_id, task_id, revision, session_id,
+                     expected_generation),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("nested evidence question changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id, task_id=task_id, event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return reservation, question
+
+    def answer_fable_clarification_evidence_question_and_resume(self, **kwargs: object) -> QuestionRecord:
+        """Answer nested evidence and restore the exact active Fable clarification."""
+        return self._answer_nested_fable_evidence_question(
+            **kwargs, parent_kind="clarification", outer_question_id=None,
+        )
+
+    def answer_fable_answer_evidence_question(self, **kwargs: object) -> QuestionRecord:
+        """Answer nested evidence and restore the exact outer Sol-to-Fable pause."""
+        return self._answer_nested_fable_evidence_question(
+            **kwargs, parent_kind="question",
+        )
+
+    def _answer_nested_fable_evidence_question(
+        self, *, session_id: object, task_id: object, revision: object,
+        question_id: object, expected_generation: object, answer_text: object,
+        event: object, parent_kind: Literal["clarification", "question"],
+        outer_question_id: object | None = None,
+    ) -> QuestionRecord:
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        question_id = _prepared_identifier(question_id, "question_id")
+        answer_text = _require_string(answer_text, "answer_text")
+        outer_id = None if outer_question_id is None else _prepared_identifier(
+            outer_question_id, "outer_question_id",
+        )
+        if not isinstance(event, ConversationEnvelope):
+            raise ValueError("event must be a ConversationEnvelope")
+        self._validate_answer_event_binding(
+            event=event, task_id=task_id, revision=revision,
+            expected_generation=expected_generation, question_id=question_id,
+            answer_text=answer_text, answered_by=ConversationActor.SOL,
+        )
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    expected_generation=expected_generation,
+                )
+                self._require_nested_agent_identity(task)
+                question, state, pending, pause_id = self._question_exact(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    expected_generation=expected_generation, question_id=question_id,
+                )
+                if (
+                    question.nested_parent_kind != parent_kind
+                    or question.parent_question_id != outer_id
+                    or question.asked_by is not ConversationActor.FABLE
+                    or question.routed_to is not ConversationTarget.SOL
+                    or question.answer_text is not None
+                    or state is not TaskState.FABLE_CLARIFYING
+                    or task.state is not TaskState.AWAITING_USER_INPUT
+                    or task.continuation_state is not TaskState.FABLE_CLARIFYING
+                    or task.pending != pending
+                    or self._directed_pause_id(
+                        session_id=session_id, task_id=task_id, revision=revision,
+                        expected_generation=expected_generation,
+                    ) != pause_id
+                ):
+                    raise RuntimeError("nested evidence continuation changed")
+                restore_state = TaskState.FABLE_CLARIFYING
+                restore_pending = pending
+                restore_pause: str | None = None
+                if parent_kind == "question":
+                    if question.parent_continuation_pause_id is None or outer_id is None:
+                        raise RuntimeError("nested outer question identity is invalid")
+                    outer, restore_state, restore_pending, restore_pause = self._question_exact(
+                        session_id=session_id, task_id=task_id, revision=revision,
+                        expected_generation=expected_generation, question_id=outer_id,
+                    )
+                    if (
+                        outer.nested_parent_kind is not None
+                        or outer.asked_by is not ConversationActor.SOL
+                        or outer.routed_to is not ConversationTarget.FABLE
+                        or outer.answer_text is not None
+                        or restore_state not in _SOL_TASK_STATES
+                        or restore_pause != question.parent_continuation_pause_id
+                    ):
+                        raise RuntimeError("nested outer question parent changed")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE questions SET answer_text = ?, answered_by = ?
+                    WHERE question_id = ? AND answer_text IS NULL AND answered_by IS NULL
+                    """,
+                    (answer_text, ConversationActor.SOL.value, question_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("nested evidence question changed concurrently")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?,
+                        continuation_pause_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND continuation_generation = ? AND state = ?
+                      AND continuation_state = ? AND pending_json = ?
+                      AND continuation_pause_id = ?
+                    """,
+                    (restore_state.value if parent_kind == "clarification" else TaskState.AWAITING_USER_INPUT.value,
+                     None if parent_kind == "clarification" else restore_state.value,
+                     _encode_json(restore_pending), restore_pause, task_id, revision,
+                     session_id, expected_generation, TaskState.AWAITING_USER_INPUT.value,
+                     TaskState.FABLE_CLARIFYING.value, _encode_json(pending), pause_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("nested evidence task changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id, task_id=task_id, event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return replace(question, answer_text=answer_text, answered_by=ConversationActor.SOL)
 
     def reserve_internal_question(
         self,
@@ -1903,6 +2472,156 @@ class SQLiteStore:
             self._publish_committed_events(emitted)
         return self.get_task(task_id, revision)
 
+    def pause_fable_clarification_evidence_permission(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_generation: int,
+        attempted_question: DirectedAgentQuestion,
+        event: ConversationEnvelope,
+    ) -> TaskRecord:
+        """Persist the one grantable nested-clarification pause without changing parent."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        if (
+            not isinstance(attempted_question, DirectedAgentQuestion)
+            or attempted_question.addressed_to != "sol"
+        ):
+            raise ValueError("nested attempted question is invalid")
+        self._validate_permission_event_binding(
+            event=event, task_id=task_id, revision=revision,
+            expected_generation=expected_generation,
+        )
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    expected_generation=expected_generation,
+                )
+                self._require_nested_agent_identity(task)
+                if (
+                    task.state is not TaskState.FABLE_CLARIFYING
+                    or task.continuation_state not in {None, TaskState.SOL_RUNNING}
+                    or task.exchange_allowance != 0
+                    or task.pending is None
+                ):
+                    raise RuntimeError("nested clarification permission changed")
+                pending = {
+                    **task.pending,
+                    "attempted_question": attempted_question.to_dict(),
+                }
+                pause_id = self._new_continuation_pause_id()
+                permission_id = self._new_exchange_permission_id()
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?,
+                        continuation_pause_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND continuation_generation = ? AND state = ?
+                      AND continuation_pause_id IS NULL AND exchange_allowance = 0
+                    """,
+                    (TaskState.AWAITING_USER_INPUT.value, TaskState.FABLE_CLARIFYING.value,
+                     _encode_json(pending), pause_id, task_id, revision, session_id,
+                     expected_generation, TaskState.FABLE_CLARIFYING.value),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("nested clarification permission changed")
+                self._connection.execute(
+                    """
+                    INSERT INTO exchange_permissions (
+                        permission_id, session_id, task_id, revision,
+                        continuation_generation, continuation_pause_id, grant_request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (permission_id, session_id, task_id, revision,
+                     expected_generation, pause_id),
+                )
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id, task_id=task_id, event=event,
+                ))
+            self._publish_committed_events(emitted)
+        return self.get_task(task_id, revision)
+
+    def pause_fable_answer_evidence_permission(
+        self, *, session_id: str, task_id: str, revision: int,
+        expected_generation: int, outer_question_id: str,
+        attempted_question: DirectedAgentQuestion, event: ConversationEnvelope,
+    ) -> TaskRecord:
+        """Pause one exact outer Sol question before Fable can seek Sol evidence."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(
+            session_id, task_id, revision, expected_generation,
+        )
+        outer_question_id = _prepared_identifier(outer_question_id, "outer_question_id")
+        if not isinstance(attempted_question, DirectedAgentQuestion) or attempted_question.addressed_to != "sol":
+            raise ValueError("nested attempted question is invalid")
+        self._validate_permission_event_binding(event=event, task_id=task_id, revision=revision, expected_generation=expected_generation)
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(session_id=session_id, task_id=task_id, revision=revision, expected_generation=expected_generation)
+                outer, outer_state, pending, outer_pause_id = self._question_exact(
+                    session_id=session_id, task_id=task_id, revision=revision,
+                    expected_generation=expected_generation, question_id=outer_question_id,
+                )
+                if (
+                    outer.nested_parent_kind is not None or outer.asked_by is not ConversationActor.SOL
+                    or outer.routed_to is not ConversationTarget.FABLE or outer.answer_text is not None
+                    or outer_state not in _SOL_TASK_STATES or task.state is not TaskState.AWAITING_USER_INPUT
+                    or task.continuation_state is not outer_state or task.pending != pending
+                    or self._directed_pause_id(session_id=session_id, task_id=task_id, revision=revision, expected_generation=expected_generation) != outer_pause_id
+                    or task.exchange_allowance != 0
+                ):
+                    raise RuntimeError("nested outer evidence permission changed")
+                pause_id = self._new_continuation_pause_id()
+                permission_id = self._new_exchange_permission_id()
+                paused_pending = {**pending, "attempted_question": attempted_question.to_dict()}
+                cursor = self._connection.execute(
+                    """UPDATE tasks SET continuation_state = ?, pending_json = ?, continuation_pause_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                      AND continuation_state = ? AND continuation_generation = ? AND continuation_pause_id = ?""",
+                    (TaskState.FABLE_CLARIFYING.value, _encode_json(paused_pending), pause_id,
+                     task_id, revision, session_id, TaskState.AWAITING_USER_INPUT.value,
+                     outer_state.value, expected_generation, outer_pause_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("nested outer evidence permission changed")
+                self._connection.execute(
+                    """INSERT INTO exchange_permissions (permission_id, session_id, task_id, revision,
+                    continuation_generation, continuation_pause_id, grant_request_id) VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                    (permission_id, session_id, task_id, revision, expected_generation, pause_id),
+                )
+                emitted.append(self._insert_conversation_event_in_transaction(session_id=session_id, task_id=task_id, event=event))
+            self._publish_committed_events(emitted)
+        return self.get_task(task_id, revision)
+
+    def restore_fable_answer_parent_for_retry(
+        self, *, session_id: str, task_id: str, revision: int,
+        expected_generation: int, outer_question_id: str,
+    ) -> QuestionRecord:
+        """Restore exactly the persisted outer pause after its authenticated +3 grant."""
+        session_id, task_id, revision, expected_generation = self._directed_identity(session_id, task_id, revision, expected_generation)
+        outer_question_id = _prepared_identifier(outer_question_id, "outer_question_id")
+        with self._immediate_transaction():
+            task = self._directed_task_exact(session_id=session_id, task_id=task_id, revision=revision, expected_generation=expected_generation)
+            outer, outer_state, pending, outer_pause_id = self._question_exact(session_id=session_id, task_id=task_id, revision=revision, expected_generation=expected_generation, question_id=outer_question_id)
+            if (outer.nested_parent_kind is not None or outer.answer_text is not None or outer_state not in _SOL_TASK_STATES
+                or task.state is not TaskState.FABLE_CLARIFYING or task.continuation_state is not None):
+                raise RuntimeError("nested outer evidence retry changed")
+            cursor = self._connection.execute(
+                """UPDATE tasks SET state = ?, continuation_state = ?, pending_json = ?, continuation_pause_id = ?
+                WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ? AND continuation_state IS NULL
+                  AND continuation_generation = ?""",
+                (TaskState.AWAITING_USER_INPUT.value, outer_state.value, _encode_json(pending), outer_pause_id,
+                 task_id, revision, session_id, TaskState.FABLE_CLARIFYING.value, expected_generation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("nested outer evidence retry changed")
+        return outer
+
     def grant_internal_exchanges(
         self,
         *,
@@ -2183,6 +2902,16 @@ class SQLiteStore:
         if task.state is not continuation_state or task.continuation_state is not None:
             raise RuntimeError("task continuation changed concurrently")
 
+    @staticmethod
+    def _require_nested_agent_identity(task: TaskRecord) -> None:
+        if (
+            task.approved_at is None
+            or task.baseline_id is None
+            or task.fable_session_id is None
+            or task.sol_thread_id is None
+        ):
+            raise RuntimeError("nested evidence parent has no exact approved agent identity")
+
     def _directed_pause_id(
         self,
         *,
@@ -2257,10 +2986,111 @@ class SQLiteStore:
             """
             SELECT * FROM questions
             WHERE task_id = ? AND revision = ? AND answer_text IS NULL
+              AND nested_parent_kind IS NULL
             """,
             (task_id, revision),
         ).fetchone()
         return None if row is None else self._question_from_row(row)
+
+    def _active_nested_child(self, parent_question_id: str) -> QuestionRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE parent_question_id = ? AND answer_text IS NULL
+            """,
+            (_prepared_identifier(parent_question_id, "parent_question_id"),),
+        ).fetchone()
+        return None if row is None else self._question_from_row(row)
+
+    def nested_evidence_for_parent(self, parent_question_id: str) -> str | None:
+        """Return one completed, authenticated direct child answer for outer Fable resumption."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE parent_question_id = ? AND nested_parent_kind = 'question'
+              AND answer_text IS NOT NULL AND answered_by = ?
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (_prepared_identifier(parent_question_id, "parent_question_id"), ConversationActor.SOL.value),
+        ).fetchone()
+        if row is None:
+            return None
+        question = self._question_from_row(row)
+        if question.answer_text is None:
+            raise RuntimeError("nested evidence answer is invalid")
+        return question.answer_text
+
+    def _validate_nested_question_rows_in_transaction(self) -> None:
+        """Authenticate the two allowed non-recursive nested question shapes."""
+        invalid = self._connection.execute(
+            """
+            SELECT 1 FROM questions AS child
+            LEFT JOIN questions AS parent ON parent.question_id = child.parent_question_id
+            WHERE
+                (child.nested_parent_kind IS NULL AND (
+                    child.parent_question_id IS NOT NULL
+                    OR child.parent_continuation_pause_id IS NOT NULL
+                ))
+                OR (child.nested_parent_kind = 'clarification' AND (
+                    child.parent_question_id IS NOT NULL
+                    OR child.parent_continuation_pause_id IS NOT NULL
+                ))
+                OR (child.nested_parent_kind = 'question' AND (
+                    child.parent_question_id IS NULL
+                    OR child.parent_continuation_pause_id IS NULL
+                    OR parent.question_id IS NULL
+                    OR parent.nested_parent_kind IS NOT NULL
+                    OR parent.session_id != child.session_id
+                    OR parent.task_id != child.task_id
+                    OR parent.revision != child.revision
+                    OR parent.continuation_generation != child.continuation_generation
+                    OR parent.continuation_pause_id != child.parent_continuation_pause_id
+                ))
+                OR child.nested_parent_kind NOT IN ('clarification', 'question')
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError("persisted nested question is invalid")
+        sibling = self._connection.execute(
+            """
+            SELECT 1 FROM questions
+            WHERE answer_text IS NULL AND nested_parent_kind IS NOT NULL
+            GROUP BY task_id, revision HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if sibling is not None:
+            raise RuntimeError("persisted nested question sibling is invalid")
+        active_mismatch = self._connection.execute(
+            """
+            SELECT 1 FROM questions AS child
+            JOIN tasks AS task
+              ON task.task_id = child.task_id AND task.revision = child.revision
+            LEFT JOIN questions AS parent ON parent.question_id = child.parent_question_id
+            WHERE child.answer_text IS NULL AND child.nested_parent_kind IS NOT NULL
+              AND (
+                task.state != ? OR task.continuation_state != ?
+                OR task.continuation_generation != child.continuation_generation
+                OR task.continuation_pause_id != child.continuation_pause_id
+                OR task.pending_json != child.pending_action_json
+                OR (child.nested_parent_kind = 'question' AND (
+                    parent.answer_text IS NOT NULL
+                    OR parent.continuation_state NOT IN (?, ?)
+                    OR parent.pending_action_json != child.pending_action_json
+                ))
+              )
+            LIMIT 1
+            """,
+            (
+                TaskState.AWAITING_USER_INPUT.value,
+                TaskState.FABLE_CLARIFYING.value,
+                TaskState.SOL_RUNNING.value,
+                TaskState.SOL_CORRECTING.value,
+            ),
+        ).fetchone()
+        if active_mismatch is not None:
+            raise RuntimeError("persisted nested question state is invalid")
 
     def _question_exact(
         self,
@@ -2366,8 +3196,9 @@ class SQLiteStore:
                 question_id, session_id, task_id, revision, continuation_generation,
                 asked_by, addressed_to, routed_to, text, exchange_id,
                 continuation_state, pending_action_json, continuation_pause_id,
+                nested_parent_kind, parent_question_id, parent_continuation_pause_id,
                 answer_text, answered_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 question.question_id,
@@ -2383,6 +3214,9 @@ class SQLiteStore:
                 continuation_state.value,
                 _encode_json(frozen_pending),
                 continuation_pause_id,
+                question.nested_parent_kind,
+                question.parent_question_id,
+                question.parent_continuation_pause_id,
                 question.answer_text,
                 None if question.answered_by is None else question.answered_by.value,
             ),
@@ -2727,6 +3561,8 @@ class SQLiteStore:
                     raise RuntimeError("task is not eligible for prepared answer")
                 if task.continuation_state is None:
                     raise RuntimeError("prepared answer has no continuation")
+                if self._unanswered_question_for_task(task_id, revision) is not None:
+                    raise RuntimeError("exact directed question answer is required")
                 active = task.continuation_state
                 self._validate_prepared_context(task, payload.continuation)
                 require_transition(task.state, active)
@@ -2752,6 +3588,414 @@ class SQLiteStore:
                     pending_context=payload.continuation,
                     previous_preparation_id=None, generation=generation,
                 )
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_continuation_message_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: ContinuationMessagePayload,
+    ) -> PreparedActionRecord:
+        """Atomically record and activate one exact non-question user continuation."""
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation,
+        )
+        if not isinstance(payload, ContinuationMessagePayload):
+            raise ValueError("continuation message preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                if (
+                    task.continuation_generation != payload.continuation_generation
+                    or task.state is not TaskState.AWAITING_USER_INPUT
+                    or task.continuation_state is None
+                ):
+                    raise RuntimeError("task is not eligible for a bound continuation")
+                if self._unanswered_question_for_task(task_id, revision) is not None:
+                    raise RuntimeError("exact directed questions require their question answer action")
+                pause_id = self._directed_pause_id(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                if pause_id is not None and self._exchange_permission_for_pause(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                    continuation_pause_id=pause_id,
+                ) is not None:
+                    raise RuntimeError("exchange permission requires its grant action")
+                self._validate_prepared_context(task, payload.continuation)
+                active = task.continuation_state
+                if self._target_for_prepared_continuation(payload.continuation) is not payload.routed_to:
+                    raise RuntimeError("continuation route does not match its exact continuation")
+                record = self._insert_prepared_action(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    action="continuation_message",
+                    payload=payload,
+                    source_state=TaskState.AWAITING_USER_INPUT,
+                    active_state=active,
+                    continuation_state=active,
+                    pending_context=payload.continuation,
+                    previous_preparation_id=None,
+                    generation=generation,
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND continuation_generation = ? AND state = ?
+                      AND continuation_state = ?
+                    """,
+                    (
+                        active.value,
+                        task_id,
+                        revision,
+                        session_id,
+                        payload.continuation_generation,
+                        TaskState.AWAITING_USER_INPUT.value,
+                        active.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("bound continuation changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=ConversationEnvelope(
+                        sender=ConversationActor.USER,
+                        addressed_to=payload.addressed_to,
+                        routed_to=payload.routed_to,
+                        message_type=ConversationMessageType.STATEMENT,
+                        text=payload.text,
+                        task_id=task_id,
+                        revision=revision,
+                        continuation_generation=payload.continuation_generation,
+                    ),
+                ))
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_question_answer_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: QuestionAnswerPayload,
+    ) -> PreparedActionRecord:
+        """Atomically answer one user-routed question and create its typed runner row."""
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation,
+        )
+        if not isinstance(payload, QuestionAnswerPayload):
+            raise ValueError("question answer preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                (
+                    question,
+                    continuation_state,
+                    question_pending,
+                    question_pause_id,
+                ) = self._question_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                    question_id=payload.question_id,
+                )
+                if question.answer_text is not None:
+                    raise RuntimeError("question was already answered")
+                task_pause_id = self._directed_pause_id_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                if (
+                    task.state is not TaskState.AWAITING_USER_INPUT
+                    or task.continuation_state is not continuation_state
+                    or task.pending != question_pending
+                    or task_pause_id != question_pause_id
+                    or question.routed_to is not ConversationTarget.USER
+                ):
+                    raise RuntimeError("question continuation changed concurrently")
+                self._validate_prepared_context(task, payload.continuation)
+                record = self._insert_prepared_action(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    action="question_answer",
+                    payload=payload,
+                    source_state=TaskState.AWAITING_USER_INPUT,
+                    active_state=continuation_state,
+                    continuation_state=continuation_state,
+                    pending_context=payload.continuation,
+                    previous_preparation_id=None,
+                    generation=generation,
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE questions SET answer_text = ?, answered_by = ?
+                    WHERE question_id = ? AND session_id = ? AND task_id = ?
+                      AND revision = ? AND continuation_generation = ?
+                      AND answer_text IS NULL AND answered_by IS NULL
+                    """,
+                    (
+                        payload.answer,
+                        ConversationActor.USER.value,
+                        question.question_id,
+                        session_id,
+                        task_id,
+                        revision,
+                        payload.continuation_generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("question changed concurrently")
+                next_generation = self._reset_internal_exchanges_for_human_direction_in_transaction(
+                    cursor,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = NULL,
+                        continuation_pause_id = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND state = ? AND continuation_state = ?
+                      AND continuation_generation = ? AND pending_json = ?
+                      AND continuation_pause_id = ?
+                    """,
+                    (
+                        continuation_state.value,
+                        task_id,
+                        revision,
+                        session_id,
+                        TaskState.AWAITING_USER_INPUT.value,
+                        continuation_state.value,
+                        next_generation,
+                        _encode_json(question_pending),
+                        question_pause_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("task question continuation changed concurrently")
+                reply_target = self._target_for_question_asker(question.asked_by)
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=ConversationEnvelope(
+                        sender=ConversationActor.USER,
+                        addressed_to=reply_target,
+                        routed_to=reply_target,
+                        message_type=ConversationMessageType.ANSWER,
+                        text=payload.answer,
+                        task_id=task_id,
+                        revision=revision,
+                        continuation_generation=payload.continuation_generation,
+                        reply_to_question_id=question.question_id,
+                    ),
+                ))
+            self._publish_committed_events(emitted)
+        return record
+
+    def prepare_exchange_grant_action(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        generation: int,
+        payload: ExchangeGrantPayload,
+    ) -> PreparedActionRecord:
+        """Atomically consume one permission, grant +3, and resume its exact action."""
+        project_id, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation,
+        )
+        if not isinstance(payload, ExchangeGrantPayload):
+            raise ValueError("exchange grant preparation payload is invalid")
+        emitted: list[StreamEvent] = []
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                task = self._directed_task_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                self._prepared_task_exact(session_id, task_id, revision)
+                self._verify_prepared_project_identity(project_id, session_id)
+                existing = self._prepared_exchange_grant_retry(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    payload=payload,
+                )
+                if existing is not None:
+                    return existing
+                if (
+                    task.state is not TaskState.AWAITING_USER_INPUT
+                    or task.continuation_state is None
+                    or task.exchange_allowance != 0
+                ):
+                    raise RuntimeError("task is not awaiting exchange permission")
+                self._validate_prepared_context(task, payload.continuation)
+                pause_id = self._directed_pause_id_exact(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                )
+                permission = self._exchange_permission_for_pause(
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    expected_generation=payload.continuation_generation,
+                    continuation_pause_id=pause_id,
+                )
+                if permission is None or permission["grant_request_id"] is not None:
+                    raise RuntimeError("exchange permission already received its grant")
+                attempted = (task.pending or {}).get("attempted_question")
+                try:
+                    stored_attempted = DirectedAgentQuestion.from_dict(
+                        _prepared_mapping(attempted, "attempted_question")
+                    )
+                except ValueError as error:
+                    raise RuntimeError("exchange permission is missing its attempted question") from error
+                if stored_attempted != payload.attempted_question:
+                    raise RuntimeError("exchange permission attempted question changed")
+                if payload.outer_question_id is not None:
+                    outer, outer_state, outer_pending, outer_pause = self._question_exact(
+                        session_id=session_id, task_id=task_id, revision=revision,
+                        expected_generation=payload.continuation_generation,
+                        question_id=payload.outer_question_id,
+                    )
+                    if (
+                        outer.nested_parent_kind is not None
+                        or outer.answer_text is not None
+                        or outer.asked_by is not ConversationActor.SOL
+                        or outer.routed_to is not ConversationTarget.FABLE
+                        or outer_state not in _SOL_TASK_STATES
+                        or outer_pending is None
+                        or outer_pause is None
+                    ):
+                        raise RuntimeError("exchange grant outer question changed")
+                active = task.continuation_state
+                resumed_pending = (
+                    task.pending
+                    if payload.parent_mode == "clarification"
+                    else None
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE exchange_permissions SET grant_request_id = ?
+                    WHERE permission_id = ? AND grant_request_id IS NULL
+                    """,
+                    (payload.request_id, permission["permission_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("exchange permission already received its grant")
+                self._connection.execute(
+                    """
+                    INSERT INTO exchange_grants (
+                        session_id, task_id, revision, request_id, permission_id,
+                        continuation_generation, grant_size
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        task_id,
+                        revision,
+                        payload.request_id,
+                        permission["permission_id"],
+                        payload.continuation_generation,
+                        EXCHANGE_GRANT_SIZE,
+                    ),
+                )
+                record = self._insert_prepared_action(
+                    project_id=project_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    revision=revision,
+                    action="exchange_grant",
+                    payload=payload,
+                    source_state=TaskState.AWAITING_USER_INPUT,
+                    active_state=active,
+                    continuation_state=active,
+                    pending_context=payload.continuation,
+                    previous_preparation_id=None,
+                    generation=generation,
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET exchange_allowance = exchange_allowance + ?, state = ?,
+                        continuation_state = NULL, pending_json = ?,
+                        continuation_pause_id = NULL
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND continuation_generation = ? AND continuation_pause_id = ?
+                      AND state = ? AND continuation_state = ? AND exchange_allowance = 0
+                    """,
+                    (
+                        EXCHANGE_GRANT_SIZE,
+                        active.value,
+                        None if resumed_pending is None else _encode_json(resumed_pending),
+                        task_id,
+                        revision,
+                        session_id,
+                        payload.continuation_generation,
+                        pause_id,
+                        TaskState.AWAITING_USER_INPUT.value,
+                        active.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("exchange grant changed concurrently")
+                emitted.append(self._insert_conversation_event_in_transaction(
+                    session_id=session_id,
+                    task_id=task_id,
+                    event=ConversationEnvelope(
+                        sender=ConversationActor.USER,
+                        addressed_to=ConversationTarget.TEAM,
+                        routed_to=ConversationTarget.FABLE,
+                        message_type=ConversationMessageType.APPROVAL,
+                        text="Allow three more internal exchanges.",
+                        task_id=task_id,
+                        revision=revision,
+                    ),
+                ))
             self._publish_committed_events(emitted)
         return record
 
@@ -3014,6 +4258,7 @@ class SQLiteStore:
         prepared_actions_recovered = 0
         tasks_interrupted = 0
         with self._immediate_transaction():
+            self._validate_nested_question_rows_in_transaction()
             last_preparation_id = ""
             while True:
                 rows = self._connection.execute(
@@ -3051,6 +4296,8 @@ class SQLiteStore:
                         if cursor.rowcount != 1:
                             raise RuntimeError("unfinished prepared action task changed")
                         tasks_interrupted += cursor.rowcount
+                    elif self._claimed_exchange_grant_checkpoint_child(record, task) is not None:
+                        pass
                     elif task.state is not TaskState.INTERRUPTED:
                         raise RuntimeError("unfinished prepared action task changed")
                     else:
@@ -3093,6 +4340,185 @@ class SQLiteStore:
             tasks_interrupted=tasks_interrupted,
             agent_runs_interrupted=0,
         )
+
+    def resume_recovered_exchange_grant(
+        self, preparation_id: str, *, generation: int,
+    ) -> PreparedActionRecord:
+        """Re-arm exactly one recovered typed grant without recreating its charge."""
+        with self._immediate_transaction():
+            record = self._prepared_required(preparation_id)
+            self._require_record_generation(record, generation)
+            if record.action != "exchange_grant" or record.status != "RECOVERED":
+                raise RuntimeError("recovered exchange grant is not resumable")
+            if not isinstance(record.payload, ExchangeGrantPayload):
+                raise RuntimeError("recovered exchange grant payload is invalid")
+            task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+            if (
+                task.state is not TaskState.INTERRUPTED
+                or task.continuation_state is not record.active_state
+                or task.continuation_generation != record.payload.continuation_generation
+            ):
+                raise RuntimeError("recovered exchange grant task changed")
+            cursor = self._connection.execute(
+                """UPDATE tasks SET state = ?, continuation_state = NULL
+                WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
+                  AND continuation_state = ? AND continuation_generation = ?""",
+                (record.active_state.value, record.task_id, record.revision,
+                 record.session_id, TaskState.INTERRUPTED.value,
+                 record.active_state.value, record.payload.continuation_generation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("recovered exchange grant task changed")
+            cursor = self._connection.execute(
+                """UPDATE prepared_actions SET status = 'PREPARED'
+                WHERE preparation_id = ? AND generation = ? AND status = 'RECOVERED'""",
+                (record.preparation_id, record.generation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("recovered exchange grant changed")
+        return self._prepared_required(preparation_id)
+
+    def resume_claimed_exchange_grant_checkpoint(
+        self, preparation_id: str, *, generation: int,
+    ) -> QuestionRecord:
+        """Authenticate a post-dispatch nested grant checkpoint without recharging it."""
+        with self._immediate_transaction():
+            record = self._prepared_required(preparation_id)
+            self._require_record_generation(record, generation)
+            if record.status not in {"CLAIMED", "RECOVERED"}:
+                raise RuntimeError("exchange grant checkpoint is invalid")
+            task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+            child = self._claimed_exchange_grant_checkpoint_child(record, task)
+            if child is None:
+                raise RuntimeError("exchange grant checkpoint changed")
+            if record.status == "RECOVERED":
+                cursor = self._connection.execute(
+                    "UPDATE prepared_actions SET status = 'CLAIMED' WHERE preparation_id = ? AND generation = ? AND status = 'RECOVERED'",
+                    (record.preparation_id, record.generation),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("exchange grant checkpoint changed")
+        return child
+
+    def rebind_recovered_exchange_grant_checkpoint(
+        self,
+        preparation_id: str,
+        *,
+        old_generation: int,
+        generation: int,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+    ) -> PreparedActionRecord:
+        """Atomically bind one recovered checkpoint to its newly acquired Hub lease."""
+        _, session_id, task_id, revision, generation = self._prepared_identity(
+            project_id, session_id, task_id, revision, generation,
+        )
+        old_generation = _require_integer(old_generation, "old_generation")
+        if old_generation < 0:
+            raise ValueError("old_generation must be non-negative")
+        with self._immediate_transaction():
+            record = self._prepared_required(preparation_id)
+            if (
+                record.project_id != project_id
+                or record.session_id != session_id
+                or record.task_id != task_id
+                or record.revision != revision
+                or record.generation != old_generation
+                or record.status != "RECOVERED"
+            ):
+                raise RuntimeError("recovered exchange grant ownership changed")
+            task = self._prepared_task_exact(session_id, task_id, revision)
+            if self._claimed_exchange_grant_checkpoint_child(record, task) is None:
+                raise RuntimeError("recovered exchange grant checkpoint changed")
+            cursor = self._connection.execute(
+                """UPDATE prepared_actions SET generation = ?, status = 'CLAIMED'
+                WHERE preparation_id = ? AND project_id = ? AND session_id = ?
+                  AND task_id = ? AND revision = ? AND generation = ?
+                  AND status = 'RECOVERED'""",
+                (
+                    generation, preparation_id, project_id, session_id, task_id,
+                    revision, old_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("recovered exchange grant ownership changed")
+        return self._prepared_required(preparation_id)
+
+    def _claimed_exchange_grant_checkpoint_child(
+        self, record: PreparedActionRecord, task: TaskRecord,
+    ) -> QuestionRecord | None:
+        """Return only an exact post-dispatch grant checkpoint, without repairing it."""
+        payload = record.payload
+        if (
+            record.action != "exchange_grant"
+            or record.status not in {"CLAIMED", "RECOVERED"}
+            or not isinstance(payload, ExchangeGrantPayload)
+            or payload.parent_mode not in {"clarification", "question"}
+            or task.state is not TaskState.AWAITING_USER_INPUT
+            or task.continuation_generation != payload.continuation_generation
+        ):
+            return None
+        if payload.parent_mode == "question":
+            if (
+                payload.outer_question_id is None
+                or task.continuation_state not in _SOL_TASK_STATES
+            ):
+                return None
+            child, state, pending, pause_id = self._question_exact(
+                session_id=record.session_id, task_id=record.task_id,
+                revision=record.revision,
+                expected_generation=payload.continuation_generation,
+                question_id=payload.outer_question_id,
+            )
+            if (
+                child.nested_parent_kind is not None
+                or child.asked_by is not ConversationActor.SOL
+                or child.routed_to is not ConversationTarget.FABLE
+                or child.answer_text is not None
+                or state is not task.continuation_state
+                or pending != task.pending
+                or pause_id != self._directed_pause_id(
+                    session_id=record.session_id, task_id=record.task_id,
+                    revision=record.revision,
+                    expected_generation=payload.continuation_generation,
+                )
+            ):
+                return None
+            return child
+        if (
+            task.continuation_state is not TaskState.FABLE_CLARIFYING
+            or not isinstance(payload.continuation, ClarificationContext)
+            or task.pending is None
+        ):
+            return None
+        try:
+            self._validate_prepared_context(task, payload.continuation)
+        except RuntimeError:
+            return None
+        rows = self._connection.execute(
+            """SELECT * FROM questions WHERE task_id = ? AND revision = ?
+            AND continuation_generation = ? AND answer_text IS NULL
+            AND nested_parent_kind = 'clarification'""",
+            (record.task_id, record.revision, payload.continuation_generation),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        child = self._question_from_row(rows[0])
+        if (
+            child.parent_question_id is not None
+            or child.asked_by is not ConversationActor.FABLE
+            or child.routed_to is not ConversationTarget.SOL
+            or child.text != payload.attempted_question.text
+            or self._question_pause_id(child.question_id) != self._directed_pause_id(
+                session_id=record.session_id, task_id=record.task_id,
+                revision=record.revision,
+                expected_generation=payload.continuation_generation,
+            )
+        ):
+            return None
+        return child
 
     def _prepared_identity(
         self,
@@ -3249,6 +4675,51 @@ class SQLiteStore:
         return TaskState.FABLE_PLANNING
 
     @staticmethod
+    def _target_for_prepared_continuation(
+        context: PreparedContinuationContext,
+    ) -> ConversationTarget:
+        """Derive the only provider target permitted by a typed continuation."""
+        while isinstance(context, AnswerContext):
+            context = context.underlying_continuation
+        if isinstance(context, (ScopeApprovalContext, SolResumeContext)):
+            return ConversationTarget.SOL
+        if isinstance(context, (ReviewContext, ClarificationContext)):
+            return ConversationTarget.FABLE
+        raise RuntimeError("prepared continuation has no agent route")
+
+    def _prepared_exchange_grant_retry(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        payload: ExchangeGrantPayload,
+    ) -> PreparedActionRecord | None:
+        """Return only the same still-runnable typed grant preparation."""
+        rows = self._connection.execute(
+            """
+            SELECT * FROM prepared_actions
+            WHERE project_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+              AND action = 'exchange_grant'
+            ORDER BY rowid DESC
+            """,
+            (project_id, session_id, task_id, revision),
+        ).fetchall()
+        for row in rows:
+            record = self._prepared_action_from_row(row)
+            if not isinstance(record.payload, ExchangeGrantPayload):
+                raise RuntimeError("prepared exchange grant payload is invalid")
+            if record.payload.request_id != payload.request_id:
+                continue
+            if record.payload != payload:
+                raise RuntimeError("exchange grant request changed")
+            if record.status not in {"PREPARED", "CLAIMED"}:
+                raise RuntimeError("exchange grant action is no longer runnable")
+            return record
+        return None
+
+    @staticmethod
     def _prepared_pending_projection(
         record: PreparedActionRecord, *, reason: str,
     ) -> dict[str, object]:
@@ -3311,6 +4782,25 @@ class SQLiteStore:
         if task.continuation_state is None:
             raise RuntimeError("prepared continuation is missing")
         pending = task.pending or {}
+        if (
+            task.continuation_state is TaskState.FABLE_CLARIFYING
+            and isinstance(context, SolResumeContext)
+            and not isinstance(pending.get("clarification_prompt"), str)
+        ):
+            parent = self._unanswered_question_for_task(task.task_id, task.revision)
+            if parent is not None and parent.nested_parent_kind is None:
+                parent_row = self._connection.execute(
+                    "SELECT pending_action_json FROM questions WHERE question_id = ?",
+                    (parent.question_id,),
+                ).fetchone()
+                if parent_row is not None:
+                    original = _decode_mapping(parent_row["pending_action_json"], "parent pending")
+                    if (
+                        context.sol_thread_id == task.sol_thread_id
+                        and context.sol_run_id == original.get("sol_run_id")
+                        and context.prompt == original.get("prompt")
+                    ):
+                        return
         projection = pending.get("prepared_action")
         if self._is_initial_approval_resume_context(
             task, context, predecessor, projection,
@@ -4596,6 +6086,7 @@ class SQLiteStore:
         placeholders = ", ".join("?" for _ in active_values)
         tasks_interrupted = 0
         with self._immediate_transaction():
+            self._validate_nested_question_rows_in_transaction()
             while True:
                 rows = self._connection.execute(
                     f"""
@@ -4690,6 +6181,10 @@ class SQLiteStore:
 
         if has_row("PRAGMA foreign_key_check"):
             reasons.add("foreign_key_integrity")
+        try:
+            self._validate_nested_question_rows_in_transaction()
+        except RuntimeError:
+            reasons.add("question_integrity")
         if has_row(
             """
             SELECT 1 FROM sessions
@@ -4965,6 +6460,127 @@ class SQLiteStore:
                 return False
             if not self._legacy_prepared_lineage_matches(record, rowid):
                 return False
+        elif record.action in {
+            "continuation_message", "question_answer", "exchange_grant",
+        }:
+            if (
+                record.source_state is not TaskState.AWAITING_USER_INPUT
+                or record.continuation_state is None
+                or record.active_state is not record.continuation_state
+                or record.previous_preparation_id is not None
+                or not self._conversation_prepared_context_matches_task(
+                    task, record.pending_context,
+                )
+            ):
+                return False
+            if record.action == "continuation_message":
+                payload = record.payload
+                if (
+                    not isinstance(payload, ContinuationMessagePayload)
+                    or payload.continuation != record.pending_context
+                    or payload.continuation_generation != task.continuation_generation
+                    or self._target_for_prepared_continuation(payload.continuation)
+                    is not payload.routed_to
+                    or not self._conversation_event_exists(
+                        session_id=record.session_id,
+                        task_id=record.task_id,
+                        sender=ConversationActor.USER,
+                        addressed_to=payload.addressed_to,
+                        routed_to=payload.routed_to,
+                        message_type=ConversationMessageType.STATEMENT,
+                        text=payload.text,
+                        revision=record.revision,
+                        continuation_generation=payload.continuation_generation,
+                    )
+                ):
+                    return False
+            elif record.action == "question_answer":
+                payload = record.payload
+                question = None
+                if isinstance(payload, QuestionAnswerPayload):
+                    question = self.question(payload.question_id)
+                if (
+                    not isinstance(payload, QuestionAnswerPayload)
+                    or payload.continuation != record.pending_context
+                    or task.continuation_generation != payload.continuation_generation + 1
+                    or question is None
+                    or question.session_id != record.session_id
+                    or question.task_id != record.task_id
+                    or question.revision != record.revision
+                    or question.continuation_generation != payload.continuation_generation
+                    or question.routed_to is not ConversationTarget.USER
+                    or question.answer_text != payload.answer
+                    or question.answered_by is not ConversationActor.USER
+                    or not self._conversation_event_exists(
+                        session_id=record.session_id,
+                        task_id=record.task_id,
+                        sender=ConversationActor.USER,
+                        addressed_to=self._target_for_question_asker(question.asked_by),
+                        routed_to=self._target_for_question_asker(question.asked_by),
+                        message_type=ConversationMessageType.ANSWER,
+                        text=payload.answer,
+                        revision=record.revision,
+                        continuation_generation=payload.continuation_generation,
+                        reply_to_question_id=payload.question_id,
+                    )
+                ):
+                    return False
+            else:
+                payload = record.payload
+                grant = None
+                if isinstance(payload, ExchangeGrantPayload):
+                    grant = self._connection.execute(
+                        """
+                        SELECT grant_size FROM exchange_grants
+                        WHERE session_id = ? AND task_id = ? AND revision = ?
+                          AND request_id = ? AND continuation_generation = ?
+                        """,
+                        (
+                            record.session_id,
+                            record.task_id,
+                            record.revision,
+                            payload.request_id,
+                            payload.continuation_generation,
+                        ),
+                    ).fetchone()
+                if (
+                    not isinstance(payload, ExchangeGrantPayload)
+                    or payload.continuation != record.pending_context
+                    or payload.continuation_generation != task.continuation_generation
+                    or (
+                        payload.parent_mode == "top_level"
+                        and (payload.outer_question_id is not None or isinstance(payload.continuation, ClarificationContext))
+                    )
+                    or (
+                        payload.parent_mode == "clarification"
+                        and not isinstance(payload.continuation, ClarificationContext)
+                    )
+                    or (
+                        payload.parent_mode == "question" and (
+                            payload.outer_question_id is None
+                            or (parent := self.question(payload.outer_question_id)) is None
+                            or parent.task_id != record.task_id
+                            or parent.revision != record.revision
+                            or parent.nested_parent_kind is not None
+                            or parent.asked_by is not ConversationActor.SOL
+                            or parent.routed_to is not ConversationTarget.FABLE
+                        )
+                    )
+                    or (payload.parent_mode == "clarification" and payload.outer_question_id is not None)
+                    or grant is None
+                    or int(grant["grant_size"]) != EXCHANGE_GRANT_SIZE
+                    or not self._conversation_event_exists(
+                        session_id=record.session_id,
+                        task_id=record.task_id,
+                        sender=ConversationActor.USER,
+                        addressed_to=ConversationTarget.TEAM,
+                        routed_to=ConversationTarget.FABLE,
+                        message_type=ConversationMessageType.APPROVAL,
+                        text="Allow three more internal exchanges.",
+                        revision=record.revision,
+                    )
+                ):
+                    return False
         else:  # PreparedActionRecord normally prevents this; keep audit fail-closed.
             return False
         if record.action != "new_request":
@@ -4973,6 +6589,71 @@ class SQLiteStore:
             except ValueError:
                 return False
         return True
+
+    @staticmethod
+    def _conversation_prepared_context_matches_task(
+        task: TaskRecord,
+        context: PreparedContinuationContext,
+    ) -> bool:
+        while isinstance(context, AnswerContext):
+            context = context.underlying_continuation
+        if isinstance(context, SolResumeContext):
+            return task.sol_thread_id == context.sol_thread_id
+        if isinstance(context, ScopeApprovalContext):
+            return (
+                task.baseline_id == context.baseline_id
+                and task.revision == context.approved_revision
+                and (
+                    context.underlying_continuation is None
+                    or task.sol_thread_id == context.underlying_continuation.sol_thread_id
+                )
+            )
+        if isinstance(context, ReviewContext):
+            return task.fable_session_id == context.fable_session_id
+        if isinstance(context, ClarificationContext):
+            return task.fable_session_id == context.fable_session_id
+        return False
+
+    def _conversation_event_exists(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        sender: ConversationActor,
+        addressed_to: ConversationTarget,
+        routed_to: ConversationTarget,
+        message_type: ConversationMessageType,
+        text: str,
+        revision: int,
+        continuation_generation: int | None = None,
+        reply_to_question_id: str | None = None,
+    ) -> bool:
+        for row in self._connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE session_id = ? AND task_id = ? AND kind = 'conversation'
+            """,
+            (session_id, task_id),
+        ):
+            try:
+                event = ConversationEnvelope.from_dict(
+                    _decode_mapping(row["payload_json"], "conversation event")
+                )
+            except (RuntimeError, ValueError):
+                continue
+            if (
+                event.sender is sender
+                and event.addressed_to is addressed_to
+                and event.routed_to is routed_to
+                and event.message_type is message_type
+                and event.text == text
+                and event.task_id == task_id
+                and event.revision == revision
+                and event.continuation_generation == continuation_generation
+                and event.reply_to_question_id == reply_to_question_id
+            ):
+                return True
+        return False
 
     def _legacy_prepared_context_matches_task(
         self,
@@ -5172,8 +6853,7 @@ class SQLiteStore:
         except (TypeError, ValueError, OverflowError) as error:
             raise RuntimeError("persisted task is invalid") from error
 
-    @staticmethod
-    def _question_from_row(row: sqlite3.Row) -> QuestionRecord:
+    def _question_from_row(self, row: sqlite3.Row) -> QuestionRecord:
         try:
             raw_answered_by = row["answered_by"]
             return QuestionRecord(
@@ -5193,6 +6873,9 @@ class SQLiteStore:
                     if raw_answered_by is None
                     else ConversationActor(raw_answered_by)
                 ),
+                nested_parent_kind=row["nested_parent_kind"],
+                parent_question_id=row["parent_question_id"],
+                parent_continuation_pause_id=row["parent_continuation_pause_id"],
             )
         except (TypeError, ValueError, OverflowError) as error:
             raise RuntimeError("persisted question is invalid") from error
