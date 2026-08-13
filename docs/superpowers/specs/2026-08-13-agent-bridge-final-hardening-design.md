@@ -1,6 +1,6 @@
 # Agent Bridge Final Hardening Design
 
-**Status:** Approved design pending written-spec review
+**Status:** Approved
 
 ## Goal
 
