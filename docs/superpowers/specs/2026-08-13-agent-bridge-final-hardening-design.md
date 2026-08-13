@@ -54,29 +54,37 @@ This remains a read-only audit. It must not repair or normalize corrupt rows.
 ## 2. File-scoped provider schema capability
 
 Sol needs read access to one generated JSON schema, not to the private schema
-directory. The launcher will create or open `sol-outcome.json` through its
-retained private schema-directory descriptor, then close the directory
-descriptor and retain only the regular-file descriptor. The Codex adapter will
-therefore pass that inherited, read-only regular-file descriptor whose
-child-visible path is
-`/proc/self/fd/<fd>`.
+directory or the pathname of any private state. The launcher will create or
+open the persisted `sol-outcome.json` through its retained private
+schema-directory descriptor and use that file only for compatibility and
+startup validation. It is never inherited by the provider.
 
-The schema bytes are materialized and authenticated before the provider starts.
-The inherited descriptor exposes only that file: the child cannot traverse
-`..` to reach the project database, locks, artifacts, or other state. No state
-directory descriptor is inherited by a provider child.
+For every Sol start or Resume invocation, the Codex adapter creates a fresh
+anonymous Linux `memfd`, writes the canonical schema, changes its mode to
+`0400`, applies write/grow/shrink/seal seals, reopens it read-only, and closes
+the writable descriptor. The provider receives only that read-only sealed FD;
+its child-visible argument is `/proc/self/fd/<fd>`. The adapter closes the FD in
+`finally` immediately after the child exits, raises, or is cancelled.
+
+The schema bytes and required seals are authenticated before the provider
+starts. The proc entry resolves to an anonymous memfd name, not an absolute
+private-state pathname. The child cannot derive or traverse to the project
+database, locks, artifacts, or other state, and cannot reopen or mutate the
+schema through proc. No state, artifact, schema-directory, database, or named
+schema-file descriptor is inherited by a provider child.
 
 Descriptor ownership remains explicit:
 
 - the launcher/store assembly owns and closes state-directory capabilities and
-  the retained schema-file descriptor;
-- the Codex adapter receives only the schema-file capability needed by its child
-  process and never closes its caller-owned descriptor;
-- success, failure, cancellation, and startup rollback close every duplicate;
+  its persisted schema-file descriptor after adapter validation;
+- the Codex adapter owns each per-invocation sealed memfd and closes it in the
+  same invocation's `finally` block;
+- success, failure, cancellation, and startup rollback close every descriptor;
 - existing fake-provider and schema-path behavior remains compatible.
 
 The current implementation already relies on Linux `/proc/self/fd` semantics;
-this design does not introduce a new platform dependency.
+Linux `memfd_create` and file seals narrow that existing platform boundary and
+do not introduce a second supported platform.
 
 ## 3. Bounded startup recovery result
 
@@ -121,8 +129,10 @@ Implementation is test-first. Required adversarial coverage includes:
 
 1. An Answer prepared row with a state-incompatible context is rejected before
    recovery, plus positive cases for every valid Answer continuation family.
-2. A fake provider can read the inherited schema file but cannot open sibling
-   database, lock, artifact, or state files through the descriptor path.
+2. A fake provider can read the inherited schema memfd, but its proc link does
+   not reveal a private path; opening/writing it as writable fails; resolving or
+   traversing it cannot open sibling database, lock, artifact, or state files;
+   and the invocation closes it on success, error, and cancellation.
 3. Large sets of recoverable active tasks and unfinished prepared actions stay
    under a fixed memory oracle, return accurate summary counts, remain atomic,
    and are idempotent.

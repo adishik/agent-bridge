@@ -210,7 +210,12 @@ git commit -m "fix: authenticate prepared answer recovery"
 
 **Interfaces:**
 - Consumes: `_open_private_directory()`, `_OpenedProjectState.release_state_authority()`, `CodexCLI`, `ProcessRunner`'s `pass_fds` parameter, and canonical `SOL_OUTCOME_SCHEMA` serialization.
-- Produces: `materialize_sol_schema_file(directory_fd: int) -> int`, returning one caller-owned, read-only regular-file descriptor; the existing `CodexCLI` constructor gains the keyword `schema_file_fd: int | None = None` and passes only that file descriptor to Sol.
+- Produces: `materialize_sol_schema_file(directory_fd: int) -> int`, returning
+  one caller-owned read-only descriptor for validation of the persisted schema,
+  plus `_create_sealed_sol_schema_memfd() -> int`, returning one adapter-owned,
+  anonymous, sealed, read-only per-invocation descriptor. The existing
+  `CodexCLI` constructor gains `schema_file_fd: int | None = None` for startup
+  validation but never passes that named-file descriptor to Sol.
 
 - [ ] **Step 1: Add the malicious-child capability test**
 
@@ -219,11 +224,18 @@ Open realistic private state containing `bridge.sqlite3`, a lock, an artifact, a
 ```python
 schema_path = Path(argv[argv.index("--output-schema") + 1])
 schema = json.loads(schema_path.read_text(encoding="utf-8"))
+proc_target = os.readlink(schema_path)
+attempt_open(schema_path, os.O_WRONLY)
+attempt_write(schema_path)
+assert private_state_path not in proc_target
 for sibling in ("bridge.sqlite3", "artifacts", "locks"):
-    attempt_open(schema_path / ".." / sibling)
+    attempt_open(resolve_from_proc_target(proc_target, sibling))
 ```
 
-Assert it reads the exact schema, every sibling attempt fails, and the recorded `pass_fds` contains a regular file descriptor but no directory descriptor.
+Assert it reads the exact schema, the proc target is an anonymous memfd name,
+every writable/sibling attempt fails, all required seals are present, and the
+recorded `pass_fds` contains one regular memfd but no directory or named
+private-state descriptor.
 
 - [ ] **Step 2: Run the capability tests and verify honest RED**
 
@@ -233,7 +245,8 @@ PYTHONPATH="$PWD/src" /home/adi/agent-bridge/.venv/bin/python -m pytest -q \
   -k 'schema_file_capability or provider_cannot_traverse_schema'
 ```
 
-Expected: FAIL because the current child inherits the schemas directory and can traverse to its parent.
+Expected: FAIL because the current named-file proc entry reveals the absolute
+private schema path and can be reopened writable by the same-UID child.
 
 - [ ] **Step 3: Implement secure schema-file materialization**
 
@@ -249,7 +262,22 @@ def materialize_sol_schema_file(directory_fd: int) -> int:
     # return the read-only fd; close all temporary/write fds on every path
 ```
 
-Do not pass the directory descriptor to a child.
+Do not pass the directory or returned named-file descriptor to a child.
+
+Add the per-invocation helper:
+
+```python
+def _create_sealed_sol_schema_memfd() -> int:
+    writable_fd = os.memfd_create(
+        "agent-bridge-sol-schema",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    # write canonical bytes; fchmod 0o400; fsync
+    # add F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL
+    # reopen /proc/self/fd/<writable_fd> O_RDONLY | O_CLOEXEC
+    # close writable_fd; authenticate mode, bytes, and exact required seals
+    # return read-only fd; close both descriptors on every error
+```
 
 - [ ] **Step 4: Narrow `CodexCLI` and launcher ownership**
 
@@ -259,16 +287,26 @@ Keep direct adapter construction without an injected descriptor compatible. For 
 - call `materialize_sol_schema_file()`;
 - close the schemas directory descriptor immediately;
 - store only `schema_file_descriptor` on `_OpenedProjectState`;
-- give `CodexCLI` `schema_path=Path(f"/proc/self/fd/{schema_file_descriptor}")` through its `schema_file_fd` seam;
-- make `CodexCLI` verify the injected descriptor is a read-only regular file containing the exact canonical schema;
-- pass only the file FD to `ProcessRunner`;
-- close the caller-owned file FD in `release_state_authority()` and every partial-startup rollback path.
+- make `CodexCLI` verify the injected persisted descriptor is a read-only
+  regular file containing the exact canonical schema, then retain no provider
+  authority to its pathname;
+- before each `start()` and `resume()`, create a fresh sealed memfd, build the
+  `--output-schema /proc/self/fd/<memfd>` argument, pass only that memfd to
+  `ProcessRunner`, and close it in `finally` after the awaited run;
+- close the launcher-owned persisted schema FD immediately after `CodexCLI`
+  validation and in every partial-startup rollback path;
+- keep the public persisted `schema_path` and direct temp-directory
+  materialization compatible, but never use that named path in child argv.
 
 No provider child may inherit a state, artifact, schema-directory, or database descriptor.
 
 - [ ] **Step 5: Add lifecycle and compatibility tests**
 
-Cover constructor rejection of directory, writable, closed, and wrong-content FDs; direct temp-directory adapter behavior; start/resume schema reading; startup failure cleanup; runtime close cleanup; and the full fake Codex invocation.
+Cover constructor rejection of directory, writable, closed, and wrong-content
+persisted FDs; direct temp-directory adapter behavior; start/resume anonymous
+schema reading; exact seals and `0400` mode; proc-link non-disclosure;
+same-UID reopen/write denial; per-invocation cleanup on success, runner error,
+and cancellation; startup failure cleanup; and the full fake Codex invocation.
 
 - [ ] **Step 6: Run affected tests**
 
