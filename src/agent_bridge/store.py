@@ -3554,6 +3554,11 @@ class SQLiteStore:
         return (
             active_state in _SOL_TASK_STATES
             and isinstance(context, (ScopeApprovalContext, SolResumeContext))
+            and (
+                not isinstance(context, ScopeApprovalContext)
+                or context.underlying_continuation is not None
+                or (task.sol_thread_id is None and not task.pending)
+            )
             and self._legacy_continuation_identifiers_match_task(task, context)
         )
 
@@ -3681,38 +3686,43 @@ class SQLiteStore:
             raise RuntimeError("persisted chat is invalid") from error
 
     def _task_from_row(self, row: sqlite3.Row) -> TaskRecord:
-        revision = int(row["revision"])
-        raw_brief = row["brief_json"]
-        if revision == 0:
-            if raw_brief is not None:
-                raise RuntimeError("revision-zero task must not have a brief")
-            brief = None
-        else:
-            if raw_brief is None:
-                raise RuntimeError("task revision is missing its brief")
-            try:
-                brief = TaskBrief.from_dict(_decode_mapping(raw_brief, "task brief"))
-            except ValueError as error:
-                raise RuntimeError("persisted task brief is invalid") from error
-            if brief.revision != revision or brief.task_id != row["task_id"]:
-                raise RuntimeError("persisted task brief identity does not match its record")
-        raw_pending = row["pending_json"]
-        pending = None if raw_pending is None else _decode_mapping(raw_pending, "pending context")
-        raw_continuation = row["continuation_state"]
-        return TaskRecord(
-            task_id=row["task_id"],
-            revision=revision,
-            session_id=row["session_id"],
-            state=TaskState(row["state"]),
-            brief=brief,
-            approved_at=row["approved_at"],
-            fable_session_id=row["fable_session_id"],
-            sol_thread_id=row["sol_thread_id"],
-            baseline_id=row["baseline_id"],
-            correction_count=int(row["correction_count"]),
-            continuation_state=None if raw_continuation is None else TaskState(raw_continuation),
-            pending=pending,
-        )
+        try:
+            revision = int(row["revision"])
+            raw_brief = row["brief_json"]
+            if revision == 0:
+                if raw_brief is not None:
+                    raise RuntimeError("revision-zero task must not have a brief")
+                brief = None
+            else:
+                if raw_brief is None:
+                    raise RuntimeError("task revision is missing its brief")
+                try:
+                    brief = TaskBrief.from_dict(_decode_mapping(raw_brief, "task brief"))
+                except ValueError as error:
+                    raise RuntimeError("persisted task brief is invalid") from error
+                if brief.revision != revision or brief.task_id != row["task_id"]:
+                    raise RuntimeError("persisted task brief identity does not match its record")
+            raw_pending = row["pending_json"]
+            pending = None if raw_pending is None else _decode_mapping(raw_pending, "pending context")
+            raw_continuation = row["continuation_state"]
+            return TaskRecord(
+                task_id=row["task_id"],
+                revision=revision,
+                session_id=row["session_id"],
+                state=TaskState(row["state"]),
+                brief=brief,
+                approved_at=row["approved_at"],
+                fable_session_id=row["fable_session_id"],
+                sol_thread_id=row["sol_thread_id"],
+                baseline_id=row["baseline_id"],
+                correction_count=int(row["correction_count"]),
+                continuation_state=(
+                    None if raw_continuation is None else TaskState(raw_continuation)
+                ),
+                pending=pending,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("persisted task is invalid") from error
 
     def _prepared_action_from_row(self, row: sqlite3.Row) -> PreparedActionRecord:
         try:

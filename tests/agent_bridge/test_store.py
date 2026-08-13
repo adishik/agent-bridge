@@ -1783,6 +1783,71 @@ def _replace_prepared_answer_context(
     )
 
 
+def test_legacy_audit_rejects_top_level_scope_without_underlying_before_recovery(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """An audited Answer cannot replace an exact Sol resume with a fresh start."""
+    continuation = SolResumeContext(
+        "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+    )
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=TaskState.SOL_RUNNING,
+        continuation=continuation,
+    )
+    assert store.get_task(valid_brief.task_id, valid_brief.revision).sol_thread_id == (
+        continuation.sol_thread_id
+    )
+    _replace_prepared_answer_context(
+        store,
+        prepared.preparation_id,
+        payload_context=ScopeApprovalContext("baseline-1", 1, None),
+    )
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(canonical_root)
+
+    assert _legacy_table_rows(store._connection) == before
+    recovered = store.prepared_action(prepared.preparation_id)
+    assert recovered is not None
+    assert recovered.status == "PREPARED"
+    assert store.get_task(valid_brief.task_id, valid_brief.revision).state is TaskState.SOL_RUNNING
+
+
+@pytest.mark.parametrize("column", ("state", "continuation_state"))
+def test_legacy_audit_redacts_corrupt_task_state_parse_failures(
+    tmp_path,
+    valid_brief,
+    column: str,
+) -> None:
+    """Task-row enum corruption must fail through the fixed audit boundary."""
+    store, canonical_root, prepared = _prepared_answer_for_legacy_audit(
+        tmp_path,
+        valid_brief,
+        active_state=TaskState.SOL_RUNNING,
+        continuation=SolResumeContext(
+            "11111111-1111-4111-8111-111111111111", "run-sol", "continue exact work",
+        ),
+    )
+    sentinel = "CORRUPT_TASK_STATE_SENTINEL_/outside/legacy"
+    store._connection.execute(
+        f"UPDATE tasks SET {column} = ? WHERE task_id = ? AND revision = ?",
+        (sentinel, valid_brief.task_id, valid_brief.revision),
+    )
+    before = _legacy_table_rows(store._connection)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed") as error:
+        store.audit_legacy_project_ownership(canonical_root)
+
+    assert sentinel not in repr(error.value)
+    assert "/outside/legacy" not in repr(error.value)
+    assert _legacy_table_rows(store._connection) == before
+    assert store.prepared_action(prepared.preparation_id) is not None
+
+
 @pytest.mark.parametrize(
     ("prepared_active_state", "corrupt_active_state", "corrupt_context"),
     (

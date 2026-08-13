@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
     NewRequestPayload,
     PreparedActionOutcome,
+    ResumeDriftProjection,
     ResumePayload,
     ScopeApprovalContext,
     SQLiteStore,
@@ -439,6 +441,106 @@ def test_coordinator_forwards_recovery_summary(harness: CoordinatorHarness) -> N
     )
     assert harness.store.prepared_action(prepared.preparation_id).status == "RECOVERED"
     assert harness.store.get_task(prepared.task_id, prepared.revision).state is TaskState.INTERRUPTED
+
+
+def test_legacy_audit_blocks_corrupt_scope_before_recovery_can_route_a_fresh_sol_start(
+    harness: CoordinatorHarness,
+) -> None:
+    """An exact-thread Answer must not recover into the initial Sol-start path."""
+    async def scenario() -> None:
+        blocked = SolOutcome.from_dict({
+            "status": "blocked",
+            "summary": "The exact user decision is required.",
+            "changed_files": [],
+            "commands_run": [],
+            "known_failures": [],
+            "remaining_risks": [],
+            "architecture_docs": "No durable architecture change.",
+            "question": None,
+        })
+        harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+        harness.sol.queue(blocked)
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        await harness.coordinator.approve_task("task-1", revision=1)
+        waiting = harness.store.get_task("task-1", 1)
+        assert waiting.state is TaskState.AWAITING_USER_INPUT
+        assert waiting.sol_thread_id == THREAD_ID
+        assert waiting.baseline_id is not None
+        prepared = harness.coordinator.prepare_answer(
+            session_id="session-1",
+            task_id="task-1",
+            revision=1,
+            answer="continue",
+            generation=7,
+        )
+        corrupt_context = ScopeApprovalContext(
+            baseline_id=waiting.baseline_id,
+            approved_revision=1,
+            underlying_continuation=None,
+        )
+        payload = json.loads(harness.store._connection.execute(
+            "SELECT payload_json FROM prepared_actions WHERE preparation_id = ?",
+            (prepared.preparation_id,),
+        ).fetchone()["payload_json"])
+        context_data = store_module._context_to_data(corrupt_context)
+        payload["continuation"] = context_data
+        harness.store._connection.execute(
+            """
+            UPDATE prepared_actions SET payload_json = ?, pending_context_json = ?
+            WHERE preparation_id = ?
+            """,
+            (
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                json.dumps(context_data, separators=(",", ":"), sort_keys=True),
+                prepared.preparation_id,
+            ),
+        )
+        starts_before_startup = len(harness.sol.starts)
+
+        try:
+            harness.store.audit_legacy_project_ownership(str(harness.repo))
+        except RuntimeError:
+            pass
+        else:
+            assert harness.store.recover_active_tasks() == store_module.RecoverySummary(
+                prepared_actions_recovered=0,
+                tasks_interrupted=1,
+                agent_runs_interrupted=0,
+            )
+            assert harness.store.recover_unfinished_prepared_actions() == store_module.RecoverySummary(
+                prepared_actions_recovered=1,
+                tasks_interrupted=0,
+                agent_runs_interrupted=0,
+            )
+            resumed = harness.store.prepare_resume_action(
+                project_id=harness.coordinator.project_id,
+                session_id="session-1",
+                task_id="task-1",
+                revision=1,
+                generation=8,
+                payload=ResumePayload(
+                    continuation=corrupt_context,
+                    drift_event=ResumeDriftProjection(
+                        status="unchanged",
+                        summary="Repository drift was checked.",
+                        evidence_hashes=(),
+                    ),
+                ),
+                previous_preparation_id=prepared.preparation_id,
+            )
+            await harness.coordinator.run_prepared_action(resumed.preparation_id)
+            assert len(harness.sol.starts) == starts_before_startup + 1
+            assert harness.sol.resume_threads == []
+            pytest.fail("legacy audit admitted a corrupted exact-thread Answer")
+
+        recovered = harness.store.prepared_action(prepared.preparation_id)
+        assert recovered is not None
+        assert recovered.status == "PREPARED"
+        assert harness.store.get_task("task-1", 1).state is TaskState.SOL_RUNNING
+        assert len(harness.sol.starts) == starts_before_startup
+        assert harness.sol.resume_threads == []
+
+    asyncio.run(scenario())
 
 
 def test_sol_never_starts_before_exact_revision_approval(harness) -> None:
