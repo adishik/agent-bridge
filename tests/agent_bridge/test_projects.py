@@ -217,6 +217,26 @@ def test_same_basename_repositories_have_distinct_identity_and_state(tmp_path: P
     assert tuple(spec.project_id for spec in specs) == tuple(sorted(spec.project_id for spec in specs))
 
 
+def test_build_rejects_a_digest_collision_before_creating_shared_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shortened opaque ID may never become authority for two roots."""
+    first = _repository(tmp_path, "first")
+    second = _repository(tmp_path, "second")
+    state_root = tmp_path / "state"
+
+    monkeypatch.setattr(
+        "agent_bridge.projects._project_id_from_canonical_root",
+        lambda root: "c" * 32,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        _projects([("first", first), ("second", second)], tmp_path)
+
+    assert not (state_root / "projects" / ("c" * 32)).exists()
+
+
 def test_renaming_a_label_does_not_change_state_identity(tmp_path: Path) -> None:
     repo = _repository(tmp_path, "repo")
 

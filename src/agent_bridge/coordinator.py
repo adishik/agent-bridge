@@ -83,6 +83,7 @@ _FABLE_EVENT_TYPES = frozenset({
 _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_AUDIT_COUNT = 2**63 - 1
+MAX_AGENT_STRUCTURAL_EVENTS = 1_024
 _MIN_EXIT_CODE = -(2**31)
 _MAX_EXIT_CODE = 2**31 - 1
 
@@ -293,7 +294,9 @@ class Coordinator:
             task_id=task_id,
             revision=revision,
         )
-        context = self._context_from_task(task)
+        context = self._initial_approval_resume_context(task, predecessor)
+        if context is None:
+            context = self._context_from_task(task)
         if predecessor is not None and (
             predecessor.pending_context is not None
             or task.continuation_state is TaskState.FABLE_PLANNING
@@ -545,6 +548,38 @@ class Coordinator:
     def _stored_sol_context(self, task: TaskRecord) -> SolResumeContext:
         """Return the exact Sol continuation retained with a paused Fable step."""
         return self._sol_context(task, (task.pending or {}).get("prompt"))
+
+    @staticmethod
+    def _initial_approval_resume_context(
+        task: TaskRecord,
+        predecessor: PreparedActionRecord | None,
+    ) -> ScopeApprovalContext | None:
+        """Rebuild a pre-thread initial approval from its durable action payload."""
+        if (
+            predecessor is None
+            or predecessor.action != "approval"
+            or not isinstance(predecessor.payload, ApprovalPayload)
+            or predecessor.payload.scope is not None
+            or task.continuation_state is not TaskState.SOL_RUNNING
+            or task.sol_thread_id is not None
+            or task.baseline_id != predecessor.payload.baseline_id
+        ):
+            return None
+        projection = (task.pending or {}).get("prepared_action")
+        if (
+            not isinstance(projection, Mapping)
+            or set(projection) != {"preparation_id", "action", "reason", "context"}
+            or projection.get("preparation_id") != predecessor.preparation_id
+            or projection.get("action") != "approval"
+            or projection.get("context") is not None
+            or not isinstance(projection.get("reason"), str)
+        ):
+            return None
+        return ScopeApprovalContext(
+            baseline_id=predecessor.payload.baseline_id,
+            approved_revision=task.revision,
+            underlying_continuation=None,
+        )
 
     @staticmethod
     def _scope_context(task: TaskRecord) -> ScopeApprovalContext:
@@ -1773,11 +1808,14 @@ class Coordinator:
         run = self._store.agent_run(run_id)
         if result.cli_session_id is not None and run.status == "running":
             self._store.set_agent_run_session(run_id, result.cli_session_id)
-        normalized = tuple(
-            safe_event
-            for event in result.events
-            if (safe_event := self._structural_agent_event(actor, event)) is not None
-        )
+        normalized_events: list[Mapping[str, object]] = []
+        for event in result.events:
+            if len(normalized_events) == MAX_AGENT_STRUCTURAL_EVENTS:
+                break
+            safe_event = self._structural_agent_event(actor, event)
+            if safe_event is not None:
+                normalized_events.append(safe_event)
+        normalized = tuple(normalized_events)
         for safe_event in normalized:
             self._store.append_event(
                 task.session_id,

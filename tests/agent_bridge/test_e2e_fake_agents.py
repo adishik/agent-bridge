@@ -2269,11 +2269,11 @@ def test_partial_project_lock_failure_opens_no_runtime_or_database(
     original_acquire = launcher.acquire_instance_lock
     lifecycle: list[str] = []
 
-    def fail_on_second_project(path: Path):
+    def fail_on_second_project(path: Path, **kwargs: object):
         calls.append(path)
         if len(calls) == 3:
             raise RuntimeError("controlled second-project lock failure")
-        return original_acquire(path)
+        return original_acquire(path, **kwargs)
 
     def forbidden_open(*args: object, **kwargs: object) -> object:
         lifecycle.append("open")

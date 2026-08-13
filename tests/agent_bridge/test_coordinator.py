@@ -29,7 +29,13 @@ from agent_bridge.coordinator import (
 from agent_bridge.process import ProcessRunner
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import NewRequestPayload, PreparedActionOutcome, SQLiteStore
+from agent_bridge.store import (
+    NewRequestPayload,
+    PreparedActionOutcome,
+    ResumePayload,
+    ScopeApprovalContext,
+    SQLiteStore,
+)
 
 
 THREAD_ID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
@@ -1037,6 +1043,25 @@ def test_coordinator_rebuilds_structural_events_without_forwarding_allowed_key_s
             "item_type": "command_execution",
         }
         assert harness.store.latest_task("task-1").state is TaskState.AWAITING_USER_INPUT  # type: ignore[union-attr]
+
+    asyncio.run(scenario())
+
+
+def test_coordinator_bounds_structural_events_from_a_fake_adapter(harness) -> None:
+    """An adapter seam cannot turn one run into unbounded persisted events."""
+    async def scenario() -> None:
+        harness.sol.queue(
+            _completed(),
+            events=(_command_event(TEST_COMMAND),) * 1_300,
+        )
+
+        await harness.run_approved_task()
+
+        structural = [
+            event for event in harness.store.events_after("session-1", 0)
+            if event.actor == "sol" and event.kind == "agent_event"
+        ]
+        assert len(structural) <= 1_024
 
     asyncio.run(scenario())
 
@@ -2679,6 +2704,66 @@ def test_prepare_resume_persists_drift_failure_without_creating_a_child_action(
         ]
         assert len(drift_events) == 1
         assert "unapproved-drift.txt" not in repr(drift_events[0])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", ("scheduler", "stop", "restart"))
+def test_initial_approval_resume_reconstructs_the_durable_start_context_before_a_sol_thread(
+    harness: CoordinatorHarness,
+    interruption: str,
+) -> None:
+    """An interrupted initial approval must restart Sol, not require a thread to resume."""
+    async def scenario() -> None:
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        prepared = harness.coordinator.prepare_approval(
+            session_id="session-1", task_id="task-1", revision=1, generation=41,
+        )
+        approved = harness.store.get_task("task-1", 1)
+        assert approved.state is TaskState.SOL_RUNNING
+        assert approved.sol_thread_id is None
+
+        coordinator = harness.coordinator
+        if interruption == "scheduler":
+            coordinator.abort_prepared_action(
+                prepared.preparation_id,
+                generation=41,
+                reason="scheduler_unavailable",
+            )
+        elif interruption == "stop":
+            harness.store.mark_interrupted(
+                "task-1", 1, continuation=TaskState.SOL_RUNNING,
+            )
+            coordinator.interrupt_claimed_prepared_action(
+                prepared.preparation_id, generation=41, reason="stop",
+            )
+        else:
+            coordinator.close()
+            coordinator = Coordinator(
+                store=harness.store,
+                repository=harness.tracker,
+                runner=harness.runner,
+                fable=harness.fable,
+                sol=harness.sol,
+                ids=harness.ids,
+                repo_root=harness.repo,
+                repo_context="Binding AGENTS instructions.",
+                trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+            )
+
+        resumed = coordinator.prepare_resume(
+            session_id="session-1", task_id="task-1", revision=1, generation=42,
+        )
+
+        assert isinstance(resumed.payload, ResumePayload)
+        assert resumed.payload.continuation == ScopeApprovalContext(
+            baseline_id=prepared.payload.baseline_id,  # type: ignore[union-attr]
+            approved_revision=1,
+            underlying_continuation=None,
+        )
+        await coordinator.run_prepared_action(resumed.preparation_id)
+        assert len(harness.sol.starts) == 1
+        assert harness.sol.resume_threads == []
 
     asyncio.run(scenario())
 

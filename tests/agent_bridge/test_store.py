@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+import tracemalloc
 
 import pytest
 
@@ -1432,6 +1433,177 @@ def test_legacy_project_ownership_audit_aggregates_generic_reasons_without_mutat
     assert str(error.value).count(",") <= 7
     assert "/outside" not in str(error.value)
     assert _legacy_table_rows(store._connection) == before
+
+
+def test_legacy_audit_rejects_a_foreign_prepared_action_before_recovery(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A prepared row can later drive recovery, so it must bind to this root."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _store(tmp_path)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    baseline_setting = BaselineSetting(
+        key="agent_bridge.baseline.task-1.1",
+        value_json=json.dumps({
+            "task_id": "task-1",
+            "revision": 1,
+            "baseline_id": "baseline-1",
+            "manifest": {"baseline_id": "baseline-1", "repo_root": str(repo)},
+        }, separators=(",", ":"), sort_keys=True),
+    )
+    prepared = store.prepare_approval_action(
+        project_id=project_id_for_root(repo.resolve()),
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=7,
+        payload=ApprovalPayload("baseline-1", baseline_setting, None),
+    )
+    assert store.audit_legacy_project_ownership(str(repo.resolve())) is None
+    store._connection.execute(
+        "UPDATE prepared_actions SET project_id = ? WHERE preparation_id = ?",
+        ("foreign-project", prepared.preparation_id),
+    )
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(str(repo.resolve()))
+
+    assert store.get_task(valid_brief.task_id, valid_brief.revision).state is TaskState.SOL_RUNNING
+
+
+def test_legacy_audit_rejects_an_inconsistent_prepared_action_lineage(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A row that cannot be an exact resume lineage must not survive adoption."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _store(tmp_path)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    baseline_setting = BaselineSetting(
+        key="agent_bridge.baseline.task-1.1",
+        value_json=json.dumps({
+            "task_id": "task-1",
+            "revision": 1,
+            "baseline_id": "baseline-1",
+            "manifest": {"baseline_id": "baseline-1", "repo_root": str(repo)},
+        }, separators=(",", ":"), sort_keys=True),
+    )
+    prepared = store.prepare_approval_action(
+        project_id=project_id_for_root(repo.resolve()),
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=7,
+        payload=ApprovalPayload("baseline-1", baseline_setting, None),
+    )
+    store._connection.execute(
+        "UPDATE prepared_actions SET previous_preparation_id = ? WHERE preparation_id = ?",
+        ("missing-predecessor", prepared.preparation_id),
+    )
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(str(repo.resolve()))
+
+
+def test_legacy_audit_rejects_a_prepared_scope_for_a_different_baseline(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A recovery-capable scope must remain bound to its approved baseline."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _store(tmp_path)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    baseline_setting = BaselineSetting(
+        key="agent_bridge.baseline.task-1.1",
+        value_json=json.dumps({
+            "task_id": "task-1",
+            "revision": 1,
+            "baseline_id": "baseline-1",
+            "manifest": {"baseline_id": "baseline-1", "repo_root": str(repo)},
+        }, separators=(",", ":"), sort_keys=True),
+    )
+    prepared = store.prepare_approval_action(
+        project_id=project_id_for_root(repo.resolve()),
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=7,
+        payload=ApprovalPayload("baseline-1", baseline_setting, None),
+    )
+    payload = json.loads(store._connection.execute(
+        "SELECT payload_json FROM prepared_actions WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()["payload_json"])
+    scope = {
+        "kind": "scope_approval",
+        "baseline_id": "foreign-baseline",
+        "approved_revision": valid_brief.revision,
+        "underlying_continuation": None,
+    }
+    payload["scope"] = scope
+    store._connection.execute(
+        """
+        UPDATE prepared_actions
+        SET payload_json = ?, pending_context_json = ?, continuation_state = ?
+        WHERE preparation_id = ?
+        """,
+        (
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            json.dumps(scope, separators=(",", ":"), sort_keys=True),
+            TaskState.SOL_RUNNING.value,
+            prepared.preparation_id,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership(str(repo.resolve()))
+
+
+def test_startup_audit_and_recovery_do_not_materialize_large_unrelated_history(
+    tmp_path,
+) -> None:
+    """Large completed history must not become a Python-sized startup snapshot."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    canonical_repo = str(repo.resolve())
+    store = _store(tmp_path)
+    store.create_session("session-1", canonical_repo)
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store._connection.executemany(
+        """
+        INSERT INTO tasks (task_id, revision, session_id, state, correction_count)
+        VALUES (?, 0, 'session-1', 'completed', 0)
+        """,
+        ((f"finished-{index:05d}",) for index in range(20_000)),
+    )
+    prepared = store.prepare_new_request_action(
+        project_id=project_id_for_root(repo.resolve()),
+        session_id="session-1",
+        task_id="active-task",
+        generation=1,
+        payload=NewRequestPayload("one active action"),
+    )
+
+    tracemalloc.start()
+    try:
+        store.audit_legacy_project_ownership(canonical_repo)
+        recovered = store.recover_unfinished_prepared_actions()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert recovered[0].preparation_id == prepared.preparation_id
+    assert peak < 2_500_000
 
 
 def test_prepared_action_new_request_is_store_owned_and_has_no_task_pending_context(

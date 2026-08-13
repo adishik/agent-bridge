@@ -168,6 +168,7 @@ class OwnedProjectRuntime:
     broadcaster: EventBroadcaster
     readiness: RuntimeReadiness
     lock: InstanceLock
+    state_authority_close: Callable[[], None] | None = None
     _event_listener_token: int | None = field(init=False, default=None, repr=False)
     _closed: bool = field(init=False, default=False, repr=False)
 
@@ -211,6 +212,9 @@ class OwnedProjectRuntime:
         release(self.coordinator.close)
         release(self.tracker.close)
         release(self.store.close)
+        if self.state_authority_close is not None:
+            release(self.state_authority_close)
+            self.state_authority_close = None
         release(self.lock.release)
         if errors:
             raise errors[0]

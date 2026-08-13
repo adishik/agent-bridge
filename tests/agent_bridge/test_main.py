@@ -795,6 +795,101 @@ def test_project_cli_requires_one_immutable_allowlist_and_uses_digest_state(
     assert "immutable allowlist" in help_text
 
 
+def test_parse_settings_rejects_a_project_id_collision_before_legacy_selection_or_mkdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first = _repo(tmp_path)
+    second = _named_repo(tmp_path, "second")
+    state_root = tmp_path / "state" / "agent-bridge"
+    legacy = state_root / "repo"
+    legacy.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "agent_bridge.projects._project_id_from_canonical_root",
+        lambda root: "c" * 32,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        parse_settings(
+            _project_args([("first", first), ("second", second)], tools),
+            environ=_environment(tmp_path, first),
+        )
+
+    assert not (state_root / "projects" / ("c" * 32)).exists()
+
+
+def test_compatible_repo_startup_uses_a_detached_branch_label_for_a_real_detached_checkout(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    git = Path("/usr/bin/git")
+    assert git.is_file()
+    subprocess.run([str(git), "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([str(git), "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run([str(git), "config", "user.name", "Agent Bridge Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run([str(git), "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run([str(git), "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([str(git), "checkout", "--detach"], cwd=repo, check=True, capture_output=True)
+    args = _args(repo, tools)
+    args[args.index("--git-executable") + 1] = str(git)
+    output = io.StringIO()
+
+    assert main(
+        args,
+        environ=_environment(tmp_path, repo),
+        stdout=output,
+        uvicorn_run=lambda *args, **kwargs: None,
+    ) == 0
+
+    assert json.loads(output.getvalue())['branch'] == "detached"
+
+
+def test_state_authority_stays_with_the_opened_directory_when_an_ancestor_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock files, subdirectories, and SQLite must not follow a later ancestor symlink."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    settings = parse_settings(_args(repo, tools), environ=_environment(tmp_path, repo))
+    state_root = settings.hub_state_dir.parent
+    parked_state_root = tmp_path / "parked-state-root"
+    outside = tmp_path / "outside"
+    for candidate in (settings.hub_state_dir, *(spec.state_dir for spec in settings.projects)):
+        (outside / candidate.relative_to(state_root)).mkdir(parents=True, exist_ok=True)
+    original_acquire = launcher.acquire_instance_lock
+    swapped = False
+
+    def swap_then_acquire(path: Path, *args: object, **kwargs: object):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            state_root.rename(parked_state_root)
+            state_root.symlink_to(outside, target_is_directory=True)
+        return original_acquire(path, *args, **kwargs)
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", swap_then_acquire)
+
+    assert main(
+        [],
+        environ=_environment(tmp_path, repo),
+        stdout=io.StringIO(),
+        uvicorn_run=lambda *args, **kwargs: None,
+    ) == 0
+
+    assert (parked_state_root / "hub" / "hub.sqlite3").is_file()
+    assert (parked_state_root / "projects" / settings.projects[0].project_id / "bridge.sqlite3").is_file()
+    assert not list(outside.rglob("*.sqlite3"))
+    assert not list(outside.rglob("agent-bridge.lock"))
+    assert not list(outside.rglob("artifacts"))
+    assert not list(outside.rglob("schemas"))
+
+
 def test_main_acquires_every_lock_before_opening_any_database_and_releases_on_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -843,7 +938,7 @@ def test_main_acquires_every_lock_before_opening_any_database_and_releases_on_fa
         candidate.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    def acquire(path: Path) -> FakeLock:
+    def acquire(path: Path, **kwargs: object) -> FakeLock:
         events.append(f"lock:{path.parent.name}")
         if path.parent.name == "2" * 32:
             raise ValueError("injected second lock failure")
@@ -938,7 +1033,9 @@ def test_main_closes_constructed_runtime_and_every_lock_when_later_assembly_fail
 
     monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
     monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
-    monkeypatch.setattr(launcher, "acquire_instance_lock", lambda path: FakeLock(path))
+    monkeypatch.setattr(
+        launcher, "acquire_instance_lock", lambda path, **kwargs: FakeLock(path),
+    )
     monkeypatch.setattr("agent_bridge.hub_store.HubStore", FakeHubStore)
     monkeypatch.setattr(launcher, "assemble_project_runtime", assemble)
 
@@ -1207,7 +1304,7 @@ def test_lock_failure_opens_no_database_or_runtime_and_releases_acquired_locks(
         candidate.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    def acquire(path: Path) -> FakeLock:
+    def acquire(path: Path, **kwargs: object) -> FakeLock:
         events.append(f"lock:{path.parent.name}")
         if path.parent.name == "2" * 32:
             raise ValueError("second lock failed")

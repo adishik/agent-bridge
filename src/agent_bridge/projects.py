@@ -67,6 +67,7 @@ def build_project_specs(
     state_root: Path,
     git_executable: Path,
     probe_timeout_seconds: float = 10.0,
+    create_state_dirs: bool = True,
 ) -> tuple[ProjectSpec, ...]:
     """Validate explicit projects, then create their isolated state directories."""
     normalized_entries = tuple(entries)
@@ -84,11 +85,14 @@ def build_project_specs(
         or normalized_probe_timeout_seconds <= 0
     ):
         raise ValueError("probe_timeout_seconds must be a finite positive number")
+    if not isinstance(create_state_dirs, bool):
+        raise ValueError("create_state_dirs must be a bool")
 
     validated_git = _validate_git_executable(git_executable)
     validated_state_root = _validate_state_root(state_root)
     labels: set[str] = set()
     roots: set[Path] = set()
+    roots_by_project_id: dict[str, Path] = {}
     prepared: list[tuple[str, Path, str, str]] = []
     for entry in normalized_entries:
         if not isinstance(entry, tuple) or len(entry) != 2:
@@ -104,6 +108,10 @@ def build_project_specs(
             raise ValueError("duplicate canonical project root")
         roots.add(canonical_root)
         project_id = _project_id_from_canonical_root(canonical_root)
+        claimed_root = roots_by_project_id.get(project_id)
+        if claimed_root is not None and claimed_root != canonical_root:
+            raise ValueError("project identity collision")
+        roots_by_project_id[project_id] = canonical_root
         top_level = _run_git_probe(
             validated_git,
             canonical_root,
@@ -116,12 +124,13 @@ def build_project_specs(
         branch = _run_git_probe(
             validated_git,
             canonical_root,
-            ("symbolic-ref", "--quiet", "--short", "HEAD"),
+            ("branch", "--show-current"),
             timeout_seconds=normalized_probe_timeout_seconds,
             label="Git branch probe",
+            allow_empty=True,
         )
         if not branch:
-            raise ValueError("Git branch probe returned an empty branch")
+            branch = "detached"
         prepared.append((project_id, canonical_root, label, branch))
 
     state_parent = validated_state_root / "projects"
@@ -135,11 +144,12 @@ def build_project_specs(
         )
         for project_id, canonical_root, label, branch in sorted(prepared)
     )
-    try:
-        for spec in specs:
-            spec.state_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise ValueError("could not create project state directory") from error
+    if create_state_dirs:
+        try:
+            for spec in specs:
+                spec.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise ValueError("could not create project state directory") from error
     return specs
 
 
@@ -212,6 +222,7 @@ def _run_git_probe(
     *,
     timeout_seconds: float,
     label: str,
+    allow_empty: bool = False,
 ) -> str:
     command = (str(git_executable), "--no-pager", *args)
     try:
@@ -266,6 +277,8 @@ def _run_git_probe(
         records = b"".join(chunks).decode("utf-8").splitlines()
     except UnicodeDecodeError as error:
         raise ValueError(f"{label} returned invalid output") from error
+    if allow_empty and not records:
+        return ""
     if len(records) != 1 or not records[0]:
         raise ValueError(f"{label} must return exactly one record")
     return records[0]

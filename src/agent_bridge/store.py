@@ -11,7 +11,9 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -48,6 +50,7 @@ _MAX_LEGACY_AUDIT_REASONS = 8
 _MAX_PREPARED_TEXT_LENGTH = 16 * 1024
 _MAX_RESUME_DRIFT_SUMMARY_LENGTH = 1024
 _MAX_PREPARATION_ID_ATTEMPTS = 8
+_STARTUP_RECOVERY_BATCH_SIZE = 128
 _PREPARED_ACTION_KINDS = frozenset({"new_request", "approval", "answer", "resume"})
 _PREPARED_ACTION_STATUSES = frozenset({
     "PREPARED", "CLAIMED", "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
@@ -1339,11 +1342,15 @@ class SQLiteStore:
                 if task.continuation_state is None:
                     raise RuntimeError("prepared resume has no continuation")
                 active = task.continuation_state
-                self._validate_prepared_context(task, payload.continuation)
                 require_transition(task.state, active)
-                self._validate_predecessor(
+                predecessor = self._validate_predecessor(
                     project_id, session_id, task_id, revision, generation,
                     previous_preparation_id,
+                )
+                self._validate_prepared_context(
+                    task,
+                    payload.continuation,
+                    predecessor=predecessor,
                 )
                 cursor = self._connection.execute(
                     """
@@ -1561,61 +1568,71 @@ class SQLiteStore:
     def recover_unfinished_prepared_actions(self) -> tuple[PreparedActionRecord, ...]:
         recovered_ids: list[str] = []
         with self._immediate_transaction():
-            rows = tuple(self._connection.execute(
-                "SELECT * FROM prepared_actions WHERE status IN ('PREPARED', 'CLAIMED') ORDER BY preparation_id"
-            ))
-            for row in rows:
-                record = self._prepared_action_from_row(row)
-                task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
-                pending = self._prepared_pending_projection(record, reason="recovery")
-                if task.state is record.active_state:
-                    require_transition(record.active_state, TaskState.INTERRUPTED)
-                    cursor = self._connection.execute(
-                        """
-                        UPDATE tasks
-                        SET state = ?, continuation_state = ?, pending_json = ?
-                        WHERE task_id = ? AND revision = ? AND state = ?
-                        """,
-                        (
-                            TaskState.INTERRUPTED.value,
-                            record.active_state.value,
-                            _encode_json(pending),
-                            record.task_id,
-                            record.revision,
-                            record.active_state.value,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
+            last_preparation_id = ""
+            while True:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM prepared_actions
+                    WHERE status IN ('PREPARED', 'CLAIMED') AND preparation_id > ?
+                    ORDER BY preparation_id LIMIT ?
+                    """,
+                    (last_preparation_id, _STARTUP_RECOVERY_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    record = self._prepared_action_from_row(row)
+                    task = self._prepared_task_exact(record.session_id, record.task_id, record.revision)
+                    pending = self._prepared_pending_projection(record, reason="recovery")
+                    if task.state is record.active_state:
+                        require_transition(record.active_state, TaskState.INTERRUPTED)
+                        cursor = self._connection.execute(
+                            """
+                            UPDATE tasks
+                            SET state = ?, continuation_state = ?, pending_json = ?
+                            WHERE task_id = ? AND revision = ? AND state = ?
+                            """,
+                            (
+                                TaskState.INTERRUPTED.value,
+                                record.active_state.value,
+                                _encode_json(pending),
+                                record.task_id,
+                                record.revision,
+                                record.active_state.value,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("unfinished prepared action task changed")
+                    elif task.state is not TaskState.INTERRUPTED:
                         raise RuntimeError("unfinished prepared action task changed")
-                elif task.state is not TaskState.INTERRUPTED:
-                    raise RuntimeError("unfinished prepared action task changed")
-                else:
-                    continuation = task.continuation_state or record.active_state
-                    if task.pending is not None and (
-                        task.continuation_state is not record.active_state
-                        or "sol_run_id" in task.pending
-                    ):
-                        pending = task.pending
-                    cursor = self._connection.execute(
-                        """
-                        UPDATE tasks SET continuation_state = ?, pending_json = ?
-                        WHERE task_id = ? AND revision = ? AND state = ?
-                        """,
-                        (
-                            continuation.value,
-                            _encode_json(pending),
-                            record.task_id,
-                            record.revision,
-                            TaskState.INTERRUPTED.value,
-                        ),
+                    else:
+                        continuation = task.continuation_state or record.active_state
+                        if task.pending is not None and (
+                            task.continuation_state is not record.active_state
+                            or "sol_run_id" in task.pending
+                        ):
+                            pending = task.pending
+                        cursor = self._connection.execute(
+                            """
+                            UPDATE tasks SET continuation_state = ?, pending_json = ?
+                            WHERE task_id = ? AND revision = ? AND state = ?
+                            """,
+                            (
+                                continuation.value,
+                                _encode_json(pending),
+                                record.task_id,
+                                record.revision,
+                                TaskState.INTERRUPTED.value,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("unfinished prepared action task changed")
+                    self._connection.execute(
+                        "UPDATE prepared_actions SET status = 'RECOVERED', reason = NULL WHERE preparation_id = ?",
+                        (record.preparation_id,),
                     )
-                    if cursor.rowcount != 1:
-                        raise RuntimeError("unfinished prepared action task changed")
-                self._connection.execute(
-                    "UPDATE prepared_actions SET status = 'RECOVERED', reason = NULL WHERE preparation_id = ?",
-                    (record.preparation_id,),
-                )
-                recovered_ids.append(record.preparation_id)
+                    recovered_ids.append(record.preparation_id)
+                last_preparation_id = str(rows[-1]["preparation_id"])
         return tuple(self._prepared_required(identifier) for identifier in recovered_ids)
 
     def _prepared_identity(
@@ -1794,7 +1811,7 @@ class SQLiteStore:
         revision: int,
         generation: int,
         previous_preparation_id: str | None,
-    ) -> None:
+    ) -> PreparedActionRecord | None:
         existing = tuple(self._connection.execute(
             """
             SELECT preparation_id, generation FROM prepared_actions
@@ -1806,7 +1823,7 @@ class SQLiteStore:
         if previous_preparation_id is None:
             if existing:
                 raise RuntimeError("prepared resume requires a previous preparation")
-            return
+            return None
         previous = self._prepared_required(previous_preparation_id)
         if (
             previous.project_id != project_id
@@ -1823,16 +1840,23 @@ class SQLiteStore:
                 raise RuntimeError("prepared resume generation changed")
         elif generation <= previous.generation:
             raise RuntimeError("prepared resume generation did not advance")
+        return previous
 
-    @staticmethod
     def _validate_prepared_context(
+        self,
         task: TaskRecord, context: PreparedContinuationContext,
+        *,
+        predecessor: PreparedActionRecord | None = None,
     ) -> None:
         """Reject a context substituted for the exact persisted continuation."""
         if task.continuation_state is None:
             raise RuntimeError("prepared continuation is missing")
         pending = task.pending or {}
         projection = pending.get("prepared_action")
+        if self._is_initial_approval_resume_context(
+            task, context, predecessor, projection,
+        ):
+            return
         if isinstance(projection, Mapping) and "context" in projection:
             try:
                 frozen = _context_from_data(projection["context"])
@@ -1912,6 +1936,38 @@ class SQLiteStore:
         if task.continuation_state is TaskState.FABLE_PLANNING and context is None:
             return
         raise RuntimeError("prepared continuation does not match task")
+
+    @staticmethod
+    def _is_initial_approval_resume_context(
+        task: TaskRecord,
+        context: PreparedContinuationContext,
+        predecessor: PreparedActionRecord | None,
+        projection: object,
+    ) -> bool:
+        if (
+            predecessor is None
+            or predecessor.action != "approval"
+            or not isinstance(predecessor.payload, ApprovalPayload)
+            or predecessor.payload.scope is not None
+            or task.continuation_state is not TaskState.SOL_RUNNING
+            or task.sol_thread_id is not None
+            or task.baseline_id != predecessor.payload.baseline_id
+            or not isinstance(context, ScopeApprovalContext)
+            or context != ScopeApprovalContext(
+                baseline_id=predecessor.payload.baseline_id,
+                approved_revision=task.revision,
+                underlying_continuation=None,
+            )
+            or not isinstance(projection, Mapping)
+        ):
+            return False
+        return (
+            set(projection) == {"preparation_id", "action", "reason", "context"}
+            and projection.get("preparation_id") == predecessor.preparation_id
+            and projection.get("action") == "approval"
+            and projection.get("context") is None
+            and isinstance(projection.get("reason"), str)
+        )
 
     def _transition_prepared_action(
         self,
@@ -3071,40 +3127,40 @@ class SQLiteStore:
         """
         active_values = tuple(state.value for state in _ACTIVE_TASK_STATES)
         placeholders = ", ".join("?" for _ in active_values)
-        identities: tuple[tuple[str, int], ...]
+        identities: list[tuple[str, int]] = []
         with self._immediate_transaction():
-            rows = self._connection.execute(
-                f"""
-                SELECT task.task_id, task.revision
-                FROM tasks AS task
-                WHERE task.state IN ({placeholders})
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM tasks AS newer
-                      WHERE newer.task_id = task.task_id
-                        AND newer.revision > task.revision
-                  )
-                ORDER BY task.task_id, task.revision
-                """,
-                active_values,
-            ).fetchall()
-            identities = tuple(
-                (str(row["task_id"]), int(row["revision"])) for row in rows
-            )
-            self._connection.execute(
-                f"""
-                UPDATE tasks AS task
-                SET continuation_state = state, state = ?
-                WHERE task.state IN ({placeholders})
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM tasks AS newer
-                      WHERE newer.task_id = task.task_id
-                        AND newer.revision > task.revision
-                  )
-                """,
-                (TaskState.INTERRUPTED.value, *active_values),
-            )
+            while True:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT task.task_id, task.revision
+                    FROM tasks AS task
+                    WHERE task.state IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM tasks AS newer
+                          WHERE newer.task_id = task.task_id
+                            AND newer.revision > task.revision
+                      )
+                    ORDER BY task.task_id, task.revision
+                    LIMIT ?
+                    """,
+                    (*active_values, _STARTUP_RECOVERY_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    task_id, revision = str(row["task_id"]), int(row["revision"])
+                    cursor = self._connection.execute(
+                        f"""
+                        UPDATE tasks
+                        SET continuation_state = state, state = ?
+                        WHERE task_id = ? AND revision = ? AND state IN ({placeholders})
+                        """,
+                        (TaskState.INTERRUPTED.value, task_id, revision, *active_values),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("active task changed during startup recovery")
+                    identities.append((task_id, revision))
             self._connection.execute(
                 """
                 UPDATE agent_runs
@@ -3155,27 +3211,23 @@ class SQLiteStore:
     ) -> set[str]:
         """Collect generic integrity categories without exposing persisted values."""
         reasons: set[str] = set()
-        foreign_key_rows = tuple(self._connection.execute("PRAGMA foreign_key_check"))
-        if foreign_key_rows:
-            reasons.add("foreign_key_integrity")
 
-        session_rows = tuple(
-            self._connection.execute("SELECT session_id, repo_root FROM sessions")
-        )
-        session_ids: set[str] = set()
-        for row in session_rows:
-            session_id = row["session_id"]
-            repo_root = row["repo_root"]
-            if (
-                not isinstance(session_id, str)
-                or not session_id.strip()
-                or not isinstance(repo_root, str)
-                or not repo_root.strip()
-                or repo_root != canonical_repo_root
-            ):
-                reasons.add("session_ownership")
-                continue
-            session_ids.add(session_id)
+        def has_row(statement: str, parameters: tuple[object, ...] = ()) -> bool:
+            return self._connection.execute(statement, parameters).fetchone() is not None
+
+        if has_row("PRAGMA foreign_key_check"):
+            reasons.add("foreign_key_integrity")
+        if has_row(
+            """
+            SELECT 1 FROM sessions
+            WHERE typeof(session_id) != 'text' OR trim(session_id) = ''
+               OR typeof(repo_root) != 'text' OR trim(repo_root) = ''
+               OR repo_root != ?
+            LIMIT 1
+            """,
+            (canonical_repo_root,),
+        ):
+            reasons.add("session_ownership")
 
         active_row = self._connection.execute(
             "SELECT value_json FROM settings WHERE key = ?",
@@ -3192,92 +3244,110 @@ class SQLiteStore:
                 if (
                     not isinstance(active_session, str)
                     or not active_session.strip()
-                    or active_session not in session_ids
+                    or not has_row(
+                        "SELECT 1 FROM sessions WHERE session_id = ? AND repo_root = ? LIMIT 1",
+                        (active_session, canonical_repo_root),
+                    )
                 ):
                     reasons.add("active_session")
 
-        task_rows = tuple(
-            self._connection.execute(
-                "SELECT task_id, revision, session_id, baseline_id FROM tasks"
+        if has_row(
+            """
+            SELECT 1 FROM tasks AS task
+            LEFT JOIN sessions AS session ON session.session_id = task.session_id
+            WHERE typeof(task.task_id) != 'text' OR trim(task.task_id) = ''
+               OR typeof(task.revision) != 'integer' OR task.revision < 0
+               OR typeof(task.session_id) != 'text' OR session.session_id IS NULL
+               OR (task.baseline_id IS NOT NULL AND (
+                    typeof(task.baseline_id) != 'text' OR task.baseline_id = ''
+               ))
+            LIMIT 1
+            """,
+        ):
+            reasons.add("task_integrity")
+        if has_row(
+            """
+            SELECT 1 FROM tasks
+            GROUP BY task_id
+            HAVING COUNT(DISTINCT session_id) > 1
+            LIMIT 1
+            """,
+        ):
+            reasons.add("task_ownership")
+        if has_row(
+            """
+            SELECT 1 FROM (
+                SELECT task_id, MIN(revision) AS first_revision,
+                       MAX(revision) AS last_revision, COUNT(*) AS revisions
+                FROM tasks GROUP BY task_id
             )
-        )
-        task_keys: set[tuple[str, int]] = set()
-        task_baselines: dict[tuple[str, int], str | None] = {}
-        task_sessions: dict[str, str] = {}
-        task_revisions: dict[str, list[int]] = {}
-        for row in task_rows:
-            task_id = row["task_id"]
-            revision = row["revision"]
-            session_id = row["session_id"]
-            baseline_id = row["baseline_id"]
-            if (
-                not isinstance(task_id, str)
-                or not task_id.strip()
-                or not isinstance(revision, int)
-                or isinstance(revision, bool)
-                or revision < 0
-                or not isinstance(session_id, str)
-                or session_id not in session_ids
-                or (baseline_id is not None and (not isinstance(baseline_id, str) or not baseline_id))
-            ):
-                reasons.add("task_integrity")
-                continue
-            if task_id in task_sessions and task_sessions[task_id] != session_id:
-                reasons.add("task_ownership")
-            task_sessions[task_id] = session_id
-            task_keys.add((task_id, revision))
-            task_baselines[(task_id, revision)] = baseline_id
-            task_revisions.setdefault(task_id, []).append(revision)
-        for revisions in task_revisions.values():
-            ordered = sorted(revisions)
-            if (
-                ordered[0] not in {0, 1}
-                or ordered != list(range(ordered[0], ordered[-1] + 1))
-            ):
-                reasons.add("task_revision_integrity")
+            WHERE first_revision NOT IN (0, 1)
+               OR revisions != last_revision - first_revision + 1
+            LIMIT 1
+            """,
+        ):
+            reasons.add("task_revision_integrity")
 
-        for row in self._connection.execute("SELECT session_id, task_id FROM events"):
-            session_id = row["session_id"]
-            task_id = row["task_id"]
-            if not isinstance(session_id, str) or session_id not in session_ids:
-                reasons.add("event_ownership")
-                continue
-            if task_id is not None:
-                if not isinstance(task_id, str) or task_sessions.get(task_id) != session_id:
-                    reasons.add("event_task_integrity")
+        if has_row(
+            """
+            SELECT 1 FROM events AS event
+            LEFT JOIN sessions AS session ON session.session_id = event.session_id
+            WHERE typeof(event.session_id) != 'text' OR session.session_id IS NULL
+            LIMIT 1
+            """,
+        ):
+            reasons.add("event_ownership")
+        if has_row(
+            """
+            SELECT 1 FROM events AS event
+            LEFT JOIN tasks AS task
+              ON task.task_id = event.task_id AND task.session_id = event.session_id
+            WHERE event.task_id IS NOT NULL AND (
+                typeof(event.task_id) != 'text' OR trim(event.task_id) = ''
+                OR task.task_id IS NULL
+            )
+            LIMIT 1
+            """,
+        ):
+            reasons.add("event_task_integrity")
+        if has_row(
+            """
+            SELECT 1 FROM agent_runs AS run
+            LEFT JOIN tasks AS task
+              ON task.task_id = run.task_id AND task.revision = run.revision
+            WHERE typeof(run.task_id) != 'text' OR trim(run.task_id) = ''
+               OR typeof(run.revision) != 'integer' OR task.task_id IS NULL
+            LIMIT 1
+            """,
+        ):
+            reasons.add("run_task_integrity")
 
-        for row in self._connection.execute("SELECT task_id, revision FROM agent_runs"):
-            task_id = row["task_id"]
-            revision = row["revision"]
-            if (
-                not isinstance(task_id, str)
-                or not isinstance(revision, int)
-                or isinstance(revision, bool)
-                or (task_id, revision) not in task_keys
-            ):
-                reasons.add("run_task_integrity")
-
-        baseline_settings: dict[tuple[str, int], str] = {}
-        for row in self._connection.execute("SELECT key, value_json FROM settings"):
+        for row in self._connection.execute(
+            """
+            SELECT key, value_json FROM settings
+            WHERE key = ? OR key LIKE ?
+            """,
+            (_BASELINE_SETTING_PREFIX.removesuffix("."), f"{_BASELINE_SETTING_PREFIX}%"),
+        ):
             key = row["key"]
-            if not isinstance(key, str):
-                continue
-            if key != _BASELINE_SETTING_PREFIX.removesuffix(".") and not key.startswith(
-                _BASELINE_SETTING_PREFIX
-            ):
-                continue
             try:
                 persisted = json.loads(row["value_json"])
             except (TypeError, json.JSONDecodeError):
                 reasons.add("baseline_integrity")
                 continue
-            if not isinstance(persisted, dict):
+            if not isinstance(key, str) or not isinstance(persisted, dict):
                 reasons.add("baseline_integrity")
                 continue
             task_id = persisted.get("task_id")
             revision = persisted.get("revision")
             baseline_id = persisted.get("baseline_id")
             manifest = persisted.get("manifest")
+            task_row = None
+            if isinstance(task_id, str) and isinstance(revision, int) and not isinstance(revision, bool):
+                task_row = self._connection.execute(
+                    "SELECT baseline_id FROM tasks WHERE task_id = ? AND revision = ?",
+                    (task_id, revision),
+                ).fetchone()
             if (
                 not isinstance(task_id, str)
                 or not task_id.strip()
@@ -3290,16 +3360,193 @@ class SQLiteStore:
                 or key != f"{_BASELINE_SETTING_PREFIX}{task_id}.{revision}"
                 or manifest.get("baseline_id") != baseline_id
                 or manifest.get("repo_root") != canonical_repo_root
-                or task_baselines.get((task_id, revision)) != baseline_id
+                or task_row is None
+                or task_row["baseline_id"] != baseline_id
             ):
                 reasons.add("baseline_integrity")
+        if has_row(
+            """
+            SELECT 1 FROM tasks AS task
+            WHERE task.baseline_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM settings AS setting
+                  WHERE setting.key = ? || task.task_id || '.' || task.revision
+              )
+            LIMIT 1
+            """,
+            (_BASELINE_SETTING_PREFIX,),
+        ):
+            reasons.add("baseline_integrity")
+
+        expected_project_id = hashlib.sha256(
+            os.fsencode(canonical_repo_root)
+        ).hexdigest()[:32]
+        for row in self._connection.execute(
+            "SELECT rowid, * FROM prepared_actions ORDER BY rowid"
+        ):
+            try:
+                record = self._prepared_action_from_row(row)
+            except RuntimeError:
+                reasons.add("prepared_action_integrity")
                 continue
-            baseline_settings[(task_id, revision)] = baseline_id
-        for task_key, baseline_id in task_baselines.items():
-            if baseline_id is not None and baseline_settings.get(task_key) != baseline_id:
-                reasons.add("baseline_integrity")
+            if record.project_id != expected_project_id:
+                reasons.add("prepared_action_ownership")
+                continue
+            if not self._legacy_prepared_action_is_authenticated(record, int(row["rowid"])):
+                reasons.add("prepared_action_integrity")
 
         return reasons
+
+    def _legacy_prepared_action_is_authenticated(
+        self, record: PreparedActionRecord, rowid: int,
+    ) -> bool:
+        """Authenticate one recovery-capable row without retaining history."""
+        task = self._connection.execute(
+            """
+            SELECT session_id, baseline_id FROM tasks
+            WHERE task_id = ? AND revision = ?
+            """,
+            (record.task_id, record.revision),
+        ).fetchone()
+        if task is None or task["session_id"] != record.session_id:
+            return False
+        if record.action == "new_request":
+            if (
+                record.revision != 0
+                or record.source_state is not TaskState.FABLE_PLANNING
+                or record.active_state is not TaskState.FABLE_PLANNING
+                or record.continuation_state is not None
+                or record.pending_context is not None
+                or record.previous_preparation_id is not None
+            ):
+                return False
+        elif record.action == "approval":
+            payload = record.payload
+            if not isinstance(payload, ApprovalPayload) or task["baseline_id"] != payload.baseline_id:
+                return False
+            if payload.scope is not None and (
+                payload.scope.baseline_id != payload.baseline_id
+                or payload.scope.approved_revision != record.revision
+            ):
+                return False
+            if record.source_state is TaskState.AWAITING_SCOPE_APPROVAL:
+                if (
+                    payload.scope is None
+                    or record.continuation_state is None
+                    or record.active_state is not record.continuation_state
+                ):
+                    return False
+            elif record.source_state is TaskState.AWAITING_USER_APPROVAL:
+                if payload.scope is None:
+                    if (
+                        record.continuation_state is not None
+                        or record.active_state is not TaskState.SOL_RUNNING
+                    ):
+                        return False
+                elif (
+                    record.continuation_state is None
+                    or record.active_state is not record.continuation_state
+                ):
+                    return False
+            else:
+                return False
+            if record.previous_preparation_id is not None:
+                return False
+            if payload.baseline_setting is not None and not self._legacy_baseline_setting_matches(
+                payload.baseline_setting, record.task_id, record.revision, payload.baseline_id,
+            ):
+                return False
+        elif record.action == "answer":
+            if (
+                record.source_state is not TaskState.AWAITING_USER_INPUT
+                or record.continuation_state is None
+                or record.active_state is not record.continuation_state
+                or record.previous_preparation_id is not None
+            ):
+                return False
+        elif record.action == "resume":
+            if (
+                record.source_state is not TaskState.INTERRUPTED
+                or record.continuation_state is None
+                or record.active_state is not record.continuation_state
+            ):
+                return False
+            if not self._legacy_prepared_lineage_matches(record, rowid):
+                return False
+        else:  # PreparedActionRecord normally prevents this; keep audit fail-closed.
+            return False
+        if record.action != "new_request":
+            try:
+                require_transition(record.source_state, record.active_state)
+            except ValueError:
+                return False
+        return True
+
+    def _legacy_baseline_setting_matches(
+        self,
+        setting: BaselineSetting,
+        task_id: str,
+        revision: int,
+        baseline_id: str,
+    ) -> bool:
+        try:
+            value = json.loads(setting.value_json)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            setting.key == f"{_BASELINE_SETTING_PREFIX}{task_id}.{revision}"
+            and isinstance(value, Mapping)
+            and value.get("task_id") == task_id
+            and value.get("revision") == revision
+            and value.get("baseline_id") == baseline_id
+        )
+
+    def _legacy_prepared_lineage_matches(
+        self, record: PreparedActionRecord, rowid: int,
+    ) -> bool:
+        previous_id = record.previous_preparation_id
+        previous_row = self._connection.execute(
+            """
+            SELECT rowid, * FROM prepared_actions
+            WHERE preparation_id = ?
+            """,
+            (previous_id,),
+        ).fetchone() if previous_id is not None else None
+        latest = self._connection.execute(
+            """
+            SELECT preparation_id FROM prepared_actions
+            WHERE project_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+              AND rowid < ?
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (
+                record.project_id, record.session_id, record.task_id,
+                record.revision, rowid,
+            ),
+        ).fetchone()
+        if previous_id is None:
+            return latest is None
+        if latest is None or latest["preparation_id"] != previous_id or previous_row is None:
+            return False
+        try:
+            previous = self._prepared_action_from_row(previous_row)
+        except RuntimeError:
+            return False
+        if (
+            int(previous_row["rowid"]) >= rowid
+            or previous.project_id != record.project_id
+            or previous.session_id != record.session_id
+            or previous.task_id != record.task_id
+            or previous.revision != record.revision
+            or previous.status not in {"ABORTED", "RECOVERED", "INTERRUPTED"}
+        ):
+            return False
+        return (
+            record.generation == COMPATIBILITY_PREPARATION_GENERATION
+            and previous.generation == COMPATIBILITY_PREPARATION_GENERATION
+        ) or (
+            record.generation > previous.generation
+        )
 
     def _chat_from_row(self, row: sqlite3.Row) -> ChatRecord:
         updated_at = row["updated_at"]

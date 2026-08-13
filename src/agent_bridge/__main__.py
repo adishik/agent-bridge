@@ -96,6 +96,26 @@ class _PreflightStatus:
 
 
 @dataclass(slots=True)
+class _StateDirectory:
+    """A retained no-follow directory authority for startup-owned state."""
+
+    path: Path
+    descriptor: int | None
+
+    def child_path(self, name: str) -> Path:
+        if self.descriptor is None:
+            raise RuntimeError("state directory authority is closed")
+        if not isinstance(name, str) or Path(name).name != name or name in {"", ".", ".."}:
+            raise ValueError("state child name is invalid")
+        return Path(f"/proc/self/fd/{self.descriptor}/{name}")
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+@dataclass(slots=True)
 class _OpenedProjectState:
     """One migrated project database held until every legacy audit completes."""
 
@@ -104,6 +124,18 @@ class _OpenedProjectState:
     store: object
     artifacts: Path
     schemas: Path
+    state_directory: _StateDirectory
+    artifact_descriptor: int | None
+    schema_descriptor: int | None
+
+    def release_state_authority(self) -> None:
+        if self.artifact_descriptor is not None:
+            os.close(self.artifact_descriptor)
+            self.artifact_descriptor = None
+        if self.schema_descriptor is not None:
+            os.close(self.schema_descriptor)
+            self.schema_descriptor = None
+        self.state_directory.close()
 
 
 class _Ids:
@@ -377,8 +409,8 @@ def parse_settings(
         bash_executable=bash,
         sh_executable=sh,
     )
-    # ``build_project_specs`` creates digest directories.  Validate the state
-    # parent and every selected project target before permitting that write.
+    # Validate every selected state target before startup opens descriptor-
+    # anchored directories for the first write.
     preliminary_candidates = (
         preliminary_settings.hub_state_dir,
         state_root / "projects",
@@ -394,6 +426,7 @@ def parse_settings(
             entries,
             state_root=state_root,
             git_executable=git,
+            create_state_dirs=False,
         )
     except ValueError as error:
         if str(error) == "Git top-level probe failed":
@@ -407,13 +440,6 @@ def parse_settings(
         if legacy_path is None:
             selected.append(spec)
             continue
-        # ``build_project_specs`` creates an empty digest directory as part of
-        # validation.  A selected legacy state must remain in place, so remove
-        # only that freshly-created, empty directory before using the old root.
-        try:
-            spec.state_dir.rmdir()
-        except OSError as error:
-            raise ValueError("legacy state selection is ambiguous") from error
         selected.append(replace(spec, state_dir=legacy_path))
     return Settings(
         projects=tuple(selected),
@@ -446,6 +472,7 @@ def _candidate_project_specs(
 ) -> tuple[ProjectSpec, ...]:
     """Resolve the immutable authorities needed for no-write state validation."""
     candidates: list[ProjectSpec] = []
+    roots_by_project_id: dict[str, Path] = {}
     for label, root in entries:
         try:
             canonical_root = root.resolve(strict=True)
@@ -454,6 +481,10 @@ def _candidate_project_specs(
         if not canonical_root.is_dir():
             raise ValueError("repository must be an existing directory")
         project_id = project_id_for_root(canonical_root)
+        claimed_root = roots_by_project_id.get(project_id)
+        if claimed_root is not None and claimed_root != canonical_root:
+            raise ValueError("project identity collision")
+        roots_by_project_id[project_id] = canonical_root
         candidates.append(ProjectSpec(
             project_id=project_id,
             label=label,
@@ -496,6 +527,8 @@ def _validate_state_dir(settings: Settings, *, candidate: Path) -> Path:
     roots = tuple(spec.repo_root for spec in settings.projects)
     if not roots:
         raise ValueError("settings must contain at least one project")
+    if any(state_dir.is_relative_to(root) for root in roots):
+        raise ValueError("state directory must remain outside repository")
     ancestor = state_dir
     while True:
         if ancestor.is_symlink():
@@ -509,23 +542,63 @@ def _validate_state_dir(settings: Settings, *, candidate: Path) -> Path:
     return state_dir
 
 
+def _open_nofollow_directory(path: Path, *, create: bool) -> int:
+    """Open an absolute directory by descriptor without following ancestors."""
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise ValueError("state directory must support absolute no-follow access")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_state_directory(settings: Settings, *, candidate: Path) -> _StateDirectory:
+    """Validate, create, and retain one state target through one descriptor."""
+    state_dir = _validate_state_dir(settings, candidate=candidate)
+    descriptor: int | None = None
+    try:
+        descriptor = _open_nofollow_directory(state_dir, create=True)
+        entry = os.fstat(descriptor)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+            raise ValueError("state directory must be an owner-controlled directory")
+        os.fchmod(descriptor, 0o700)
+        return _StateDirectory(path=state_dir, descriptor=descriptor)
+    except ValueError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ValueError("state directory must be a safe writable directory") from error
+
+
 def prepare_state_dir(settings: Settings, *, candidate: Path | None = None) -> Path:
     """Create one external, non-symlinked, owner-only runtime directory."""
     state_dir = settings.hub_state_dir if candidate is None else candidate
-    _validate_state_dir(settings, candidate=state_dir)
-    roots = tuple(spec.repo_root for spec in settings.projects)
-    try:
-        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if state_dir.is_symlink() or not state_dir.is_dir():
-            raise ValueError("state directory must be a safe directory")
-        resolved = state_dir.resolve(strict=True)
-        if any(resolved.is_relative_to(root) for root in roots):
-            raise ValueError("state directory must remain outside repository")
-        state_dir.chmod(0o700)
-    except ValueError:
-        raise
-    except OSError as error:
-        raise ValueError("state directory must be a safe writable directory") from error
+    authority = _open_state_directory(settings, candidate=state_dir)
+    authority.close()
     return state_dir
 
 
@@ -574,14 +647,17 @@ def ssh_forward_command(*, port: int, user: str, ssh_connection: str) -> str:
     return f"ssh -N -L {port}:127.0.0.1:{port} {user}@{server_text}"
 
 
-def _secure_regular_file(path: Path) -> None:
+def _secure_regular_file(path: Path, *, directory_fd: int | None = None) -> None:
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if directory_fd is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
         try:
             entry = os.fstat(descriptor)
             if not stat.S_ISREG(entry.st_mode):
@@ -595,7 +671,7 @@ def _secure_regular_file(path: Path) -> None:
         raise ValueError("database must be a safe owner-only file") from error
 
 
-def acquire_instance_lock(path: Path) -> InstanceLock:
+def acquire_instance_lock(path: Path, *, directory_fd: int | None = None) -> InstanceLock:
     """Acquire one nonblocking process-lifetime lock at its explicit path."""
     from agent_bridge.hub import InstanceLock
 
@@ -608,7 +684,10 @@ def acquire_instance_lock(path: Path) -> InstanceLock:
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if directory_fd is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
         entry = os.fstat(descriptor)
         if (
             not stat.S_ISREG(entry.st_mode)
@@ -628,17 +707,42 @@ def acquire_instance_lock(path: Path) -> InstanceLock:
         raise
 
 
-def _prepare_private_directory(path: Path) -> Path:
+def _open_private_directory(path: Path, *, directory_fd: int | None = None) -> int:
+    """Create/open one owner-only state child under retained authority."""
+    descriptor: int | None = None
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.is_symlink() or not path.is_dir():
-            raise ValueError("runtime subdirectory must be a safe directory")
-        path.chmod(0o700)
+        if directory_fd is None:
+            descriptor = _open_nofollow_directory(path, create=True)
+        else:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+        entry = os.fstat(descriptor)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+            raise ValueError("runtime subdirectory must be an owner-controlled directory")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
     except ValueError:
+        if descriptor is not None:
+            os.close(descriptor)
         raise
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
         raise ValueError("runtime subdirectory must be writable") from error
-    return path
+
+
+def _prepare_private_directory(path: Path, *, directory_fd: int | None = None) -> Path:
+    descriptor: int | None = None
+    try:
+        descriptor = _open_private_directory(path, directory_fd=directory_fd)
+        return path
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 async def _version(
@@ -792,18 +896,32 @@ def _open_project_state(
     *,
     lock: InstanceLock,
     clock: Callable[[], datetime],
+    state_directory: _StateDirectory | None = None,
 ) -> _OpenedProjectState:
     """Open and migrate one project database without recovering work."""
     from agent_bridge.store import SQLiteStore
 
+    owns_state_directory = state_directory is None
     database_path = spec.state_dir / "bridge.sqlite3"
     store = None
+    artifact_descriptor: int | None = None
+    schema_descriptor: int | None = None
     try:
-        _secure_regular_file(database_path)
-        artifacts = _prepare_private_directory(spec.state_dir / "artifacts")
-        schemas = _prepare_private_directory(spec.state_dir / "schemas")
+        if state_directory is None:
+            descriptor = _open_nofollow_directory(spec.state_dir, create=True)
+            state_directory = _StateDirectory(spec.state_dir, descriptor)
+            os.fchmod(descriptor, 0o700)
+        if state_directory.descriptor is None:
+            raise RuntimeError("state directory authority is closed")
+        _secure_regular_file(database_path, directory_fd=state_directory.descriptor)
+        artifact_descriptor = _open_private_directory(
+            spec.state_dir / "artifacts", directory_fd=state_directory.descriptor,
+        )
+        schema_descriptor = _open_private_directory(
+            spec.state_dir / "schemas", directory_fd=state_directory.descriptor,
+        )
         store = SQLiteStore(
-            database_path,
+            state_directory.child_path("bridge.sqlite3"),
             clock=_store_clock(clock),
             check_same_thread=False,
         )
@@ -811,8 +929,11 @@ def _open_project_state(
             spec=spec,
             lock=lock,
             store=store,
-            artifacts=artifacts,
-            schemas=schemas,
+            artifacts=spec.state_dir / "artifacts",
+            schemas=Path(f"/proc/self/fd/{schema_descriptor}"),
+            state_directory=state_directory,
+            artifact_descriptor=artifact_descriptor,
+            schema_descriptor=schema_descriptor,
         )
     except BaseException:
         if store is not None:
@@ -820,6 +941,12 @@ def _open_project_state(
                 store.close()
             except BaseException:
                 pass
+        if artifact_descriptor is not None:
+            os.close(artifact_descriptor)
+        if schema_descriptor is not None:
+            os.close(schema_descriptor)
+        if owns_state_directory and state_directory is not None:
+            state_directory.close()
         raise
 
 
@@ -887,6 +1014,7 @@ def assemble_project_runtime(
             repo_root=spec.repo_root,
             schema_dir=opened.schemas,
             env=codex_child_environment,
+            schema_directory_fd=opened.schema_descriptor,
         )
         preflight = asyncio.run(_run_preflights(
             runner=runner,
@@ -919,6 +1047,7 @@ def assemble_project_runtime(
             spec.repo_root,
             opened.artifacts,
             git_executable=settings.git_executable,
+            artifact_directory_fd=opened.artifact_descriptor,
         )
         coordinator = Coordinator(
             store=opened.store,
@@ -945,6 +1074,7 @@ def assemble_project_runtime(
             broadcaster=InMemoryEventBroadcaster(),
             readiness=readiness,
             lock=lock,
+            state_authority_close=opened.release_state_authority,
         )
     except BaseException:
         if tracker is not None:
@@ -957,6 +1087,7 @@ def assemble_project_runtime(
                 opened.store.close()
             except BaseException:
                 pass
+            opened.release_state_authority()
         raise
 
 
@@ -980,19 +1111,31 @@ def main(
     output = sys.stdout if stdout is None else stdout
     settings = parse_settings(argv, environ=environment)
     ordered_specs = tuple(sorted(settings.projects, key=lambda spec: spec.project_id))
-    for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in ordered_specs)):
-        prepare_state_dir(settings, candidate=state_dir)
+    state_authorities: dict[Path, _StateDirectory] = {}
     locks: list[object] = []
     try:
-        hub_lock = acquire_instance_lock(settings.hub_state_dir / "agent-bridge.lock")
+        for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in ordered_specs)):
+            prepare_state_dir(settings, candidate=state_dir)
+            state_authorities[state_dir] = _open_state_directory(
+                settings, candidate=state_dir,
+            )
+        hub_lock = acquire_instance_lock(
+            settings.hub_state_dir / "agent-bridge.lock",
+            directory_fd=state_authorities[settings.hub_state_dir].descriptor,
+        )
         locks.append(hub_lock)
         project_locks: dict[str, object] = {}
         for spec in ordered_specs:
-            lock = acquire_instance_lock(spec.state_dir / "agent-bridge.lock")
+            lock = acquire_instance_lock(
+                spec.state_dir / "agent-bridge.lock",
+                directory_fd=state_authorities[spec.state_dir].descriptor,
+            )
             locks.append(lock)
             project_locks[spec.project_id] = lock
     except BaseException:
         _release_locks(locks)
+        for authority in state_authorities.values():
+            authority.close()
         raise
 
     hub_store = None
@@ -1006,13 +1149,15 @@ def main(
         from agent_bridge.hub_store import HubStore
 
         hub_database = settings.hub_state_dir / "hub.sqlite3"
-        _secure_regular_file(hub_database)
-        hub_store = HubStore(hub_database, clock=_now)
+        hub_authority = state_authorities[settings.hub_state_dir]
+        _secure_regular_file(hub_database, directory_fd=hub_authority.descriptor)
+        hub_store = HubStore(hub_authority.child_path("hub.sqlite3"), clock=_now)
         for spec in ordered_specs:
             opened_states.append(_open_project_state(
                 spec,
                 lock=project_locks[spec.project_id],
                 clock=_now,
+                state_directory=state_authorities[spec.state_dir],
             ))
         for opened in opened_states:
             _audit_project_state(opened, settings)
@@ -1097,12 +1242,12 @@ def main(
                 except BaseException:
                     pass
         for opened in reversed(opened_states):
-            if opened.spec.project_id in owned_project_ids:
-                continue
-            try:
-                opened.store.close()
-            except BaseException:
-                pass
+            if opened.spec.project_id not in owned_project_ids:
+                try:
+                    opened.store.close()
+                except BaseException:
+                    pass
+            opened.release_state_authority()
         if hub_store is not None:
             try:
                 hub_store.close()
@@ -1116,6 +1261,8 @@ def main(
                 if spec.project_id not in owned_project_ids
             ),
         ))
+        for authority in state_authorities.values():
+            authority.close()
 
 
 if __name__ == "__main__":

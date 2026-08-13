@@ -28,6 +28,7 @@ METERED_ENV_KEYS = frozenset({
     "AWS_BEARER_TOKEN_BEDROCK",
     "GOOGLE_APPLICATION_CREDENTIALS",
 })
+MAX_CLAUDE_AUDIT_EVENTS = 1_024
 
 
 class SubscriptionAuthError(RuntimeError):
@@ -51,6 +52,7 @@ class _EventParseError(ValueError):
 @dataclass(frozen=True)
 class _ParsedEvents:
     audit_events: tuple[Mapping[str, object], ...]
+    session_id: str | None
     structured_output: Mapping[str, object] | None
     result_seen: bool
 
@@ -264,7 +266,7 @@ class ClaudeCLI:
                 result=self._failed_result(run_id, process, error.events),
             ) from None
         events = parsed.audit_events
-        cli_session_id = self._session_id(events)
+        cli_session_id = parsed.session_id
         if (
             session_id is not None
             and cli_session_id is not None
@@ -332,6 +334,8 @@ class ClaudeCLI:
         lines: tuple[str, ...], *, interrupted: bool,
     ) -> _ParsedEvents:
         events: list[Mapping[str, object]] = []
+        dropped_audit_events = 0
+        session_id: str | None = None
         structured_output: Mapping[str, object] | None = None
         result_seen = False
         for line in lines:
@@ -353,9 +357,11 @@ class ClaudeCLI:
             audit_event: dict[str, object] | None = None
             if event_type == "system" and event.get("subtype") == "init":
                 audit_event = {"type": "system", "subtype": "init"}
-                session_id = event.get("session_id")
-                if isinstance(session_id, str) and session_id:
-                    audit_event["session_id"] = session_id
+                candidate_session_id = event.get("session_id")
+                if isinstance(candidate_session_id, str) and candidate_session_id:
+                    audit_event["session_id"] = candidate_session_id
+                    if session_id is None:
+                        session_id = candidate_session_id
             elif isinstance(event_type, str) and event_type in {
                 "assistant", "user", "stream_event",
             }:
@@ -372,9 +378,21 @@ class ClaudeCLI:
                 frozen = freeze_json(audit_event)
                 if not isinstance(frozen, Mapping):
                     raise RuntimeError("audit event normalization did not produce an object")
-                events.append(frozen)
+                if len(events) < MAX_CLAUDE_AUDIT_EVENTS - 1:
+                    events.append(frozen)
+                else:
+                    dropped_audit_events += 1
+        if dropped_audit_events:
+            summary = freeze_json({
+                "type": "audit_events_truncated",
+                "dropped_count": dropped_audit_events,
+            })
+            if not isinstance(summary, Mapping):
+                raise RuntimeError("audit event normalization did not produce an object")
+            events.append(summary)
         return _ParsedEvents(
             audit_events=tuple(events),
+            session_id=session_id,
             structured_output=structured_output,
             result_seen=result_seen,
         )

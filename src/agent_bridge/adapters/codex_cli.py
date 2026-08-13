@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 from uuid import UUID
 
@@ -35,6 +36,7 @@ _AUDIT_ITEM_STATUSES = frozenset({
     "in_progress",
     "interrupted",
 })
+MAX_CODEX_AUDIT_EVENTS = 1_024
 
 
 class CodexRunError(RuntimeError):
@@ -75,6 +77,7 @@ class CodexCLI:
         repo_root: str | Path,
         schema_dir: str | Path,
         env: Mapping[str, str] | None = None,
+        schema_directory_fd: int | None = None,
     ) -> None:
         executable_path = Path(executable)
         if not executable_path.is_absolute():
@@ -91,6 +94,21 @@ class CodexCLI:
         self._runner = runner
         self.repo_root = repo_root_path
         self._env = dict(os.environ if env is None else env)
+        if schema_directory_fd is None:
+            self._schema_pass_fds: tuple[int, ...] = ()
+        else:
+            if (
+                not isinstance(schema_directory_fd, int)
+                or isinstance(schema_directory_fd, bool)
+                or schema_directory_fd < 0
+            ):
+                raise ValueError("schema_directory_fd must be an open directory descriptor")
+            try:
+                if not stat.S_ISDIR(os.fstat(schema_directory_fd).st_mode):
+                    raise ValueError("schema_directory_fd must be an open directory descriptor")
+            except OSError as error:
+                raise ValueError("schema_directory_fd must be an open directory descriptor") from error
+            self._schema_pass_fds = (schema_directory_fd,)
         self.schema_path = schema_dir_path / "sol-outcome.json"
         self._materialize_schema()
 
@@ -114,6 +132,7 @@ class CodexCLI:
             run_id=run_id,
             argv=argv,
             expected_thread_id=None,
+            pass_fds=self._schema_pass_fds,
         )
 
     async def resume(
@@ -132,6 +151,7 @@ class CodexCLI:
             run_id=run_id,
             argv=argv,
             expected_thread_id=thread_id,
+            pass_fds=self._schema_pass_fds,
         )
 
     def _materialize_schema(self) -> None:
@@ -170,15 +190,19 @@ class CodexCLI:
         run_id: str,
         argv: tuple[str, ...],
         expected_thread_id: str | None,
+        pass_fds: tuple[int, ...] = (),
     ) -> AgentRunResult:
-        process = await self._runner.run(
-            run_id=run_id,
-            argv=argv,
-            cwd=self.repo_root,
-            env=self._env,
-            stdin=None,
-            on_line=lambda stream, line: None,
-        )
+        process_arguments: dict[str, object] = {
+            "run_id": run_id,
+            "argv": argv,
+            "cwd": self.repo_root,
+            "env": self._env,
+            "stdin": None,
+            "on_line": lambda stream, line: None,
+        }
+        if pass_fds:
+            process_arguments["pass_fds"] = pass_fds
+        process = await self._runner.run(**process_arguments)
         try:
             parsed = self._parse_events(process.stdout, interrupted=process.interrupted)
         except _EventParseError as error:
@@ -279,6 +303,7 @@ class CodexCLI:
         lines: tuple[str, ...], *, interrupted: bool,
     ) -> _ParsedEvents:
         events: list[Mapping[str, object]] = []
+        dropped_audit_events = 0
         thread_id: str | None = None
         final_message: str | None = None
         for line in lines:
@@ -360,7 +385,18 @@ class CodexCLI:
                 frozen = freeze_json(audit_event)
                 if not isinstance(frozen, Mapping):
                     raise RuntimeError("audit event normalization did not produce an object")
-                events.append(frozen)
+                if len(events) < MAX_CODEX_AUDIT_EVENTS - 1:
+                    events.append(frozen)
+                else:
+                    dropped_audit_events += 1
+        if dropped_audit_events:
+            summary = freeze_json({
+                "type": "audit_events_truncated",
+                "dropped_count": dropped_audit_events,
+            })
+            if not isinstance(summary, Mapping):
+                raise RuntimeError("audit event normalization did not produce an object")
+            events.append(summary)
         return _ParsedEvents(
             audit_events=tuple(events),
             thread_id=thread_id,

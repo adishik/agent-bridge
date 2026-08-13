@@ -12,6 +12,42 @@ import signal
 
 
 LineCallback = Callable[[str, str], None]
+# Existing fake-provider volume is 2,000 34-byte lines per stream (68 KiB).
+# These limits retain headroom while bounding a provider-controlled transcript.
+MAX_PROCESS_STREAM_LINES = 4_096
+MAX_PROCESS_STREAM_BYTES = 256 * 1024
+MAX_PROCESS_TOTAL_LINES = 8_192
+MAX_PROCESS_TOTAL_BYTES = 512 * 1024
+_OUTPUT_LIMIT_ERROR = "provider process output exceeded configured bounds"
+
+
+class ProcessOutputLimitExceeded(RuntimeError):
+    """A provider process exceeded the bounded output capture contract."""
+
+
+@dataclass
+class _OutputBudget:
+    stream_lines: dict[str, int]
+    stream_bytes: dict[str, int]
+    total_lines: int = 0
+    total_bytes: int = 0
+
+    def accept(self, stream: str, raw_line: bytes) -> None:
+        next_stream_lines = self.stream_lines[stream] + 1
+        next_stream_bytes = self.stream_bytes[stream] + len(raw_line)
+        next_total_lines = self.total_lines + 1
+        next_total_bytes = self.total_bytes + len(raw_line)
+        if (
+            next_stream_lines > MAX_PROCESS_STREAM_LINES
+            or next_stream_bytes > MAX_PROCESS_STREAM_BYTES
+            or next_total_lines > MAX_PROCESS_TOTAL_LINES
+            or next_total_bytes > MAX_PROCESS_TOTAL_BYTES
+        ):
+            raise ProcessOutputLimitExceeded(_OUTPUT_LIMIT_ERROR)
+        self.stream_lines[stream] = next_stream_lines
+        self.stream_bytes[stream] = next_stream_bytes
+        self.total_lines = next_total_lines
+        self.total_bytes = next_total_bytes
 
 
 @dataclass(frozen=True)
@@ -57,6 +93,7 @@ class ProcessRunner:
         env: Mapping[str, str],
         stdin: bytes | None,
         on_line: LineCallback,
+        pass_fds: Sequence[int] = (),
     ) -> ProcessResult:
         """Synchronously await one exec child and collect its output lines."""
         if not isinstance(run_id, str) or not run_id:
@@ -66,6 +103,19 @@ class ProcessRunner:
             raise ValueError("argv must be a non-empty sequence of strings")
         normalized_cwd = os.fspath(cwd)
         normalized_env = dict(env)
+        normalized_pass_fds = tuple(pass_fds)
+        if not all(
+            isinstance(descriptor, int)
+            and not isinstance(descriptor, bool)
+            and descriptor >= 0
+            for descriptor in normalized_pass_fds
+        ):
+            raise ValueError("pass_fds must contain open file descriptors")
+        try:
+            for descriptor in normalized_pass_fds:
+                os.fstat(descriptor)
+        except OSError as error:
+            raise ValueError("pass_fds must contain open file descriptors") from error
         if stdin is not None and not isinstance(stdin, bytes):
             raise ValueError("stdin must be bytes or None")
         if not callable(on_line):
@@ -83,6 +133,10 @@ class ProcessRunner:
         )
         stdout: list[str] = []
         stderr: list[str] = []
+        output_budget = _OutputBudget(
+            stream_lines={"stdout": 0, "stderr": 0},
+            stream_bytes={"stdout": 0, "stderr": 0},
+        )
         try:
             self._start_events[run_id] = started
             self._active_runs[run_id] = active
@@ -94,6 +148,7 @@ class ProcessRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                pass_fds=normalized_pass_fds,
             ))
             try:
                 process = await asyncio.shield(launch_task)
@@ -109,12 +164,24 @@ class ProcessRunner:
             if active.stop_requested:
                 await self._stop_active(active)
 
-            await asyncio.gather(
-                self._drain("stdout", process.stdout, stdout, on_line),
-                self._drain("stderr", process.stderr, stderr, on_line),
-                self._write_stdin(process.stdin, stdin),
-                process.wait(),
+            execution_tasks = (
+                asyncio.create_task(
+                    self._drain("stdout", process.stdout, stdout, on_line, output_budget)
+                ),
+                asyncio.create_task(
+                    self._drain("stderr", process.stderr, stderr, on_line, output_budget)
+                ),
+                asyncio.create_task(self._write_stdin(process.stdin, stdin)),
+                asyncio.create_task(process.wait()),
             )
+            try:
+                await asyncio.gather(*execution_tasks)
+            except BaseException:
+                for task in execution_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*execution_tasks, return_exceptions=True)
+                raise
             if process.returncode is None:
                 raise RuntimeError("child process did not report an exit code")
             return ProcessResult(
@@ -210,10 +277,18 @@ class ProcessRunner:
         reader: asyncio.StreamReader | None,
         captured: list[str],
         on_line: LineCallback,
+        output_budget: _OutputBudget,
     ) -> None:
         if reader is None:
             raise RuntimeError(f"{stream} pipe was not created")
-        while raw_line := await reader.readline():
+        while True:
+            try:
+                raw_line = await reader.readline()
+            except ValueError:
+                raise ProcessOutputLimitExceeded(_OUTPUT_LIMIT_ERROR) from None
+            if not raw_line:
+                break
+            output_budget.accept(stream, raw_line)
             line = raw_line.decode("utf-8", errors="replace").removesuffix("\n").removesuffix("\r")
             captured.append(line)
             on_line(stream, line)

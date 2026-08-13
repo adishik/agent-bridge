@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import stat
 
@@ -188,6 +189,35 @@ def test_sol_materializes_schema_with_owner_only_mode(
     assert stat.S_IMODE(schema_path.stat().st_mode) == 0o600
 
 
+def test_sol_keeps_a_descriptor_anchored_schema_path_available_to_its_child(
+    fake_codex: Path, brief: TaskBrief, tmp_path: Path,
+) -> None:
+    """A child must resolve the schema through the retained state authority."""
+    async def scenario() -> None:
+        state = tmp_path / "state"
+        state.mkdir()
+        schemas = state / "schemas"
+        schemas.mkdir()
+        descriptor = os.open(schemas, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            adapter = CodexCLI(
+                fake_codex,
+                ProcessRunner(stop_grace_seconds=0.02),
+                repo_root=tmp_path,
+                schema_dir=Path(f"/proc/self/fd/{descriptor}"),
+                schema_directory_fd=descriptor,
+                env=SAFE_ENV,
+            )
+            result = await adapter.start(
+                run_id="descriptor-anchored-schema", brief=brief, context="context",
+            )
+        finally:
+            os.close(descriptor)
+        assert result.payload is not None
+
+    asyncio.run(scenario())
+
+
 def test_sol_resume_uses_exact_thread_and_validates_outcome(
     fake_codex: Path, brief: TaskBrief, tmp_path: Path,
 ) -> None:
@@ -297,6 +327,28 @@ def test_sol_returns_only_structural_audit_events_and_summarized_stderr(
         _assert_no_secret_sentinel(result)
 
     asyncio.run(scenario())
+
+
+def test_sol_parser_coalesces_a_structural_event_flood_but_keeps_completion_data() -> None:
+    """Audit retention must not scale linearly with an untrusted event stream."""
+    flood = json.dumps({
+        "type": "item.updated",
+        "item": {"type": "todo_list"},
+    })
+    lines = (
+        json.dumps({"type": "thread.started", "thread_id": THREAD_ID}),
+        *(flood for _ in range(1_300)),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "{}"},
+        }),
+    )
+
+    parsed = CodexCLI._parse_events(lines, interrupted=False)
+
+    assert parsed.thread_id == THREAD_ID
+    assert parsed.final_message == "{}"
+    assert len(parsed.audit_events) <= 1_024
 
 
 @pytest.mark.parametrize(

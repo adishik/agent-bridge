@@ -358,3 +358,38 @@ def test_runner_drains_both_streams_under_simultaneous_volume(tmp_path: Path) ->
         assert result.stderr[-1] == "err-1999-xxxxxxxxxxxxxxxxxxxxxxxx"
 
     asyncio.run(scenario())
+
+
+def test_runner_terminates_its_exact_process_group_when_output_exceeds_the_bound(
+    tmp_path: Path,
+) -> None:
+    """Overflow must be a fixed failure and must not leave a TERM-ignoring child."""
+    async def scenario() -> None:
+        escaped = tmp_path / "descendant-escaped.txt"
+        runner = ProcessRunner(stop_grace_seconds=0.02)
+        with pytest.raises(RuntimeError, match="output") as raised:
+            await runner.run(
+                run_id="output-overflow",
+                argv=(
+                    sys.executable,
+                    "-c",
+                    "import os, signal, time\n"
+                    "if os.fork() == 0:\n"
+                    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    "    time.sleep(0.3)\n"
+                    f"    open({str(escaped)!r}, 'w').write('escaped')\n"
+                    "else:\n"
+                    "    for index in range(5000):\n"
+                    "        print('SECRET_OUTPUT_' + str(index), flush=True)\n",
+                ),
+                cwd=tmp_path,
+                env=dict(os.environ),
+                stdin=None,
+                on_line=lambda stream, line: None,
+            )
+        await asyncio.sleep(0.35)
+        assert "SECRET_OUTPUT" not in str(raised.value)
+        assert escaped.exists() is False
+        assert runner.is_running("output-overflow") is False
+
+    asyncio.run(scenario())
