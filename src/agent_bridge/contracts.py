@@ -75,7 +75,11 @@ _SAFE_CONVERSATION_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z
 
 def _bounded_conversation_text(value: object, name: str) -> str:
     text = _string(value, name, non_empty=True)
-    if len(text) > _MAX_CONVERSATION_TEXT_LENGTH:
+    try:
+        encoded_length = len(text.encode("utf-8"))
+    except UnicodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8") from error
+    if encoded_length > _MAX_CONVERSATION_TEXT_LENGTH:
         raise ValueError(f"{name} is too long")
     if any(ord(character) < 32 or ord(character) == 127 for character in text):
         raise ValueError(f"{name} must not contain control characters")
@@ -523,10 +527,19 @@ _CONVERSATION_ENVELOPE_FIELDS = (
 
 
 def _conversation_binding(
+    message_type: ConversationMessageType,
     task_id: str | None,
     revision: int | None,
     continuation_generation: int | None,
 ) -> tuple[str | None, int | None, int | None]:
+    if message_type is ConversationMessageType.APPROVAL:
+        if task_id is None or revision is None or continuation_generation is not None:
+            raise ValueError("approvals require exactly task_id and revision")
+        task_id = _conversation_identifier(task_id, "task_id")
+        revision = _integer(revision, "revision")
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        return task_id, revision, None
     if (task_id is None, revision is None, continuation_generation is None).count(True) not in (0, 3):
         raise ValueError("task_id, revision, and continuation_generation binding must be all-or-none")
     if task_id is not None:
@@ -591,7 +604,7 @@ class ConversationEnvelope:
             raise ValueError("message_type must be a ConversationMessageType")
         object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
         task_id, revision, continuation_generation = _conversation_binding(
-            self.task_id, self.revision, self.continuation_generation
+            self.message_type, self.task_id, self.revision, self.continuation_generation
         )
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "revision", revision)
@@ -606,10 +619,6 @@ class ConversationEnvelope:
         )
         object.__setattr__(self, "question_id", question_id)
         object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
-        if self.message_type is ConversationMessageType.APPROVAL and (
-            task_id is None or revision is None
-        ):
-            raise ValueError("approvals require task_id and revision")
         if self.message_type is ConversationMessageType.STATUS and self.sender is not ConversationActor.SYSTEM:
             raise ValueError("status messages require sender=system")
 
@@ -677,9 +686,11 @@ class UserConversationInput:
             raise ValueError("addressed_to must be a ConversationTarget")
         if not isinstance(self.message_type, ConversationMessageType):
             raise ValueError("message_type must be a ConversationMessageType")
+        if self.message_type is ConversationMessageType.STATUS:
+            raise ValueError("status messages are system-only")
         object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
         task_id, revision, continuation_generation = _conversation_binding(
-            self.task_id, self.revision, self.continuation_generation
+            self.message_type, self.task_id, self.revision, self.continuation_generation
         )
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "revision", revision)
@@ -694,10 +705,6 @@ class UserConversationInput:
         )
         object.__setattr__(self, "question_id", question_id)
         object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
-        if self.message_type is ConversationMessageType.APPROVAL and (
-            task_id is None or revision is None
-        ):
-            raise ValueError("approvals require task_id and revision")
 
 
 @dataclass(frozen=True, slots=True)

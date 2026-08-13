@@ -175,6 +175,89 @@ def test_conversation_envelope_requires_approval_binding_and_system_status_sende
         )
 
 
+@pytest.mark.parametrize(
+    ("character", "count", "is_valid"),
+    [
+        ("x", 16 * 1024, True),
+        ("x", 16 * 1024 + 1, False),
+        ("é", 8192, True),
+        ("é", 8193, False),
+        ("é", 9000, False),
+    ],
+)
+def test_conversation_envelope_enforces_a_utf8_byte_limit(
+    character: str, count: int, is_valid: bool,
+) -> None:
+    text = character * count
+    kwargs = {
+        "sender": ConversationActor.USER,
+        "addressed_to": ConversationTarget.TEAM,
+        "routed_to": ConversationTarget.TEAM,
+        "message_type": ConversationMessageType.STATEMENT,
+        "text": text,
+    }
+
+    if is_valid:
+        assert ConversationEnvelope(**kwargs).text == text
+    else:
+        with pytest.raises(ValueError, match="text is too long"):
+            ConversationEnvelope(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("character", "count", "is_valid"),
+    [
+        ("x", 16 * 1024, True),
+        ("x", 16 * 1024 + 1, False),
+        ("é", 8192, True),
+        ("é", 8193, False),
+        ("é", 9000, False),
+    ],
+)
+def test_directed_agent_question_enforces_a_utf8_byte_limit(
+    character: str, count: int, is_valid: bool,
+) -> None:
+    reason = character * count
+    kwargs = {"addressed_to": "fable", "text": "Question?", "reason": reason}
+
+    if is_valid:
+        assert DirectedAgentQuestion(**kwargs).reason == reason
+    else:
+        with pytest.raises(ValueError, match="reason is too long"):
+            DirectedAgentQuestion(**kwargs)
+
+
+def test_conversation_envelope_approval_binds_exactly_task_and_revision() -> None:
+    approval = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.TEAM,
+        routed_to=ConversationTarget.TEAM,
+        message_type=ConversationMessageType.APPROVAL,
+        text="Approved.",
+        task_id="task-1",
+        revision=1,
+    )
+
+    assert approval.continuation_generation is None
+    for binding in (
+        {"task_id": "task-1"},
+        {"revision": 1},
+        {"continuation_generation": 1},
+        {"task_id": "task-1", "continuation_generation": 1},
+        {"revision": 1, "continuation_generation": 1},
+        {"task_id": "task-1", "revision": 1, "continuation_generation": 1},
+    ):
+        with pytest.raises(ValueError, match="approval"):
+            ConversationEnvelope(
+                sender=ConversationActor.USER,
+                addressed_to=ConversationTarget.TEAM,
+                routed_to=ConversationTarget.TEAM,
+                message_type=ConversationMessageType.APPROVAL,
+                text="Approved.",
+                **binding,
+            )
+
+
 def test_user_conversation_input_validates_exact_optional_binding_before_routing() -> None:
     input_message = UserConversationInput(
         addressed_to=ConversationTarget.FABLE,
@@ -187,6 +270,13 @@ def test_user_conversation_input_validates_exact_optional_binding_before_routing
     )
 
     assert input_message.addressed_to is ConversationTarget.FABLE
+    assert UserConversationInput(
+        addressed_to=ConversationTarget.TEAM,
+        message_type=ConversationMessageType.APPROVAL,
+        text="Approved.",
+        task_id="task-1",
+        revision=1,
+    ).continuation_generation is None
     with pytest.raises(ValueError, match="binding"):
         UserConversationInput(
             addressed_to=ConversationTarget.FABLE,
@@ -225,6 +315,12 @@ def test_user_conversation_input_validates_exact_optional_binding_before_routing
             message_type=ConversationMessageType.STATEMENT,
             text="Coordinator must route this.",
             routed_to=ConversationTarget.FABLE,
+        )
+    with pytest.raises(ValueError, match="status"):
+        UserConversationInput(
+            addressed_to=ConversationTarget.TEAM,
+            message_type=ConversationMessageType.STATUS,
+            text="The user cannot emit this.",
         )
 
 
