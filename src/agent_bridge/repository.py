@@ -397,6 +397,7 @@ class RepositoryTracker:
         max_inventory_listing_bytes: int = 16 * 1024 * 1024,
         max_inventory_content_bytes: int = 64 * 1024 * 1024,
         protected_prefixes: tuple[str, ...] | None = None,
+        artifact_directory_fd: int | None = None,
     ) -> None:
         self._artifact_fd: int | None = None
         self._repo_root = Path(repo_root).resolve()
@@ -460,7 +461,25 @@ class RepositoryTracker:
         ):
             raise ValueError("Git executable must be a safe regular executable")
         try:
-            self._artifact_fd = _open_absolute_directory(self._artifact_directory, create=True)
+            if artifact_directory_fd is None:
+                self._artifact_fd = _open_absolute_directory(self._artifact_directory, create=True)
+            else:
+                if (
+                    not isinstance(artifact_directory_fd, int)
+                    or isinstance(artifact_directory_fd, bool)
+                    or artifact_directory_fd < 0
+                ):
+                    raise ValueError("artifact_directory_fd must be an open directory descriptor")
+                descriptor = os.dup(artifact_directory_fd)
+                try:
+                    is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                if not is_directory:
+                    os.close(descriptor)
+                    raise ValueError("artifact_directory_fd must be an open directory descriptor")
+                self._artifact_fd = descriptor
         except OSError as error:
             raise ValueError("artifact_directory must be a safe writable directory") from error
         self._max_snapshot_bytes = max_snapshot_bytes

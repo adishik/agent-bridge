@@ -31,6 +31,8 @@ const KNOWN_STATES = new Set([
 export const MAX_CONVERSATION_MESSAGES = 300;
 export const MAX_TASK_HISTORY = 100;
 export const MAX_TASK_OVERVIEWS = 200;
+export const MAX_NAV_PROJECTS = 100;
+export const MAX_NAV_CHATS = 50;
 
 const MESSAGE_EVENT_KINDS = new Set([
   "message",
@@ -93,6 +95,7 @@ const FIELD_LABELS = Object.freeze({
 const RECONNECT_DELAYS = Object.freeze([500, 1000, 2000, 5000, 10000]);
 const BOOTSTRAP_REFRESH_DELAY = 500;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_CSRF_TOKEN = /^[\x21-\x7e]+$/;
 
 
 function requireSafeId(value, name) {
@@ -952,6 +955,43 @@ export function sessionMessagePath(sessionId) {
 }
 
 
+export function projectChatsPath(projectId) {
+  requireSafeId(projectId, "project_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats?limit=${MAX_NAV_CHATS}`;
+}
+
+
+export function projectNewChatPath(projectId) {
+  requireSafeId(projectId, "project_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats`;
+}
+
+
+export function projectChatBootstrapPath(projectId, sessionId) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/bootstrap`;
+}
+
+
+export function projectChatMessagePath(projectId, sessionId) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/messages`;
+}
+
+
+export function projectTaskActionPath(projectId, sessionId, taskId, action) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  requireSafeId(taskId, "task_id");
+  if (!TASK_ACTIONS.has(action)) {
+    throw new Error("unsupported task action");
+  }
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/${action}`;
+}
+
+
 export async function postJson(fetchFunction, path, payload, csrfToken) {
   if (typeof path !== "string" || !path.startsWith("/api/") || path.includes("?")) {
     throw new Error("mutation path must be a body-only API path");
@@ -1013,6 +1053,26 @@ export function websocketUrl(sessionId, lastSequence, locationValue) {
 }
 
 
+export function projectWebsocketPath(projectId, sessionId, lastSequence) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  if (!Number.isSafeInteger(lastSequence) || lastSequence < 0) {
+    throw new Error("last sequence must be a non-negative safe integer");
+  }
+  return `/ws?project_id=${encodeURIComponent(projectId)}&session_id=${encodeURIComponent(sessionId)}&after=${lastSequence}`;
+}
+
+
+export function projectWebsocketUrl(projectId, sessionId, lastSequence, locationValue) {
+  const location = asObject(locationValue);
+  if (!['http:', 'https:'].includes(location.protocol) || typeof location.host !== "string") {
+    throw new Error("browser location must be loopback HTTP or HTTPS");
+  }
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${location.host}${projectWebsocketPath(projectId, sessionId, lastSequence)}`;
+}
+
+
 export function createEventStream({
   sessionId,
   initialSequence = 0,
@@ -1020,6 +1080,7 @@ export function createEventStream({
   schedule,
   cancelSchedule,
   location,
+  socketUrl = websocketUrl,
   bootstrap,
   onEvent,
   onStatus,
@@ -1032,6 +1093,7 @@ export function createEventStream({
     typeof WebSocketCtor !== "function"
     || typeof schedule !== "function"
     || typeof cancelSchedule !== "function"
+    || typeof socketUrl !== "function"
   ) {
     throw new Error("event stream dependencies are invalid");
   }
@@ -1120,7 +1182,7 @@ export function createEventStream({
     }
     generation += 1;
     const ownGeneration = generation;
-    const ownSocket = new WebSocketCtor(websocketUrl(sessionId, lastSequence, location));
+    const ownSocket = new WebSocketCtor(socketUrl(sessionId, lastSequence, location));
     socket = ownSocket;
     ownSocket.addEventListener("open", async () => {
       if (stopped || ownGeneration !== generation) {
@@ -1201,9 +1263,603 @@ export function createEventStream({
 }
 
 
+function navigationProject(value) {
+  const candidate = asObject(value);
+  if (typeof candidate.project_id !== "string" || !SAFE_ID.test(candidate.project_id)) {
+    return null;
+  }
+  return {
+    projectId: candidate.project_id,
+    label: typeof candidate.label === "string" && candidate.label
+      ? candidate.label
+      : candidate.project_id,
+    branch: typeof candidate.branch === "string" ? candidate.branch : null,
+    readiness: asObject(candidate.readiness),
+  };
+}
+
+
+function navigationChat(value) {
+  const candidate = asObject(value);
+  if (typeof candidate.session_id !== "string" || !SAFE_ID.test(candidate.session_id)) {
+    return null;
+  }
+  return {
+    sessionId: candidate.session_id,
+    title: typeof candidate.title === "string" && candidate.title
+      ? candidate.title
+      : "New chat",
+    latestSequence: Number.isSafeInteger(candidate.latest_sequence)
+      ? candidate.latest_sequence
+      : 0,
+  };
+}
+
+
+function navigationLease(value) {
+  const candidate = asObject(value);
+  if (
+    typeof candidate.project_id !== "string"
+    || typeof candidate.session_id !== "string"
+    || typeof candidate.task_id !== "string"
+    || !SAFE_ID.test(candidate.project_id)
+    || !SAFE_ID.test(candidate.session_id)
+    || !SAFE_ID.test(candidate.task_id)
+  ) {
+    return null;
+  }
+  return {
+    projectId: candidate.project_id,
+    sessionId: candidate.session_id,
+    taskId: candidate.task_id,
+  };
+}
+
+
+function navigationLeaseState(payload) {
+  if (!Object.hasOwn(payload, "active_lease")) {
+    return {activeLease: null, navigationLocked: true};
+  }
+  if (payload.active_lease === null) {
+    return {activeLease: null, navigationLocked: false};
+  }
+  const activeLease = navigationLease(payload.active_lease);
+  return activeLease === null
+    ? {activeLease: null, navigationLocked: true}
+    : {activeLease, navigationLocked: false};
+}
+
+
+function navigationCsrfToken(payload) {
+  return typeof payload.csrf_token === "string" && SAFE_CSRF_TOKEN.test(payload.csrf_token)
+    ? payload.csrf_token
+    : null;
+}
+
+
+function boundedNavigationRecords(records, normalizer, maximum) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+  return records
+    .map(normalizer)
+    .filter((record) => record !== null)
+    .slice(0, maximum);
+}
+
+
+function navigationProjectReadiness(projects, projectId) {
+  return asObject(projects.find((project) => project.projectId === projectId)?.readiness);
+}
+
+
+function navigationProjectGate(projects, projectId, acknowledged) {
+  const readiness = navigationProjectReadiness(projects, projectId);
+  return subscriptionGate({
+    fable_ready: readiness.fable_ready,
+    fable_status: readiness.fable_status,
+    sol_status: readiness.sol_status,
+    usage_credits_acknowledged: acknowledged === true,
+  });
+}
+
+
+function navigationState(previousState, payload) {
+  const payloadObject = asObject(payload);
+  const lease = navigationLeaseState(payloadObject);
+  const csrfToken = navigationCsrfToken(payloadObject);
+  const projects = boundedNavigationRecords(
+    payloadObject.projects,
+    navigationProject,
+    MAX_NAV_PROJECTS,
+  );
+  const acknowledged = payloadObject.usage_credits_acknowledged === true;
+  return {
+    ...previousState,
+    csrfToken: csrfToken ?? "",
+    projects,
+    activeLease: lease.navigationLocked
+      ? (previousState.activeLease ?? null)
+      : lease.activeLease,
+    navigationLocked: lease.navigationLocked || csrfToken === null,
+    gate: navigationProjectGate(projects, previousState.projectId, acknowledged),
+    solStatus: navigationProjectReadiness(projects, previousState.projectId).sol_status ?? null,
+  };
+}
+
+
+function chatListState(previousState, payload) {
+  return {
+    ...previousState,
+    chats: boundedNavigationRecords(asObject(payload).chats, navigationChat, MAX_NAV_CHATS),
+  };
+}
+
+
+function projectLabelFor(state, projectId) {
+  return state.projects.find((project) => project.projectId === projectId)?.label
+    ?? projectId
+    ?? null;
+}
+
+
+function navigationAttribute(node, name) {
+  if (typeof node?.getAttribute === "function") {
+    return node.getAttribute(name);
+  }
+  return node?.attributes?.[name] ?? null;
+}
+
+
+function navigationListMatches(container, records, selectedId, locked, idName, labelName) {
+  if (!container || container.children.length !== records.length) {
+    return false;
+  }
+  return records.every((record, index) => {
+    const button = container.children[index]?.children?.[0];
+    return button?.dataset?.[idName] === record[idName]
+      && button.textContent === record[labelName]
+      && button.disabled === locked
+      && navigationAttribute(button, "aria-current") === (
+        record[idName] === selectedId ? "true" : "false"
+      );
+  });
+}
+
+
+function renderNavigationList(
+  documentRoot,
+  container,
+  records,
+  selectedId,
+  locked,
+  idName,
+  labelName,
+  onSelect,
+) {
+  if (navigationListMatches(container, records, selectedId, locked, idName, labelName)) {
+    return;
+  }
+  const items = [];
+  for (const record of records) {
+    if (typeof record?.[idName] !== "string") {
+      continue;
+    }
+    const item = element(documentRoot, "li");
+    const button = element(documentRoot, "button", record[labelName], "project-navigation-button");
+    button.type = "button";
+    button.disabled = locked;
+    button.dataset[idName] = record[idName];
+    button.setAttribute("aria-current", record[idName] === selectedId ? "true" : "false");
+    button.addEventListener("click", () => onSelect(record[idName]));
+    item.append(button);
+    items.push(item);
+  }
+  container?.replaceChildren(...items);
+}
+
+
+export function renderProjectNavigation(documentRoot, currentState, handlers = {}) {
+  const state = asObject(currentState);
+  const projectList = documentRoot.querySelector("#project-list");
+  const chatList = documentRoot.querySelector("#chat-list");
+  const newChat = documentRoot.querySelector("#new-chat");
+  const projectName = documentRoot.querySelector("#selected-project-name");
+  const chatName = documentRoot.querySelector("#selected-chat-name");
+  const projects = Array.isArray(state.projects)
+    ? state.projects.slice(0, MAX_NAV_PROJECTS)
+    : [];
+  const chats = Array.isArray(state.chats)
+    ? state.chats.slice(0, MAX_NAV_CHATS)
+    : [];
+  const locked = state.activeLease !== null && state.activeLease !== undefined
+    || state.navigationLocked === true
+    || state.navigationPending === true;
+  const selectedProject = projects.find((project) => project?.projectId === state.projectId);
+  const selectedChat = chats.find((chat) => chat?.sessionId === state.sessionId);
+  if (projectName) {
+    projectName.textContent = typeof selectedProject?.label === "string"
+      ? selectedProject.label
+      : (typeof state.projectLabel === "string" ? state.projectLabel : "No project selected");
+  }
+  if (chatName) {
+    chatName.textContent = typeof selectedChat?.title === "string"
+      ? selectedChat.title
+      : "No chat selected";
+  }
+  if (projectList) {
+    renderNavigationList(
+      documentRoot, projectList, projects, state.projectId, locked,
+      "projectId", "label", (projectId) => handlers.onProject?.(projectId),
+    );
+  }
+  if (chatList) {
+    renderNavigationList(
+      documentRoot, chatList, chats, state.sessionId, locked,
+      "sessionId", "title", (sessionId) => handlers.onChat?.(sessionId),
+    );
+  }
+  if (newChat) {
+    newChat.disabled = locked
+      || typeof state.projectId !== "string"
+      || typeof state.csrfToken !== "string"
+      || state.csrfToken.length === 0;
+    newChat.onclick = () => handlers.onNewChat?.();
+  }
+}
+
+
+export function createProjectChatController({
+  fetchFunction,
+  WebSocketCtor,
+  schedule,
+  cancelSchedule,
+  location,
+  onState = () => {},
+  onEvent = () => {},
+  onStatus = () => {},
+  onChatReset = () => {},
+}) {
+  if (typeof fetchFunction !== "function") {
+    throw new Error("project chat fetch function is required");
+  }
+  let state = {
+    csrfToken: "",
+    projectId: null,
+    projectLabel: null,
+    sessionId: null,
+    projects: [],
+    chats: [],
+    activeLease: null,
+    navigationLocked: true,
+    navigationPending: false,
+    tasks: [],
+    selectedTaskId: null,
+    gate: subscriptionGate({}),
+    lastSequence: 0,
+  };
+  let stream = null;
+  let selectionGeneration = 0;
+  let projectRefreshGeneration = 0;
+  let projectRefreshInFlight = null;
+  let projectRefreshPending = false;
+  let selectionPending = false;
+  let projectRefreshBlocksNavigation = false;
+
+  function publish(nextState) {
+    state = nextState;
+    onState(state);
+  }
+
+  async function getJson(path) {
+    const response = await fetchFunction(path, {
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function selected(projectId, sessionId, generation) {
+    return selectionGeneration === generation
+      && state.projectId === projectId
+      && state.sessionId === sessionId;
+  }
+
+  function stopStream() {
+    stream?.stop();
+    stream = null;
+  }
+
+  function navigationPending() {
+    return selectionPending || projectRefreshBlocksNavigation;
+  }
+
+  function invalidateProjectRefresh() {
+    projectRefreshGeneration += 1;
+    if (projectRefreshInFlight !== null) {
+      projectRefreshPending = true;
+      projectRefreshBlocksNavigation = true;
+    }
+  }
+
+  function beginChatSelection(projectId, sessionId) {
+    stopStream();
+    invalidateProjectRefresh();
+    selectionPending = true;
+    if (state.sessionId !== null && state.sessionId !== sessionId) {
+      onChatReset();
+    }
+    selectionGeneration += 1;
+    publish({
+      ...state,
+      projectId,
+      projectLabel: projectLabelFor(state, projectId),
+      sessionId,
+      tasks: [],
+      selectedTaskId: null,
+      gate: navigationProjectGate(state.projects, projectId, state.gate.acknowledged),
+      solStatus: navigationProjectReadiness(state.projects, projectId).sol_status ?? null,
+      lastSequence: 0,
+      navigationPending: navigationPending(),
+    });
+    return selectionGeneration;
+  }
+
+  function startStream(projectId, sessionId) {
+    if (stream || !selected(projectId, sessionId, selectionGeneration)) {
+      return;
+    }
+    stream = createEventStream({
+      sessionId,
+      initialSequence: state.lastSequence,
+      WebSocketCtor,
+      schedule,
+      cancelSchedule,
+      location,
+      socketUrl: (_streamSessionId, lastSequence, locationValue) => (
+        projectWebsocketUrl(projectId, sessionId, lastSequence, locationValue)
+      ),
+      bootstrap: (isCurrent) => bootstrapSelected(
+        projectId,
+        sessionId,
+        selectionGeneration,
+        isCurrent,
+      ),
+      onEvent: (event) => {
+        const previousSelection = state.selectedTaskId;
+        const tasks = reduceTaskEvent(state.tasks, event);
+        const selectedTaskId = repairTaskSelection(tasks, previousSelection);
+        const sequence = Number.isSafeInteger(event?.sequence) && event.sequence >= 0
+          ? Math.max(state.lastSequence, event.sequence)
+          : state.lastSequence;
+        publish({...state, tasks, selectedTaskId, lastSequence: sequence});
+        const associatedTask = tasks.find((task) => taskIdentity(task) === event?.task_id);
+        onEvent(event, associatedTask);
+        void refreshProjects().catch(() => {});
+      },
+      onStatus: (status) => {
+        if (["bootstrap_refreshing", "bootstrap_stale", "bootstrap_error"].includes(status)) {
+          publish({
+            ...state,
+            gate: {...state.gate, ready: false, canCompose: false},
+          });
+        }
+        onStatus(status);
+      },
+    });
+    stream.connect();
+  }
+
+  async function bootstrapSelected(projectId, sessionId, generation, isCurrent = () => true) {
+    const bootstrapData = await getJson(projectChatBootstrapPath(projectId, sessionId));
+    if (!isCurrent() || !selected(projectId, sessionId, generation)) {
+      return false;
+    }
+    const applied = applyBootstrap(state, bootstrapData);
+    if (applied.projectId !== projectId || applied.sessionId !== sessionId) {
+      throw new Error("bootstrap selection did not match the requested project chat");
+    }
+    selectionPending = false;
+    publish({
+      ...applied,
+      projectLabel: projectLabelFor(applied, projectId),
+      navigationPending: navigationPending(),
+    });
+    startStream(projectId, sessionId);
+    return true;
+  }
+
+  async function selectChat(projectId, sessionId) {
+    requireSafeId(projectId, "project_id");
+    requireSafeId(sessionId, "session_id");
+    if (state.projectId !== projectId) {
+      return selectProject(projectId, sessionId);
+    }
+    if (state.sessionId === sessionId && stream !== null) {
+      return true;
+    }
+    const generation = beginChatSelection(projectId, sessionId);
+    return bootstrapSelected(projectId, sessionId, generation);
+  }
+
+  async function selectProject(projectId, requestedSessionId = null) {
+    requireSafeId(projectId, "project_id");
+    if (requestedSessionId !== null) {
+      requireSafeId(requestedSessionId, "session_id");
+    }
+    if (state.projectId === projectId && requestedSessionId === null && stream !== null) {
+      return true;
+    }
+    const currentSessionId = state.projectId === projectId ? state.sessionId : null;
+    stopStream();
+    invalidateProjectRefresh();
+    selectionPending = true;
+    if (state.sessionId !== null) {
+      onChatReset();
+    }
+    selectionGeneration += 1;
+    const generation = selectionGeneration;
+    publish({
+      ...state,
+      projectId,
+      projectLabel: projectLabelFor(state, projectId),
+      sessionId: null,
+      chats: [],
+      tasks: [],
+      selectedTaskId: null,
+      gate: navigationProjectGate(state.projects, projectId, state.gate.acknowledged),
+      solStatus: navigationProjectReadiness(state.projects, projectId).sol_status ?? null,
+      lastSequence: 0,
+      navigationPending: navigationPending(),
+    });
+    const chatPayload = await getJson(projectChatsPath(projectId));
+    if (generation !== selectionGeneration || state.projectId !== projectId) {
+      return false;
+    }
+    const withChats = chatListState(state, chatPayload);
+    publish(withChats);
+    const leasedSessionId = state.activeLease?.projectId === projectId
+      ? state.activeLease.sessionId
+      : null;
+    const targetSessionId = requestedSessionId
+      ?? leasedSessionId
+      ?? (withChats.chats.some((chat) => chat.sessionId === currentSessionId)
+        ? currentSessionId
+        : withChats.chats[0]?.sessionId);
+    if (typeof targetSessionId !== "string") {
+      selectionPending = false;
+      publish({...withChats, navigationPending: navigationPending()});
+      return true;
+    }
+    return selectChat(projectId, targetSessionId);
+  }
+
+  async function performProjectRefresh() {
+    const ownGeneration = projectRefreshGeneration;
+    let refreshed = false;
+    try {
+      const payload = await getJson("/api/projects");
+      if (ownGeneration === projectRefreshGeneration) {
+        projectRefreshBlocksNavigation = false;
+        const nextState = navigationState(state, payload);
+        const label = typeof nextState.projectId === "string"
+          ? projectLabelFor(nextState, nextState.projectId)
+          : null;
+        publish({...nextState, projectLabel: label, navigationPending: navigationPending()});
+        refreshed = true;
+      }
+    } catch (_error) {
+      if (ownGeneration === projectRefreshGeneration) {
+        projectRefreshBlocksNavigation = false;
+        publish({...state, navigationLocked: true, navigationPending: navigationPending()});
+      }
+    }
+    if (projectRefreshPending) {
+      projectRefreshPending = false;
+      return performProjectRefresh();
+    }
+    return refreshed;
+  }
+
+  function refreshProjects() {
+    projectRefreshGeneration += 1;
+    if (projectRefreshInFlight !== null) {
+      projectRefreshPending = true;
+      return projectRefreshInFlight;
+    }
+    const refresh = performProjectRefresh();
+    projectRefreshInFlight = refresh;
+    void refresh.finally(() => {
+      if (projectRefreshInFlight === refresh) {
+        projectRefreshInFlight = null;
+      }
+    });
+    return refresh;
+  }
+
+  async function bootstrapInitial() {
+    await refreshProjects();
+    const leasedProjectId = state.activeLease?.projectId ?? null;
+    const selectedProjectId = leasedProjectId
+      ?? (state.projects.some((project) => project.projectId === state.projectId)
+        ? state.projectId
+        : state.projects[0]?.projectId);
+    if (typeof selectedProjectId !== "string") {
+      return false;
+    }
+    return selectProject(selectedProjectId);
+  }
+
+  async function refreshSelectedBootstrap() {
+    if (typeof state.projectId !== "string" || typeof state.sessionId !== "string") {
+      return false;
+    }
+    return bootstrapSelected(state.projectId, state.sessionId, selectionGeneration);
+  }
+
+  async function createChat() {
+    if (
+      state.activeLease !== null
+      || state.navigationLocked
+      || state.navigationPending
+      || typeof state.projectId !== "string"
+      || typeof state.csrfToken !== "string"
+      || state.csrfToken.length === 0
+    ) {
+      throw new Error("new chat is unavailable while navigation is locked");
+    }
+    const projectId = state.projectId;
+    const sessionId = state.sessionId;
+    const generation = selectionGeneration;
+    const response = await postJson(
+      fetchFunction,
+      projectNewChatPath(projectId),
+      {},
+      state.csrfToken,
+    );
+    const created = navigationChat(await response.json());
+    if (created === null) {
+      throw new Error("new chat response was invalid");
+    }
+    if (
+      generation !== selectionGeneration
+      || state.projectId !== projectId
+      || state.sessionId !== sessionId
+    ) {
+      return false;
+    }
+    publish({
+      ...state,
+      chats: [created, ...state.chats.filter((chat) => chat.sessionId !== created.sessionId)]
+        .slice(0, MAX_NAV_CHATS),
+    });
+    return selectChat(projectId, created.sessionId);
+  }
+
+  return {
+    bootstrapInitial,
+    createChat,
+    refreshProjects,
+    refreshSelectedBootstrap,
+    selectChat,
+    selectProject,
+    stop: stopStream,
+    get state() {
+      return state;
+    },
+  };
+}
+
+
 export function applyBootstrap(previousState, bootstrapData) {
   const previous = asObject(previousState);
   const bootstrap = asObject(bootstrapData);
+  const projectId = typeof bootstrap.project_id === "string" && SAFE_ID.test(bootstrap.project_id)
+    ? bootstrap.project_id
+    : null;
   const sessionId = typeof bootstrap.session_id === "string" && SAFE_ID.test(bootstrap.session_id)
     ? bootstrap.session_id
     : null;
@@ -1251,6 +1907,7 @@ export function applyBootstrap(previousState, bootstrapData) {
   return {
     ...previous,
     csrfToken: typeof bootstrap.csrf_token === "string" ? bootstrap.csrf_token : "",
+    projectId,
     sessionId,
     tasks,
     selectedTaskId,
@@ -1498,13 +2155,19 @@ function wireDrawer(
 export function startBrowserApp(documentRoot, windowRoot) {
   let state = {
     csrfToken: "",
+    projectId: null,
+    projectLabel: null,
     sessionId: null,
+    projects: [],
+    chats: [],
+    activeLease: null,
+    navigationPending: false,
     tasks: [],
     selectedTaskId: null,
     gate: subscriptionGate({}),
     lastSequence: 0,
   };
-  let stream = null;
+  let controller = null;
   let ready = Promise.resolve(false);
 
   const composer = documentRoot.querySelector("#composer");
@@ -1554,9 +2217,9 @@ export function startBrowserApp(documentRoot, windowRoot) {
       setStatus(solNode, `Sol · ${label}`, label === "Ready" ? "ready" : "checking");
     }
     if (repoNode) {
-      const repository = typeof state.repository === "string" ? state.repository : "checking";
+      const project = typeof state.projectLabel === "string" ? state.projectLabel : "checking";
       const branch = typeof state.branch === "string" ? state.branch : "checking";
-      repoNode.textContent = `Repository: ${repository} · Branch: ${branch}`;
+      repoNode.textContent = `Project: ${project} · Branch: ${branch}`;
     }
     messageInput.disabled = !state.gate.canCompose || state.sessionId === null;
     composerSubmit.disabled = messageInput.disabled;
@@ -1566,6 +2229,26 @@ export function startBrowserApp(documentRoot, windowRoot) {
   }
 
   function renderWorkspace() {
+    renderProjectNavigation(documentRoot, state, {
+      onProject: (projectId) => {
+        void controller?.selectProject(projectId).catch((error) => {
+          showToast(documentRoot, String(error.message ?? error), true);
+        });
+      },
+      onChat: (sessionId) => {
+        if (typeof state.projectId !== "string") {
+          return;
+        }
+        void controller?.selectChat(state.projectId, sessionId).catch((error) => {
+          showToast(documentRoot, String(error.message ?? error), true);
+        });
+      },
+      onNewChat: () => {
+        void controller?.createChat().catch((error) => {
+          showToast(documentRoot, String(error.message ?? error), true);
+        });
+      },
+    });
     renderTaskList(documentRoot, state.tasks, state.selectedTaskId, (taskId) => {
       state.selectedTaskId = taskId;
       renderWorkspace();
@@ -1580,21 +2263,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
     });
   }
 
-  async function loadBootstrap(isCurrent = () => true) {
-    const response = await windowRoot.fetch("/api/bootstrap", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      throw new Error(`Bootstrap failed with status ${response.status}`);
-    }
-    const bootstrapData = await response.json();
-    if (!isCurrent()) {
-      return false;
-    }
-    state = applyBootstrap(state, bootstrapData);
-    renderStatus();
-    renderWorkspace();
+  function syncUsageModal() {
     if (state.gate.acknowledged) {
       if (usageModal.open) {
         if (typeof usageModal.close === "function") {
@@ -1609,7 +2278,6 @@ export function startBrowserApp(documentRoot, windowRoot) {
     } else {
       usageModal.setAttribute("open", "");
     }
-    return true;
   }
 
   function taskActionPayload(action, task, supplied) {
@@ -1623,9 +2291,12 @@ export function startBrowserApp(documentRoot, windowRoot) {
   }
 
   async function sendTaskAction(action, task, supplied) {
+    if (typeof state.projectId !== "string" || typeof state.sessionId !== "string") {
+      throw new Error("project chat selection is unavailable");
+    }
     await postJson(
       windowRoot.fetch.bind(windowRoot),
-      taskActionPath(taskIdentity(task), action),
+      projectTaskActionPath(state.projectId, state.sessionId, taskIdentity(task), action),
       taskActionPayload(action, task, supplied),
       state.csrfToken,
     );
@@ -1639,9 +2310,12 @@ export function startBrowserApp(documentRoot, windowRoot) {
         task,
         async (edited) => {
           try {
+            if (typeof state.projectId !== "string" || typeof state.sessionId !== "string") {
+              throw new Error("project chat selection is unavailable");
+            }
             await postJson(
               windowRoot.fetch.bind(windowRoot),
-              taskActionPath(taskIdentity(task), "edit"),
+              projectTaskActionPath(state.projectId, state.sessionId, taskIdentity(task), "edit"),
               edited,
               state.csrfToken,
             );
@@ -1659,21 +2333,12 @@ export function startBrowserApp(documentRoot, windowRoot) {
     });
   }
 
-  function handleEvent(event) {
-    const previousTasks = state.tasks;
-    const previousSelection = state.selectedTaskId;
-    state.tasks = reduceTaskEvent(state.tasks, event);
-    state.selectedTaskId = repairTaskSelection(state.tasks, state.selectedTaskId);
-    const associatedTask = state.tasks.find((task) => taskIdentity(task) === event?.task_id);
+  function handleEvent(event, associatedTask) {
     const rendered = renderConversationEvent(
       documentRoot,
       event,
       associatedRevisionForEvent(event, associatedTask),
     );
-    if (state.tasks !== previousTasks || state.selectedTaskId !== previousSelection) {
-      renderWorkspace();
-      renderStatus();
-    }
     const conversation = documentRoot.querySelector("#conversation");
     if (rendered && conversation) {
       conversation.scrollTop = conversation.scrollHeight;
@@ -1694,37 +2359,14 @@ export function startBrowserApp(documentRoot, windowRoot) {
       bootstrap_refreshing: ["Connection · live · refreshing status", "running"],
       invalid_event: ["Connection · invalid event ignored", "error"],
     };
-    if (["bootstrap_refreshing", "bootstrap_stale", "bootstrap_error"].includes(status)) {
-      state = {...state, gate: subscriptionGate({})};
-      renderStatus();
-      renderWorkspace();
-    }
     const [label, variant] = labels[status] ?? ["Connection · checking", "checking"];
     setStatus(connection, label, variant);
-  }
-
-  function beginStream() {
-    if (!state.sessionId || stream) {
-      return;
-    }
-    stream = createEventStream({
-      sessionId: state.sessionId,
-      initialSequence: state.lastSequence,
-      WebSocketCtor: windowRoot.WebSocket,
-      schedule: windowRoot.setTimeout.bind(windowRoot),
-      cancelSchedule: windowRoot.clearTimeout.bind(windowRoot),
-      location: windowRoot.location,
-      bootstrap: loadBootstrap,
-      onEvent: handleEvent,
-      onStatus: updateConnection,
-    });
-    stream.connect();
   }
 
   composer.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = String(messageInput.value ?? "");
-    if (!state.gate.canCompose || !state.sessionId || !text.trim()) {
+    if (!state.gate.canCompose || !state.projectId || !state.sessionId || !text.trim()) {
       return;
     }
     messageInput.disabled = true;
@@ -1732,7 +2374,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
     try {
       await postJson(
         windowRoot.fetch.bind(windowRoot),
-        sessionMessagePath(state.sessionId),
+        projectChatMessagePath(state.projectId, state.sessionId),
         {text},
         state.csrfToken,
       );
@@ -1762,7 +2404,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
         {acknowledged: true},
         state.csrfToken,
       );
-      await loadBootstrap();
+      const refreshed = await controller.refreshProjects();
+      if (!refreshed || !state.gate.acknowledged) {
+        throw new Error("usage-credit acknowledgement could not be confirmed");
+      }
     } catch (error) {
       usageError.textContent = String(error.message ?? error);
       usageSubmit.disabled = false;
@@ -1828,12 +2473,34 @@ export function startBrowserApp(documentRoot, windowRoot) {
     }
   });
 
+  controller = createProjectChatController({
+    fetchFunction: windowRoot.fetch.bind(windowRoot),
+    WebSocketCtor: windowRoot.WebSocket,
+    schedule: windowRoot.setTimeout.bind(windowRoot),
+    cancelSchedule: windowRoot.clearTimeout.bind(windowRoot),
+    location: windowRoot.location,
+    onState(nextState) {
+      state = nextState;
+      renderStatus();
+      renderWorkspace();
+      syncUsageModal();
+    },
+    onEvent: handleEvent,
+    onStatus: updateConnection,
+    onChatReset() {
+      const conversation = documentRoot.querySelector("#conversation");
+      conversation?.replaceChildren();
+    },
+  });
+
   function attemptBootstrap() {
     bootstrapRetry.hidden = true;
     usageError.textContent = "";
-    ready = loadBootstrap()
-      .then(() => {
-        beginStream();
+    ready = controller.bootstrapInitial()
+      .then((bootstrapped) => {
+        if (!bootstrapped) {
+          throw new Error("No project chats are available.");
+        }
         return true;
       })
       .catch((error) => {
@@ -1851,7 +2518,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
   bootstrapRetry.addEventListener("click", () => attemptBootstrap());
   attemptBootstrap();
 
-  windowRoot.addEventListener("beforeunload", () => stream?.stop());
+  windowRoot.addEventListener("beforeunload", () => controller?.stop());
   return {
     get ready() {
       return ready;
@@ -1861,7 +2528,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
     },
     retry: attemptBootstrap,
     stop() {
-      stream?.stop();
+      controller?.stop();
     },
   };
 }

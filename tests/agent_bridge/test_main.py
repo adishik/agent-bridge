@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -15,8 +17,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import agent_bridge.__main__ as launcher
+from agent_bridge.adapters.claude_cli import SubscriptionAuthError
 from agent_bridge.adapters.codex_cli import CodexCLI
 from agent_bridge.process import ProcessRunner
+from agent_bridge.projects import ProjectSpec, project_id_for_root
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import SQLiteStore
 from agent_bridge.__main__ import (
@@ -140,7 +144,7 @@ if (control_dir / "git-fail").exists():
 if sys.argv[-2:] == ["rev-parse", "--show-toplevel"]:
     override = control_dir / "git-root"
     print(override.read_text() if override.exists() else os.getcwd())
-elif sys.argv[-2:] == ["branch", "--show-current"]:
+elif sys.argv[-2:] == ["branch", "--show-current"] or sys.argv[-4:] == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
     print("feat/test-launcher")
 else:
     raise SystemExit(93)
@@ -284,7 +288,7 @@ def test_state_directory_is_external_owner_only_and_repository_specific(tmp_path
 
     state_dir = prepare_state_dir(settings)
 
-    assert state_dir == tmp_path / "state" / "agent-bridge" / "repo"
+    assert state_dir == tmp_path / "state" / "agent-bridge" / "hub"
     assert not state_dir.is_relative_to(repo)
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
     state_dir.chmod(0o777)
@@ -299,10 +303,8 @@ def test_state_directory_inside_repository_is_rejected(tmp_path: Path) -> None:
         **_environment(tmp_path, repo),
         "XDG_STATE_HOME": str(repo / "state"),
     }
-    settings = parse_settings(_args(repo, tools), environ=environ)
-
     with pytest.raises(ValueError, match="outside repository"):
-        prepare_state_dir(settings)
+        parse_settings(_args(repo, tools), environ=environ)
 
 
 def test_repository_context_reads_only_bounded_regular_repo_entry(
@@ -514,16 +516,15 @@ def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_c
             assert len(lines) == 1
             record = json.loads(lines[0])
             startup_records.append(record)
-            key = parse_qs(urlparse(str(record["url"])).query)["key"][0]
-            with TestClient(app) as client:
-                assert client.get(f"/?key={key}", follow_redirects=False).status_code == 303
-                bootstrap = client.get("/api/bootstrap").json()
-            assert bootstrap["fable_ready"] is True
-            assert bootstrap["fable_status"] == "subscription_ready"
-            assert bootstrap["sol_status"] == "ready"
-            assert bootstrap["repository"] == str(repo)
-            assert bootstrap["branch"] == "feat/test-launcher"
-            observed_sessions.append(bootstrap["session_id"])
+            runtime = app.state.project_registry.projects()[0]
+            readiness = runtime.readiness.snapshot()
+            assert readiness.fable_ready is True
+            assert readiness.fable_status == "subscription_ready"
+            assert readiness.sol_status == "ready"
+            assert runtime.branch == "feat/test-launcher"
+            chats = runtime.store.list_chats()
+            assert len(chats) == 1
+            observed_sessions.append(chats[0].session_id)
 
         assert main(
             _args(repo, tools), environ=environ, stdout=output,
@@ -552,7 +553,7 @@ def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_c
             environ["PASSWORD"],
         ):
             assert secret not in serialized
-    state_dir = tmp_path / "state" / "agent-bridge" / "repo"
+    state_dir = tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)
     assert stat.S_IMODE((state_dir / "bridge.sqlite3").stat().st_mode) == 0o600
     calls = [
         json.loads(line)
@@ -593,7 +594,7 @@ def test_single_instance_lock_prevents_second_recovery_and_releases_after_exit(
     repo = _repo(tmp_path)
     environ = _environment(tmp_path, repo)
     args = _args(repo, tools)
-    state_dir = tmp_path / "state" / "agent-bridge" / "repo"
+    state_dir = tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)
     inner_attempted = False
 
     def first_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
@@ -705,11 +706,12 @@ def test_invalid_subscription_still_starts_with_server_gate_disabled(tmp_path: P
     observed: list[dict[str, object]] = []
 
     def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
-        record = json.loads(output.getvalue())
-        key = parse_qs(urlparse(str(record["url"])).query)["key"][0]
-        with TestClient(app) as client:
-            client.get(f"/?key={key}", follow_redirects=False)
-            observed.append(client.get("/api/bootstrap").json())
+        readiness = app.state.project_registry.projects()[0].readiness.snapshot()
+        observed.append({
+            "fable_ready": readiness.fable_ready,
+            "fable_status": readiness.fable_status,
+            "sol_status": readiness.sol_status,
+        })
 
     assert main(
         _args(repo, tools), environ=environ, stdout=output,
@@ -730,3 +732,1333 @@ def test_path_resolution_is_owned_only_by_main_module() -> None:
     for path in python_files:
         if path.name != "__main__.py":
             assert "shutil.which(" not in path.read_text(encoding="utf-8")
+
+
+def _project_spec(repo: Path, label: str, state_dir: Path) -> ProjectSpec:
+    return ProjectSpec(
+        project_id=project_id_for_root(repo),
+        label=label,
+        repo_root=repo,
+        branch="feat/test-launcher",
+        state_dir=state_dir,
+    )
+
+
+def test_project_cli_requires_one_immutable_allowlist_and_uses_digest_state(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+
+    with pytest.raises(SystemExit) as missing:
+        parse_settings(_args(repo, tools)[2:], environ=environment)
+    assert missing.value.code == 2
+    with pytest.raises(SystemExit) as mixed:
+        parse_settings(
+            [
+                *_args(repo, tools),
+                "--project", f"second={repo}",
+            ],
+            environ=environment,
+        )
+    assert mixed.value.code == 2
+
+    repo_settings = parse_settings(_args(repo, tools), environ=environment)
+    named_settings = parse_settings(
+        [
+            "--project", f"renamed={repo}",
+            "--claude-executable", str(tools["claude"]),
+            "--codex-executable", str(tools["codex"]),
+            "--git-executable", str(tools["git"]),
+            "--bash-executable", str(tools["bash"]),
+            "--sh-executable", str(tools["sh"]),
+        ],
+        environ=environment,
+    )
+
+    expected_id = project_id_for_root(repo)
+    assert repo_settings.projects == (
+        ProjectSpec(
+            project_id=expected_id,
+            label="repo",
+            repo_root=repo,
+            branch="feat/test-launcher",
+            state_dir=tmp_path / "state" / "agent-bridge" / "projects" / expected_id,
+        ),
+    )
+    assert named_settings.projects[0].project_id == expected_id
+    assert named_settings.projects[0].state_dir == repo_settings.projects[0].state_dir
+    assert named_settings.projects[0].label == "renamed"
+    assert repo_settings.hub_state_dir == tmp_path / "state" / "agent-bridge" / "hub"
+    help_text = launcher._parser().format_help().lower()
+    assert "restart-required" in help_text
+    assert "immutable allowlist" in help_text
+
+
+def test_parse_settings_rejects_a_project_id_collision_before_legacy_selection_or_mkdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first = _repo(tmp_path)
+    second = _named_repo(tmp_path, "second")
+    state_root = tmp_path / "state" / "agent-bridge"
+    legacy = state_root / "repo"
+    legacy.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "agent_bridge.projects._project_id_from_canonical_root",
+        lambda root: "c" * 32,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        parse_settings(
+            _project_args([("first", first), ("second", second)], tools),
+            environ=_environment(tmp_path, first),
+        )
+
+    assert not (state_root / "projects" / ("c" * 32)).exists()
+
+
+def test_compatible_repo_startup_uses_a_detached_branch_label_for_a_real_detached_checkout(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    git = Path("/usr/bin/git")
+    assert git.is_file()
+    subprocess.run([str(git), "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([str(git), "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run([str(git), "config", "user.name", "Agent Bridge Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run([str(git), "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run([str(git), "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
+    subprocess.run([str(git), "checkout", "--detach"], cwd=repo, check=True, capture_output=True)
+    args = _args(repo, tools)
+    args[args.index("--git-executable") + 1] = str(git)
+    output = io.StringIO()
+
+    assert main(
+        args,
+        environ=_environment(tmp_path, repo),
+        stdout=output,
+        uvicorn_run=lambda *args, **kwargs: None,
+    ) == 0
+
+    assert json.loads(output.getvalue())['branch'] == "detached"
+
+
+def test_state_authority_stays_with_the_opened_directory_when_an_ancestor_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock files, subdirectories, and SQLite must not follow a later ancestor symlink."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    settings = parse_settings(_args(repo, tools), environ=_environment(tmp_path, repo))
+    state_root = settings.hub_state_dir.parent
+    parked_state_root = tmp_path / "parked-state-root"
+    outside = tmp_path / "outside"
+    for candidate in (settings.hub_state_dir, *(spec.state_dir for spec in settings.projects)):
+        (outside / candidate.relative_to(state_root)).mkdir(parents=True, exist_ok=True)
+    original_acquire = launcher.acquire_instance_lock
+    swapped = False
+
+    def swap_then_acquire(path: Path, *args: object, **kwargs: object):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            state_root.rename(parked_state_root)
+            state_root.symlink_to(outside, target_is_directory=True)
+        return original_acquire(path, *args, **kwargs)
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", swap_then_acquire)
+
+    assert main(
+        [],
+        environ=_environment(tmp_path, repo),
+        stdout=io.StringIO(),
+        uvicorn_run=lambda *args, **kwargs: None,
+    ) == 0
+
+    assert (parked_state_root / "hub" / "hub.sqlite3").is_file()
+    assert (parked_state_root / "projects" / settings.projects[0].project_id / "bridge.sqlite3").is_file()
+    assert not list(outside.rglob("*.sqlite3"))
+    assert not list(outside.rglob("agent-bridge.lock"))
+    assert not list(outside.rglob("artifacts"))
+    assert not list(outside.rglob("schemas"))
+
+
+def test_provider_cannot_traverse_schema_file_capability(
+    tmp_path: Path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real launcher must give Codex one schema file, never its state directory."""
+    tools = _fake_tools(tmp_path)
+    report_path = tmp_path / "codex-home" / "schema-capability.json"
+    tools["codex"] = _write_executable(
+        tmp_path / "capability-codex",
+        """
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli capability")
+    raise SystemExit(0)
+if sys.argv[1:3] != ["exec", "--json"]:
+    raise SystemExit(92)
+schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
+schema = json.loads(schema_path.read_text(encoding="utf-8"))
+proc_target = os.readlink(schema_path)
+siblings = {}
+for sibling in ("bridge.sqlite3", "artifacts", "locks"):
+    try:
+        descriptor = os.open(Path(proc_target).parent / sibling, os.O_RDONLY)
+    except OSError:
+        siblings[sibling] = False
+    else:
+        os.close(descriptor)
+        siblings[sibling] = True
+try:
+    writable_descriptor = os.open(schema_path, os.O_WRONLY)
+except OSError:
+    writable_opened = False
+    writable_write = False
+else:
+    writable_opened = True
+    try:
+        os.write(writable_descriptor, b"X")
+    except OSError:
+        writable_write = False
+    else:
+        writable_write = True
+    finally:
+        os.close(writable_descriptor)
+try:
+    readonly_descriptor = os.open(schema_path, os.O_RDONLY)
+    try:
+        seals = fcntl.fcntl(readonly_descriptor, fcntl.F_GET_SEALS)
+    finally:
+        os.close(readonly_descriptor)
+except OSError:
+    seals = None
+report_path = Path(os.environ["CODEX_HOME"]) / "schema-capability.json"
+report_path.parent.mkdir(parents=True, exist_ok=True)
+report_path.write_text(json.dumps({"schema": schema, "proc_target": proc_target, "siblings": siblings, "writable_opened": writable_opened, "writable_write": writable_write, "seals": seals}), encoding="utf-8")
+print(json.dumps({"type": "thread.started", "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps({"status": "completed", "summary": "capability checked", "changed_files": [], "commands_run": [], "known_failures": [], "remaining_risks": [], "architecture_docs": "No change.", "question": None})}}))
+""",
+    )
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    state_dir = settings.projects[0].state_dir
+    (state_dir / "artifacts").mkdir(parents=True)
+    (state_dir / "artifacts" / "private-artifact").write_text("artifact", encoding="utf-8")
+    (state_dir / "locks").mkdir()
+    (state_dir / "locks" / "private-lock").write_text("lock", encoding="utf-8")
+    observed_pass_fds: list[tuple[tuple[int, bool, bool, str, int | None], ...]] = []
+    persisted_schema_fds: list[int] = []
+    closed_descriptors: list[int] = []
+    from agent_bridge.adapters import codex_cli
+
+    original_materialize = codex_cli.materialize_sol_schema_file
+    original_close = os.close
+
+    def capture_persisted_schema_fd(directory_fd: int) -> int:
+        descriptor = original_materialize(directory_fd)
+        persisted_schema_fds.append(descriptor)
+        return descriptor
+
+    original_preflights = launcher._run_preflights
+
+    async def verify_persisted_schema_fd_closed(**kwargs):
+        assert len(persisted_schema_fds) == 1
+        assert persisted_schema_fds[0] in closed_descriptors
+        return await original_preflights(**kwargs)
+
+    def record_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(codex_cli, "materialize_sol_schema_file", capture_persisted_schema_fd)
+    monkeypatch.setattr(launcher, "_run_preflights", verify_persisted_schema_fd_closed)
+    monkeypatch.setattr(os, "close", record_close)
+
+    class RecordingProcessRunner(ProcessRunner):
+        async def run(self, *, pass_fds=(), **kwargs):
+            descriptors = []
+            for descriptor in pass_fds:
+                try:
+                    seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+                except OSError:
+                    seals = None
+                descriptors.append((
+                    descriptor,
+                    stat.S_ISREG(os.fstat(descriptor).st_mode),
+                    stat.S_ISDIR(os.fstat(descriptor).st_mode),
+                    os.readlink(f"/proc/self/fd/{descriptor}"),
+                    seals,
+                ))
+            observed_pass_fds.append(tuple(descriptors))
+            return await super().run(pass_fds=pass_fds, **kwargs)
+
+    monkeypatch.setattr("agent_bridge.process.ProcessRunner", RecordingProcessRunner)
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        runtime = app.state.project_registry.projects()[0]
+        result = asyncio.run(runtime.sol.start(
+            run_id="schema-file-capability", brief=valid_brief, context="capability test",
+        ))
+        assert result.payload is not None
+
+    assert main(
+        _args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=run_uvicorn,
+    ) == 0
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    from agent_bridge.contracts import SOL_OUTCOME_SCHEMA
+    assert report["schema"] == SOL_OUTCOME_SCHEMA
+    assert str(state_dir) not in report["proc_target"]
+    assert report["proc_target"].startswith("/memfd:agent-bridge-sol-schema")
+    assert report["siblings"] == {
+        "bridge.sqlite3": False,
+        "artifacts": False,
+        "locks": False,
+    }
+    assert report["writable_opened"] is False
+    assert report["writable_write"] is False
+    required_seals = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    assert report["seals"] == required_seals
+    codex_pass_fds = [pass_fds for pass_fds in observed_pass_fds if pass_fds]
+    assert len(codex_pass_fds) == 1
+    assert len(codex_pass_fds[0]) == 1
+    descriptor, is_regular, is_directory, target, seals = codex_pass_fds[0][0]
+    assert is_regular is True
+    assert is_directory is False
+    assert target.startswith("/memfd:agent-bridge-sol-schema")
+    assert str(state_dir) not in target
+    assert seals == required_seals
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_schema_file_descriptor_closes_during_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    created_descriptors: list[int] = []
+    from agent_bridge.adapters import codex_cli
+
+    original_materialize = codex_cli.materialize_sol_schema_file
+
+    def record_schema_file(directory_fd: int) -> int:
+        descriptor = original_materialize(directory_fd)
+        created_descriptors.append(descriptor)
+        return descriptor
+
+    class RejectingCodexCLI:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("injected Codex construction failure")
+
+    monkeypatch.setattr(codex_cli, "materialize_sol_schema_file", record_schema_file)
+    monkeypatch.setattr(codex_cli, "CodexCLI", RejectingCodexCLI)
+
+    with pytest.raises(RuntimeError, match="injected Codex construction failure"):
+        main(
+            _args(repo, tools), environ=environment, stdout=io.StringIO(),
+            uvicorn_run=lambda *args, **kwargs: None,
+        )
+
+    assert len(created_descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(created_descriptors[0])
+
+
+def test_main_acquires_every_lock_before_opening_any_database_and_releases_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _repo(tmp_path)
+    second_repo = tmp_path / "second-repo"
+    second_repo.mkdir()
+    (second_repo / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    third_repo = tmp_path / "third-repo"
+    third_repo.mkdir()
+    (third_repo / "AGENTS.md").write_text("# third\n", encoding="utf-8")
+    state_root = tmp_path / "state" / "agent-bridge"
+    specs = tuple(sorted((
+        _project_spec(first_repo, "first", state_root / "projects" / project_id_for_root(first_repo)),
+        ProjectSpec("2" * 32, "second", second_repo, "main", state_root / "projects" / ("2" * 32)),
+        ProjectSpec("1" * 32, "third", third_repo, "main", state_root / "projects" / ("1" * 32)),
+    ), key=lambda spec: spec.project_id))
+    settings = launcher.Settings(
+        projects=specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    events: list[str] = []
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+            events.append(f"release:{self.path.parent.name}")
+
+    acquired: list[FakeLock] = []
+
+    def prepare(candidate_settings: launcher.Settings, *, candidate: Path) -> Path:
+        assert candidate_settings is settings
+        events.append(f"validate:{candidate.name}")
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def acquire(path: Path, **kwargs: object) -> FakeLock:
+        events.append(f"lock:{path.parent.name}")
+        if path.parent.name == "2" * 32:
+            raise ValueError("injected second lock failure")
+        lock = FakeLock(path)
+        acquired.append(lock)
+        return lock
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", acquire)
+
+    with pytest.raises(ValueError, match="second lock failure"):
+        main([], environ=_environment(tmp_path, first_repo), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert events[:4] == [
+        "validate:hub",
+        *(f"validate:{spec.project_id}" for spec in specs),
+    ]
+    failed_at = next(index for index, spec in enumerate(specs) if spec.project_id == "2" * 32)
+    assert events[4:] == [
+        "lock:hub",
+        *(f"lock:{spec.project_id}" for spec in specs[:failed_at + 1]),
+        *(f"release:{spec.project_id}" for spec in reversed(specs[:failed_at])),
+        "release:hub",
+    ]
+    assert all(lock.released for lock in acquired)
+    assert not list(state_root.rglob("*.sqlite3"))
+
+
+def test_main_closes_constructed_runtime_and_every_lock_when_later_assembly_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _repo(tmp_path)
+    second_repo = tmp_path / "second-repo"
+    second_repo.mkdir()
+    (second_repo / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    state_root = tmp_path / "state" / "agent-bridge"
+    specs = tuple(sorted((
+        _project_spec(first_repo, "first", state_root / "projects" / project_id_for_root(first_repo)),
+        ProjectSpec("1" * 32, "second", second_repo, "main", state_root / "projects" / ("1" * 32)),
+    ), key=lambda spec: spec.project_id))
+    settings = launcher.Settings(
+        projects=specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    events: list[str] = []
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def release(self) -> None:
+            events.append(f"release:{self.path.parent.name}")
+
+    class FakeHubStore:
+        def __init__(self, path: Path, *, clock) -> None:
+            events.append("hub-store")
+
+        def close(self) -> None:
+            events.append("hub-close")
+
+        def usage_credits_acknowledged(self) -> bool:
+            return False
+
+    class FakeRuntime:
+        def __init__(self, spec: ProjectSpec, lock: FakeLock) -> None:
+            self.spec = spec
+            self.lock = lock
+
+        def close(self) -> None:
+            events.append(f"runtime-close:{self.spec.project_id}")
+            self.lock.release()
+
+    def prepare(candidate_settings: launcher.Settings, *, candidate: Path) -> Path:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def assemble(spec: ProjectSpec, **kwargs: object) -> FakeRuntime:
+        events.append(f"assemble:{spec.project_id}")
+        if spec.project_id == specs[1].project_id:
+            raise RuntimeError("injected runtime two failure")
+        return FakeRuntime(spec, kwargs["lock"])
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
+    monkeypatch.setattr(
+        launcher, "acquire_instance_lock", lambda path, **kwargs: FakeLock(path),
+    )
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", FakeHubStore)
+    monkeypatch.setattr(launcher, "assemble_project_runtime", assemble)
+
+    with pytest.raises(RuntimeError, match="runtime two failure"):
+        main([], environ=_environment(tmp_path, first_repo), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert events == [
+        "hub-store",
+        f"assemble:{specs[0].project_id}",
+        f"assemble:{specs[1].project_id}",
+        f"runtime-close:{specs[0].project_id}",
+        f"release:{specs[0].project_id}",
+        "hub-close",
+        f"release:{specs[1].project_id}",
+        "release:hub",
+    ]
+
+
+@pytest.mark.parametrize("argument_kind", ("repo", "project"))
+def test_legacy_state_is_audited_and_adopted_in_place(
+    tmp_path: Path,
+    argument_kind: str,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    legacy_state = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    args = _args(repo, tools) if argument_kind == "repo" else [
+        "--project", f"chosen={repo}",
+        "--claude-executable", str(tools["claude"]),
+        "--codex-executable", str(tools["codex"]),
+        "--git-executable", str(tools["git"]),
+        "--bash-executable", str(tools["bash"]),
+        "--sh-executable", str(tools["sh"]),
+    ]
+
+    assert main(args, environ=environment, stdout=io.StringIO(), uvicorn_run=lambda *args, **kwargs: None) == 0
+
+    assert legacy_state.is_dir()
+    assert database.is_file()
+    assert not (tmp_path / "state" / "agent-bridge" / "projects" / project_id_for_root(repo)).exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE sessions SET repo_root = '/other' WHERE session_id = 'session-1'"
+            ),
+            id="mixed-root",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO events (session_id, task_id, actor, kind, payload_json, created_at) VALUES ('missing', NULL, 'user', 'message', '{}', '2026-08-11T00:00:00Z')"
+            ),
+            id="orphan",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "UPDATE settings SET value_json = '\"missing\"' WHERE key = 'agent_bridge.active_session_id'"
+            ),
+            id="invalid-active-session",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO settings (key, value_json) VALUES ('agent_bridge.baseline.', 'not-json')"
+            ),
+            id="corrupt-baseline",
+        ),
+        pytest.param(
+            lambda connection: connection.execute(
+                "INSERT INTO tasks (task_id, revision, session_id, state, correction_count) VALUES ('orphan', 1, 'missing', 'fable_planning', 0)"
+            ),
+            id="failed-foreign-key",
+        ),
+    ),
+)
+def test_invalid_legacy_state_aborts_before_recovery(
+    tmp_path: Path,
+    corrupt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    legacy_state = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    corrupt(connection)
+    connection.commit()
+    connection.close()
+    recoveries: list[Path] = []
+    original_recover = SQLiteStore.recover_active_tasks
+
+    def recover(self: SQLiteStore):
+        recoveries.append(database)
+        return original_recover(self)
+
+    monkeypatch.setattr(SQLiteStore, "recover_active_tasks", recover)
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        main(_args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=lambda *args, **kwargs: None)
+
+    assert recoveries == []
+
+
+def test_legacy_and_digest_state_for_one_root_is_rejected_as_ambiguous(tmp_path: Path) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    (state_root / "repo").mkdir(parents=True)
+    (state_root / "projects" / project_id_for_root(repo)).mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        parse_settings(_args(repo, tools), environ=_environment(tmp_path, repo))
+
+
+def test_two_roots_cannot_claim_one_existing_legacy_state_directory(tmp_path: Path) -> None:
+    tools = _fake_tools(tmp_path)
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = first_parent / "repo"
+    second = second_parent / "repo"
+    first.mkdir()
+    second.mkdir()
+    (first / "AGENTS.md").write_text("# first\n", encoding="utf-8")
+    (second / "AGENTS.md").write_text("# second\n", encoding="utf-8")
+    legacy = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy.mkdir(parents=True)
+    arguments = [
+        "--project", f"first={first}",
+        "--project", f"second={second}",
+        "--claude-executable", str(tools["claude"]),
+        "--codex-executable", str(tools["codex"]),
+        "--git-executable", str(tools["git"]),
+        "--bash-executable", str(tools["bash"]),
+        "--sh-executable", str(tools["sh"]),
+    ]
+
+    with pytest.raises(ValueError, match="legacy"):
+        parse_settings(arguments, environ=_environment(tmp_path, first))
+
+
+def _named_repo(parent: Path, name: str) -> Path:
+    repo = parent / name
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text(f"# {name}\n", encoding="utf-8")
+    return repo.resolve()
+
+
+def _project_args(
+    projects: list[tuple[str, Path]], tools: dict[str, Path],
+) -> list[str]:
+    arguments: list[str] = []
+    for label, repo in projects:
+        arguments.extend(("--project", f"{label}={repo}"))
+    return [
+        *arguments,
+        "--claude-executable", str(tools["claude"]),
+        "--codex-executable", str(tools["codex"]),
+        "--git-executable", str(tools["git"]),
+        "--bash-executable", str(tools["bash"]),
+        "--sh-executable", str(tools["sh"]),
+    ]
+
+
+@pytest.mark.parametrize("hostile_state", ("inside-root", "symlinked-ancestor"))
+def test_parse_settings_rejects_hostile_state_paths_before_project_state_creation(
+    tmp_path: Path,
+    hostile_state: str,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    if hostile_state == "inside-root":
+        state_home = repo / "hostile-state"
+    else:
+        state_parent = tmp_path / "state-parent"
+        state_parent.mkdir()
+        link = state_parent / "inside-repository"
+        link.symlink_to(repo, target_is_directory=True)
+        state_home = link / "state-home"
+    environment = {
+        **_environment(tmp_path, repo),
+        "XDG_STATE_HOME": str(state_home),
+    }
+
+    with pytest.raises(ValueError, match="state directory"):
+        parse_settings(_args(repo, tools), environ=environment)
+
+    assert not (repo / "hostile-state" / "agent-bridge" / "projects").exists()
+    assert not (repo / "state-home" / "agent-bridge" / "projects").exists()
+
+
+def test_lock_failure_opens_no_database_or_runtime_and_releases_acquired_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _repo(tmp_path)
+    second_repo = _named_repo(tmp_path, "second")
+    third_repo = _named_repo(tmp_path, "third")
+    state_root = tmp_path / "state" / "agent-bridge"
+    specs = tuple(sorted((
+        _project_spec(first_repo, "first", state_root / "projects" / project_id_for_root(first_repo)),
+        ProjectSpec("2" * 32, "second", second_repo, "main", state_root / "projects" / ("2" * 32)),
+        ProjectSpec("1" * 32, "third", third_repo, "main", state_root / "projects" / ("1" * 32)),
+    ), key=lambda spec: spec.project_id))
+    settings = launcher.Settings(
+        projects=specs,
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    events: list[str] = []
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def release(self) -> None:
+            events.append(f"release:{self.path.parent.name}")
+
+    class UnexpectedStore:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            events.append("sqlite-open")
+
+        def _migrate(self) -> None:
+            events.append("sqlite-migrate")
+
+        def audit_legacy_project_ownership(self, root: str) -> None:
+            events.append("sqlite-audit")
+
+        def recover_active_tasks(self) -> None:
+            events.append("sqlite-recover")
+
+    class UnexpectedHubStore:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            events.append("hub-open")
+
+        def _migrate(self) -> None:
+            events.append("hub-migrate")
+
+    def prepare(candidate_settings: launcher.Settings, *, candidate: Path) -> Path:
+        assert candidate_settings is settings
+        events.append(f"validate:{candidate.name}")
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def acquire(path: Path, **kwargs: object) -> FakeLock:
+        events.append(f"lock:{path.parent.name}")
+        if path.parent.name == "2" * 32:
+            raise ValueError("second lock failed")
+        return FakeLock(path)
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher, "prepare_state_dir", prepare)
+    monkeypatch.setattr(launcher, "acquire_instance_lock", acquire)
+    monkeypatch.setattr("agent_bridge.store.SQLiteStore", UnexpectedStore)
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", UnexpectedHubStore)
+    monkeypatch.setattr(
+        launcher,
+        "assemble_project_runtime",
+        lambda *args, **kwargs: events.append("runtime-assemble"),
+    )
+
+    with pytest.raises(ValueError, match="second lock failed"):
+        main(
+            [],
+            environ=_environment(tmp_path, first_repo),
+            uvicorn_run=lambda *args, **kwargs: events.append("uvicorn"),
+        )
+
+    assert events[:4] == [
+        "validate:hub",
+        *(f"validate:{spec.project_id}" for spec in specs),
+    ]
+    failed_at = next(index for index, spec in enumerate(specs) if spec.project_id == "2" * 32)
+    assert events[4:] == [
+        "lock:hub",
+        *(f"lock:{spec.project_id}" for spec in specs[:failed_at + 1]),
+        *(f"release:{spec.project_id}" for spec in reversed(specs[:failed_at])),
+        "release:hub",
+    ]
+    assert not {
+        "sqlite-open", "sqlite-migrate", "sqlite-audit", "sqlite-recover",
+        "hub-open", "hub-migrate", "runtime-assemble", "uvicorn",
+    }.intersection(events)
+
+
+def test_legacy_audit_for_all_projects_precedes_every_project_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    first_repo = _named_repo(tmp_path, "first")
+    second_repo = _named_repo(tmp_path, "second")
+    ordered_repos = tuple(sorted((first_repo, second_repo), key=project_id_for_root))
+    state_root = tmp_path / "state" / "agent-bridge"
+    for repo in ordered_repos:
+        legacy_state = state_root / repo.name
+        legacy_state.mkdir(parents=True)
+        store = SQLiteStore(legacy_state / "bridge.sqlite3")
+        store.create_session("session-1", str(repo))
+        store.set_setting("agent_bridge.active_session_id", "session-1")
+        store.close()
+    bad_database = state_root / ordered_repos[1].name / "bridge.sqlite3"
+    connection = sqlite3.connect(bad_database)
+    connection.execute(
+        "UPDATE sessions SET repo_root = '/wrong-root' WHERE session_id = 'session-1'"
+    )
+    connection.commit()
+    connection.close()
+    audits: list[Path] = []
+    recoveries: list[Path] = []
+    closed: list[object] = []
+    original_audit = SQLiteStore.audit_legacy_project_ownership
+    original_recover = SQLiteStore.recover_active_tasks
+    original_close = SQLiteStore.close
+
+    def audit(self: SQLiteStore, root: str) -> None:
+        audits.append(Path(root))
+        original_audit(self, root)
+
+    def recover(self: SQLiteStore):
+        recoveries.append(self)
+        return original_recover(self)
+
+    def close(self: SQLiteStore) -> None:
+        closed.append(self)
+        original_close(self)
+
+    monkeypatch.setattr(SQLiteStore, "audit_legacy_project_ownership", audit)
+    monkeypatch.setattr(SQLiteStore, "recover_active_tasks", recover)
+    monkeypatch.setattr(SQLiteStore, "close", close)
+    uvicorn_calls: list[None] = []
+    arguments = _project_args(
+        [("first", first_repo), ("second", second_repo)], tools,
+    )
+
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        main(
+            arguments,
+            environ=_environment(tmp_path, first_repo),
+            uvicorn_run=lambda *args, **kwargs: uvicorn_calls.append(None),
+        )
+
+    assert audits == list(ordered_repos)
+    assert recoveries == []
+    assert len(closed) == 2
+    assert uvicorn_calls == []
+    settings = parse_settings(arguments, environ=_environment(tmp_path, first_repo))
+    for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in settings.projects)):
+        lock = launcher.acquire_instance_lock(state_dir / "agent-bridge.lock")
+        lock.release()
+
+
+def test_direct_assembler_closes_its_store_when_legacy_audit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a direct-assembler audit escape that otherwise leaks SQLite state."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    legacy_state = state_root / "repo"
+    legacy_state.mkdir(parents=True)
+    database = legacy_state / "bridge.sqlite3"
+    seed = SQLiteStore(database)
+    seed.create_session("session-1", "/foreign-repository")
+    seed.set_setting("agent_bridge.active_session_id", "session-1")
+    seed.close()
+    spec = _project_spec(repo, "repo", legacy_state)
+    settings = launcher.Settings(
+        projects=(spec,),
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    stores: list[SQLiteStore] = []
+    recoveries: list[SQLiteStore] = []
+    closed: list[SQLiteStore] = []
+    children: list[str] = []
+
+    class TrackingStore(SQLiteStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            stores.append(self)
+
+        def recover_active_tasks(self):
+            recoveries.append(self)
+            return super().recover_active_tasks()
+
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class CallerOwnedLock:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    def unexpected_runner() -> None:
+        children.append("runner")
+        raise AssertionError("runtime child must not be constructed after audit failure")
+
+    lock = CallerOwnedLock()
+    monkeypatch.setattr("agent_bridge.store.SQLiteStore", TrackingStore)
+    monkeypatch.setattr("agent_bridge.process.ProcessRunner", unexpected_runner)
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy project ownership audit failed: active_session, session_ownership",
+    ):
+        launcher.assemble_project_runtime(
+            spec,
+            lock=lock,
+            settings=settings,
+            environment=_environment(tmp_path, repo),
+            ids=launcher._Ids(),
+            clock=launcher._now,
+        )
+
+    assert len(stores) == 1
+    assert closed == stores
+    assert recoveries == []
+    assert children == []
+    assert lock.release_count == 0
+
+
+def test_direct_assembler_leaves_caller_opened_state_owned_by_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An externally opened state remains with its caller when completion fails."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    state_root = tmp_path / "state" / "agent-bridge"
+    spec = _project_spec(
+        repo,
+        "repo",
+        state_root / "projects" / project_id_for_root(repo),
+    )
+    spec.state_dir.mkdir(parents=True)
+    settings = launcher.Settings(
+        projects=(spec,),
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=56590,
+        claude_executable=tools["claude"],
+        codex_executable=tools["codex"],
+        git_executable=tools["git"],
+        bash_executable=tools["bash"],
+        sh_executable=tools["sh"],
+    )
+    closed: list[SQLiteStore] = []
+
+    class TrackingStore(SQLiteStore):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class CallerOwnedLock:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    def failed_recovery():
+        raise RuntimeError("injected recovery failure")
+
+    lock = CallerOwnedLock()
+    monkeypatch.setattr("agent_bridge.store.SQLiteStore", TrackingStore)
+    opened = launcher._open_project_state(spec, lock=lock, clock=launcher._now)
+    monkeypatch.setattr(opened.store, "recover_active_tasks", failed_recovery)
+
+    with pytest.raises(RuntimeError, match="injected recovery failure"):
+        launcher.assemble_project_runtime(
+            spec,
+            lock=lock,
+            settings=settings,
+            environment=_environment(tmp_path, repo),
+            ids=launcher._Ids(),
+            clock=launcher._now,
+            _opened_state=opened,
+        )
+
+    assert closed == []
+    assert lock.release_count == 0
+    opened.store.close()
+    assert closed == [opened.store]
+
+
+def test_successful_three_project_assembly_keeps_project_resources_independent(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    projects = [
+        ("first", _named_repo(tmp_path, "first")),
+        ("second", _named_repo(tmp_path, "second")),
+        ("third", _named_repo(tmp_path, "third")),
+    ]
+    captured: dict[str, object] = {}
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        captured["settings"] = app.state.launcher_settings
+        captured["registry"] = app.state.project_registry
+        captured["hub_store"] = app.state.hub_store
+        captured["orchestrator"] = app.state.hub_orchestrator
+        runtimes = app.state.project_registry.projects()
+        captured["runtimes"] = runtimes
+        assert len(runtimes) == 3
+        for attribute in (
+            "store", "tracker", "runner", "fable", "sol", "coordinator",
+            "broadcaster", "lock",
+        ):
+            assert len({id(getattr(runtime, attribute)) for runtime in runtimes}) == 3
+        assert len({runtime.spec.state_dir / "artifacts" for runtime in runtimes}) == 3
+        assert all((runtime.spec.state_dir / "artifacts").is_dir() for runtime in runtimes)
+
+    assert main(
+        _project_args(projects, tools),
+        environ=_environment(tmp_path, projects[0][1]),
+        stdout=io.StringIO(),
+        uvicorn_run=run_uvicorn,
+    ) == 0
+
+    assert captured["settings"].projects == tuple(
+        runtime.spec for runtime in captured["runtimes"]
+    )
+    assert captured["hub_store"] is not captured["runtimes"][0].store
+    assert captured["orchestrator"]._registry is captured["registry"]
+
+
+def test_main_builds_the_actual_project_aware_boundary_from_assembled_hub_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing the hub app with the legacy wrapper would lose this boundary."""
+    import agent_bridge.app as web
+
+    tools = _fake_tools(tmp_path)
+    projects = [
+        ("first", _named_repo(tmp_path, "first")),
+        ("second", _named_repo(tmp_path, "second")),
+    ]
+    factory_calls: list[dict[str, object]] = []
+    created_hub_stores: list[object] = []
+    original_hub_factory = web.create_hub_app
+
+    class ThreadSafeHubStore:
+        def __init__(self, path: Path, *, clock: object) -> None:
+            self.acknowledged = False
+            self.close_calls = 0
+            created_hub_stores.append(self)
+
+        def usage_credits_acknowledged(self) -> bool:
+            return self.acknowledged
+
+        def acknowledge_usage_credits(self) -> None:
+            self.acknowledged = True
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def build_hub_app(**kwargs: object):
+        factory_calls.append(kwargs)
+        return original_hub_factory(**kwargs)  # type: ignore[arg-type]
+
+    def legacy_app_is_for_compatibility_only(**kwargs: object) -> object:
+        raise AssertionError("launcher must not create the legacy wrapper")
+
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", ThreadSafeHubStore)
+    monkeypatch.setattr(web, "create_hub_app", build_hub_app)
+    monkeypatch.setattr(web, "create_app", legacy_app_is_for_compatibility_only)
+    captured: dict[str, object] = {}
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        captured["app"] = app
+        runtimes = app.state.project_registry.projects()
+        primary = runtimes[0]
+        direct_calls: list[object] = []
+        prepared: list[object] = []
+        original_prepare = app.state.hub_orchestrator.prepare_new_request
+
+        async def direct_legacy_call(*args: object, **kwargs: object) -> object:
+            direct_calls.append((args, kwargs))
+            raise AssertionError("hub mutation must not call primary legacy entrypoint")
+
+        async def record_preparation(**kwargs: object) -> object:
+            prepared_action = await original_prepare(**kwargs)
+            prepared.append(prepared_action)
+            return prepared_action
+
+        async def abort_after_scheduling(prepared_action: object) -> None:
+            app.state.hub_orchestrator.abort_prepared(
+                prepared_action, reason="test scheduler"
+            )
+
+        primary.coordinator.handle_user_request = direct_legacy_call
+        app.state.hub_orchestrator.prepare_new_request = record_preparation
+        app.state.hub_orchestrator.run = abort_after_scheduling
+        with TestClient(app) as client:
+            assert client.get(f"/?key={factory_calls[0]['session_key']}", follow_redirects=False).status_code == 303
+            projects_response = client.get("/api/projects")
+            assert projects_response.status_code == 200
+            assert [item["project_id"] for item in projects_response.json()["projects"]] == [
+                runtime.project_id for runtime in runtimes
+            ]
+            assert client.post(
+                "/api/settings/usage-credits-acknowledgement",
+                json={"acknowledged": True},
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            ).status_code == 202
+            project_id = primary.project_id
+            created = client.post(
+                f"/api/projects/{project_id}/chats",
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            )
+            assert created.status_code == 201
+            session_id = created.json()["session_id"]
+            accepted = client.post(
+                f"/api/projects/{project_id}/chats/{session_id}/messages",
+                json={"text": "route through the hub"},
+                headers={"X-CSRF-Token": factory_calls[0]["csrf_token"]},
+            )
+            assert accepted.status_code == 202
+            deadline = time.monotonic() + 1
+            while not prepared and time.monotonic() < deadline:
+                time.sleep(0.005)
+        assert direct_calls == []
+        assert len(prepared) == 1
+        assert prepared[0].token.project_id == project_id
+        assert prepared[0].token.session_id == session_id
+
+    assert main(
+        _project_args(projects, tools),
+        environ=_environment(tmp_path, projects[0][1]),
+        stdout=io.StringIO(),
+        uvicorn_run=run_uvicorn,
+    ) == 0
+
+    assert len(factory_calls) == 1
+    arguments = factory_calls[0]
+    app = captured["app"]
+    assert arguments["registry"] is app.state.project_registry
+    assert arguments["hub_store"] is app.state.hub_store
+    assert arguments["workflows"] is app.state.hub_orchestrator
+    assert arguments["static_dir"] == Path(launcher.__file__).resolve().parent / "static"
+    assert len(created_hub_stores) == 1
+    assert created_hub_stores[0].close_calls == 1
+
+
+@pytest.mark.parametrize("foreground_failure", (False, True))
+def test_main_closes_hub_registry_and_store_once_after_foreground_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreground_failure: bool,
+) -> None:
+    """A factory cutover must not duplicate or skip existing ownership cleanup."""
+    import agent_bridge.hub as hub
+
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    stores: list[object] = []
+    closed_registries: list[object] = []
+    original_registry_close = hub.ProjectRegistry.close
+
+    class RecordingHubStore:
+        def __init__(self, path: Path, *, clock: object) -> None:
+            self.close_calls = 0
+            stores.append(self)
+
+        def usage_credits_acknowledged(self) -> bool:
+            return False
+
+        def acknowledge_usage_credits(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def close_registry(registry: object) -> None:
+        closed_registries.append(registry)
+        original_registry_close(registry)
+
+    def run_uvicorn(*args: object, **kwargs: object) -> None:
+        if foreground_failure:
+            raise RuntimeError("injected foreground failure")
+
+    monkeypatch.setattr("agent_bridge.hub_store.HubStore", RecordingHubStore)
+    monkeypatch.setattr(hub.ProjectRegistry, "close", close_registry)
+    if foreground_failure:
+        with pytest.raises(RuntimeError, match="foreground failure"):
+            main(
+                _args(repo, tools),
+                environ=_environment(tmp_path, repo),
+                stdout=io.StringIO(),
+                uvicorn_run=run_uvicorn,
+            )
+    else:
+        assert main(
+            _args(repo, tools),
+            environ=_environment(tmp_path, repo),
+            stdout=io.StringIO(),
+            uvicorn_run=run_uvicorn,
+        ) == 0
+    assert len(closed_registries) == 1
+    assert len(stores) == 1
+    assert stores[0].close_calls == 1
+
+
+def test_hub_acknowledgement_does_not_copy_the_legacy_project_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    legacy_state = tmp_path / "state" / "agent-bridge" / "repo"
+    legacy_state.mkdir(parents=True)
+    store = SQLiteStore(legacy_state / "bridge.sqlite3")
+    store.create_session("session-1", str(repo))
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.set_setting("usage_credits_acknowledged", True)
+    store.close()
+    captured: dict[str, object] = {}
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        captured["hub_acknowledged"] = app.state.hub_store.usage_credits_acknowledged()
+        primary = app.state.project_registry.projects()[0]
+        captured["project_acknowledged"] = (
+            primary.store.get_setting("usage_credits_acknowledged")
+        )
+
+    assert main(
+        _args(repo, tools),
+        environ=_environment(tmp_path, repo),
+        stdout=io.StringIO(),
+        uvicorn_run=run_uvicorn,
+    ) == 0
+
+    assert captured == {
+        "hub_acknowledged": False,
+        "project_acknowledged": True,
+    }
+
+
+def test_structured_auth_failure_invalidates_only_its_runtime_and_reprobes_at_hub_boundary(
+    tmp_path: Path,
+) -> None:
+    tools = _fake_tools(tmp_path)
+    projects = [
+        ("first", _named_repo(tmp_path, "first")),
+        ("second", _named_repo(tmp_path, "second")),
+    ]
+    observed: dict[str, object] = {}
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        runtimes = app.state.project_registry.projects()
+        failed_runtime, unaffected_runtime = runtimes
+        failed_runtime.fable._env["AGENT_BRIDGE_TEST_AUTH"] = "invalid"
+        session_id = launcher._active_session(
+            failed_runtime.store, failed_runtime.spec.repo_root,
+        )
+        with pytest.raises(SubscriptionAuthError):
+            asyncio.run(failed_runtime.coordinator.handle_user_request(session_id, "Plan work"))
+        observed["failed_after_execution"] = failed_runtime.readiness.snapshot()
+        observed["unaffected_after_execution"] = unaffected_runtime.readiness.snapshot()
+        fable_probe = failed_runtime.fable.preflight
+        probe_count = 0
+
+        async def counted_fable_probe():
+            nonlocal probe_count
+            probe_count += 1
+            return await fable_probe()
+
+        failed_runtime.fable.preflight = counted_fable_probe
+        app.state.hub_store.acknowledge_usage_credits()
+        with pytest.raises(RuntimeError, match="model runtime is not ready"):
+            asyncio.run(app.state.hub_orchestrator.prepare_new_request(
+                project_id=failed_runtime.project_id,
+                session_id=session_id,
+                text="Plan again",
+                ids=launcher._Ids(),
+            ))
+        observed["failed_after_reprobe"] = failed_runtime.readiness.snapshot()
+        observed["unaffected_after_reprobe"] = unaffected_runtime.readiness.snapshot()
+        observed["failed_probe_count"] = probe_count
+
+    assert main(
+        _project_args(projects, tools),
+        environ=_environment(tmp_path, projects[0][1]),
+        stdout=io.StringIO(),
+        uvicorn_run=run_uvicorn,
+    ) == 0
+
+    assert observed["failed_after_execution"].fable_status == "subscription_unavailable"
+    assert observed["failed_after_reprobe"].fable_status == "subscription_unavailable"
+    assert observed["unaffected_after_execution"].fable_status == "subscription_ready"
+    assert observed["unaffected_after_reprobe"].fable_status == "subscription_ready"
+    assert observed["failed_probe_count"] == 1

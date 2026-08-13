@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
+import stat
 from uuid import UUID
 
 from agent_bridge.adapters.base import AgentRunResult
@@ -35,6 +36,172 @@ _AUDIT_ITEM_STATUSES = frozenset({
     "in_progress",
     "interrupted",
 })
+MAX_CODEX_AUDIT_EVENTS = 1_024
+_SOL_SCHEMA_FILENAME = "sol-outcome.json"
+_SOL_SCHEMA_MEMFD_NAME = "agent-bridge-sol-schema"
+_REQUIRED_SOL_SCHEMA_SEALS = (
+    fcntl.F_SEAL_WRITE
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_SEAL
+)
+
+
+def _serialized_sol_outcome_schema() -> bytes:
+    return json.dumps(
+        SOL_OUTCOME_SCHEMA,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _validated_sol_schema_file_descriptor(descriptor: int) -> None:
+    """Fail closed unless *descriptor* is the exact read-only schema file."""
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+    try:
+        if fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+        entry = os.fstat(descriptor)
+        expected = _serialized_sol_outcome_schema()
+        if not stat.S_ISREG(entry.st_mode) or entry.st_size != len(expected):
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+        duplicate = os.dup(descriptor)
+        try:
+            contents = os.pread(duplicate, len(expected) + 1, 0)
+        finally:
+            os.close(duplicate)
+        if contents != expected:
+            raise ValueError("schema_file_fd must be an open read-only schema file descriptor")
+    except OSError as error:
+        raise ValueError("schema_file_fd must be an open read-only schema file descriptor") from error
+
+
+def _validated_sealed_sol_schema_memfd(descriptor: int) -> None:
+    _validated_sol_schema_file_descriptor(descriptor)
+    try:
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o400:
+            raise ValueError("Sol schema memfd must be sealed read-only canonical data")
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != _REQUIRED_SOL_SCHEMA_SEALS:
+            raise ValueError("Sol schema memfd must be sealed read-only canonical data")
+    except OSError as error:
+        raise ValueError("Sol schema memfd must be sealed read-only canonical data") from error
+
+
+def _validated_sol_schema_directory_descriptor(descriptor: int) -> None:
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        raise ValueError("schema directory descriptor must be an open directory descriptor")
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError("schema directory descriptor must be an open directory descriptor")
+    except OSError as error:
+        raise ValueError("schema directory descriptor must be an open directory descriptor") from error
+
+
+def materialize_sol_schema_file(directory_fd: int) -> int:
+    """Atomically return one caller-owned, authenticated schema-file descriptor."""
+    _validated_sol_schema_directory_descriptor(directory_fd)
+    expected = _serialized_sol_outcome_schema()
+    write_descriptor = -1
+    schema_file_descriptor = -1
+    temporary_name: str | None = None
+    try:
+        temporary_name = f".{_SOL_SCHEMA_FILENAME}-{os.urandom(16).hex()}.tmp"
+        write_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(write_descriptor, 0o600)
+        written = 0
+        while written < len(expected):
+            count = os.write(write_descriptor, expected[written:])
+            if count <= 0:
+                raise OSError("schema write did not make progress")
+            written += count
+        os.fsync(write_descriptor)
+        os.close(write_descriptor)
+        write_descriptor = -1
+        os.replace(
+            temporary_name,
+            _SOL_SCHEMA_FILENAME,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
+        schema_file_descriptor = os.open(
+            _SOL_SCHEMA_FILENAME,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        _validated_sol_schema_file_descriptor(schema_file_descriptor)
+        result = schema_file_descriptor
+        schema_file_descriptor = -1
+        return result
+    except OSError as error:
+        raise ValueError("Sol schema file could not be materialized") from error
+    finally:
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if schema_file_descriptor >= 0:
+            os.close(schema_file_descriptor)
+
+
+def _create_sealed_sol_schema_memfd() -> int:
+    """Create one adapter-owned sealed anonymous schema descriptor."""
+    expected = _serialized_sol_outcome_schema()
+    writable_descriptor = -1
+    readonly_descriptor = -1
+    try:
+        writable_descriptor = os.memfd_create(
+            _SOL_SCHEMA_MEMFD_NAME,
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        written = 0
+        while written < len(expected):
+            count = os.write(writable_descriptor, expected[written:])
+            if count <= 0:
+                raise OSError("schema write did not make progress")
+            written += count
+        os.fchmod(writable_descriptor, 0o400)
+        os.fsync(writable_descriptor)
+        fcntl.fcntl(
+            writable_descriptor,
+            fcntl.F_ADD_SEALS,
+            _REQUIRED_SOL_SCHEMA_SEALS,
+        )
+        readonly_descriptor = os.open(
+            f"/proc/self/fd/{writable_descriptor}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        _validated_sealed_sol_schema_memfd(readonly_descriptor)
+        os.close(writable_descriptor)
+        writable_descriptor = -1
+        result = readonly_descriptor
+        readonly_descriptor = -1
+        return result
+    except OSError as error:
+        raise ValueError("Sol schema memfd could not be created") from error
+    finally:
+        if readonly_descriptor >= 0:
+            os.close(readonly_descriptor)
+        if writable_descriptor >= 0:
+            os.close(writable_descriptor)
 
 
 class CodexRunError(RuntimeError):
@@ -75,6 +242,7 @@ class CodexCLI:
         repo_root: str | Path,
         schema_dir: str | Path,
         env: Mapping[str, str] | None = None,
+        schema_file_fd: int | None = None,
     ) -> None:
         executable_path = Path(executable)
         if not executable_path.is_absolute():
@@ -91,8 +259,11 @@ class CodexCLI:
         self._runner = runner
         self.repo_root = repo_root_path
         self._env = dict(os.environ if env is None else env)
-        self.schema_path = schema_dir_path / "sol-outcome.json"
-        self._materialize_schema()
+        self.schema_path = schema_dir_path / _SOL_SCHEMA_FILENAME
+        if schema_file_fd is None:
+            self._materialize_schema()
+        else:
+            _validated_sol_schema_file_descriptor(schema_file_fd)
 
     async def start(
         self, *, run_id: str, brief: TaskBrief, context: str,
@@ -100,69 +271,72 @@ class CodexCLI:
         if not isinstance(brief, TaskBrief):
             raise ValueError("brief must be a TaskBrief")
         prompt = self._start_prompt(brief, context)
-        argv = (
-            str(self.executable),
-            "exec", "--json",
-            "--model", "gpt-5.6-sol",
-            "--sandbox", "workspace-write",
-            "--approve-for-me",
-            "--cd", str(self.repo_root),
-            "--output-schema", str(self.schema_path),
-            prompt,
-        )
-        return await self._run_contract(
+        return await self._run_with_sealed_schema(
             run_id=run_id,
-            argv=argv,
             expected_thread_id=None,
+            build_argv=lambda schema_path: (
+                str(self.executable),
+                "exec", "--json",
+                "--model", "gpt-5.6-sol",
+                "--sandbox", "workspace-write",
+                "--approve-for-me",
+                "--cd", str(self.repo_root),
+                "--output-schema", schema_path,
+                prompt,
+            ),
         )
 
     async def resume(
         self, *, run_id: str, thread_id: str, prompt: str,
     ) -> AgentRunResult:
         thread_id = self._canonical_thread_id(thread_id)
-        argv = (
-            str(self.executable),
-            "exec", "resume", "--json",
-            "--model", "gpt-5.6-sol",
-            "--output-schema", str(self.schema_path),
-            thread_id,
-            self._resume_prompt(prompt),
-        )
-        return await self._run_contract(
+        return await self._run_with_sealed_schema(
             run_id=run_id,
-            argv=argv,
             expected_thread_id=thread_id,
+            build_argv=lambda schema_path: (
+                str(self.executable),
+                "exec", "resume", "--json",
+                "--model", "gpt-5.6-sol",
+                "--output-schema", schema_path,
+                thread_id,
+                self._resume_prompt(prompt),
+            ),
         )
 
     def _materialize_schema(self) -> None:
         schema_dir = self.schema_path.parent
         schema_dir.mkdir(parents=True, exist_ok=True)
-        serialized = json.dumps(
-            SOL_OUTCOME_SCHEMA,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=schema_dir,
-            prefix=".sol-outcome-",
-            suffix=".tmp",
-        )
-        temporary_path = Path(temporary_name)
+        directory_descriptor = -1
+        schema_file_descriptor = -1
         try:
-            os.chmod(temporary_path, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = -1
-                handle.write(serialized)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self.schema_path)
+            directory_descriptor = os.open(
+                schema_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+            schema_file_descriptor = materialize_sol_schema_file(directory_descriptor)
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+            if schema_file_descriptor >= 0:
+                os.close(schema_file_descriptor)
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+
+    async def _run_with_sealed_schema(
+        self,
+        *,
+        run_id: str,
+        expected_thread_id: str | None,
+        build_argv: Callable[[str], tuple[str, ...]],
+    ) -> AgentRunResult:
+        schema_file_descriptor = _create_sealed_sol_schema_memfd()
+        try:
+            return await self._run_contract(
+                run_id=run_id,
+                argv=build_argv(f"/proc/self/fd/{schema_file_descriptor}"),
+                expected_thread_id=expected_thread_id,
+                pass_fds=(schema_file_descriptor,),
+            )
+        finally:
+            os.close(schema_file_descriptor)
 
     async def _run_contract(
         self,
@@ -170,15 +344,19 @@ class CodexCLI:
         run_id: str,
         argv: tuple[str, ...],
         expected_thread_id: str | None,
+        pass_fds: tuple[int, ...] = (),
     ) -> AgentRunResult:
-        process = await self._runner.run(
-            run_id=run_id,
-            argv=argv,
-            cwd=self.repo_root,
-            env=self._env,
-            stdin=None,
-            on_line=lambda stream, line: None,
-        )
+        process_arguments: dict[str, object] = {
+            "run_id": run_id,
+            "argv": argv,
+            "cwd": self.repo_root,
+            "env": self._env,
+            "stdin": None,
+            "on_line": lambda stream, line: None,
+        }
+        if pass_fds:
+            process_arguments["pass_fds"] = pass_fds
+        process = await self._runner.run(**process_arguments)
         try:
             parsed = self._parse_events(process.stdout, interrupted=process.interrupted)
         except _EventParseError as error:
@@ -279,6 +457,7 @@ class CodexCLI:
         lines: tuple[str, ...], *, interrupted: bool,
     ) -> _ParsedEvents:
         events: list[Mapping[str, object]] = []
+        dropped_audit_events = 0
         thread_id: str | None = None
         final_message: str | None = None
         for line in lines:
@@ -360,7 +539,18 @@ class CodexCLI:
                 frozen = freeze_json(audit_event)
                 if not isinstance(frozen, Mapping):
                     raise RuntimeError("audit event normalization did not produce an object")
-                events.append(frozen)
+                if len(events) < MAX_CODEX_AUDIT_EVENTS - 1:
+                    events.append(frozen)
+                else:
+                    dropped_audit_events += 1
+        if dropped_audit_events:
+            summary = freeze_json({
+                "type": "audit_events_truncated",
+                "dropped_count": dropped_audit_events,
+            })
+            if not isinstance(summary, Mapping):
+                raise RuntimeError("audit event normalization did not produce an object")
+            events.append(summary)
         return _ParsedEvents(
             audit_events=tuple(events),
             thread_id=thread_id,

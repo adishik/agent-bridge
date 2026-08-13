@@ -17,11 +17,30 @@
     <header id="app-header">
       <div class="brand-block">
         <strong>Agent Bridge</strong>
-        <span id="repository-status">Repository: checking · Branch: checking</span>
+        <span id="repository-status">Project: checking · Branch: checking</span>
         <span id="repository-authority-note" class="repository-authority-note">
           Selected at server startup. Messages cannot change repository authority.
         </span>
       </div>
+      <nav id="project-navigation" class="project-navigation" aria-label="Projects and chats">
+        <div class="project-navigation-group">
+          <p class="project-navigation-label">
+            Project <strong id="selected-project-name">No project selected</strong>
+          </p>
+          <ul id="project-list" class="project-navigation-list" aria-label="Projects"></ul>
+        </div>
+        <div class="project-navigation-group">
+          <div class="project-navigation-chat-heading">
+            <p class="project-navigation-label">
+              Chat <strong id="selected-chat-name">No chat selected</strong>
+            </p>
+            <button id="new-chat" class="button button-quiet" type="button" disabled>
+              New Chat
+            </button>
+          </div>
+          <ul id="chat-list" class="project-navigation-list" aria-label="Chats"></ul>
+        </div>
+      </nav>
       <div class="header-statuses" aria-label="Bridge status">
         <span id="connection-status" class="status-pill status-checking">
           Connection · checking

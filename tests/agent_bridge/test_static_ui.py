@@ -992,3 +992,427 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
     assert ".message-fable" in styles
     assert ".message-sol" in styles
     assert ".message-coordinator" in styles
+
+
+def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert {
+        "project-navigation",
+        "project-list",
+        "chat-list",
+        "new-chat",
+        "selected-project-name",
+        "selected-chat-name",
+    } <= rendered.ids
+    assert rendered.element("nav", "project-navigation")["aria-label"] == "Projects and chats"
+    assert rendered.element("ul", "project-list")["aria-label"] == "Projects"
+    assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
+    assert rendered.element("button", "new-chat")["type"] == "button"
+    assert rendered.element("button", "new-chat")["disabled"] is None
+    assert rendered.element("section", "conversation")["id"] == "conversation"
+    assert rendered.element("aside", "task-inspector")["id"] == "task-inspector"
+    assert "Fable" in " ".join(rendered.text)
+    assert "Sol" in " ".join(rendered.text)
+    assert not any(
+        tag == "input" and "path" in " ".join(
+            value or "" for value in attrs.values()
+        ).lower()
+        for tag, attrs in rendered.elements
+    )
+
+
+def test_project_chat_controller_scopes_selection_routes_and_stream_lifecycle() -> None:
+    harness = r"""
+      const calls = [];
+      const replies = new Map([
+        ["GET /api/projects", [
+          {csrf_token: "csrf", projects: [
+            {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "project-b", label: "Beta", branch: "release", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ], active_lease: null},
+          {csrf_token: "csrf", projects: [
+            {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "project-b", label: "Beta", branch: "release", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ], active_lease: null},
+        ]],
+        ["GET /api/projects/project-a/chats?limit=50", [
+          {chats: [
+            {session_id: "shared-chat", title: "Shared Alpha", latest_sequence: 0},
+            {session_id: "old-chat", title: "Old Alpha", latest_sequence: 0},
+          ]},
+        ]],
+        ["GET /api/projects/project-a/chats/shared-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 2, tasks: []},
+        ]],
+        ["GET /api/projects/project-a/chats/old-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "old-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []},
+        ]],
+        ["POST /api/projects/project-a/chats", [
+          {session_id: "random-chat-99", title: "New chat", latest_sequence: 0},
+        ]],
+        ["GET /api/projects/project-a/chats/random-chat-99/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-a", session_id: "random-chat-99", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []},
+        ]],
+        ["GET /api/projects/project-b/chats?limit=50", [
+          {chats: [{session_id: "shared-chat", title: "Shared Beta", latest_sequence: 0}]},
+        ]],
+        ["GET /api/projects/project-b/chats/shared-chat/bootstrap", [
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-b", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "release", replay_after: 0, tasks: []},
+          {csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "project-b", session_id: "shared-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "release", replay_after: 7, tasks: []},
+        ]],
+      ]);
+      const fetchFunction = async (url, options = {}) => {
+        const key = `${options.method ?? "GET"} ${url}`;
+        calls.push({url, options});
+        const reply = replies.get(key)?.shift();
+        if (!reply) throw new Error(`unexpected ${key}`);
+        return {ok: true, status: options.method === "POST" ? 201 : 200, json: async () => reply};
+      };
+      const sockets = [];
+      class Socket {
+        constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        emit(kind, value = {}) { return this.listeners[kind]?.(value); }
+        close() { this.closed = true; }
+      }
+      const timers = [];
+      const cancelled = [];
+      const states = [];
+      const chatResets = [];
+      const controller = bridge.createProjectChatController({
+        fetchFunction,
+        WebSocketCtor: Socket,
+        schedule(callback, delay) { timers.push({callback, delay}); return timers.length; },
+        cancelSchedule(timer) { cancelled.push(timer); },
+        location: {protocol: "https:", host: "bridge.test"},
+        onState(state) { states.push(state); },
+        onEvent() {},
+        onStatus() {},
+        onChatReset() { chatResets.push("reset"); },
+      });
+
+      await controller.bootstrapInitial();
+      if (controller.state.projectId !== "project-a" || controller.state.sessionId !== "shared-chat") process.exit(2);
+      if (sockets.length !== 1 || !sockets[0].url.includes("project_id=project-a") || !sockets[0].url.includes("session_id=shared-chat") || !sockets[0].url.endsWith("after=2")) process.exit(3);
+
+      await controller.selectChat("project-a", "old-chat");
+      if (!sockets[0].closed || controller.state.sessionId !== "old-chat" || controller.state.lastSequence !== 0) process.exit(4);
+
+      await controller.createChat();
+      if (controller.state.sessionId !== "random-chat-99" || !calls.some((call) => call.url === "/api/projects/project-a/chats" && call.options.headers["X-CSRF-Token"] === "csrf")) process.exit(5);
+      if (sockets.filter((socket) => socket.closed).length !== 2) process.exit(6);
+
+      await controller.selectProject("project-b");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "shared-chat") process.exit(7);
+      if (!sockets[2].closed || !sockets[3].url.includes("project_id=project-b") || !sockets[3].url.includes("session_id=shared-chat")) process.exit(8);
+      if (chatResets.length !== 3) process.exit(20);
+
+      sockets[3].emit("message", {data: JSON.stringify({sequence: 7, task_id: null, payload: {text: "safe"}})});
+      sockets[3].emit("close");
+      if (timers.length !== 1 || timers[0].delay !== 500) process.exit(9);
+      timers[0].callback();
+      if (sockets.length !== 5 || !sockets[4].url.endsWith("after=7")) process.exit(10);
+      await sockets[4].emit("open");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "shared-chat" || controller.state.lastSequence !== 7) process.exit(11);
+      if (cancelled.length !== 0 || states.some((state) => state.projectId === "project-a" && state.sessionId === "shared-chat" && state.lastSequence === 7)) process.exit(12);
+
+      if (bridge.projectChatMessagePath("project:a", "chat.2") !== "/api/projects/project%3Aa/chats/chat.2/messages") process.exit(13);
+      if (bridge.projectTaskActionPath("project-a", "chat-a", "task-a", "approve") !== "/api/projects/project-a/chats/chat-a/tasks/task-a/approve") process.exit(14);
+      if (bridge.projectWebsocketPath("project-a", "chat-a", 9) !== "/ws?project_id=project-a&session_id=chat-a&after=9") process.exit(15);
+      let unsafeRejected = false;
+      try { bridge.projectChatBootstrapPath("project-a", "chat/escape"); } catch { unsafeRejected = true; }
+      if (!unsafeRejected) process.exit(16);
+
+      class Node {
+        constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.disabled = false; this._text = ""; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        replaceChildren(...children) { this.children = [...children]; this._text = ""; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener() {}
+      }
+      const projectList = new Node("ul");
+      const chatList = new Node("ul");
+      const newChat = new Node("button");
+      const selectedProject = new Node("strong");
+      const selectedChat = new Node("strong");
+      const roots = {
+        "#project-list": projectList, "#chat-list": chatList, "#new-chat": newChat,
+        "#selected-project-name": selectedProject, "#selected-chat-name": selectedChat,
+      };
+      const documentRoot = {
+        createElement(tag) { return new Node(tag); },
+        querySelector(selector) { return roots[selector] ?? null; },
+      };
+      bridge.renderProjectNavigation(documentRoot, {
+        projectId: "project-0", projectLabel: "<script>Alpha</script>", sessionId: "chat-0",
+        projects: Array.from({length: bridge.MAX_NAV_PROJECTS + 5}, (_, index) => ({projectId: `project-${index}`, label: index === 0 ? "<script>Alpha</script>" : `Project ${index}`})),
+        chats: Array.from({length: bridge.MAX_NAV_CHATS + 5}, (_, index) => ({sessionId: `chat-${index}`, title: index === 0 ? "<img>" : `Chat ${index}`})),
+        activeLease: {projectId: "project-0", sessionId: "chat-0", taskId: "task-0"},
+        csrfToken: "csrf",
+      }, {onProject() {}, onChat() {}, onNewChat() {}});
+      if (projectList.children.length !== bridge.MAX_NAV_PROJECTS || chatList.children.length !== bridge.MAX_NAV_CHATS) process.exit(17);
+      if (!newChat.disabled || projectList.children.some((item) => !item.children[0].disabled) || chatList.children.some((item) => !item.children[0].disabled)) process.exit(18);
+      if (selectedProject.textContent !== "<script>Alpha</script>" || selectedChat.textContent !== "<img>") process.exit(19);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_controller_keeps_empty_chat_csrf_selection_refresh_and_focus_safe() -> None:
+    harness = r"""
+      const payloads = {
+        empty: {
+          csrf_token: "csrf-empty",
+          projects: [
+            {project_id: "empty", label: "Empty", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "other", label: "Other", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ],
+          active_lease: null,
+        },
+        leased: {
+          csrf_token: "csrf-empty",
+          projects: [
+            {project_id: "empty", label: "Empty", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+            {project_id: "other", label: "Other", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          ],
+          active_lease: {project_id: "other", session_id: "other-chat", task_id: "task-1"},
+        },
+      };
+      const projectRequests = [];
+      const deferredCreates = [];
+      const flush = async () => { for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); };
+      const fetchFunction = (url, options = {}) => {
+        if (url === "/api/projects") {
+          return new Promise((resolve) => projectRequests.push(resolve));
+        }
+        if (url === "/api/projects/empty/chats?limit=50") {
+          return Promise.resolve({ok: true, status: 200, json: async () => ({chats: []})});
+        }
+        if (url === "/api/projects/other/chats?limit=50") {
+          return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "other-chat", title: "Other chat", latest_sequence: 0}]})});
+        }
+        if (url === "/api/projects/other/chats/other-chat/bootstrap") {
+          return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-empty", usage_credits_acknowledged: true, project_id: "other", session_id: "other-chat", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []})});
+        }
+        if (url === "/api/projects/empty/chats" && options.method === "POST") {
+          return new Promise((resolve) => deferredCreates.push(resolve));
+        }
+        throw new Error(`unexpected ${options.method ?? "GET"} ${url}`);
+      };
+      const sockets = [];
+      class Socket {
+        constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket, schedule() { return 1; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      const initial = controller.bootstrapInitial();
+      if (projectRequests.length !== 1) process.exit(2);
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.empty});
+      await initial;
+      if (controller.state.projectId !== "empty" || controller.state.sessionId !== null || controller.state.csrfToken !== "csrf-empty") process.exit(3);
+
+      const create = controller.createChat();
+      if (deferredCreates.length !== 1) process.exit(4);
+      const switchProject = controller.selectProject("other");
+      await switchProject;
+      deferredCreates.shift()({ok: true, status: 201, json: async () => ({session_id: "late-empty", title: "Late empty", latest_sequence: 0})});
+      await create;
+      if (controller.state.projectId !== "other" || controller.state.sessionId !== "other-chat" || sockets.length !== 1 || !sockets[0].url.includes("project_id=other")) process.exit(5);
+
+      const refreshOne = controller.refreshProjects();
+      const refreshTwo = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(6);
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.leased});
+      await flush();
+      if (controller.state.activeLease !== null || projectRequests.length !== 1) process.exit(7);
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.empty});
+      await Promise.all([refreshOne, refreshTwo]);
+      if (controller.state.activeLease !== null || controller.state.navigationLocked !== false) process.exit(8);
+
+      const malformed = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({csrf_token: "csrf-empty", projects: payloads.empty.projects, active_lease: {project_id: "not a safe id"}})});
+      await malformed;
+      if (controller.state.navigationLocked !== true || controller.state.activeLease !== null) process.exit(9);
+
+      const missingLease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({csrf_token: "csrf-empty", projects: payloads.empty.projects})});
+      await missingLease;
+      if (controller.state.navigationLocked !== true || controller.state.activeLease !== null) process.exit(19);
+
+      const malformedCsrf = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({csrf_token: "bad\ncsrf", projects: payloads.empty.projects, active_lease: null})});
+      await malformedCsrf;
+      if (controller.state.navigationLocked !== true || controller.state.csrfToken !== "") process.exit(27);
+
+      const recovered = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.empty});
+      await recovered;
+      if (controller.state.navigationLocked !== false || controller.state.activeLease !== null) process.exit(20);
+
+      const oldReleased = controller.refreshProjects();
+      const newerLeased = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(21);
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.empty});
+      await flush();
+      if (controller.state.activeLease !== null || projectRequests.length !== 1) process.exit(22);
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.leased});
+      await Promise.all([oldReleased, newerLeased]);
+      if (controller.state.activeLease?.projectId !== "other" || controller.state.navigationLocked !== false) process.exit(23);
+
+      const malformedLiveLease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({csrf_token: "csrf-empty", projects: payloads.empty.projects, active_lease: {project_id: "not a safe id"}})});
+      await malformedLiveLease;
+      if (controller.state.navigationLocked !== true || controller.state.activeLease?.projectId !== "other") process.exit(28);
+
+      const failedRefresh = controller.refreshProjects();
+      projectRequests.shift()({ok: false, status: 503, json: async () => ({})});
+      await failedRefresh;
+      if (controller.state.navigationLocked !== true || controller.state.activeLease?.projectId !== "other") process.exit(24);
+      const recoveredLease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => payloads.empty});
+      await recoveredLease;
+      if (controller.state.navigationLocked !== false || controller.state.activeLease !== null) process.exit(25);
+
+      const sameCreates = [];
+      const sameController = bridge.createProjectChatController({
+        fetchFunction(url, options = {}) {
+          if (url === "/api/projects") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-same", projects: [{project_id: "same", label: "Same", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}}], active_lease: null})});
+          if (url === "/api/projects/same/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "old", title: "Old", latest_sequence: 0}, {session_id: "newer", title: "Newer", latest_sequence: 0}]})});
+          if (url === "/api/projects/same/chats/old/bootstrap" || url === "/api/projects/same/chats/newer/bootstrap") {
+            const sessionId = url.includes("/old/") ? "old" : "newer";
+            return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-same", usage_credits_acknowledged: true, project_id: "same", session_id: sessionId, fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []})});
+          }
+          if (url === "/api/projects/same/chats" && options.method === "POST") return new Promise((resolve) => sameCreates.push(resolve));
+          throw new Error(`unexpected ${options.method ?? "GET"} ${url}`);
+        },
+        WebSocketCtor: Socket, schedule() { return 1; }, cancelSchedule() {}, location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await sameController.bootstrapInitial();
+      const sameCreate = sameController.createChat();
+      await sameController.selectChat("same", "newer");
+      sameCreates.shift()({ok: true, status: 201, json: async () => ({session_id: "late-same", title: "Late same", latest_sequence: 0})});
+      await sameCreate;
+      if (sameController.state.projectId !== "same" || sameController.state.sessionId !== "newer" || sameController.state.lastSequence !== 0) process.exit(26);
+
+      class Node {
+        constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.attributes = {}; this.disabled = false; this._text = ""; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        replaceChildren(...children) { this.children = [...children]; this._text = ""; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener() {}
+      }
+      const projectList = new Node("ul");
+      const chatList = new Node("ul");
+      const newChat = new Node("button");
+      const projectName = new Node("strong");
+      const chatName = new Node("strong");
+      const roots = {"#project-list": projectList, "#chat-list": chatList, "#new-chat": newChat, "#selected-project-name": projectName, "#selected-chat-name": chatName};
+      const documentRoot = {createElement(tag) { return new Node(tag); }, querySelector(selector) { return roots[selector] ?? null; }};
+      const navigationState = {projectId: "empty", projectLabel: "Empty", sessionId: null, csrfToken: "csrf-empty", activeLease: null, navigationLocked: false, navigationPending: false, projects: [{projectId: "empty", label: "Empty"}], chats: []};
+      bridge.renderProjectNavigation(documentRoot, navigationState, {});
+      const focusedButton = projectList.children[0].children[0];
+      bridge.renderProjectNavigation(documentRoot, {...navigationState}, {});
+      if (projectList.children[0].children[0] !== focusedButton || newChat.disabled) process.exit(10);
+      bridge.renderProjectNavigation(documentRoot, {...navigationState, navigationLocked: true}, {});
+      if (!newChat.disabled || !projectList.children[0].children[0].disabled) process.exit(11);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_controller_replaces_invalidated_lease_refresh_before_unlocking() -> None:
+    harness = r"""
+      const released = {
+        csrf_token: "csrf-refresh",
+        usage_credits_acknowledged: true,
+        projects: [
+          {project_id: "project-a", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "project-b", label: "Beta", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ],
+        active_lease: null,
+      };
+      const leased = {
+        ...released,
+        active_lease: {project_id: "project-b", session_id: "chat-b", task_id: "task-b"},
+      };
+      const projectRequests = [];
+      let projectFetches = 0;
+      const flush = async () => { for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); };
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") {
+          projectFetches += 1;
+          if (projectFetches === 1) return Promise.resolve({ok: true, status: 200, json: async () => released});
+          return new Promise((resolve) => projectRequests.push(resolve));
+        }
+        if (url === "/api/projects/project-a/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "Alpha chat", latest_sequence: 0}]})});
+        if (url === "/api/projects/project-b/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "Beta chat", latest_sequence: 0}]})});
+        if (url === "/api/projects/project-a/chats/chat-a/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-refresh", usage_credits_acknowledged: true, project_id: "project-a", session_id: "chat-a", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: []})});
+        if (url === "/api/projects/project-b/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf-refresh", usage_credits_acknowledged: true, project_id: "project-b", session_id: "chat-b", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []})});
+        throw new Error(`unexpected GET ${url}`);
+      };
+      const sockets = [];
+      class Socket {
+        constructor(url) { this.url = url; this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket, schedule() { return 1; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      if (controller.state.projectId !== "project-a" || controller.state.sessionId !== "chat-a" || controller.state.navigationPending) process.exit(2);
+
+      const staleReleased = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(3);
+      await controller.selectProject("project-b");
+      if (controller.state.projectId !== "project-b" || controller.state.sessionId !== "chat-b" || !controller.state.navigationPending) process.exit(4);
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await flush();
+      if (projectRequests.length !== 1 || controller.state.activeLease !== null || !controller.state.navigationPending) process.exit(5);
+      projectRequests.shift()({ok: true, status: 200, json: async () => leased});
+      await staleReleased;
+      if (controller.state.activeLease?.projectId !== "project-b" || controller.state.navigationPending || controller.state.navigationLocked) process.exit(6);
+
+      const staleFailure = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(7);
+      await controller.selectProject("project-a");
+      if (!controller.state.navigationPending) process.exit(8);
+      projectRequests.shift()({ok: true, status: 200, json: async () => leased});
+      await flush();
+      if (projectRequests.length !== 1 || !controller.state.navigationPending) process.exit(9);
+      projectRequests.shift()({ok: false, status: 503, json: async () => ({})});
+      await staleFailure;
+      if (!controller.state.navigationLocked || controller.state.navigationPending) process.exit(10);
+
+      const validRelease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await validRelease;
+      if (controller.state.navigationLocked || controller.state.activeLease !== null || controller.state.navigationPending) process.exit(11);
+
+      const staleMalformed = controller.refreshProjects();
+      if (projectRequests.length !== 1) process.exit(12);
+      await controller.selectProject("project-b");
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await flush();
+      if (projectRequests.length !== 1 || !controller.state.navigationPending) process.exit(13);
+      projectRequests.shift()({ok: true, status: 200, json: async () => ({...released, active_lease: {project_id: "bad id"}})});
+      await staleMalformed;
+      if (!controller.state.navigationLocked || controller.state.navigationPending) process.exit(14);
+
+      const finalRelease = controller.refreshProjects();
+      projectRequests.shift()({ok: true, status: 200, json: async () => released});
+      await finalRelease;
+      const activeSockets = sockets.filter((socket) => !socket.closed);
+      if (controller.state.navigationLocked || controller.state.activeLease !== null || controller.state.navigationPending || activeSockets.length !== 1 || !activeSockets[0].url.includes("project_id=project-b")) process.exit(15);
+    """
+    _run_module_harness(harness)

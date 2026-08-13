@@ -599,3 +599,19 @@ def test_interrupted_resume_rejects_an_observed_different_session(
         _assert_no_secret_sentinel(result)
 
     asyncio.run(scenario())
+
+
+def test_fable_parser_coalesces_a_structural_event_flood_but_keeps_the_result() -> None:
+    """The Fable adapter must retain bounded audit metadata under event flood."""
+    flood = json.dumps({"type": "assistant", "message": {"text": "ignored"}})
+    lines = (
+        json.dumps({"type": "system", "subtype": "init", "session_id": "session-1"}),
+        *(flood for _ in range(1_300)),
+        json.dumps({"type": "result", "structured_output": {}}),
+    )
+
+    parsed = ClaudeCLI._parse_events(lines, interrupted=False)
+
+    assert parsed.result_seen is True
+    assert parsed.structured_output == {}
+    assert len(parsed.audit_events) <= 1_024

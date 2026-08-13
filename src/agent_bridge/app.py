@@ -9,14 +9,14 @@ authenticated bootstrap endpoint.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 import re
 import secrets
 import threading
-from typing import Annotated, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
 
 from fastapi import (
     Depends,
@@ -38,10 +38,17 @@ from agent_bridge.contracts import StreamEvent, TaskBrief
 from agent_bridge.coordinator import Coordinator
 from agent_bridge.store import (
     EVENT_REPLAY_PAGE_SIZE,
+    MAX_CHAT_PAGE_SIZE,
+    ChatCursor,
+    ChatRecord,
     SQLiteStore,
     TaskOverview,
     TaskRecord,
 )
+
+if TYPE_CHECKING:
+    from agent_bridge.hub import HubWorkflowOrchestrator, ProjectRegistry
+    from agent_bridge.hub_store import HubStore
 
 
 SESSION_COOKIE = "agent_bridge_session"
@@ -251,6 +258,20 @@ SocketSessionId = Annotated[
     Query(min_length=1, max_length=128, pattern=_SAFE_ID_PATTERN),
 ]
 ReplayCursor = Annotated[int, Query(ge=0, le=2**53 - 1)]
+ProjectId = Annotated[
+    str,
+    PathParameter(min_length=1, max_length=128, pattern=_SAFE_ID_PATTERN),
+]
+ChatPageLimit = Annotated[int, Query(ge=1, le=MAX_CHAT_PAGE_SIZE)]
+ChatCursorSequence = Annotated[int | None, Query(ge=0, le=2**53 - 1)]
+ChatCursorSession = Annotated[
+    str | None,
+    Query(min_length=1, max_length=128, pattern=_SAFE_ID_PATTERN),
+]
+SocketProjectId = Annotated[
+    str,
+    Query(min_length=1, max_length=128, pattern=_SAFE_ID_PATTERN),
+]
 
 
 _FABLE_STATUSES = frozenset({
@@ -289,6 +310,20 @@ class BootstrapStatus:
                 raise ValueError(f"{name} must be null or a non-empty string")
 
 
+@dataclass(frozen=True, slots=True)
+class CompatibilityProjectRuntime:
+    """One non-owning app-facing projection for the legacy factory."""
+
+    project_id: str
+    label: str
+    repository: str
+    branch: str
+    coordinator: Coordinator
+    store: SQLiteStore
+    broadcaster: EventBroadcaster
+    readiness: object
+
+
 def _require_safe_id(value: str, name: str) -> None:
     if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
         raise ValueError(f"{name} must be a safe identifier")
@@ -313,6 +348,804 @@ def _token_matches(candidate: str | None, expected: bytes) -> bool:
     return secrets.compare_digest(encoded, expected)
 
 
+def create_hub_app(
+    *,
+    registry: ProjectRegistry,
+    hub_store: HubStore,
+    workflows: HubWorkflowOrchestrator,
+    static_dir: str | Path,
+    session_key: str,
+    csrf_token: str,
+) -> FastAPI:
+    """Create the project-scoped authenticated browser application.
+
+    The registry lookup is deliberately the first application operation in
+    every project route.  Session and task identifiers are only meaningful in
+    the selected runtime, so no fallback or hub-wide persistence lookup exists.
+    """
+
+    session_key_bytes = _ascii_token(session_key, "session_key")
+    csrf_token_bytes = _ascii_token(csrf_token, "csrf_token")
+    static_root = Path(static_dir).resolve()
+    index_path = static_root / "index.html"
+    if not static_root.is_dir() or not index_path.is_file():
+        raise ValueError("static_dir must contain index.html")
+
+    def thaw_projection(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: thaw_projection(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return [thaw_projection(item) for item in value]
+        return value
+
+    def task_snapshot(overview: TaskOverview) -> Mapping[str, object]:
+        task = overview.task
+        return {
+            "task_id": task.task_id,
+            "revision": task.revision,
+            "state": task.state.value,
+            "brief": None if task.brief is None else task.brief.to_dict(),
+            "approved_at": task.approved_at,
+            "correction_count": task.correction_count,
+            "continuation_state": (
+                None if task.continuation_state is None else task.continuation_state.value
+            ),
+            "updated_at": overview.updated_at,
+            "active_agent": overview.active_agent,
+            "active_started_at": overview.active_started_at,
+            "revision_start_sequence": overview.revision_start_sequence,
+            "outcome": thaw_projection(overview.outcome),
+            "review": thaw_projection(overview.review),
+            "clarification": thaw_projection(overview.clarification),
+            "activity": thaw_projection(overview.activity),
+        }
+
+    def chat_snapshot(chat: ChatRecord) -> Mapping[str, object]:
+        return {
+            "session_id": chat.session_id,
+            "title": chat.title,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+            "latest_sequence": chat.latest_sequence,
+        }
+
+    @asynccontextmanager
+    async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
+        lifespan_app.state.shutting_down = False
+        try:
+            yield
+        finally:
+            lifespan_app.state.shutting_down = True
+            active = tuple(lifespan_app.state.active_coroutines)
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+                await asyncio.sleep(0)
+                lifespan_app.state.active_coroutines.difference_update(active)
+
+    app = FastAPI(title="Agent Bridge", version="0.1.0", lifespan=lifespan)
+    app.state.active_coroutines = set()
+    app.state.coroutine_observation_failures = []
+    app.state.shutting_down = False
+    app.state.project_registry = registry
+    app.state.hub_store = hub_store
+    app.state.hub_orchestrator = workflows
+
+    def require_session(request: Request) -> None:
+        if not _token_matches(request.cookies.get(SESSION_COOKIE), session_key_bytes):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+
+    def require_mutation(
+        request: Request,
+        x_csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+    ) -> None:
+        require_session(request)
+        if request.query_params:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="mutation query parameters are not accepted",
+            )
+        if not _token_matches(x_csrf_token, csrf_token_bytes):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+
+    def selected_runtime(project_id: str) -> object:
+        """Resolve the opaque project before any caller-controlled identifier."""
+        try:
+            return registry.runtime(project_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="project not found",
+            ) from None
+
+    def selected_chat(runtime: object, session_id: str) -> ChatRecord:
+        chat = runtime.store.chat(session_id)
+        if chat is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="chat not found"
+            )
+        return chat
+
+    def selected_task(runtime: object, session_id: str, task_id: str) -> TaskRecord:
+        task = runtime.store.latest_task(task_id)
+        if task is None or task.session_id != session_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="task not found"
+            )
+        return task
+
+    def workflow_http_error(error: BaseException) -> None:
+        if isinstance(error, LookupError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="chat or task not found"
+            ) from None
+        if isinstance(error, (PermissionError, RuntimeError, ValueError)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="workflow is not currently available",
+            ) from None
+        raise error
+
+    def observe_coroutine(
+        task: asyncio.Task[object],
+        *,
+        runtime: object,
+        session_id: str,
+        task_id: str | None,
+        action: str,
+    ) -> None:
+        app.state.active_coroutines.discard(task)
+        if task.cancelled() and app.state.shutting_down:
+            return
+        try:
+            error = asyncio.CancelledError() if task.cancelled() else task.exception()
+        except BaseException as observation_error:
+            error = observation_error
+        if error is None:
+            return
+        try:
+            runtime.store.append_event(
+                session_id,
+                task_id,
+                "coordinator",
+                "action_error",
+                {"action": action, "error_type": type(error).__name__},
+            )
+        except BaseException as persistence_error:
+            app.state.coroutine_observation_failures.append(
+                {
+                    "stage": "persistence",
+                    "action": action,
+                    "error_type": type(persistence_error).__name__,
+                }
+            )
+
+    def install_action(
+        *,
+        runtime: object,
+        session_id: str,
+        task_id: str | None,
+        action: str,
+        coroutine_factory: Callable[[], Coroutine[object, object, None]],
+    ) -> bool:
+        if app.state.shutting_down:
+            return False
+        coroutine: Coroutine[object, object, None] | None = None
+        try:
+            coroutine = coroutine_factory()
+            task = asyncio.create_task(coroutine, name=f"agent-bridge-{action}")
+        except BaseException:
+            if coroutine is not None:
+                coroutine.close()
+            return False
+        app.state.active_coroutines.add(task)
+        task.add_done_callback(
+            lambda completed: observe_coroutine(
+                completed,
+                runtime=runtime,
+                session_id=session_id,
+                task_id=task_id,
+                action=action,
+            )
+        )
+        return True
+
+    def install_stop_action(
+        *,
+        runtime: object,
+        session_id: str,
+        task_id: str,
+        coroutine_factory: Callable[[], Coroutine[object, object, None]],
+        cancel_reservation: Callable[[], None],
+    ) -> bool:
+        """Install a reserved Stop or synchronously return its exact claim."""
+        if app.state.shutting_down:
+            try:
+                cancel_reservation()
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "stop_reservation", "error_type": type(error).__name__}
+                )
+            return False
+        coroutine: Coroutine[object, object, None] | None = None
+        try:
+            coroutine = coroutine_factory()
+            task = asyncio.create_task(coroutine, name="agent-bridge-stop")
+        except BaseException:
+            if coroutine is not None:
+                coroutine.close()
+            try:
+                cancel_reservation()
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "stop_reservation", "error_type": type(error).__name__}
+                )
+            return False
+        app.state.active_coroutines.add(task)
+        task.add_done_callback(
+            lambda completed: observe_coroutine(
+                completed,
+                runtime=runtime,
+                session_id=session_id,
+                task_id=task_id,
+                action="stop",
+            )
+        )
+        return True
+
+    # This closure deliberately owns only the task it installs.  The workflow
+    # object remains the sole owner of the lease and durable preparation.
+    def install_prepared_action(
+        *,
+        prepared: object,
+        coroutine_factory: Callable[[], Coroutine[object, object, None]],
+        abort: Callable[[object, str], None],
+    ) -> bool:
+        if app.state.shutting_down:
+            try:
+                abort(prepared, "scheduler_unavailable")
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "abort", "error_type": type(error).__name__}
+                )
+            return False
+        coroutine: Coroutine[object, object, None] | None = None
+        try:
+            coroutine = coroutine_factory()
+            task = asyncio.create_task(coroutine, name="agent-bridge-prepared")
+        except BaseException:
+            if coroutine is not None:
+                coroutine.close()
+            try:
+                abort(prepared, "scheduler_unavailable")
+            except BaseException as error:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "abort", "error_type": type(error).__name__}
+                )
+            return False
+        app.state.active_coroutines.add(task)
+        def observe_prepared(completed: asyncio.Task[object]) -> None:
+            app.state.active_coroutines.discard(completed)
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                if not app.state.shutting_down:
+                    app.state.coroutine_observation_failures.append(
+                        {"stage": "prepared", "outcome": "cancelled"}
+                    )
+                return
+            except BaseException as observation_error:
+                error = observation_error
+            if error is not None:
+                app.state.coroutine_observation_failures.append(
+                    {"stage": "prepared", "error_type": type(error).__name__}
+                )
+
+        task.add_done_callback(observe_prepared)
+        return True
+
+    def recoverable_preparation(prepared: object) -> HTTPException:
+        preparation_id = getattr(prepared, "preparation_id", None)
+        token = getattr(prepared, "token", None)
+        project_id = getattr(token, "project_id", getattr(prepared, "project_id", None))
+        session_id = getattr(token, "session_id", getattr(prepared, "session_id", None))
+        task_id = getattr(token, "task_id", getattr(prepared, "task_id", None))
+        revision = getattr(prepared, "revision", None)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "state": "recoverable",
+                "preparation_id": preparation_id if isinstance(preparation_id, str) else None,
+                "project_id": project_id if isinstance(project_id, str) else None,
+                "session_id": session_id if isinstance(session_id, str) else None,
+                "task_id": task_id if isinstance(task_id, str) else None,
+                "revision": revision if isinstance(revision, int) and revision >= 0 else None,
+            },
+        )
+
+    class BrowserIds:
+        def new_task_id(self) -> str:
+            return f"task-{secrets.token_hex(16)}"
+
+    browser_ids = BrowserIds()
+
+    @app.get("/healthz")
+    async def healthz() -> Mapping[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/")
+    async def index(
+        request: Request,
+        key: Annotated[str | None, Query()] = None,
+    ) -> Response:
+        if key is not None:
+            if not _token_matches(key, session_key_bytes):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+            response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.set_cookie(
+                SESSION_COOKIE, session_key, httponly=True, samesite="strict", path="/"
+            )
+            return response
+        require_session(request)
+        response = FileResponse(index_path)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    @app.get("/api/projects", dependencies=[Depends(require_session)])
+    async def projects(request: Request, response: Response) -> Mapping[str, object]:
+        if request.query_params:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="project query parameters are not accepted",
+            )
+        active = workflows.active_lease_snapshot()
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "csrf_token": csrf_token,
+            "usage_credits_acknowledged": hub_store.usage_credits_acknowledged(),
+            "projects": [
+                {
+                    "project_id": runtime.project_id,
+                    "label": runtime.label,
+                    "branch": runtime.branch,
+                    "readiness": {
+                        "fable_ready": runtime.readiness.snapshot().fable_ready,
+                        "fable_status": runtime.readiness.snapshot().fable_status,
+                        "sol_status": runtime.readiness.snapshot().sol_status,
+                    },
+                }
+                for runtime in registry.projects()
+            ],
+            "active_lease": (
+                None
+                if active is None
+                else {
+                    "project_id": active.project_id,
+                    "session_id": active.session_id,
+                    "task_id": active.task_id,
+                }
+            ),
+        }
+
+    @app.get("/api/projects/{project_id}/chats", dependencies=[Depends(require_session)])
+    async def list_chats(
+        project_id: ProjectId,
+        before_sequence: ChatCursorSequence = None,
+        before_session_id: ChatCursorSession = None,
+        limit: ChatPageLimit = MAX_CHAT_PAGE_SIZE,
+    ) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        if (before_sequence is None) != (before_session_id is None):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="chat cursor requires both sequence and session id",
+            )
+        before = (
+            None
+            if before_sequence is None
+            else ChatCursor(before_sequence, before_session_id)
+        )
+        return {"chats": [chat_snapshot(chat) for chat in runtime.store.list_chats(before=before, limit=limit)]}
+
+    @app.post(
+        "/api/projects/{project_id}/chats",
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def create_chat(project_id: ProjectId) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
+        return chat_snapshot(runtime.store.create_chat(runtime.repository))
+
+    @app.get(
+        "/api/projects/{project_id}/chats/{session_id}/bootstrap",
+        dependencies=[Depends(require_session)],
+    )
+    async def bootstrap(
+        project_id: ProjectId,
+        session_id: SessionId,
+        request: Request,
+        response: Response,
+    ) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        if request.query_params:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="bootstrap query parameters are not accepted",
+            )
+        try:
+            workflows.require_navigation_allowed(
+                project_id=project_id, session_id=session_id,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        selected_chat(runtime, session_id)
+        response.headers["Cache-Control"] = "no-store"
+        readiness = runtime.readiness.snapshot()
+        return {
+            "csrf_token": csrf_token,
+            "usage_credits_acknowledged": hub_store.usage_credits_acknowledged(),
+            "project_id": project_id,
+            "session_id": session_id,
+            "fable_ready": readiness.fable_ready,
+            "fable_status": readiness.fable_status,
+            "sol_status": readiness.sol_status,
+            "branch": runtime.branch,
+            "replay_after": runtime.store.browser_replay_floor(session_id),
+            "tasks": [
+                task_snapshot(overview)
+                for overview in runtime.store.latest_task_overviews(session_id)
+            ],
+        }
+
+    @app.post(
+        "/api/settings/usage-credits-acknowledgement",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def acknowledge_usage_credits(
+        body: UsageCreditsAcknowledgementRequest,
+    ) -> Response:
+        if body.acknowledged:
+            hub_store.acknowledge_usage_credits()
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/messages",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def send_message(
+        project_id: ProjectId, session_id: SessionId, body: MessageRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
+        selected_chat(runtime, session_id)
+        try:
+            prepared = await workflows.prepare_new_request(
+                project_id=project_id,
+                session_id=session_id,
+                text=body.text,
+                ids=browser_ids,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/approve",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def approve_task(
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: TaskId,
+        body: ApprovalRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
+        selected_chat(runtime, session_id)
+        task = selected_task(runtime, session_id, task_id)
+        if body.revision != task.revision:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="approval must name the latest exact revision",
+            )
+        if task.brief is None or task.brief.open_questions:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="resolve the TaskBrief open questions before approval",
+            )
+        try:
+            prepared = await workflows.prepare_approval(
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=body.revision,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/edit",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def edit_task(
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: TaskId,
+        body: TaskBriefRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        task = selected_task(runtime, session_id, task_id)
+        try:
+            brief = TaskBrief.from_dict(body.model_dump(mode="python"))
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from None
+        if brief.task_id != task_id or brief.revision != task.revision + 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="edit must name the same task and next exact revision",
+            )
+        if not install_action(
+            runtime=runtime,
+            session_id=session_id,
+            task_id=task_id,
+            action="edit",
+            coroutine_factory=lambda: runtime.coordinator.edit_task(task_id, brief),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="bridge is shutting down",
+            )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/reject",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def reject_task(
+        project_id: ProjectId, session_id: SessionId, task_id: TaskId,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        selected_task(runtime, session_id, task_id)
+        if not install_action(
+            runtime=runtime,
+            session_id=session_id,
+            task_id=task_id,
+            action="reject",
+            coroutine_factory=lambda: runtime.coordinator.reject_task(task_id),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="bridge is shutting down",
+            )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/answer",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def answer_task(
+        project_id: ProjectId,
+        session_id: SessionId,
+        task_id: TaskId,
+        body: AnswerRequest,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
+        selected_chat(runtime, session_id)
+        task = selected_task(runtime, session_id, task_id)
+        try:
+            prepared = await workflows.prepare_answer(
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=task.revision,
+                answer=body.answer,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/stop",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def stop_task(
+        project_id: ProjectId, session_id: SessionId, task_id: TaskId,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        try:
+            stop_reservation = workflows.reserve_stop(
+                project_id=project_id, session_id=session_id, task_id=task_id,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        try:
+            selected_chat(runtime, session_id)
+            selected_task(runtime, session_id, task_id)
+        except BaseException:
+            workflows.cancel_stop_reservation(stop_reservation)
+            raise
+        if not install_stop_action(
+            runtime=runtime,
+            session_id=session_id,
+            task_id=task_id,
+            coroutine_factory=lambda: workflows.stop(
+                reservation=stop_reservation,
+            ),
+            cancel_reservation=lambda: workflows.cancel_stop_reservation(stop_reservation),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="bridge is shutting down",
+            )
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/resume",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def resume_task(
+        project_id: ProjectId, session_id: SessionId, task_id: TaskId,
+    ) -> Response:
+        runtime = selected_runtime(project_id)
+        try:
+            workflows.require_no_active_lease()
+        except BaseException as error:
+            workflow_http_error(error)
+        selected_chat(runtime, session_id)
+        task = selected_task(runtime, session_id, task_id)
+        try:
+            prepared = await workflows.prepare_resume(
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=task.revision,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        if not install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.run(prepared),
+            abort=lambda value, reason: workflows.abort_prepared(value, reason=reason),
+        ):
+            raise recoverable_preparation(prepared)
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.get("/static/{asset_path:path}")
+    async def static_asset(asset_path: str) -> Response:
+        try:
+            candidate = (static_root / asset_path).resolve(strict=True)
+            candidate.relative_to(static_root)
+            is_file = candidate.is_file()
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="asset not found"
+            ) from None
+        if not is_file or candidate.name == "index.html":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="asset not found"
+            )
+        return FileResponse(candidate)
+
+    @app.websocket("/ws")
+    async def websocket_events(
+        websocket: WebSocket,
+        project_id: SocketProjectId,
+        session_id: SocketSessionId,
+        after: ReplayCursor = 0,
+    ) -> None:
+        if (
+            not _token_matches(websocket.cookies.get(SESSION_COOKIE), session_key_bytes)
+            or _SAFE_ID.fullmatch(project_id) is None
+            or _SAFE_ID.fullmatch(session_id) is None
+        ):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        try:
+            runtime = selected_runtime(project_id)
+            workflows.require_navigation_allowed(
+                project_id=project_id, session_id=session_id,
+            )
+            selected_chat(runtime, session_id)
+        except (HTTPException, RuntimeError):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        last_sequence = after
+
+        async def send_event_pages(cursor: int) -> int:
+            while True:
+                page = runtime.store.events_after(
+                    session_id, cursor, limit=EVENT_REPLAY_PAGE_SIZE
+                )
+                for event in page:
+                    if event.sequence <= cursor:
+                        continue
+                    await websocket.send_json(event.to_dict())
+                    cursor = event.sequence
+                if len(page) < EVENT_REPLAY_PAGE_SIZE:
+                    return cursor
+
+        try:
+            async with runtime.broadcaster.subscribe(session_id) as subscription:
+                last_sequence = await send_event_pages(last_sequence)
+                while True:
+                    live_task = asyncio.create_task(anext(subscription))
+                    receive_task = asyncio.create_task(websocket.receive())
+                    done, _ = await asyncio.wait(
+                        {live_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if receive_task in done:
+                        incoming = receive_task.result()
+                        live_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await live_task
+                        if incoming.get("type") == "websocket.disconnect":
+                            break
+                        await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                        break
+                    receive_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await receive_task
+                    try:
+                        live_task.result()
+                    except StopAsyncIteration:
+                        break
+                    last_sequence = await send_event_pages(last_sequence)
+        except (WebSocketDisconnect, RuntimeError):
+            return
+
+    return app
+
+
 def create_app(
     *,
     coordinator: Coordinator,
@@ -322,6 +1155,7 @@ def create_app(
     csrf_token: str,
     broadcaster: EventBroadcaster | None = None,
     bootstrap_status: Callable[[], BootstrapStatus] | None = None,
+    readiness_check: Callable[[], Awaitable[BootstrapStatus]] | None = None,
 ) -> FastAPI:
     """Create the authenticated loopback web application.
 
@@ -403,6 +1237,43 @@ def create_app(
     app.state.event_broadcaster = event_broadcaster
     app.state.shutting_down = False
 
+    # The legacy factory is intentionally non-owning.  It retains its original
+    # routes while exposing a single opaque runtime projection for callers that
+    # need the same app-facing shape as the hub factory.
+    from agent_bridge.hub import ProjectRegistry, RuntimeReadiness, RuntimeStatus
+
+    async def compatibility_status() -> BootstrapStatus:
+        runtime_status = (
+            await readiness_check() if readiness_check is not None else status_provider()
+        )
+        if not isinstance(runtime_status, BootstrapStatus):
+            raise RuntimeError("bootstrap status provider returned an invalid value")
+        return runtime_status
+
+    async def compatibility_fable_probe() -> tuple[bool, str]:
+        runtime_status = await compatibility_status()
+        return runtime_status.fable_ready, runtime_status.fable_status
+
+    async def compatibility_sol_probe() -> str:
+        return (await compatibility_status()).sol_status
+
+    compatibility_runtime = CompatibilityProjectRuntime(
+        project_id="default-project",
+        label="Default project",
+        repository="default-project",
+        branch="default",
+        coordinator=coordinator,
+        store=store,
+        broadcaster=event_broadcaster,
+        readiness=RuntimeReadiness(
+            initial=RuntimeStatus(False, "checking", "checking"),
+            fable_probe=compatibility_fable_probe,
+            sol_probe=compatibility_sol_probe,
+        ),
+    )
+    app.state.compatibility_runtime = compatibility_runtime
+    app.state.project_registry = ProjectRegistry((compatibility_runtime,))
+
     def require_session(request: Request) -> None:
         if not _token_matches(
             request.cookies.get(SESSION_COOKIE), session_key_bytes
@@ -444,8 +1315,12 @@ def create_app(
             raise RuntimeError("bootstrap status provider returned an invalid value")
         return runtime_status
 
-    def require_model_start_ready(session_id: str) -> None:
-        runtime_status = current_bootstrap_status()
+    async def require_model_start_ready(session_id: str) -> None:
+        runtime_status = (
+            await compatibility_status()
+            if readiness_check is not None
+            else current_bootstrap_status()
+        )
         if (
             store.get_setting(USAGE_CREDITS_SETTING) is not True
             or runtime_status.session_id != session_id
@@ -461,6 +1336,19 @@ def create_app(
                     "for this session"
                 ),
             )
+        try:
+            await compatibility_runtime.readiness.require_model_start_ready(
+                usage_credits_acknowledged=True
+            )
+        except (PermissionError, RuntimeError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "model actions require Fable subscription readiness, "
+                    "Sol readiness, and usage-credit acknowledgement "
+                    "for this session"
+                ),
+            ) from None
 
     def observe_coroutine(
         task: asyncio.Task[object],
@@ -616,7 +1504,7 @@ def create_app(
     )
     async def send_message(session_id: SessionId, body: MessageRequest) -> Response:
         require_known_session(session_id)
-        require_model_start_ready(session_id)
+        await require_model_start_ready(session_id)
         schedule(
             coordinator.handle_user_request(session_id, body.text),
             session_id=session_id,
@@ -642,7 +1530,7 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="resolve the TaskBrief open questions before approval",
             )
-        require_model_start_ready(task.session_id)
+        await require_model_start_ready(task.session_id)
         schedule(
             coordinator.approve_task(task_id, body.revision),
             session_id=task.session_id,
@@ -703,7 +1591,7 @@ def create_app(
         body: AnswerRequest,
     ) -> Response:
         task = latest_task(task_id)
-        require_model_start_ready(task.session_id)
+        await require_model_start_ready(task.session_id)
         schedule(
             coordinator.answer_user_question(task_id, body.answer),
             session_id=task.session_id,
@@ -734,7 +1622,7 @@ def create_app(
     )
     async def resume_task(task_id: TaskId) -> Response:
         task = latest_task(task_id)
-        require_model_start_ready(task.session_id)
+        await require_model_start_ready(task.session_id)
         schedule(
             coordinator.resume_task(task_id),
             session_id=task.session_id,
@@ -838,4 +1726,5 @@ __all__ = [
     "InMemoryEventBroadcaster",
     "SESSION_COOKIE",
     "create_app",
+    "create_hub_app",
 ]

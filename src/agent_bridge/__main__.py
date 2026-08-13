@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import fcntl
 import ipaddress
 import json
@@ -18,7 +19,18 @@ import socket
 import stat
 import subprocess
 import sys
-from typing import Protocol, TextIO
+from typing import TYPE_CHECKING, Protocol, TextIO
+
+from agent_bridge.projects import (
+    ProjectSpec,
+    build_project_specs,
+    parse_project_argument,
+    project_id_for_root,
+)
+
+if TYPE_CHECKING:
+    from agent_bridge.coordinator import IdFactory
+    from agent_bridge.hub import InstanceLock, OwnedProjectRuntime
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
@@ -61,13 +73,12 @@ class UvicornRun(Protocol):
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Settings:
-    repo_root: Path
-    branch: str
+    projects: tuple[ProjectSpec, ...]
+    hub_state_dir: Path
     host: str
     port: int
-    state_dir: Path
     claude_executable: Path
     codex_executable: Path
     git_executable: Path
@@ -84,6 +95,48 @@ class _PreflightStatus:
     sol_status: str
 
 
+@dataclass(slots=True)
+class _StateDirectory:
+    """A retained no-follow directory authority for startup-owned state."""
+
+    path: Path
+    descriptor: int | None
+
+    def child_path(self, name: str) -> Path:
+        if self.descriptor is None:
+            raise RuntimeError("state directory authority is closed")
+        if not isinstance(name, str) or Path(name).name != name or name in {"", ".", ".."}:
+            raise ValueError("state child name is invalid")
+        return Path(f"/proc/self/fd/{self.descriptor}/{name}")
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+@dataclass(slots=True)
+class _OpenedProjectState:
+    """One migrated project database held until every legacy audit completes."""
+
+    spec: ProjectSpec
+    lock: InstanceLock
+    store: object
+    artifacts: Path
+    state_directory: _StateDirectory
+    artifact_descriptor: int | None
+    schema_file_descriptor: int | None
+
+    def release_state_authority(self) -> None:
+        if self.artifact_descriptor is not None:
+            os.close(self.artifact_descriptor)
+            self.artifact_descriptor = None
+        if self.schema_file_descriptor is not None:
+            os.close(self.schema_file_descriptor)
+            self.schema_file_descriptor = None
+        self.state_directory.close()
+
+
 class _Ids:
     def new_task_id(self) -> str:
         return f"task-{secrets.token_hex(16)}"
@@ -97,8 +150,22 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the local Agent Bridge.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--repo", required=True, help="Repository authority for this run.",
+    projects = parser.add_mutually_exclusive_group(required=True)
+    projects.add_argument(
+        "--repo",
+        help=(
+            "Single repository authority for this run; it becomes a "
+            "restart-required immutable allowlist entry."
+        ),
+    )
+    projects.add_argument(
+        "--project",
+        action="append",
+        metavar="LABEL=/ABSOLUTE/REPOSITORY",
+        help=(
+            "Repeatable restart-required immutable allowlist entry. "
+            "Labels are display-only."
+        ),
     )
     parser.add_argument(
         "--host",
@@ -304,13 +371,6 @@ def parse_settings(
         raise ValueError("host must be a loopback address")
     if arguments.port < 0 or arguments.port > 65535:
         raise ValueError("port must be between 0 and 65535")
-    try:
-        repo_root = Path(arguments.repo).resolve(strict=True)
-    except OSError as error:
-        raise ValueError("repository must be an existing directory") from error
-    if not repo_root.is_dir():
-        raise ValueError("repository must be an existing directory")
-
     claude = _resolve_executable(
         arguments.claude_executable, command="claude", label="Claude",
     )
@@ -326,21 +386,6 @@ def parse_settings(
     sh = _resolve_executable(
         arguments.sh_executable, command="sh", label="sh",
     )
-    top_level_text = _run_git(
-        git, repo_root, ("rev-parse", "--show-toplevel"),
-    )
-    try:
-        top_level = Path(top_level_text).resolve(strict=True)
-    except OSError as error:
-        raise ValueError("Git top level is not an existing directory") from error
-    if top_level != repo_root:
-        raise ValueError("repository must equal its Git top level")
-    branch = _run_git(
-        git, repo_root, ("branch", "--show-current"),
-    )
-    if not branch:
-        branch = "detached"
-
     xdg_text = environment.get("XDG_STATE_HOME")
     if xdg_text:
         state_home = Path(xdg_text)
@@ -348,13 +393,58 @@ def parse_settings(
             raise ValueError("XDG_STATE_HOME must be an absolute path")
     else:
         state_home = Path.home() / ".local" / "state"
-    state_dir = Path(os.path.abspath(state_home / "agent-bridge" / _repository_slug(repo_root)))
-    return Settings(
-        repo_root=repo_root,
-        branch=branch,
+    state_root = Path(os.path.abspath(state_home / "agent-bridge"))
+    entries = _project_entries(arguments)
+    candidate_specs = _candidate_project_specs(entries, state_root)
+    legacy_paths = _resolve_legacy_paths(candidate_specs, state_root)
+    preliminary_settings = Settings(
+        projects=candidate_specs,
+        hub_state_dir=state_root / "hub",
         host="127.0.0.1",
         port=arguments.port,
-        state_dir=state_dir,
+        claude_executable=claude,
+        codex_executable=codex,
+        git_executable=git,
+        bash_executable=bash,
+        sh_executable=sh,
+    )
+    # Validate every selected state target before startup opens descriptor-
+    # anchored directories for the first write.
+    preliminary_candidates = (
+        preliminary_settings.hub_state_dir,
+        state_root / "projects",
+        *(
+            legacy_paths.get(spec.project_id, spec.state_dir)
+            for spec in candidate_specs
+        ),
+    )
+    for candidate in preliminary_candidates:
+        _validate_state_dir(preliminary_settings, candidate=candidate)
+    try:
+        specs = build_project_specs(
+            entries,
+            state_root=state_root,
+            git_executable=git,
+            create_state_dirs=False,
+        )
+    except ValueError as error:
+        if str(error) == "Git top-level probe failed":
+            raise ValueError("repository must be a readable Git repository") from error
+        if str(error) == "Git top-level does not match the canonical project root":
+            raise ValueError("repository must equal its Git top level") from error
+        raise
+    selected: list[ProjectSpec] = []
+    for spec in specs:
+        legacy_path = legacy_paths.get(spec.project_id)
+        if legacy_path is None:
+            selected.append(spec)
+            continue
+        selected.append(replace(spec, state_dir=legacy_path))
+    return Settings(
+        projects=tuple(selected),
+        hub_state_dir=state_root / "hub",
+        host="127.0.0.1",
+        port=arguments.port,
         claude_executable=claude,
         codex_executable=codex,
         git_executable=git,
@@ -363,26 +453,152 @@ def parse_settings(
     )
 
 
-def prepare_state_dir(settings: Settings) -> Path:
-    """Create one external, non-symlinked, owner-only runtime directory."""
-    if not isinstance(settings, Settings):
-        raise ValueError("settings must be Settings")
-    candidate = settings.state_dir
-    resolved_candidate = candidate.resolve(strict=False)
-    if resolved_candidate.is_relative_to(settings.repo_root):
-        raise ValueError("state directory must remain outside repository")
+def _project_entries(arguments: argparse.Namespace) -> tuple[tuple[str, Path], ...]:
+    if arguments.repo is not None:
+        raw_root = Path(arguments.repo)
+        if not raw_root.is_absolute():
+            raw_root = Path(os.path.abspath(raw_root))
+        return ((_repository_slug(raw_root), raw_root),)
+    values = tuple(arguments.project or ())
     try:
-        candidate.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if candidate.is_symlink() or not candidate.is_dir():
-            raise ValueError("state directory must be a safe directory")
-        if candidate.resolve(strict=True).is_relative_to(settings.repo_root):
-            raise ValueError("state directory must remain outside repository")
-        candidate.chmod(0o700)
+        return tuple(parse_project_argument(value) for value in values)
     except ValueError:
         raise
+
+
+def _candidate_project_specs(
+    entries: Sequence[tuple[str, Path]], state_root: Path,
+) -> tuple[ProjectSpec, ...]:
+    """Resolve the immutable authorities needed for no-write state validation."""
+    candidates: list[ProjectSpec] = []
+    roots_by_project_id: dict[str, Path] = {}
+    for label, root in entries:
+        try:
+            canonical_root = root.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("repository must be an existing directory") from error
+        if not canonical_root.is_dir():
+            raise ValueError("repository must be an existing directory")
+        project_id = project_id_for_root(canonical_root)
+        claimed_root = roots_by_project_id.get(project_id)
+        if claimed_root is not None and claimed_root != canonical_root:
+            raise ValueError("project identity collision")
+        roots_by_project_id[project_id] = canonical_root
+        candidates.append(ProjectSpec(
+            project_id=project_id,
+            label=label,
+            repo_root=canonical_root,
+            branch="pending",
+            state_dir=state_root / "projects" / project_id,
+        ))
+    return tuple(sorted(candidates, key=lambda spec: spec.project_id))
+
+
+def _resolve_legacy_paths(
+    specs: Sequence[ProjectSpec], state_root: Path,
+) -> dict[str, Path]:
+    """Select auditable basename state without opening a database."""
+    candidates: dict[Path, list[Path]] = {}
+    selected: dict[str, Path] = {}
+    for spec in specs:
+        legacy_path = state_root / _repository_slug(spec.repo_root)
+        digest_path = state_root / "projects" / spec.project_id
+        legacy_exists = legacy_path.exists()
+        digest_exists = digest_path.exists()
+        if legacy_exists and digest_exists:
+            raise ValueError("legacy and digest project state are ambiguous")
+        if legacy_exists:
+            candidates.setdefault(legacy_path, []).append(spec.repo_root)
+            selected[spec.project_id] = legacy_path
+    for roots in candidates.values():
+        if len(roots) > 1:
+            raise ValueError("multiple configured roots claim one legacy state directory")
+    return selected
+
+
+def _validate_state_dir(settings: Settings, *, candidate: Path) -> Path:
+    """Check a state target without creating it or following symlinked parents."""
+    if not isinstance(settings, Settings):
+        raise ValueError("settings must be Settings")
+    state_dir = candidate
+    if not isinstance(state_dir, Path) or not state_dir.is_absolute():
+        raise ValueError("state directory must be an absolute path")
+    roots = tuple(spec.repo_root for spec in settings.projects)
+    if not roots:
+        raise ValueError("settings must contain at least one project")
+    if any(state_dir.is_relative_to(root) for root in roots):
+        raise ValueError("state directory must remain outside repository")
+    ancestor = state_dir
+    while True:
+        if ancestor.is_symlink():
+            raise ValueError("state directory must not have a symlinked ancestor")
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
+    resolved_candidate = state_dir.resolve(strict=False)
+    if any(resolved_candidate.is_relative_to(root) for root in roots):
+        raise ValueError("state directory must remain outside repository")
+    return state_dir
+
+
+def _open_nofollow_directory(path: Path, *, create: bool) -> int:
+    """Open an absolute directory by descriptor without following ancestors."""
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+    ):
+        raise ValueError("state directory must support absolute no-follow access")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_state_directory(settings: Settings, *, candidate: Path) -> _StateDirectory:
+    """Validate, create, and retain one state target through one descriptor."""
+    state_dir = _validate_state_dir(settings, candidate=candidate)
+    descriptor: int | None = None
+    try:
+        descriptor = _open_nofollow_directory(state_dir, create=True)
+        entry = os.fstat(descriptor)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+            raise ValueError("state directory must be an owner-controlled directory")
+        os.fchmod(descriptor, 0o700)
+        return _StateDirectory(path=state_dir, descriptor=descriptor)
+    except ValueError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
         raise ValueError("state directory must be a safe writable directory") from error
-    return candidate
+
+
+def prepare_state_dir(settings: Settings, *, candidate: Path | None = None) -> Path:
+    """Create one external, non-symlinked, owner-only runtime directory."""
+    state_dir = settings.hub_state_dir if candidate is None else candidate
+    authority = _open_state_directory(settings, candidate=state_dir)
+    authority.close()
+    return state_dir
 
 
 def select_port(
@@ -430,14 +646,17 @@ def ssh_forward_command(*, port: int, user: str, ssh_connection: str) -> str:
     return f"ssh -N -L {port}:127.0.0.1:{port} {user}@{server_text}"
 
 
-def _secure_regular_file(path: Path) -> None:
+def _secure_regular_file(path: Path, *, directory_fd: int | None = None) -> None:
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if directory_fd is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
         try:
             entry = os.fstat(descriptor)
             if not stat.S_ISREG(entry.st_mode):
@@ -451,9 +670,12 @@ def _secure_regular_file(path: Path) -> None:
         raise ValueError("database must be a safe owner-only file") from error
 
 
-def acquire_instance_lock(state_dir: Path) -> int:
-    """Acquire the repository state's nonblocking process-lifetime lock."""
-    path = state_dir / "agent-bridge.lock"
+def acquire_instance_lock(path: Path, *, directory_fd: int | None = None) -> InstanceLock:
+    """Acquire one nonblocking process-lifetime lock at its explicit path."""
+    from agent_bridge.hub import InstanceLock
+
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError("instance lock path must be absolute")
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -461,7 +683,10 @@ def acquire_instance_lock(state_dir: Path) -> int:
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
+        if directory_fd is None:
+            descriptor = os.open(path, flags, 0o600)
+        else:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
         entry = os.fstat(descriptor)
         if (
             not stat.S_ISREG(entry.st_mode)
@@ -474,24 +699,49 @@ def acquire_instance_lock(state_dir: Path) -> int:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("agent bridge is already running for this repository") from error
-        return descriptor
+        return InstanceLock(path=path, descriptor=descriptor)
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
         raise
 
 
-def _prepare_private_directory(path: Path) -> Path:
+def _open_private_directory(path: Path, *, directory_fd: int | None = None) -> int:
+    """Create/open one owner-only state child under retained authority."""
+    descriptor: int | None = None
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.is_symlink() or not path.is_dir():
-            raise ValueError("runtime subdirectory must be a safe directory")
-        path.chmod(0o700)
+        if directory_fd is None:
+            descriptor = _open_nofollow_directory(path, create=True)
+        else:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            try:
+                os.mkdir(path.name, mode=0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+        entry = os.fstat(descriptor)
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+            raise ValueError("runtime subdirectory must be an owner-controlled directory")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
     except ValueError:
+        if descriptor is not None:
+            os.close(descriptor)
         raise
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
         raise ValueError("runtime subdirectory must be writable") from error
-    return path
+
+
+def _prepare_private_directory(path: Path, *, directory_fd: int | None = None) -> Path:
+    descriptor: int | None = None
+    try:
+        descriptor = _open_private_directory(path, directory_fd=directory_fd)
+        return path
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 async def _version(
@@ -521,6 +771,7 @@ async def _run_preflights(
     runner: object,
     fable: object,
     settings: Settings,
+    spec: ProjectSpec,
     claude_source_environment: Mapping[str, str],
     codex_child_environment: Mapping[str, str],
 ) -> _PreflightStatus:
@@ -536,7 +787,7 @@ async def _run_preflights(
                 runner=runner,
                 run_id="startup-claude-version",
                 executable=settings.claude_executable,
-                cwd=settings.repo_root,
+                cwd=spec.repo_root,
                 environment=claude_environment,
             ),
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -557,7 +808,7 @@ async def _run_preflights(
                 runner=runner,
                 run_id="startup-codex-version",
                 executable=settings.codex_executable,
-                cwd=settings.repo_root,
+                cwd=spec.repo_root,
                 environment=codex_child_environment,
             ),
             timeout=PREFLIGHT_TIMEOUT_SECONDS,
@@ -576,6 +827,48 @@ async def _run_preflights(
     )
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _store_clock(clock: Callable[[], datetime]) -> Callable[[], str]:
+    def timestamp() -> str:
+        value = clock()
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        return value.isoformat()
+    return timestamp
+
+
+async def _fresh_fable_probe(fable: object) -> tuple[bool, str]:
+    from agent_bridge.adapters.claude_cli import SubscriptionAuthError
+
+    try:
+        await asyncio.wait_for(fable.preflight(), timeout=PREFLIGHT_TIMEOUT_SECONDS)
+    except (OSError, RuntimeError, SubscriptionAuthError, TimeoutError):
+        return False, "subscription_unavailable"
+    return True, "subscription_ready"
+
+
+async def _fresh_sol_probe(
+    *, runner: object, settings: Settings, spec: ProjectSpec, environment: Mapping[str, str],
+) -> str:
+    try:
+        version = await asyncio.wait_for(
+            _version(
+                runner=runner,
+                run_id=f"readiness-codex-version-{spec.project_id}",
+                executable=settings.codex_executable,
+                cwd=spec.repo_root,
+                environment=environment,
+            ),
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except (OSError, RuntimeError, TimeoutError):
+        return "unavailable"
+    return "ready" if version is not None else "unavailable"
+
+
 def _active_session(store: object, repo_root: Path) -> str:
     configured = store.get_setting(_ACTIVE_SESSION_SETTING)
     if isinstance(configured, str):
@@ -591,6 +884,231 @@ def _active_session(store: object, repo_root: Path) -> str:
     return session_id
 
 
+def _is_legacy_state(spec: ProjectSpec, settings: Settings) -> bool:
+    return spec.state_dir == (
+        settings.hub_state_dir.parent / _repository_slug(spec.repo_root)
+    )
+
+
+def _open_project_state(
+    spec: ProjectSpec,
+    *,
+    lock: InstanceLock,
+    clock: Callable[[], datetime],
+    state_directory: _StateDirectory | None = None,
+) -> _OpenedProjectState:
+    """Open and migrate one project database without recovering work."""
+    from agent_bridge.store import SQLiteStore
+
+    owns_state_directory = state_directory is None
+    database_path = spec.state_dir / "bridge.sqlite3"
+    store = None
+    artifact_descriptor: int | None = None
+    schema_directory_descriptor: int | None = None
+    schema_file_descriptor: int | None = None
+    try:
+        if state_directory is None:
+            descriptor = _open_nofollow_directory(spec.state_dir, create=True)
+            state_directory = _StateDirectory(spec.state_dir, descriptor)
+            os.fchmod(descriptor, 0o700)
+        if state_directory.descriptor is None:
+            raise RuntimeError("state directory authority is closed")
+        _secure_regular_file(database_path, directory_fd=state_directory.descriptor)
+        artifact_descriptor = _open_private_directory(
+            spec.state_dir / "artifacts", directory_fd=state_directory.descriptor,
+        )
+        schema_directory_descriptor = _open_private_directory(
+            spec.state_dir / "schemas", directory_fd=state_directory.descriptor,
+        )
+        from agent_bridge.adapters.codex_cli import materialize_sol_schema_file
+        schema_file_descriptor = materialize_sol_schema_file(schema_directory_descriptor)
+        os.close(schema_directory_descriptor)
+        schema_directory_descriptor = None
+        store = SQLiteStore(
+            state_directory.child_path("bridge.sqlite3"),
+            clock=_store_clock(clock),
+            check_same_thread=False,
+        )
+        return _OpenedProjectState(
+            spec=spec,
+            lock=lock,
+            store=store,
+            artifacts=spec.state_dir / "artifacts",
+            state_directory=state_directory,
+            artifact_descriptor=artifact_descriptor,
+            schema_file_descriptor=schema_file_descriptor,
+        )
+    except BaseException:
+        if store is not None:
+            try:
+                store.close()
+            except BaseException:
+                pass
+        if artifact_descriptor is not None:
+            os.close(artifact_descriptor)
+        if schema_directory_descriptor is not None:
+            os.close(schema_directory_descriptor)
+        if schema_file_descriptor is not None:
+            os.close(schema_file_descriptor)
+        if owns_state_directory and state_directory is not None:
+            state_directory.close()
+        raise
+
+
+def _audit_project_state(opened: _OpenedProjectState, settings: Settings) -> None:
+    """Perform the exact legacy-root audit before any project may recover."""
+    if _is_legacy_state(opened.spec, settings):
+        opened.store.audit_legacy_project_ownership(str(opened.spec.repo_root))
+
+
+def assemble_project_runtime(
+    spec: ProjectSpec,
+    *,
+    lock: InstanceLock,
+    settings: Settings,
+    environment: Mapping[str, str],
+    ids: IdFactory,
+    clock: Callable[[], datetime],
+    _opened_state: _OpenedProjectState | None = None,
+) -> OwnedProjectRuntime:
+    """Build one fully isolated project runtime after the legacy audit phase."""
+    from agent_bridge.adapters.claude_cli import ClaudeCLI, SubscriptionAuthError
+    from agent_bridge.adapters.codex_cli import CodexCLI
+    from agent_bridge.app import InMemoryEventBroadcaster
+    from agent_bridge.coordinator import Coordinator
+    from agent_bridge.hub import OwnedProjectRuntime, RuntimeReadiness, RuntimeStatus
+    from agent_bridge.process import ProcessRunner
+    from agent_bridge.repository import RepositoryTracker
+
+    if not isinstance(spec, ProjectSpec):
+        raise ValueError("spec must be a ProjectSpec")
+    if not isinstance(settings, Settings):
+        raise ValueError("settings must be Settings")
+    opened = _opened_state
+    opened_here = opened is None
+    tracker = None
+    try:
+        if opened is None:
+            opened = _open_project_state(spec, lock=lock, clock=clock)
+            _audit_project_state(opened, settings)
+        elif opened.spec != spec or opened.lock is not lock:
+            raise ValueError("opened project state does not match runtime inputs")
+        opened.store.recover_active_tasks()
+        runner = ProcessRunner()
+        codex_child_environment = codex_environment(environment)
+        readiness_holder: list[RuntimeReadiness] = []
+
+        class _ReadinessBoundClaudeCLI(ClaudeCLI):
+            async def _run_contract(self, **kwargs: object) -> object:
+                try:
+                    return await super()._run_contract(**kwargs)
+                except SubscriptionAuthError:
+                    if readiness_holder:
+                        readiness_holder[0].invalidate_fable_subscription()
+                    raise
+
+        fable = _ReadinessBoundClaudeCLI(
+            settings.claude_executable,
+            runner,
+            env=environment,
+            cwd=spec.repo_root,
+        )
+        try:
+            sol = CodexCLI(
+                settings.codex_executable,
+                runner,
+                repo_root=spec.repo_root,
+                schema_dir=spec.state_dir / "schemas",
+                env=codex_child_environment,
+                schema_file_fd=opened.schema_file_descriptor,
+            )
+        finally:
+            if opened.schema_file_descriptor is not None:
+                os.close(opened.schema_file_descriptor)
+                opened.schema_file_descriptor = None
+        preflight = asyncio.run(_run_preflights(
+            runner=runner,
+            fable=fable,
+            settings=settings,
+            spec=spec,
+            claude_source_environment=environment,
+            codex_child_environment=codex_child_environment,
+        ))
+        readiness = RuntimeReadiness(
+            initial=RuntimeStatus(
+                preflight.fable_ready,
+                preflight.fable_status,
+                preflight.sol_status,
+            ),
+            fable_probe=lambda: _fresh_fable_probe(fable),
+            sol_probe=lambda: _fresh_sol_probe(
+                runner=runner,
+                settings=settings,
+                spec=spec,
+                environment=codex_child_environment,
+            ),
+            timeout_seconds=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+        readiness_holder.append(readiness)
+        # The bootstrap screen displays this one bounded startup snapshot;
+        # model starts always use the fresh readiness probes above.
+        readiness._startup_preflight = preflight  # type: ignore[attr-defined]
+        tracker = RepositoryTracker(
+            spec.repo_root,
+            opened.artifacts,
+            git_executable=settings.git_executable,
+            artifact_directory_fd=opened.artifact_descriptor,
+        )
+        coordinator = Coordinator(
+            store=opened.store,
+            repository=tracker,
+            runner=runner,
+            fable=fable,
+            sol=sol,
+            ids=ids,
+            repo_root=spec.repo_root,
+            repo_context=read_repository_context(spec.repo_root),
+            trusted_shells={
+                "bash": settings.bash_executable,
+                "sh": settings.sh_executable,
+            },
+        )
+        return OwnedProjectRuntime(
+            spec=spec,
+            store=opened.store,
+            tracker=tracker,
+            runner=runner,
+            fable=fable,
+            sol=sol,
+            coordinator=coordinator,
+            broadcaster=InMemoryEventBroadcaster(),
+            readiness=readiness,
+            lock=lock,
+            state_authority_close=opened.release_state_authority,
+        )
+    except BaseException:
+        if tracker is not None:
+            try:
+                tracker.close()
+            except BaseException:
+                pass
+        if opened_here and opened is not None:
+            try:
+                opened.store.close()
+            except BaseException:
+                pass
+            opened.release_state_authority()
+        raise
+
+
+def _release_locks(locks: Sequence[object]) -> None:
+    for lock in reversed(tuple(locks)):
+        try:
+            lock.release()
+        except BaseException:
+            continue
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -602,90 +1120,92 @@ def main(
     environment = dict(os.environ if environ is None else environ)
     output = sys.stdout if stdout is None else stdout
     settings = parse_settings(argv, environ=environment)
-    state_dir = prepare_state_dir(settings)
-    instance_lock = acquire_instance_lock(state_dir)
+    ordered_specs = tuple(sorted(settings.projects, key=lambda spec: spec.project_id))
+    state_authorities: dict[Path, _StateDirectory] = {}
+    locks: list[object] = []
     try:
-        database_path = state_dir / "bridge.sqlite3"
-        _secure_regular_file(database_path)
-        artifacts = _prepare_private_directory(state_dir / "artifacts")
-        schemas = _prepare_private_directory(state_dir / "schemas")
-
-        # Optional web and agent dependencies stay outside module import time.
-        from agent_bridge.adapters.claude_cli import ClaudeCLI
-        from agent_bridge.adapters.codex_cli import CodexCLI
-        from agent_bridge.app import BootstrapStatus, create_app
-        from agent_bridge.coordinator import Coordinator
-        from agent_bridge.process import ProcessRunner
-        from agent_bridge.repository import RepositoryTracker
-        from agent_bridge.store import SQLiteStore
-
-        store = SQLiteStore(database_path, check_same_thread=False)
+        for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in ordered_specs)):
+            prepare_state_dir(settings, candidate=state_dir)
+            state_authorities[state_dir] = _open_state_directory(
+                settings, candidate=state_dir,
+            )
+        hub_lock = acquire_instance_lock(
+            settings.hub_state_dir / "agent-bridge.lock",
+            directory_fd=state_authorities[settings.hub_state_dir].descriptor,
+        )
+        locks.append(hub_lock)
+        project_locks: dict[str, object] = {}
+        for spec in ordered_specs:
+            lock = acquire_instance_lock(
+                spec.state_dir / "agent-bridge.lock",
+                directory_fd=state_authorities[spec.state_dir].descriptor,
+            )
+            locks.append(lock)
+            project_locks[spec.project_id] = lock
     except BaseException:
-        os.close(instance_lock)
+        _release_locks(locks)
+        for authority in state_authorities.values():
+            authority.close()
         raise
-    repository = None
+
+    hub_store = None
+    runtimes: list[object] = []
+    opened_states: list[_OpenedProjectState] = []
+    registry = None
+    owned_project_ids: set[str] = set()
     try:
-        store.recover_active_tasks()
-        session_id = _active_session(store, settings.repo_root)
-        runner = ProcessRunner()
-        codex_child_environment = codex_environment(environment)
-        fable = ClaudeCLI(
-            settings.claude_executable,
-            runner,
-            env=environment,
-            cwd=settings.repo_root,
+        from agent_bridge.app import create_hub_app
+        from agent_bridge.hub import ActiveAgentLease, HubWorkflowOrchestrator, ProjectRegistry
+        from agent_bridge.hub_store import HubStore
+
+        hub_database = settings.hub_state_dir / "hub.sqlite3"
+        hub_authority = state_authorities[settings.hub_state_dir]
+        _secure_regular_file(hub_database, directory_fd=hub_authority.descriptor)
+        hub_store = HubStore(hub_authority.child_path("hub.sqlite3"), clock=_now)
+        for spec in ordered_specs:
+            opened_states.append(_open_project_state(
+                spec,
+                lock=project_locks[spec.project_id],
+                clock=_now,
+                state_directory=state_authorities[spec.state_dir],
+            ))
+        for opened in opened_states:
+            _audit_project_state(opened, settings)
+        for opened in opened_states:
+            spec = opened.spec
+            runtime = assemble_project_runtime(
+                spec,
+                lock=project_locks[spec.project_id],
+                settings=settings,
+                environment=environment,
+                ids=_Ids(),
+                clock=_now,
+                _opened_state=opened,
+            )
+            runtimes.append(runtime)
+            owned_project_ids.add(spec.project_id)
+        registry = ProjectRegistry(runtimes)
+        # This binds the durable account acknowledgement to the hub rather
+        # than copying the former project-local setting into any project DB.
+        orchestrator = HubWorkflowOrchestrator(
+            registry=registry,
+            lease=ActiveAgentLease(),
+            usage_credits_acknowledged=hub_store.usage_credits_acknowledged,
         )
-        sol = CodexCLI(
-            settings.codex_executable,
-            runner,
-            repo_root=settings.repo_root,
-            schema_dir=schemas,
-            env=codex_child_environment,
-        )
-        preflight = asyncio.run(_run_preflights(
-            runner=runner,
-            fable=fable,
-            settings=settings,
-            claude_source_environment=environment,
-            codex_child_environment=codex_child_environment,
-        ))
-        repository = RepositoryTracker(
-            settings.repo_root,
-            artifacts,
-            git_executable=settings.git_executable,
-        )
-        coordinator = Coordinator(
-            store=store,
-            repository=repository,
-            runner=runner,
-            fable=fable,
-            sol=sol,
-            ids=_Ids(),
-            repo_root=settings.repo_root,
-            repo_context=read_repository_context(settings.repo_root),
-            trusted_shells={
-                "bash": settings.bash_executable,
-                "sh": settings.sh_executable,
-            },
-        )
-        status = BootstrapStatus(
-            session_id=session_id,
-            fable_ready=preflight.fable_ready,
-            fable_status=preflight.fable_status,
-            sol_status=preflight.sol_status,
-            repository=str(settings.repo_root),
-            branch=settings.branch,
-        )
+        primary = runtimes[0]
+        _active_session(primary.store, primary.spec.repo_root)
+        preflight = primary.readiness._startup_preflight
         session_key = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
-        app = create_app(
-            coordinator=coordinator,
-            store=store,
+        app = create_hub_app(
+            registry=registry,
+            hub_store=hub_store,
+            workflows=orchestrator,
             static_dir=Path(__file__).resolve().parent / "static",
             session_key=session_key,
             csrf_token=csrf_token,
-            bootstrap_status=lambda: status,
         )
+        app.state.launcher_settings = settings
         port = select_port(settings.host, settings.port)
         public_host = "127.0.0.1"
         url = f"http://{public_host}:{port}/?key={session_key}"
@@ -706,8 +1226,8 @@ def main(
             "sol_status": preflight.sol_status,
             "sol_version": preflight.sol_version,
             "ssh_command": ssh_command,
-            "repository": str(settings.repo_root),
-            "branch": settings.branch,
+            "repository": str(primary.spec.repo_root),
+            "branch": primary.spec.branch,
         }
         output.write(json.dumps(startup, separators=(",", ":"), sort_keys=True) + "\n")
         output.flush()
@@ -720,14 +1240,39 @@ def main(
         run_server(app, host=settings.host, port=port, reload=False)
         return 0
     finally:
-        try:
-            if repository is not None:
-                repository.close()
-        finally:
+        if registry is not None:
             try:
-                store.close()
-            finally:
-                os.close(instance_lock)
+                registry.close()
+            except BaseException:
+                pass
+        else:
+            for runtime in reversed(runtimes):
+                try:
+                    runtime.close()
+                except BaseException:
+                    pass
+        for opened in reversed(opened_states):
+            if opened.spec.project_id not in owned_project_ids:
+                try:
+                    opened.store.close()
+                except BaseException:
+                    pass
+            opened.release_state_authority()
+        if hub_store is not None:
+            try:
+                hub_store.close()
+            except BaseException:
+                pass
+        _release_locks((
+            hub_lock,
+            *(
+                project_locks[spec.project_id]
+                for spec in ordered_specs
+                if spec.project_id not in owned_project_ids
+            ),
+        ))
+        for authority in state_authorities.values():
+            authority.close()
 
 
 if __name__ == "__main__":

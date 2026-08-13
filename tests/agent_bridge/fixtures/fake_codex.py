@@ -58,7 +58,16 @@ def _read_json(
     expected: type,
 ) -> object:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        schema_target = os.readlink(path)
+    except OSError:
+        schema_target = ""
+    if schema_target.startswith("/memfd:agent-bridge-sol-schema"):
+        # The adapter deliberately supplies its anonymous schema capability
+        # through this procfs link; ordinary JSON inputs remain no-follow.
+        pass
+    else:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:

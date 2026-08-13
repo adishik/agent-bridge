@@ -46,11 +46,29 @@ method, account, or usage mode behind that executable.
 
 ## Run
 
-From this checkout, install, or another directory containing the package, run:
+From this checkout, install, or another directory containing the package, run
+one immutable project allowlist. For a single-project compatible launch:
 
 ```bash
 agent-bridge --repo /path/to/project
 ```
+
+For more than one project, repeat `--project` with a display label and an
+absolute Git-root path:
+
+```bash
+agent-bridge \
+  --project app=/absolute/path/to/app \
+  --project docs=/absolute/path/to/docs
+```
+
+`--repo` remains the compatible one-project spelling; it cannot be combined
+with `--project`. The selected roots are the complete authority for a running
+bridge: labels are display-only, roots are canonicalized and validated as Git
+top levels, and the allowlist cannot be changed through the browser. Stop the
+foreground bridge and restart with a new command to add, remove, or rename a
+project. The launcher rejects duplicate roots, duplicate labels, non-absolute
+roots, and unsafe executable paths before serving the browser.
 
 The default listener is `127.0.0.1:56590`. The process stays in the
 foreground and owns the server lifetime; stop it with the normal terminal
@@ -60,7 +78,8 @@ There is no public bind, background daemon, or tmux operation. If the port is
 busy, choose another local port with `--port` and use the port printed at
 startup.
 
-The launcher accepts `--repo` and optional absolute executable overrides:
+The launcher accepts `--repo`, repeatable `--project`, and optional absolute
+executable overrides:
 `--claude-executable`, `--codex-executable`, `--git-executable`,
 `--bash-executable`, and `--sh-executable`. It also accepts a loopback-only
 `--host` and a numeric `--port`; non-loopback hosts are rejected.
@@ -81,25 +100,39 @@ remote loopback listener; it does not make Agent Bridge public.
 
 ## Workflow
 
-1. Submit a request in the browser. Fable receives the repository context and
-   returns a structured plan, allowed paths, and required checks.
-2. Review the exact task revision shown by the bridge, including its scope and
+1. Select a project, then select or create a chat within that project. Chats,
+   task IDs, and provider-session IDs are project-local: identical identifiers
+   in two projects are not shared state.
+2. Submit a request in the selected chat. Fable receives that repository's
+   context and returns a structured plan, allowed paths, and required checks.
+3. Review the exact task revision shown by the bridge, including its scope and
    requested test command.
-3. Approve that revision, edit it, or reject it. An edit creates the next
+4. Approve that revision, edit it, or reject it. An edit creates the next
    revision; approve only the exact revision currently displayed.
-4. After approval, Sol executes within the approved repository scope. The
+5. After approval, Sol executes within the approved repository scope. The
    bridge records the commands and compares the checkout with the baseline
    captured immediately before execution.
-5. Fable reviews Sol's result and the observed repository delta. It can accept
+6. Fable reviews Sol's result and the observed repository delta. It can accept
    the result, ask a bounded correction, or ask the user for clarification.
-6. A bounded correction stays tied to the same task and revision lineage. If
+7. A bounded correction stays tied to the same task and revision lineage. If
    the requested change widens scope or cannot be resolved safely, the bridge
    escalates to the user instead of guessing.
-7. Use **Stop** to interrupt an active run. An interruption is recorded and
+8. Use **Stop** to interrupt an active run. An interruption is recorded and
    does not silently continue.
-8. Use **Resume** only after explicitly choosing to resume the interrupted
+9. Use **Resume** only after explicitly choosing to resume the interrupted
    task. Reconnect first if the browser was closed; a historical process ID is
    not evidence that work is still running.
+
+There is one hub-wide active workflow, not one per project. While a model
+workflow owns that lease, model-starting actions and opening another
+project/chat's live workflow are rejected until it reaches a terminal state or
+is stopped. This is deliberate: finish or stop the active workflow before
+changing the selected project.
+
+Phase 1 does not implement directed agent-to-agent questions, agent-directed
+intervention, or cross-project handoffs. Fable and Sol communicate only through
+the persisted task workflow; the user remains the control point for approval,
+answers, Stop, and Resume.
 
 ## Repository safety
 
@@ -121,23 +154,41 @@ the result yourself.
 
 ## State and recovery
 
-Runtime state lives outside the target repository under the platform's XDG
+Runtime state lives outside the target repositories under the platform's XDG
 state location (`XDG_STATE_HOME` when set, otherwise the user's normal local
-state directory). Repository state directories and runtime subdirectories are
-owner-only (`0700`); the SQLite database, lock, and other state files are
-owner-only (`0600`). A kernel-held instance lock prevents two bridge processes
-from coordinating the same repository at once.
+state directory). A multi-project launch has one hub database at
+`<state>/agent-bridge/hub/hub.sqlite3` and one digest-identified project state
+directory at `<state>/agent-bridge/projects/<project-id>/`, where
+`<project-id>` is derived from the canonical repository root rather than its
+label or basename. Project directories contain their own bridge database,
+artifacts, schemas, and lock. The hub owns only account-level settings. State
+directories and runtime subdirectories are owner-only (`0700`); SQLite
+databases, locks, and other state files are owner-only (`0600`).
+
+The usage-credit acknowledgement is one hub-wide account acknowledgement, not
+one acknowledgement per project. Confirm it after startup before starting any
+model action. A historical project-local acknowledgement is retained for audit
+but never copied into the hub, so it cannot silently enable a multi-project
+launch.
+
+For an existing single-project installation, Agent Bridge recognizes the
+historical basename state directory only after an exact ownership audit. The
+audit requires every historical chat, task, event, baseline setting, and agent
+run to belong to that one canonical repository; malformed, mixed-root, orphan,
+or ambiguous legacy/digest state aborts startup. A successful audit adopts the
+legacy directory in place: it preserves historical chats, events, baselines,
+and runs instead of copying them into a digest directory. It likewise preserves
+the old project-local acknowledgement without treating it as the new hub
+acknowledgement.
+
+A kernel-held hub lock plus per-project locks prevents overlapping bridge
+instances. Startup acquires every lock before opening a hub or project
+database; a partial lock failure starts no server and performs no recovery.
 
 On startup, the latest active revision is recovered as interrupted rather than
 being assumed safe to continue. Historical process IDs and process-group IDs
 are inert records for audit and recovery; they are never treated as permission
 to signal or resume a process. Resume is always an explicit user action.
-
-The current state namespace is derived from the repository basename. This
-keeps state paths predictable and outside repositories, but two different
-repositories with the same basename share a namespace. Use one bridge instance
-per basename at a time and treat the lock error as a signal to inspect the
-existing state before proceeding.
 
 ## Troubleshooting
 
@@ -152,9 +203,10 @@ existing state before proceeding.
   version check must succeed.
 - **Occupied port:** stop the other local listener, or pass a free loopback
   port with `--port`; use the resulting keyed URL and matching SSH forward.
-- **Active lock:** another instance owns the repository's kernel lock. Close
-  that instance cleanly or inspect its foreground terminal and state before
-  starting another one; do not delete the lock file while it is held.
+- **Active lock or workflow:** another bridge instance may own a hub/project
+  kernel lock, or the current bridge may have one active workflow. Close the
+  other foreground instance, or finish/stop the active workflow before
+  continuing; do not delete a lock file while it is held.
 - **Reconnect behavior:** reopen the exact keyed URL while the foreground
   process is still running. If the process stopped, restart it and follow its
   new startup URL; review any recovered interrupted revision before choosing
