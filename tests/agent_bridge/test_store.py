@@ -4120,8 +4120,66 @@ def test_directed_intervention_binding_migration_backfills_each_live_family_exac
 
 
 @pytest.mark.parametrize("binding_column", ("absent", "null"))
+def test_terminal_ordinary_migration_ignores_compatible_answered_questions(
+    tmp_path, valid_brief, binding_column: str,
+) -> None:
+    """A matching answered row is ordinary when its source matches the active phase."""
+    path = tmp_path / f"ordinary-terminal-{binding_column}.sqlite3"
+    _seed_previous_directed_intervention_families(
+        path, valid_brief, binding_column=binding_column,
+    )
+    preceding = sqlite3.connect(path)
+    for status in ("resumed", "canceled_by_stop"):
+        preceding.execute(
+            """
+            UPDATE questions
+            SET asked_by = 'fable', addressed_to = 'sol', routed_to = 'sol',
+                answered_by = 'sol'
+            WHERE question_id = ?
+            """,
+            (f"question-{status}",),
+        )
+        preceding.execute(
+            """
+            UPDATE agent_runs SET agent = 'sol', cli_session_id = ?
+            WHERE run_id = ?
+            """,
+            (f"sol-{status}", f"source-{status}"),
+        )
+    preceding.commit()
+    ordinary_before = tuple(tuple(row) for row in preceding.execute(
+        """
+        SELECT intervention_id, run_id, continuation_state, resume_attempt_id,
+               resume_run_id, acknowledgment_id, status
+        FROM interventions
+        WHERE intervention_id IN ('intervention-resumed', 'intervention-canceled_by_stop')
+        ORDER BY intervention_id
+        """
+    ))
+    preceding.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    for status in ("resumed", "canceled_by_stop"):
+        record = migrated.intervention(f"intervention-{status}")
+        assert record is not None
+        assert record.directed_binding is None
+    assert tuple(tuple(row) for row in migrated._connection.execute(
+        """
+        SELECT intervention_id, run_id, continuation_state, resume_attempt_id,
+               resume_run_id, acknowledgment_id, status
+        FROM interventions
+        WHERE intervention_id IN ('intervention-resumed', 'intervention-canceled_by_stop')
+        ORDER BY intervention_id
+        """
+    )) == ordinary_before
+    migrated.close()
+
+
+@pytest.mark.parametrize("binding_column", ("absent", "null"))
 @pytest.mark.parametrize(
-    "fault", ("incomplete", "ambiguous", "foreign_provider", "foreign_question"),
+    "fault", (
+        "incomplete", "ambiguous", "foreign_provider", "foreign_question", "owner",
+    ),
 )
 def test_directed_intervention_binding_migration_rejects_unsafe_rows_and_rolls_back(
     tmp_path, valid_brief, binding_column: str, fault: str,
@@ -4149,6 +4207,13 @@ def test_directed_intervention_binding_migration_rejects_unsafe_rows_and_rolls_b
             """
             UPDATE questions SET routed_to = 'sol'
             WHERE question_id = 'question-ready'
+            """
+        )
+    elif fault == "owner":
+        preceding.execute(
+            """
+            UPDATE interventions SET resume_attempt_id = NULL, resume_run_id = NULL
+            WHERE intervention_id = 'intervention-resumed'
             """
         )
     else:
@@ -4789,6 +4854,249 @@ def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
     return stage
 
 
+def test_child_answer_cas_preallocates_the_exact_next_fable_run(
+    tmp_path, valid_brief,
+) -> None:
+    """The successor run row exists before any next-Fable provider spawn."""
+    store = SQLiteStore(
+        tmp_path / "next-fable-preallocated.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    binding = stage.directed_binding
+    assert binding is not None
+    successor = store.agent_run(binding.next_run_id)
+    assert successor.task_id == valid_brief.task_id
+    assert successor.revision == valid_brief.revision
+    assert successor.agent == ConversationTarget.FABLE.value
+    assert successor.cli_session_id == binding.next_provider_id
+    assert successor.status == "running"
+
+
+def test_completed_next_fable_stage_atomically_terminalizes_its_intervention(
+    tmp_path, valid_brief,
+) -> None:
+    """A completed next Fable result cannot leave the intervention resumable."""
+    store = SQLiteStore(
+        tmp_path / "next-fable-terminal.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    store.start_next_fable_intervention_stage(
+        stage.intervention_id, run_id=binding.next_run_id,
+    )
+
+    terminal = store.finish_next_fable_intervention_stage(
+        stage.intervention_id, run_id=binding.next_run_id, exit_code=0,
+    )
+
+    assert terminal.status is store_module.InterventionStatus.RESUMED
+    assert store.agent_run(binding.next_run_id).status == "completed"
+    assert store.authenticated_intervention(stage.intervention_id) == terminal
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+
+
+def _seed_pre_stage_answered_nested_intervention(
+    path: Path, valid_brief, *, outcome: str, binding_shape: str,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Restore a post-answer crash image from before the stage discriminator."""
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    assert stage.directed_binding is not None
+    if outcome == "unknown":
+        assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 1)
+    elif outcome != "resuming":
+        raise AssertionError(f"unknown post-answer outcome {outcome}")
+    store.close()
+
+    preceding = sqlite3.connect(path)
+    if binding_shape == "stage_less":
+        row = preceding.execute(
+            """
+            SELECT directed_binding_json FROM interventions
+            WHERE intervention_id = 'directed-terminal'
+            """
+        ).fetchone()
+        assert row is not None
+        binding = json.loads(row[0])
+        for key in (
+            "stage", "next_attempt_id", "next_run_id", "next_provider_id",
+            "next_task_state", "next_continuation_state",
+        ):
+            binding.pop(key)
+        preceding.execute(
+            """
+            UPDATE interventions SET directed_binding_json = ?
+            WHERE intervention_id = 'directed-terminal'
+            """,
+            (json.dumps(binding, sort_keys=True, separators=(",", ":")),),
+        )
+    elif binding_shape == "null":
+        preceding.execute(
+            """
+            UPDATE interventions SET directed_binding_json = NULL
+            WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif binding_shape == "absent":
+        preceding.execute("ALTER TABLE interventions DROP COLUMN directed_binding_json")
+    else:
+        raise AssertionError(f"unknown binding shape {binding_shape}")
+    preceding.execute("DELETE FROM agent_runs WHERE run_id = 'next-fable-run'")
+    preceding.commit()
+    tables = (
+        "tasks", "interventions", "agent_runs", "questions", "exchange_reservations",
+    )
+    before = {
+        table: tuple(tuple(row) for row in preceding.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+    preceding.close()
+    return before
+
+
+@pytest.mark.parametrize("outcome", ("resuming", "unknown"))
+@pytest.mark.parametrize("binding_shape", ("absent", "null", "stage_less"))
+def test_pre_stage_answered_nested_migration_binds_one_recoverable_successor(
+    tmp_path, valid_brief, outcome: str, binding_shape: str,
+) -> None:
+    """One legacy post-answer identity migrates to one durable Fable retry stage."""
+    path = tmp_path / f"pre-stage-{outcome}-{binding_shape}.sqlite3"
+    before = _seed_pre_stage_answered_nested_intervention(
+        path, valid_brief, outcome=outcome, binding_shape=binding_shape,
+    )
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    record = migrated.authenticated_intervention("directed-terminal")
+    assert record is not None and record.directed_binding is not None
+    binding = record.directed_binding
+    assert binding.stage == "next_fable"
+    assert binding.next_attempt_id == record.resume_attempt_id
+    assert binding.next_run_id is not None
+    successor = migrated.agent_run(binding.next_run_id)
+    assert successor.agent == "fable"
+    assert successor.cli_session_id == record.fable_session_id
+    assert successor.status == ("running" if outcome == "resuming" else "interrupted")
+    child = migrated.question(binding.question_id)
+    assert child is not None and child.answer_text == "The exact nested fact is verified."
+    events_before = tuple(migrated.events_after("session-1", 0))
+    migrated.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    same = reopened.authenticated_intervention("directed-terminal")
+    assert same == record
+    assert tuple(reopened.events_after("session-1", 0)) == events_before
+    if outcome == "resuming":
+        assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 1, 1)
+    else:
+        assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+    unknown = reopened.authenticated_intervention("directed-terminal")
+    assert unknown is not None
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    assert unknown.directed_binding is not None
+    assert reopened.question(unknown.directed_binding.question_id) == child
+
+    acknowledged = reopened.authorize_retry_after_unknown(
+        unknown.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="legacy-next-fable-ack",
+    )
+    reopened.begin_intervention_resume(
+        acknowledged.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="legacy-next-fable-retry-attempt",
+        resume_run_id="legacy-next-fable-retry-run",
+    )
+    retried = reopened.authenticated_intervention("directed-terminal")
+    assert retried is not None and retried.directed_binding is not None
+    retry_binding = retried.directed_binding
+    assert retry_binding.next_attempt_id == "legacy-next-fable-retry-attempt"
+    assert retry_binding.next_run_id == "legacy-next-fable-retry-run"
+    started = reopened.start_next_fable_intervention_stage(
+        retried.intervention_id, run_id="legacy-next-fable-retry-run",
+    )
+    assert reopened.start_next_fable_intervention_stage(
+        retried.intervention_id, run_id="legacy-next-fable-retry-run",
+    ) == started
+    assert started.status == "running"
+    assert reopened.question(retry_binding.question_id) == child
+    assert tuple(reopened.events_after("session-1", 0)) == events_before
+    assert tuple(
+        tuple(row) for row in reopened._connection.execute(
+            "SELECT * FROM questions ORDER BY rowid"
+        )
+    ) == before["questions"]
+    reopened.close()
+
+
+def test_pre_stage_answered_migration_rejects_a_substituted_successor_collision(
+    tmp_path, valid_brief,
+) -> None:
+    """A deterministic legacy successor ID cannot bind a substituted run row."""
+    path = tmp_path / "pre-stage-successor-collision.sqlite3"
+    _seed_pre_stage_answered_nested_intervention(
+        path, valid_brief, outcome="resuming", binding_shape="absent",
+    )
+    preceding = sqlite3.connect(path)
+    row = preceding.execute(
+        """
+        SELECT intervention_id, resume_generation, resume_attempt_id
+        FROM interventions WHERE intervention_id = 'directed-terminal'
+        """
+    ).fetchone()
+    assert row is not None
+    seed = store_module._encode_json({
+        "intervention_id": row[0],
+        "resume_generation": row[1],
+        "resume_attempt_id": row[2],
+        "question_id": "nested-question",
+        "source_run_id": "nested-source-run",
+    })
+    successor_id = (
+        "migration-next-fable-"
+        f"{store_module.hashlib.sha256(seed.encode()).hexdigest()[:40]}"
+    )
+    preceding.execute(
+        """
+        INSERT INTO agent_runs (
+            run_id, task_id, revision, agent, cli_session_id, started_at, status
+        ) VALUES (?, ?, ?, 'sol', ?, ?, 'running')
+        """,
+        (
+            successor_id, valid_brief.task_id, valid_brief.revision,
+            "fable-session-1", "2026-08-10T12:00:00Z",
+        ),
+    )
+    preceding.commit()
+    tables = (
+        "tasks", "interventions", "agent_runs", "questions", "exchange_reservations",
+    )
+    before = {
+        table: tuple(tuple(entry) for entry in preceding.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+    preceding.close()
+
+    with pytest.raises(RuntimeError):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    after_connection = sqlite3.connect(path)
+    after = {
+        table: tuple(tuple(entry) for entry in after_connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+    after_connection.close()
+    assert after == before
+
+
 def _tamper_next_fable_intervention_stage(store, mutation: str) -> None:
     if mutation == "run":
         store._connection.execute(
@@ -4797,6 +5105,10 @@ def _tamper_next_fable_intervention_stage(store, mutation: str) -> None:
                 directed_binding_json, '$.next_run_id', 'nested-source-run'
             ) WHERE intervention_id = 'directed-terminal'
             """
+        )
+    elif mutation == "missing_run":
+        store._connection.execute(
+            "DELETE FROM agent_runs WHERE run_id = 'next-fable-run'"
         )
     elif mutation == "provider":
         store._connection.execute(
@@ -4859,7 +5171,10 @@ def _tamper_next_fable_intervention_stage(store, mutation: str) -> None:
 
 @pytest.mark.parametrize(
     "mutation",
-    ("run", "provider", "session", "question", "parent", "route", "generation", "attempt"),
+    (
+        "run", "missing_run", "provider", "session", "question", "parent", "route",
+        "generation", "attempt",
+    ),
 )
 @pytest.mark.parametrize("operation", ("invoke", "retry"))
 def test_next_fable_intervention_stage_tampering_fails_before_invoke_or_retry_and_rolls_back(

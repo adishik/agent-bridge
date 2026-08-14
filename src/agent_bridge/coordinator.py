@@ -1968,12 +1968,21 @@ class Coordinator:
                 if resume_prompt is not None
                 else self._original_user_message(task.session_id, task.task_id)
             )
-            task = self._store.set_pending_context(
-                task.task_id,
-                task.revision,
-                expected=task.state,
-                pending={"sol_run_id": run_id, "prompt": persisted_prompt},
-            )
+            pending = {"sol_run_id": run_id, "prompt": persisted_prompt}
+            if task.pending is None:
+                task = self._store.set_pending_context(
+                    task.task_id,
+                    task.revision,
+                    expected=task.state,
+                    pending=pending,
+                )
+            else:
+                task = self._store.replace_pending_context(
+                    task.task_id,
+                    task.revision,
+                    expected=task.state,
+                    pending=pending,
+                )
             completion = self._track_run(run_id)
             if resume_prompt is None:
                 if task.brief is None or context is None:
@@ -2385,6 +2394,27 @@ class Coordinator:
             raise RuntimeError("prepared Fable stage changed")
         return run_id
 
+    def _finish_fable_run_before_downstream(
+        self, task: TaskRecord, run_id: str, exit_code: int,
+    ) -> None:
+        """Consume a bound next-Fable intervention stage before recursive routing."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        binding = None if intervention is None else intervention.directed_binding
+        if (
+            intervention is not None
+            and intervention.status is InterventionStatus.RESUMING
+            and binding is not None
+            and binding.stage == "next_fable"
+            and binding.next_run_id == run_id
+        ):
+            self._store.finish_next_fable_intervention_stage(
+                intervention.intervention_id, run_id=run_id, exit_code=exit_code,
+            )
+            return
+        self._store.finish_agent_run(run_id, status="completed", exit_code=exit_code)
+
     async def _answer_sol_question_with_fable(
         self,
         task: TaskRecord,
@@ -2425,9 +2455,7 @@ class Coordinator:
             clarification = FableClarification.from_dict(result.payload)
             if clarification.status != "answered" or clarification.answer is None:
                 raise RuntimeError("Fable did not answer Sol's exact question")
-            self._store.finish_agent_run(
-                run_id, status="completed", exit_code=result.exit_code,
-            )
+            self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
         except asyncio.CancelledError:
             self._finish_interrupted_run(run_id, exit_code=-1)
             raise
@@ -2864,6 +2892,7 @@ class Coordinator:
             )
         run_id = self._start_or_reuse_fable_run(task, run_id)
         completion = self._track_run(run_id)
+        handoff_intervention_id: str | None = None
         try:
             result = await self._fable.clarify(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
@@ -2892,7 +2921,27 @@ class Coordinator:
             if result.payload is None:
                 raise RuntimeError("Fable clarification completed without a contract")
             clarification = FableClarification.from_dict(result.payload)
-            self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
+            intervention = self._store.active_intervention_for_task(
+                task.task_id, task.revision,
+            )
+            binding = None if intervention is None else intervention.directed_binding
+            normal_sol_handoff = (
+                clarification.directed_question is None
+                and clarification.status != "escalate_to_user"
+                and clarification.answer is not None
+                and not clarification.scope_changed
+            )
+            if (
+                normal_sol_handoff
+                and intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                handoff_intervention_id = intervention.intervention_id
+            else:
+                self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
         except asyncio.CancelledError:
             self._interrupt_if_active(
                 run_id,
@@ -2933,6 +2982,9 @@ class Coordinator:
             self._store.get_task(task.task_id, task.revision),
             clarification,
             underlying_continuation=underlying_continuation,
+            handoff_intervention_id=handoff_intervention_id,
+            handoff_run_id=run_id if handoff_intervention_id is not None else None,
+            handoff_exit_code=result.exit_code if handoff_intervention_id is not None else None,
         )
 
     async def _route_clarification(
@@ -2941,6 +2993,9 @@ class Coordinator:
         clarification: FableClarification,
         *,
         underlying_continuation: SolResumeContext | None = None,
+        handoff_intervention_id: str | None = None,
+        handoff_run_id: str | None = None,
+        handoff_exit_code: int | None = None,
     ) -> None:
         current = self._store.get_task(task.task_id, task.revision)
         if current.state is not TaskState.FABLE_CLARIFYING:
@@ -3083,7 +3138,16 @@ class Coordinator:
             self._emit_state(saved)
             self._emit_clarification(saved, clarification)
             return
-        if underlying_continuation is None:
+        if handoff_intervention_id is not None:
+            if handoff_run_id is None:
+                raise RuntimeError("next Fable handoff run is missing")
+            resumed = self._store.handoff_next_fable_intervention_clarification_to_sol(
+                handoff_intervention_id,
+                run_id=handoff_run_id,
+                exit_code=handoff_exit_code,
+                answer=clarification.answer,
+            )
+        elif underlying_continuation is None:
             resumed = self._store.resume_continuation(
                 task.task_id, task.revision, expected=TaskState.FABLE_CLARIFYING
             )

@@ -2079,6 +2079,9 @@ class SQLiteStore:
 
     def _migrate_intervention_directed_binding_row(self, row: sqlite3.Row) -> bool:
         raw = row["directed_binding_json"]
+        legacy_record = dict(row)
+        legacy_record["directed_binding_json"] = None
+        record = self._intervention_from_row(legacy_record)
         if raw is not None:
             if not isinstance(raw, str):
                 raise RuntimeError("persisted intervention directed binding is invalid")
@@ -2087,6 +2090,10 @@ class SQLiteStore:
                 _decode_intervention_directed_binding(raw)
                 return True
             if set(value) == _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS:
+                question_id = _prepared_identifier(value["question_id"], "question_id")
+                question = self.question(question_id)
+                if question is None:
+                    raise RuntimeError("intervention directed question is missing")
                 upgraded = {
                     **value,
                     "stage": "active_question",
@@ -2097,7 +2104,13 @@ class SQLiteStore:
                     "next_continuation_state": None,
                 }
                 encoded = _encode_json(upgraded)
-                _decode_intervention_directed_binding(encoded)
+                binding = _decode_intervention_directed_binding(encoded)
+                if binding is None:
+                    raise RuntimeError("intervention directed binding is missing")
+                binding = self._migrate_answered_nested_intervention_stage(
+                    record, self.get_task(record.task_id, record.revision), binding,
+                )
+                encoded = _encode_intervention_directed_binding(binding)
                 cursor = self._connection.execute(
                     """
                     UPDATE interventions SET directed_binding_json = ?
@@ -2143,7 +2156,13 @@ class SQLiteStore:
                 "next_continuation_state": None,
             }
             encoded = _encode_json(upgraded)
-            _decode_intervention_directed_binding(encoded)
+            binding = _decode_intervention_directed_binding(encoded)
+            if binding is None:
+                raise RuntimeError("intervention directed binding is missing")
+            binding = self._migrate_answered_nested_intervention_stage(
+                record, self.get_task(record.task_id, record.revision), binding,
+            )
+            encoded = _encode_intervention_directed_binding(binding)
             cursor = self._connection.execute(
                 """
                 UPDATE interventions SET directed_binding_json = ?
@@ -2155,7 +2174,6 @@ class SQLiteStore:
                 raise RuntimeError("intervention directed binding migration changed")
             return True
 
-        record = self._intervention_from_row(row)
         binding = self._infer_previous_intervention_directed_binding(record)
         if binding is None:
             return False
@@ -2184,7 +2202,6 @@ class SQLiteStore:
             SELECT * FROM questions
             WHERE session_id = ? AND task_id = ? AND revision = ?
               AND continuation_generation = ? AND nested_parent_kind IS NOT NULL
-              AND answer_text IS NULL
             ORDER BY rowid LIMIT 2
             """,
             (record.session_id, record.task_id, record.revision, record.resume_generation),
@@ -2227,12 +2244,15 @@ class SQLiteStore:
             ).fetchall()
             if len(child_rows) != 1:
                 raise RuntimeError("nested intervention child migration is ambiguous")
-            return self._make_intervention_directed_binding(
+            binding = self._make_intervention_directed_binding(
                 kind="nested_resume",
                 question=question,
                 continuation_pause_id=self._question_pause_id(question.question_id),
                 continuation_state=TaskState.FABLE_CLARIFYING,
                 source_run=self._agent_run_from_row(child_rows[0]),
+            )
+            return self._migrate_answered_nested_intervention_stage(
+                record, task, binding,
             )
 
         top_level_rows = self._connection.execute(
@@ -2254,6 +2274,21 @@ class SQLiteStore:
         ).fetchall()
         if len(top_level_rows) == 1:
             question = self._question_from_row(top_level_rows[0])
+            expected_source = _INTERVENTION_SOURCE_AGENTS.get(record.continuation_state)
+            if terminal_answered:
+                if source.agent == expected_source:
+                    return None
+                if (
+                    record.resume_attempt_id is None
+                    or record.resume_run_id is None
+                    or source.agent not in {
+                        ConversationTarget.FABLE.value,
+                        ConversationTarget.SOL.value,
+                    }
+                    or question.answered_by is None
+                    or question.answered_by.value != source.agent
+                ):
+                    raise RuntimeError("terminal intervention migration is ambiguous")
             return self._make_intervention_directed_binding(
                 kind="initial",
                 question=question,
@@ -2265,6 +2300,129 @@ class SQLiteStore:
         if len(top_level_rows) > 1 or source.agent != expected_source:
             raise RuntimeError("intervention directed migration is ambiguous")
         return None
+
+    def _migrate_answered_nested_intervention_stage(
+        self,
+        record: InterventionRecord,
+        task: TaskRecord,
+        binding: _InterventionDirectedBinding,
+    ) -> _InterventionDirectedBinding:
+        """Derive one durable successor only from an exact legacy answered child."""
+        question = self.question(binding.question_id)
+        if question is None:
+            raise RuntimeError("intervention directed question is missing")
+        if question.answer_text is None:
+            return binding
+        if (
+            binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.source_agent is not ConversationTarget.SOL
+            or record.status not in {
+                InterventionStatus.RESUMING,
+                InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+            }
+            or record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state not in _SOL_TASK_STATES
+            or record.resume_attempt_id is None
+            or record.resume_run_id is None
+            or task.fable_session_id != record.fable_session_id
+            or task.fable_session_id is None
+            or question.answered_by is not ConversationActor.SOL
+            or question.nested_parent_kind != binding.nested_parent_kind
+            or question.continuation_generation != binding.question_generation
+            or question.asked_by is not binding.asked_by
+            or question.addressed_to is not binding.addressed_to
+            or question.routed_to is not binding.routed_to
+            or question.parent_question_id != binding.parent_question_id
+            or question.parent_continuation_pause_id
+            != binding.parent_continuation_pause_id
+        ):
+            raise RuntimeError("answered nested intervention migration is ambiguous")
+        _, child_continuation, _, child_pause = self._question_exact(
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            expected_generation=binding.question_generation,
+            question_id=question.question_id,
+        )
+        source = self.agent_run(binding.source_run_id)
+        if (
+            child_continuation is not TaskState.FABLE_CLARIFYING
+            or child_pause != binding.continuation_pause_id
+            or source.task_id != record.task_id
+            or source.revision != record.revision
+            or source.agent != ConversationTarget.SOL.value
+            or source.cli_session_id != record.sol_thread_id
+            or source.cli_session_id != binding.source_provider_id
+        ):
+            raise RuntimeError("answered nested intervention migration is ambiguous")
+        if question.nested_parent_kind == "clarification":
+            next_task_state = TaskState.FABLE_CLARIFYING
+            next_continuation_state = None
+        elif question.nested_parent_kind == "question":
+            if question.parent_question_id is None:
+                raise RuntimeError("answered nested intervention parent is missing")
+            parent, parent_continuation, _, parent_pause = self._question_exact(
+                session_id=record.session_id,
+                task_id=record.task_id,
+                revision=record.revision,
+                expected_generation=binding.question_generation,
+                question_id=question.parent_question_id,
+            )
+            if (
+                parent.answer_text is not None
+                or parent.nested_parent_kind is not None
+                or parent.asked_by is not ConversationActor.SOL
+                or parent.routed_to is not ConversationTarget.FABLE
+                or parent_continuation not in _SOL_TASK_STATES
+                or parent_pause != binding.parent_continuation_pause_id
+            ):
+                raise RuntimeError("answered nested intervention parent changed")
+            next_task_state = TaskState.AWAITING_USER_INPUT
+            next_continuation_state = parent_continuation
+        else:
+            raise RuntimeError("answered nested intervention parent is invalid")
+        resumed_continuation = next_continuation_state or next_task_state
+        if record.status is InterventionStatus.RESUMING:
+            task_matches = (
+                task.state is next_task_state
+                and task.continuation_state is next_continuation_state
+            )
+        else:
+            task_matches = (
+                task.state is TaskState.INTERRUPTED
+                and task.continuation_state is resumed_continuation
+            )
+        if not task_matches:
+            raise RuntimeError("answered nested intervention continuation changed")
+        seed = _encode_json({
+            "intervention_id": record.intervention_id,
+            "resume_generation": record.resume_generation,
+            "resume_attempt_id": record.resume_attempt_id,
+            "question_id": binding.question_id,
+            "source_run_id": binding.source_run_id,
+        })
+        next_run_id = f"migration-next-fable-{hashlib.sha256(seed.encode()).hexdigest()[:40]}"
+        self._preallocate_next_fable_intervention_run(
+            run_id=next_run_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            provider_id=task.fable_session_id,
+            status=(
+                "running"
+                if record.status is InterventionStatus.RESUMING
+                else "interrupted"
+            ),
+        )
+        return replace(
+            binding,
+            stage="next_fable",
+            next_attempt_id=record.resume_attempt_id,
+            next_run_id=next_run_id,
+            next_provider_id=task.fable_session_id,
+            next_task_state=next_task_state,
+            next_continuation_state=next_continuation_state,
+        )
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[None]:
@@ -3214,6 +3372,12 @@ class SQLiteStore:
                 if intervention is not None and binding is not None and owns_nested_child:
                     if task.fable_session_id is None:
                         raise RuntimeError("nested intervention next Fable provider is missing")
+                    self._preallocate_next_fable_intervention_run(
+                        run_id=next_fable_run_id,
+                        task_id=task_id,
+                        revision=revision,
+                        provider_id=task.fable_session_id,
+                    )
                     next_binding = replace(
                         binding,
                         stage="next_fable",
@@ -6765,6 +6929,35 @@ class SQLiteStore:
             raise RuntimeError("task cannot accept pending context")
         return self.get_task(task_id, revision)
 
+    def replace_pending_context(
+        self,
+        task_id: str,
+        revision: int,
+        *,
+        expected: TaskState,
+        pending: Mapping[str, object],
+    ) -> TaskRecord:
+        """Replace one active phase's durable continuation before its next run."""
+        frozen_pending = freeze_json(pending)
+        if not isinstance(frozen_pending, Mapping):
+            raise ValueError("pending must be an object")
+        cursor = self._connection.execute(
+            """
+            UPDATE tasks SET pending_json = ?, continuation_pause_id = NULL
+            WHERE task_id = ? AND revision = ? AND state = ?
+              AND continuation_state IS NULL AND pending_json IS NOT NULL
+            """,
+            (
+                _encode_json(frozen_pending),
+                _require_string(task_id, "task_id"),
+                _require_integer(revision, "revision"),
+                expected.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("task has no replaceable pending context")
+        return self.get_task(task_id, revision)
+
     def clear_pending_context(
         self, task_id: str, revision: int, *, expected: TaskState,
     ) -> TaskRecord:
@@ -7752,31 +7945,223 @@ class SQLiteStore:
                 "SELECT * FROM agent_runs WHERE run_id = ?", (run_id,),
             ).fetchone()
             if row is None:
-                self._connection.execute(
-                    """
-                    INSERT INTO agent_runs (
-                        run_id, task_id, revision, agent, cli_session_id, started_at, status
-                    ) VALUES (?, ?, ?, 'fable', ?, ?, 'running')
-                    """,
-                    (
-                        run_id,
-                        record.task_id,
-                        record.revision,
-                        binding.next_provider_id,
-                        self._timestamp(),
-                    ),
-                )
-            else:
-                prepared = self._agent_run_from_row(row)
-                if (
-                    prepared.task_id != record.task_id
-                    or prepared.revision != record.revision
-                    or prepared.agent != ConversationTarget.FABLE.value
-                    or prepared.cli_session_id != binding.next_provider_id
-                    or prepared.status != "running"
-                ):
-                    raise RuntimeError("nested intervention next Fable run changed")
+                raise RuntimeError("nested intervention next Fable run is missing")
+            prepared = self._agent_run_from_row(row)
+            if (
+                prepared.task_id != record.task_id
+                or prepared.revision != record.revision
+                or prepared.agent != ConversationTarget.FABLE.value
+                or prepared.cli_session_id != binding.next_provider_id
+                or prepared.status != "running"
+            ):
+                raise RuntimeError("nested intervention next Fable run changed")
         return self.agent_run(run_id)
+
+    def finish_next_fable_intervention_stage(
+        self, intervention_id: str, *, run_id: str, exit_code: int | None,
+    ) -> InterventionRecord:
+        """Commit one completed next-Fable result with its intervention terminalization."""
+        intervention_id = _prepared_identifier(intervention_id, "intervention_id")
+        run_id = _prepared_identifier(run_id, "run_id")
+        if exit_code is not None:
+            exit_code = _require_integer(exit_code, "exit_code")
+        with self._immediate_transaction():
+            record = self.authenticated_intervention(intervention_id)
+            if record is None:
+                raise RuntimeError("intervention not found")
+            binding = record.directed_binding
+            task = self.get_task(record.task_id, record.revision)
+            if (
+                binding is None
+                or binding.stage != "next_fable"
+                or binding.next_run_id != run_id
+                or binding.next_attempt_id != record.resume_attempt_id
+                or task.state is not binding.next_task_state
+                or task.continuation_state is not binding.next_continuation_state
+            ):
+                raise RuntimeError("nested intervention next Fable stage changed")
+            row = self._connection.execute(
+                "SELECT * FROM agent_runs WHERE run_id = ?", (run_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("nested intervention next Fable run is missing")
+            successor = self._agent_run_from_row(row)
+            if (
+                successor.task_id != record.task_id
+                or successor.revision != record.revision
+                or successor.agent != ConversationTarget.FABLE.value
+                or successor.cli_session_id != binding.next_provider_id
+            ):
+                raise RuntimeError("nested intervention next Fable run changed")
+            if record.status is InterventionStatus.RESUMED:
+                if successor.status != "completed":
+                    raise RuntimeError("nested intervention next Fable completion changed")
+                return record
+            if record.status is not InterventionStatus.RESUMING or successor.status != "running":
+                raise RuntimeError("nested intervention next Fable stage changed")
+            run_cursor = self._connection.execute(
+                """
+                UPDATE agent_runs SET status = 'completed', exit_code = ?, ended_at = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (exit_code, self._timestamp(), run_id),
+            )
+            if run_cursor.rowcount != 1:
+                raise RuntimeError("nested intervention next Fable completion changed")
+            intervention_cursor = self._connection.execute(
+                """
+                UPDATE interventions SET status = ?
+                WHERE intervention_id = ? AND status = ? AND resume_generation = ?
+                  AND resume_attempt_id = ? AND resume_run_id = ?
+                """,
+                (
+                    InterventionStatus.RESUMED.value,
+                    intervention_id,
+                    InterventionStatus.RESUMING.value,
+                    record.resume_generation,
+                    record.resume_attempt_id,
+                    record.resume_run_id,
+                ),
+            )
+            if intervention_cursor.rowcount != 1:
+                raise RuntimeError("nested intervention next Fable completion changed")
+        return self._intervention_required(intervention_id)
+
+    def handoff_next_fable_intervention_clarification_to_sol(
+        self,
+        intervention_id: str,
+        *,
+        run_id: str,
+        exit_code: int | None,
+        answer: str,
+    ) -> TaskRecord:
+        """Atomically consume one staged Fable answer before ordinary Sol resumes."""
+        intervention_id = _prepared_identifier(intervention_id, "intervention_id")
+        run_id = _prepared_identifier(run_id, "run_id")
+        if exit_code is not None:
+            exit_code = _require_integer(exit_code, "exit_code")
+        answer = _intervention_text(answer)
+        with self._immediate_transaction():
+            record = self.authenticated_intervention(intervention_id)
+            if record is None:
+                raise RuntimeError("intervention not found")
+            binding = record.directed_binding
+            task = self.get_task(record.task_id, record.revision)
+            if (
+                binding is None
+                or binding.stage != "next_fable"
+                or binding.next_run_id != run_id
+                or binding.next_attempt_id != record.resume_attempt_id
+                or binding.next_task_state is not TaskState.FABLE_CLARIFYING
+                or task.state is not TaskState.FABLE_CLARIFYING
+                or task.continuation_state is not None
+                or not isinstance(task.sol_thread_id, str)
+                or not isinstance((task.pending or {}).get("sol_run_id"), str)
+            ):
+                raise RuntimeError("nested intervention next Fable stage changed")
+            row = self._connection.execute(
+                "SELECT * FROM agent_runs WHERE run_id = ?", (run_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("nested intervention next Fable run is missing")
+            successor = self._agent_run_from_row(row)
+            if (
+                successor.task_id != record.task_id
+                or successor.revision != record.revision
+                or successor.agent != ConversationTarget.FABLE.value
+                or successor.cli_session_id != binding.next_provider_id
+            ):
+                raise RuntimeError("nested intervention next Fable run changed")
+            pending = {
+                "sol_run_id": (task.pending or {})["sol_run_id"],
+                "prompt": answer,
+            }
+            if record.status is InterventionStatus.RESUMED:
+                if successor.status != "completed" or task.state is not TaskState.SOL_RUNNING:
+                    raise RuntimeError("nested intervention next Fable handoff changed")
+                if task.pending != pending:
+                    raise RuntimeError("nested intervention next Fable handoff changed")
+                return task
+            if record.status is not InterventionStatus.RESUMING or successor.status != "running":
+                raise RuntimeError("nested intervention next Fable stage changed")
+            run_cursor = self._connection.execute(
+                """
+                UPDATE agent_runs SET status = 'completed', exit_code = ?, ended_at = ?
+                WHERE run_id = ? AND status = 'running'
+                """,
+                (exit_code, self._timestamp(), run_id),
+            )
+            if run_cursor.rowcount != 1:
+                raise RuntimeError("nested intervention next Fable handoff changed")
+            task_cursor = self._connection.execute(
+                """
+                UPDATE tasks
+                SET state = ?, continuation_state = NULL, pending_json = ?,
+                    continuation_pause_id = NULL
+                WHERE task_id = ? AND revision = ? AND state = ?
+                  AND continuation_state IS NULL
+                """,
+                (
+                    TaskState.SOL_RUNNING.value,
+                    _encode_json(freeze_json(pending)),
+                    record.task_id,
+                    record.revision,
+                    TaskState.FABLE_CLARIFYING.value,
+                ),
+            )
+            if task_cursor.rowcount != 1:
+                raise RuntimeError("nested intervention next Fable handoff changed")
+            intervention_cursor = self._connection.execute(
+                """
+                UPDATE interventions SET status = ?
+                WHERE intervention_id = ? AND status = ? AND resume_generation = ?
+                  AND resume_attempt_id = ? AND resume_run_id = ?
+                """,
+                (
+                    InterventionStatus.RESUMED.value,
+                    intervention_id,
+                    InterventionStatus.RESUMING.value,
+                    record.resume_generation,
+                    record.resume_attempt_id,
+                    record.resume_run_id,
+                ),
+            )
+            if intervention_cursor.rowcount != 1:
+                raise RuntimeError("nested intervention next Fable handoff changed")
+        return self.get_task(record.task_id, record.revision)
+
+    def _preallocate_next_fable_intervention_run(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        revision: int,
+        provider_id: str,
+        status: Literal["running", "interrupted"] = "running",
+    ) -> None:
+        """Persist one exact next-Fable run before the adapter can be invoked."""
+        row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        if row is not None:
+            existing = self._agent_run_from_row(row)
+            if (
+                existing.task_id != task_id
+                or existing.revision != revision
+                or existing.agent != ConversationTarget.FABLE.value
+                or existing.cli_session_id != provider_id
+                or existing.status != status
+            ):
+                raise RuntimeError("nested intervention next Fable run changed")
+            return
+        self._connection.execute(
+            """
+            INSERT INTO agent_runs (
+                run_id, task_id, revision, agent, cli_session_id, started_at, status
+            ) VALUES (?, ?, ?, 'fable', ?, ?, ?)
+            """,
+            (run_id, task_id, revision, provider_id, self._timestamp(), status),
+        )
 
     def create_intervention_and_request_stop(
         self,
@@ -8132,6 +8517,14 @@ class SQLiteStore:
                             resumed_continuation.value,
                             record.resume_generation,
                         ),
+                    )
+                    if binding.next_provider_id is None:
+                        raise RuntimeError("intervention next Fable provider changed")
+                    self._preallocate_next_fable_intervention_run(
+                        run_id=resume_run_id,
+                        task_id=record.task_id,
+                        revision=record.revision,
+                        provider_id=binding.next_provider_id,
                     )
                     next_binding_json = _encode_intervention_directed_binding(
                         replace(
@@ -9604,18 +9997,19 @@ class SQLiteStore:
         next_row = self._connection.execute(
             "SELECT * FROM agent_runs WHERE run_id = ?", (binding.next_run_id,)
         ).fetchone()
-        if next_row is not None:
-            try:
-                successor = self._agent_run_from_row(next_row)
-            except RuntimeError:
-                return False
-            if (
-                successor.task_id != record.task_id
-                or successor.revision != record.revision
-                or successor.agent != ConversationTarget.FABLE.value
-                or successor.cli_session_id != binding.next_provider_id
-            ):
-                return False
+        if next_row is None:
+            return False
+        try:
+            successor = self._agent_run_from_row(next_row)
+        except RuntimeError:
+            return False
+        if (
+            successor.task_id != record.task_id
+            or successor.revision != record.revision
+            or successor.agent != ConversationTarget.FABLE.value
+            or successor.cli_session_id != binding.next_provider_id
+        ):
+            return False
         resumed_continuation = (
             binding.next_continuation_state or binding.next_task_state
         )
