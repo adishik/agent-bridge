@@ -4406,6 +4406,10 @@ def test_intervention_startup_recovery_never_replays_a_committed_resume_claim(
     store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
     store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
     store.set_agent_run_session("source-run-1", "sol-thread-1")
+    store.set_pending_context(
+        valid_brief.task_id, valid_brief.revision, expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "source-run-1", "prompt": "continue exactly"},
+    )
     pending = store.create_intervention_and_request_stop(
         intervention_id="pending-stop", session_id="session-1", task_id=valid_brief.task_id,
         revision=valid_brief.revision, expected_source_generation=1, message="Pause first.",
@@ -4422,10 +4426,13 @@ def test_intervention_startup_recovery_never_replays_a_committed_resume_claim(
     assert ready.status is store_module.InterventionStatus.READY
     assert recovered.agent_run("source-run-1").status == "interrupted"
     assert recovered.mark_intervention_ready("pending-stop", run_id="source-run-1") == ready
-    claimed = recovered.claim_intervention_resume(
+    claimed_task = recovered.begin_intervention_resume(
         "pending-stop", expected_resume_generation=pending.resume_generation,
         resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
     )
+    assert claimed_task.state is TaskState.FABLE_CLARIFYING
+    claimed = recovered.intervention("pending-stop")
+    assert claimed is not None
     assert claimed.status is store_module.InterventionStatus.RESUMING
     recovered.close()
 
@@ -4434,6 +4441,9 @@ def test_intervention_startup_recovery_never_replays_a_committed_resume_claim(
     unknown = reopened.intervention("pending-stop")
     assert unknown is not None
     assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    recovered_task = reopened.get_task(valid_brief.task_id, valid_brief.revision)
+    assert recovered_task.state is TaskState.INTERRUPTED
+    assert recovered_task.continuation_state is TaskState.FABLE_CLARIFYING
     with pytest.raises(RuntimeError, match="ready"):
         reopened.claim_intervention_resume(
             "pending-stop", expected_resume_generation=pending.resume_generation,

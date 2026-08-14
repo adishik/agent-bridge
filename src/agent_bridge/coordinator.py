@@ -1542,7 +1542,9 @@ class Coordinator:
             context = self._context_from_task(context_task)
             if context is None:
                 await self._run_planning(
-                    task, self._original_user_message(task.session_id, task.task_id),
+                    task,
+                    f"{self._original_user_message(task.session_id, task.task_id)}"
+                    f"\n\nIntervention guidance:\n{record.message}",
                     resume_session_id=task.fable_session_id, run_id=resume_run_id,
                 )
             else:
@@ -1558,6 +1560,15 @@ class Coordinator:
             and current.resume_attempt_id == resume_attempt_id
             and current.resume_run_id == resume_run_id
         ):
+            task = self._store.get_task(current.task_id, current.revision)
+            run = self._store.agent_run(resume_run_id)
+            if run.status != "completed" or task.state is TaskState.INTERRUPTED:
+                self._store.mark_resume_outcome_unknown(
+                    intervention_id,
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
+                return
             self._store.complete_intervention(
                 intervention_id,
                 expected_resume_generation=current.resume_generation,
@@ -1612,20 +1623,16 @@ class Coordinator:
                 intervention.intervention_id,
                 expected_resume_generation=intervention.resume_generation,
             )
-            run_id = canceled.resume_run_id if (
-                intervention.status is InterventionStatus.RESUMING
-            ) else canceled.run_id
-            try:
-                active = self._store.agent_run(run_id)
-            except RuntimeError:
-                active = None
+            active = self._store.active_run_for_task(
+                canceled.task_id, canceled.revision,
+            )
             if active is not None and active.status == "running":
                 receipt = await self._runner.stop(
-                    run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                    active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
                 )
                 if not receipt.process_exited:
                     raise TimeoutError("stop process did not exit")
-                completion = self._run_completions.get(run_id)
+                completion = self._run_completions.get(active.run_id)
                 if completion is not None:
                     await completion.wait()
             return

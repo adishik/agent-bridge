@@ -91,6 +91,9 @@ class _RuntimeStore:
     def intervention(self, intervention_id: str) -> InterventionRecord | None:
         return self.intervention_rows.get(intervention_id)
 
+    def authenticated_intervention(self, intervention_id: str) -> InterventionRecord | None:
+        return self.intervention(intervention_id)
+
     def latest_prepared_action_for_task(
         self, *, project_id: str, session_id: str, task_id: str, revision: int,
     ) -> PreparedActionRecord | None:
@@ -137,6 +140,10 @@ class _RuntimeCoordinator:
     directed_preparations: list[tuple[str, tuple[object, ...]]] = field(
         default_factory=list,
     )
+    intervention_continues: list[str] = field(default_factory=list)
+    intervention_dispatches: list[str] = field(default_factory=list)
+    intervention_dispatch_started: asyncio.Event | None = None
+    intervention_dispatch_release: asyncio.Event | None = None
 
     def _record(
         self, *, session_id: str, task_id: str, revision: int, action: str,
@@ -403,6 +410,24 @@ class _RuntimeCoordinator:
         )
         self.store.intervention_rows[intent.intervention_id] = record
         return record
+
+    async def continue_intervention(self, intervention_id: str) -> None:
+        self.intervention_continues.append(intervention_id)
+        record = self.store.intervention_rows[intervention_id]
+        self.store.intervention_rows[intervention_id] = replace(
+            record, status=InterventionStatus.READY,
+        )
+
+    async def dispatch_ready_intervention(self, intervention_id: str) -> None:
+        self.intervention_dispatches.append(intervention_id)
+        if self.intervention_dispatch_started is not None:
+            self.intervention_dispatch_started.set()
+        if self.intervention_dispatch_release is not None:
+            await self.intervention_dispatch_release.wait()
+        record = self.store.intervention_rows[intervention_id]
+        self.store.intervention_rows[intervention_id] = replace(
+            record, status=InterventionStatus.RESUMED,
+        )
 
 
 @dataclass
@@ -1279,6 +1304,53 @@ def test_hub_prepare_intervention_borrows_the_exact_live_source_lease() -> None:
         assert prepared.lease_origin.value == "borrowed_source"
         assert lease.snapshot() == source.token
         assert runtime.coordinator.stops == []
+
+    asyncio.run(exercise())
+
+
+def test_duplicate_hub_intervention_continuations_do_not_release_the_running_owner_lease() -> None:
+    """Removing Hub lifecycle ownership lets a duplicate schedule dispatch and release early."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        readiness_calls: list[None] = []
+        runtime.readiness = _readiness(fable_calls=readiness_calls, sol_calls=readiness_calls)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        runtime.coordinator.intervention_dispatch_started = started
+        runtime.coordinator.intervention_dispatch_release = release
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="intervention-1", message="Pause here.",
+                addressed_to=ConversationTarget.FABLE, revision=0,
+                continuation_generation=source.token.generation,
+            ),
+        )
+        readiness_calls.clear()
+
+        owner = asyncio.create_task(workflows.continue_intervention(prepared))
+        await started.wait()
+        follower = asyncio.create_task(workflows.continue_intervention(prepared))
+        await asyncio.sleep(0)
+
+        assert runtime.coordinator.intervention_continues == ["intervention-1"]
+        assert readiness_calls == [None, None]
+        assert runtime.coordinator.intervention_dispatches == ["intervention-1"]
+        assert lease.snapshot() == prepared.lease_token
+
+        release.set()
+        await asyncio.gather(owner, follower)
+
+        assert runtime.store.intervention("intervention-1").status is InterventionStatus.RESUMED  # type: ignore[union-attr]
+        assert lease.snapshot() is None
 
     asyncio.run(exercise())
 

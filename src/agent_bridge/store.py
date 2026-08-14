@@ -4616,15 +4616,25 @@ class SQLiteStore:
                 pending = task.pending
             else:
                 pending = self._prepared_pending_projection(record, reason=reason)
+            pause_row = self._connection.execute(
+                "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+                (task.task_id, task.revision),
+            ).fetchone()
+            pause_id = None if pause_row is None else pause_row["continuation_pause_id"]
+            preserve_pause = (
+                pause_id is not None
+                and self._unanswered_question_for_task(task.task_id, task.revision) is not None
+            )
             task_cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET continuation_state = ?, pending_json = ?, continuation_pause_id = NULL
+                SET continuation_state = ?, pending_json = ?, continuation_pause_id = ?
                 WHERE task_id = ? AND revision = ? AND session_id = ? AND state = ?
                 """,
                 (
                     continuation.value,
                     _encode_json(pending),
+                    pause_id if preserve_pause else None,
                     record.task_id,
                     record.revision,
                     record.session_id,
@@ -7332,6 +7342,35 @@ class SQLiteStore:
                 InterventionStatus.RESUMING,
             }:
                 raise RuntimeError("intervention cannot be canceled")
+            task = self.get_task(record.task_id, record.revision)
+            if task.state in _ACTIVE_TASK_STATES:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = ?
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value, task.state.value,
+                        record.task_id, record.revision, task.state.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention task changed concurrently")
+            elif task.state is TaskState.AWAITING_USER_INPUT:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value,
+                        record.task_id, record.revision, TaskState.AWAITING_USER_INPUT.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention task changed concurrently")
+            elif task.state is not TaskState.INTERRUPTED:
+                raise RuntimeError("intervention task changed concurrently")
             cursor = self._connection.execute(
                 """
                 UPDATE interventions SET status = ?
@@ -7578,8 +7617,35 @@ class SQLiteStore:
         placeholders = ", ".join("?" for _ in active_values)
         tasks_interrupted = 0
         with self._immediate_transaction():
-            self._validate_interventions_for_recovery_in_transaction()
             self._validate_nested_question_rows_in_transaction()
+            for row in self._connection.execute(
+                "SELECT * FROM interventions WHERE status = 'resuming' ORDER BY intervention_id"
+            ):
+                record = self._intervention_from_row(row)
+                task = self.get_task(record.task_id, record.revision)
+                if task.state is TaskState.INTERRUPTED:
+                    continue
+                continuation = (
+                    TaskState.FABLE_CLARIFYING
+                    if (
+                        record.routed_to is ConversationTarget.FABLE
+                        and record.continuation_state in _SOL_TASK_STATES
+                    )
+                    else record.continuation_state
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?, continuation_state = ?
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value, continuation.value,
+                        record.task_id, record.revision, task.state.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("resuming intervention task changed during recovery")
+                tasks_interrupted += 1
             while True:
                 rows = self._connection.execute(
                     f"""
@@ -7647,6 +7713,7 @@ class SQLiteStore:
                     TaskState.INTERRUPTED.value,
                 ),
             )
+            self._validate_interventions_for_recovery_in_transaction()
             self._connection.execute(
                 """
                 UPDATE interventions SET status = ?
@@ -8056,14 +8123,26 @@ class SQLiteStore:
                 )
             except RuntimeError:
                 return False
+        resumed_continuation = (
+            TaskState.FABLE_CLARIFYING
+            if (
+                record.routed_to is ConversationTarget.FABLE
+                and record.continuation_state in _SOL_TASK_STATES
+            )
+            else record.continuation_state
+        )
         if record.status in {
             InterventionStatus.PENDING_STOP,
             InterventionStatus.READY,
             InterventionStatus.CANCELED_BY_STOP,
-            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
         } and (
             task.state is not TaskState.INTERRUPTED
             or task.continuation_state is not record.continuation_state
+        ):
+            return False
+        if record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN and (
+            task.state is not TaskState.INTERRUPTED
+            or task.continuation_state is not resumed_continuation
         ):
             return False
         if record.status is InterventionStatus.RESUMING and task.state not in {

@@ -1878,6 +1878,137 @@ def test_continue_intervention_freshly_gates_claims_dispatches_and_releases_leas
         assert resumed.resume_run_id is not None
         assert readiness_calls == ["fable", "sol"]
         assert harness.sol.resume_threads == [THREAD_ID]
+        assert harness.sol.resume_prompts == ["Continue with this constraint."]
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_fable_early_planning_intervention_dispatches_its_persisted_guidance(harness) -> None:
+    """An early Fable continuation must receive durable guidance before a new plan starts."""
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        prompts: list[str] = []
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        async def plan(*, run_id: str, task_id: str, prompt: str, context: str) -> AgentRunResult:
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                started.set()
+                await release.wait()
+                return _result(run_id, None, session_id=None, interrupted=True, exit_code=-15)
+            return _result(run_id, harness.fable.brief.to_dict(), session_id="fable-session-1")
+
+        harness.fable.plan = plan  # type: ignore[method-assign]
+        harness.runner.release_on_stop = release
+        initial = asyncio.create_task(
+            harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        )
+        await started.wait()
+        planning = harness.store.get_task("task-1", 0)
+        assert planning.state is TaskState.FABLE_PLANNING
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="early-fable", message="Keep the deployment bounded.",
+                addressed_to=ConversationTarget.FABLE, revision=0,
+                continuation_generation=planning.continuation_generation,
+            ),
+        )
+        await workflows.continue_intervention(prepared)
+        await initial
+
+        assert prompts == ["Build the bridge", "Build the bridge\n\nIntervention guidance:\nKeep the deployment bounded."]
+        assert harness.store.intervention("early-fable").status.value == "resumed"  # type: ignore[union-attr]
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_intervention_adapter_result_remains_unknown_with_exact_owner(
+    harness,
+) -> None:
+    """A normal adapter return marked interrupted must never complete the intervention."""
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        async def interrupted_resume(*, run_id: str, thread_id: str, prompt: str) -> AgentRunResult:
+            harness.sol.resume_threads.append(thread_id)
+            harness.sol.resume_prompts.append(prompt)
+            return _result(run_id, None, session_id=thread_id, interrupted=True, exit_code=-15)
+
+        harness.sol.resume = interrupted_resume  # type: ignore[method-assign]
+        harness.sol.hold_start = release
+        harness.runner.release_on_stop = release
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await asyncio.sleep(0)
+        active = harness.store.active_run_for_task("task-1", 1)
+        assert active is not None
+        harness.store.set_sol_thread("task-1", 1, THREAD_ID)
+        harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(project_id=runtime.project_id, session_id="session-1", task_id="task-1")
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="interrupted-result", message="Preserve this direction.",
+                addressed_to=ConversationTarget.SOL, revision=1, continuation_generation=1,
+            ),
+        )
+        await workflows.continue_intervention(prepared)
+        await approval
+
+        record = harness.store.intervention("interrupted-result")
+        task = harness.store.get_task("task-1", 1)
+        assert record is not None
+        assert record.status.value == "resume_outcome_unknown"
+        assert record.resume_attempt_id == "intervention-run-3"
+        assert record.resume_run_id == "run-3"
+        assert task.state is TaskState.INTERRUPTED
+        assert harness.store.agent_run(record.resume_run_id).status == "interrupted"
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -1949,6 +2080,9 @@ def test_later_stop_cancels_a_claimed_intervention_before_its_resume_run(harness
         canceled = harness.store.intervention(record.intervention_id)
         assert canceled is not None
         assert canceled.status.value == "canceled_by_stop"
+        stopped = harness.store.get_task("task-1", 1)
+        assert stopped.state is TaskState.INTERRUPTED
+        assert stopped.continuation_state is TaskState.SOL_RUNNING
         with pytest.raises(RuntimeError, match="resuming"):
             harness.store.complete_intervention(
                 record.intervention_id, expected_resume_generation=record.resume_generation,
@@ -3753,6 +3887,81 @@ def test_stop_wins_while_a_reserved_directed_agent_answer_is_in_flight(harness) 
         assert unanswered is not None
         assert unanswered.question_id == question.question_id
         assert harness.sol.resume_threads == []
+
+    asyncio.run(scenario())
+
+
+def test_hub_prepared_directed_answer_stop_preserves_the_exact_pause_through_finalization(
+    harness,
+) -> None:
+    """Removing finalizer pause preservation detaches this claimed directed answer."""
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        harness.sol.queue(_directed_sol_question("Which exact rule applies?"))
+        harness.fable.on_answer_sol_question = entered.set
+        harness.fable.hold_answer_sol_question = release
+        harness.runner.release_on_stop = release
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await entered.wait()
+        waiting = harness.store.get_task("task-1", 1)
+        question = harness.store.unanswered_question_for_task("task-1", 1)
+        active = harness.store.active_run_for_task("task-1", 1)
+        pause_id = harness.store._connection.execute(
+            "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"]
+        assert waiting.state is TaskState.AWAITING_USER_INPUT
+        assert question is not None
+        assert active is not None
+        assert pause_id is not None
+        harness.store.set_agent_run_session(active.run_id, "fable-session-1")
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="directed-answer-stop", message="Pause this answer.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=waiting.continuation_generation,
+            ),
+        )
+        assert prepared.lease_token == lease.snapshot()
+
+        reservation = workflows.reserve_stop(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        await workflows.stop(reservation=reservation)
+        await approval
+
+        interrupted = harness.store.get_task("task-1", 1)
+        persisted_pause_id = harness.store._connection.execute(
+            "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"]
+        preserved_question = harness.store.unanswered_question_for_task("task-1", 1)
+        assert harness.store.intervention("directed-answer-stop").status.value == "canceled_by_stop"  # type: ignore[union-attr]
+        assert interrupted.state is TaskState.INTERRUPTED
+        assert interrupted.continuation_state is waiting.continuation_state
+        assert interrupted.pending == waiting.pending
+        assert persisted_pause_id == pause_id
+        assert preserved_question is not None
+        assert preserved_question.question_id == question.question_id
+        assert lease.snapshot() is None
 
     asyncio.run(scenario())
 

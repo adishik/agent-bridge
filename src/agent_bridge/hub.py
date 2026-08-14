@@ -457,6 +457,7 @@ class HubWorkflowOrchestrator:
         self._lease = lease
         self._usage_credits_acknowledged = usage_credits_acknowledged
         self._aborted_tokens: set[LeaseToken] = set()
+        self._intervention_continuations: dict[str, asyncio.Event] = {}
 
     def active_lease_snapshot(self) -> LeaseToken | None:
         """Return the current lease identity without exposing its owner."""
@@ -548,6 +549,12 @@ class HubWorkflowOrchestrator:
         runtime = self._runtime_for_session(
             prepared.lease_token.project_id, prepared.lease_token.session_id,
         )
+        existing = self._intervention_continuations.get(prepared.record.intervention_id)
+        if existing is not None:
+            await existing.wait()
+            return
+        completion = asyncio.Event()
+        self._intervention_continuations[prepared.record.intervention_id] = completion
         release = prepared.lease_origin is InterventionLeaseOrigin.RECOVERY_ACQUIRED
         try:
             await runtime.coordinator.continue_intervention(prepared.record.intervention_id)
@@ -581,6 +588,9 @@ class HubWorkflowOrchestrator:
         finally:
             if release and self._lease.snapshot() == prepared.lease_token:
                 self._lease.release(prepared.lease_token)
+            completion.set()
+            if self._intervention_continuations.get(prepared.record.intervention_id) is completion:
+                del self._intervention_continuations[prepared.record.intervention_id]
 
     def abort_prepared_intervention(
         self, prepared: PreparedIntervention, *, reason: str,
