@@ -3837,6 +3837,508 @@ def _save_active_directed_task(store, session_id: str, brief) -> None:
     store.save_task(session_id, brief, TaskState.SOL_RUNNING)
 
 
+def test_intervention_migration_is_additive_idempotent_and_preserves_current_rows(
+    tmp_path, valid_brief,
+) -> None:
+    """Adding interventions must not rewrite current durable rows on reopen."""
+    path = tmp_path / "intervention-migration.sqlite3"
+    initial = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    initial.create_session("session-1", "/repo")
+    initial.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    initial.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    before = {
+        table: tuple(initial._connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+        for table in ("sessions", "tasks", "events", "agent_runs", "settings")
+    }
+    initial.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    assert {
+        table: tuple(migrated._connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+        for table in before
+    } == before
+    intervention_columns = {
+        row["name"] for row in migrated._connection.execute("PRAGMA table_info(interventions)")
+    }
+    assert {
+        "intervention_id", "session_id", "task_id", "revision", "run_id",
+        "source_generation", "resume_generation", "fable_session_id", "sol_thread_id",
+        "resume_attempt_id", "resume_run_id", "acknowledgment_id", "status", "created_at",
+    } <= intervention_columns
+    migrated.close()
+
+    first_migration_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    reopened.close()
+    assert path.read_bytes() == first_migration_bytes
+
+
+def test_intervention_migration_rolls_back_ddl_after_an_injected_failure(
+    tmp_path, monkeypatch,
+) -> None:
+    path = tmp_path / "intervention-rollback.sqlite3"
+    legacy = _create_current_schema(path)
+    legacy.execute(
+        "INSERT INTO sessions (session_id, repo_root, created_at) VALUES (?, ?, ?)",
+        ("session-1", "/repo", "2026-08-10T12:00:00Z"),
+    )
+    legacy.commit()
+    legacy.close()
+
+    def fail_intervention_migration(self) -> None:
+        raise sqlite3.IntegrityError("injected intervention migration failure")
+
+    monkeypatch.setattr(
+        SQLiteStore, "_migrate_intervention_schema", fail_intervention_migration,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected intervention migration failure"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    assert inspected.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'interventions'"
+    ).fetchone() is None
+    assert inspected.execute("SELECT session_id FROM sessions").fetchone() == ("session-1",)
+    inspected.close()
+
+
+def test_create_intervention_stops_exact_active_run_and_emits_one_user_message(
+    tmp_path, valid_brief,
+) -> None:
+    """Removing any one write from creation must leave no durable intervention."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_process(
+        "source-run-1", pid=101, process_group_id=101, cli_session_id="sol-thread-1",
+    )
+
+    created = store.create_intervention_and_request_stop(
+        intervention_id="intervention-1",
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_source_generation=1,
+        message="Pause and inspect the current output.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+
+    assert created == store.intervention("intervention-1")
+    assert created.status is store_module.InterventionStatus.PENDING_STOP
+    assert created.continuation_state is TaskState.SOL_RUNNING
+    assert created.source_generation == 1
+    assert created.resume_generation == 2
+    assert created.fable_session_id is None
+    assert created.sol_thread_id == "sol-thread-1"
+    interrupted = store.get_task(valid_brief.task_id, valid_brief.revision)
+    assert interrupted.state is TaskState.INTERRUPTED
+    assert interrupted.continuation_state is TaskState.SOL_RUNNING
+    assert interrupted.continuation_generation == 2
+    assert interrupted.pending == {
+        "intervention": {
+            "intervention_id": "intervention-1",
+            "source_generation": 1,
+            "source_run_id": "source-run-1",
+            "continuation": None,
+        },
+    }
+    events = store.events_after("session-1", 0)
+    assert len(events) == 1
+    event = ConversationEnvelope.from_dict(events[0].payload)
+    assert event == ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.INTERVENTION,
+        text="Pause and inspect the current output.",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        continuation_generation=1,
+    )
+
+    assert store.create_intervention_and_request_stop(
+        intervention_id="intervention-1",
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_source_generation=1,
+        message="Pause and inspect the current output.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    ) == created
+    assert store.events_after("session-1", 0) == events
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_agent"),
+    (
+        (TaskState.FABLE_PLANNING, "fable"),
+        (TaskState.FABLE_CLARIFYING, "fable"),
+        (TaskState.FABLE_REVIEWING, "fable"),
+        (TaskState.SOL_RUNNING, "sol"),
+        (TaskState.SOL_CORRECTING, "sol"),
+    ),
+)
+def test_intervention_creation_requires_the_exact_agent_for_its_active_phase(
+    tmp_path, valid_brief, state: TaskState, expected_agent: str,
+) -> None:
+    """A source run for another agent must not interrupt an active task."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    task_id = f"agent-phase-{state.value}"
+    if state is TaskState.FABLE_PLANNING:
+        task = store.create_planning_task("session-1", task_id)
+    else:
+        task = store.save_task(
+            "session-1", replace(valid_brief, task_id=task_id), state,
+        )
+    source_run = f"source-{state.value}"
+    store.start_agent_run(source_run, task.task_id, task.revision, "other")
+    before = store.get_task(task.task_id, task.revision)
+
+    with pytest.raises(RuntimeError, match="source agent"):
+        store.create_intervention_and_request_stop(
+            intervention_id=f"intervention-{state.value}", session_id="session-1",
+            task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+            message="Pause exact work.", addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, run_id=source_run,
+        )
+
+    assert expected_agent in {"fable", "sol"}
+    assert store.intervention(f"intervention-{state.value}") is None
+    assert store.get_task(task.task_id, task.revision) == before
+    assert store.events_after("session-1", 0) == ()
+
+
+@pytest.mark.parametrize(
+    ("state", "task_provider", "run_provider"),
+    (
+        (TaskState.FABLE_PLANNING, None, "fable-session-1"),
+        (TaskState.FABLE_PLANNING, "fable-session-1", None),
+        (TaskState.FABLE_PLANNING, "fable-session-1", "other-fable-session"),
+        (TaskState.FABLE_CLARIFYING, "fable-session-1", None),
+        (TaskState.FABLE_REVIEWING, "fable-session-1", "other-fable-session"),
+        (TaskState.SOL_RUNNING, "sol-thread-1", None),
+        (TaskState.SOL_CORRECTING, "sol-thread-1", "other-sol-thread"),
+        (TaskState.SOL_RUNNING, "-malformed-thread", "-malformed-thread"),
+    ),
+)
+def test_intervention_creation_requires_exact_validated_provider_identity(
+    tmp_path, valid_brief, state: TaskState, task_provider: str | None, run_provider: str | None,
+) -> None:
+    """Missing, changed, and malformed provider identities must not create stop intent."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    task_id = f"provider-phase-{state.value}"
+    if state is TaskState.FABLE_PLANNING:
+        task = store.create_planning_task("session-1", task_id)
+        expected_agent = "fable"
+        if task_provider is not None:
+            store.set_fable_session(task.task_id, task.revision, task_provider)
+    else:
+        task = store.save_task(
+            "session-1", replace(valid_brief, task_id=task_id), state,
+        )
+        expected_agent = "fable" if state in {
+            TaskState.FABLE_CLARIFYING, TaskState.FABLE_REVIEWING,
+        } else "sol"
+        if expected_agent == "fable":
+            store.set_fable_session(task.task_id, task.revision, task_provider)
+        else:
+            store.set_sol_thread(task.task_id, task.revision, task_provider)
+    source_run = f"source-{state.value}"
+    store.start_agent_run(source_run, task.task_id, task.revision, expected_agent)
+    if run_provider is not None:
+        store.set_agent_run_session(source_run, run_provider)
+    before = store.get_task(task.task_id, task.revision)
+
+    with pytest.raises(RuntimeError, match="provider identity"):
+        store.create_intervention_and_request_stop(
+            intervention_id=f"provider-intervention-{state.value}", session_id="session-1",
+            task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+            message="Pause exact work.", addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, run_id=source_run,
+        )
+
+    assert store.intervention(f"provider-intervention-{state.value}") is None
+    assert store.get_task(task.task_id, task.revision) == before
+    assert store.events_after("session-1", 0) == ()
+
+
+def test_intervention_allows_early_fable_planning_only_before_a_session_exists(tmp_path) -> None:
+    """The first Fable plan may stop before a provider session ID has been issued."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    task = store.create_planning_task("session-1", "early-fable-task")
+    store.start_agent_run("early-fable-run", task.task_id, task.revision, "fable")
+
+    created = store.create_intervention_and_request_stop(
+        intervention_id="early-fable-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Pause before the initial Fable session.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="early-fable-run",
+    )
+
+    assert created.fable_session_id is None
+    assert created.sol_thread_id is None
+    assert created.continuation_state is TaskState.FABLE_PLANNING
+    events = store.events_after("session-1", 0)
+    assert len(events) == 1
+    event = ConversationEnvelope.from_dict(events[0].payload)
+    assert event.sender is ConversationActor.USER
+    assert event.message_type is ConversationMessageType.INTERVENTION
+    assert event.text == "Pause before the initial Fable session."
+    assert event.task_id is None
+
+
+def test_intervention_status_transitions_are_exact_owner_bound_and_idempotent(
+    tmp_path, valid_brief,
+) -> None:
+    """Changing a status, owner, or generation must reject the affected transition."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="intervention-1", session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_source_generation=1, message="Pause here.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    store.finish_agent_run("source-run-1", status="interrupted", exit_code=0)
+
+    ready = store.mark_intervention_ready("intervention-1", run_id="source-run-1")
+    assert ready.status is store_module.InterventionStatus.READY
+    assert store.mark_intervention_ready("intervention-1", run_id="source-run-1") == ready
+    with pytest.raises(RuntimeError, match="source run"):
+        store.mark_intervention_ready("intervention-1", run_id="other-run")
+    with pytest.raises(RuntimeError, match="generation"):
+        store.claim_intervention_resume(
+            "intervention-1", expected_resume_generation=1,
+            resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+        )
+
+    claimed = store.claim_intervention_resume(
+        "intervention-1", expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    assert claimed.status is store_module.InterventionStatus.RESUMING
+    assert store.claim_intervention_resume(
+        "intervention-1", expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    ) == claimed
+    with pytest.raises(RuntimeError, match="owner"):
+        store.complete_intervention(
+            "intervention-1", expected_resume_generation=created.resume_generation,
+            resume_attempt_id="attempt-other", resume_run_id="resume-run-1",
+        )
+    completed = store.complete_intervention(
+        "intervention-1", expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    assert completed.status is store_module.InterventionStatus.RESUMED
+
+    store._connection.execute(
+        "UPDATE interventions SET status = 'resuming' WHERE intervention_id = 'intervention-1'"
+    )
+    unknown = store.mark_resume_outcome_unknown(
+        "intervention-1", resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    retried = store.authorize_retry_after_unknown(
+        "intervention-1", expected_resume_generation=created.resume_generation,
+        acknowledgment_id="ack-1",
+    )
+    assert retried.status is store_module.InterventionStatus.READY
+    assert retried.resume_generation == created.resume_generation + 1
+    assert store.authorize_retry_after_unknown(
+        "intervention-1", expected_resume_generation=created.resume_generation,
+        acknowledgment_id="ack-1",
+    ) == retried
+    canceled = store.cancel_intervention_by_stop(
+        "intervention-1", expected_resume_generation=retried.resume_generation,
+    )
+    assert canceled.status is store_module.InterventionStatus.CANCELED_BY_STOP
+    with pytest.raises(RuntimeError, match="ready"):
+        store.claim_intervention_resume(
+            "intervention-1", expected_resume_generation=retried.resume_generation,
+            resume_attempt_id="attempt-2", resume_run_id="resume-run-2",
+        )
+
+
+def test_intervention_retry_audit_preserves_the_source_bound_user_event(
+    tmp_path, valid_brief,
+) -> None:
+    """Retry generation must not rewrite or invalidate the original intervention."""
+    path = tmp_path / "intervention-ack.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="acknowledged-intervention", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Pause before retry.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    store.finish_agent_run("source-run-1", status="interrupted", exit_code=0)
+    store.mark_intervention_ready(created.intervention_id, run_id="source-run-1")
+    store.claim_intervention_resume(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    store.mark_resume_outcome_unknown(
+        created.intervention_id, resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+
+    retried = store.authorize_retry_after_unknown(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        acknowledgment_id="ack-1",
+    )
+
+    assert retried.status is store_module.InterventionStatus.READY
+    assert retried.resume_generation == created.resume_generation + 1
+    events = store.events_after("session-1", 0)
+    assert len(events) == 1
+    assert ConversationEnvelope.from_dict(events[0].payload).continuation_generation == 1
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    assert store.audit_legacy_project_ownership("/repo") is None
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+    claimed = reopened.claim_intervention_resume(
+        created.intervention_id, expected_resume_generation=retried.resume_generation,
+        resume_attempt_id="attempt-2", resume_run_id="resume-run-2",
+    )
+    assert claimed.status is store_module.InterventionStatus.RESUMING
+    assert len(reopened.events_after("session-1", 0)) == 1
+    reopened._connection.execute(
+        "UPDATE interventions SET acknowledgment_id = ? WHERE intervention_id = ?",
+        ("-tampered-ack", created.intervention_id),
+    )
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        reopened.audit_legacy_project_ownership("/repo")
+
+
+def test_intervention_startup_recovery_never_replays_a_committed_resume_claim(
+    tmp_path, valid_brief,
+) -> None:
+    """A crash after claim must require an acknowledgment, never a provider retry."""
+    path = tmp_path / "intervention-recovery.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    pending = store.create_intervention_and_request_stop(
+        intervention_id="pending-stop", session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_source_generation=1, message="Pause first.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    store.close()
+
+    recovered = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    summary = recovered.recover_active_tasks()
+    assert summary.agent_runs_interrupted == 1
+    ready = recovered.intervention("pending-stop")
+    assert ready is not None
+    assert ready.status is store_module.InterventionStatus.READY
+    assert recovered.agent_run("source-run-1").status == "interrupted"
+    assert recovered.mark_intervention_ready("pending-stop", run_id="source-run-1") == ready
+    claimed = recovered.claim_intervention_resume(
+        "pending-stop", expected_resume_generation=pending.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    assert claimed.status is store_module.InterventionStatus.RESUMING
+    recovered.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.recover_active_tasks().agent_runs_interrupted == 0
+    unknown = reopened.intervention("pending-stop")
+    assert unknown is not None
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    with pytest.raises(RuntimeError, match="ready"):
+        reopened.claim_intervention_resume(
+            "pending-stop", expected_resume_generation=pending.resume_generation,
+            resume_attempt_id="attempt-2", resume_run_id="resume-run-2",
+        )
+    assert reopened.authorize_retry_after_unknown(
+        "pending-stop", expected_resume_generation=pending.resume_generation,
+        acknowledgment_id="ack-1",
+    ).status is store_module.InterventionStatus.READY
+
+
+def test_intervention_rejects_hostile_reuse_and_audits_durable_bindings(
+    tmp_path, valid_brief,
+) -> None:
+    """A substituted binding must not mutate this Store or cross into another one."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="shared-id", session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_source_generation=1, message="Keep scope.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    before_task = store.get_task(valid_brief.task_id, valid_brief.revision)
+    before_events = store.events_after("session-1", 0)
+    with pytest.raises(RuntimeError, match="bound differently"):
+        store.create_intervention_and_request_stop(
+            intervention_id="shared-id", session_id="session-1", task_id=valid_brief.task_id,
+            revision=valid_brief.revision, expected_source_generation=1, message="Change scope.",
+            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+            run_id="source-run-1",
+        )
+    assert store.intervention("shared-id") == created
+    assert store.get_task(valid_brief.task_id, valid_brief.revision) == before_task
+    assert store.events_after("session-1", 0) == before_events
+
+    foreign = SQLiteStore(tmp_path / "foreign.sqlite3", clock=lambda: "2026-08-10T12:00:00Z")
+    foreign.create_session("session-1", "/other-repo")
+    foreign.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    foreign.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    foreign.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    foreign.set_agent_run_session("source-run-1", "sol-thread-1")
+    assert foreign.intervention("shared-id") is None
+    assert foreign.create_intervention_and_request_stop(
+        intervention_id="shared-id", session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_source_generation=1, message="Foreign scope.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    ).intervention_id == "shared-id"
+    assert store.intervention("shared-id") == created
+
+    store.finish_agent_run("source-run-1", status="interrupted", exit_code=0)
+    store.mark_intervention_ready("shared-id", run_id="source-run-1")
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    assert store.audit_legacy_project_ownership("/repo") is None
+
+    store._connection.execute(
+        "UPDATE interventions SET continuation_state = ? WHERE intervention_id = ?",
+        (TaskState.COMPLETED.value, "shared-id"),
+    )
+    with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
+        store.audit_legacy_project_ownership("/repo")
+
+
 def test_question_answers_compare_and_swap_exact_identity_and_legal_recipient(
     tmp_path, valid_brief,
 ) -> None:
