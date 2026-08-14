@@ -214,10 +214,11 @@ to signal or resume a process. Resume is always an explicit user action.
 - **Missing executable:** install the named tool, put it on `PATH`, or pass an
   absolute path with the matching `--*-executable` option. The launcher checks
   every configured executable before starting the server.
-- **Fable subscription unavailable:** sign in through Claude Code's supported
-  subscription flow (for example, run its normal `claude auth login` flow in
-  the launch shell), then restart the foreground bridge. API keys and
-  usage-based fallbacks are not accepted.
+- **Fable subscription unavailable:** on the host running Agent Bridge, run
+  `claude auth login` through Claude Code's supported subscription flow. Then
+  return to the exact task and choose **Resume**. Restart the foreground
+  bridge only if the UI itself is unavailable. API keys and usage-based
+  fallbacks are not accepted.
 - **Sol executable unavailable:** install or authenticate the Codex CLI, or
   pass its absolute executable path with `--codex-executable`; the startup
   version check must succeed.
