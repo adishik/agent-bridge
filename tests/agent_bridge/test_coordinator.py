@@ -4632,14 +4632,62 @@ def test_later_stop_cancels_cross_route_resuming_nested_sol_child_and_survives_r
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "crash_boundary",
+    ("before_provider_spawn", "during_provider", "after_child_completion"),
+)
 def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_question(
     harness: CoordinatorHarness,
+    crash_boundary: str,
 ) -> None:
-    """A crash image at the nested provider boundary must reopen idempotently."""
+    """Every durable nested provider boundary must reopen idempotently."""
     async def scenario() -> None:
         source_released = asyncio.Event()
         nested_provider_blocked = asyncio.Event()
         correction_started = asyncio.Event()
+        crash_captured = asyncio.Event()
+        crash_database = harness.database.with_name(f"nested-{crash_boundary}.sqlite3")
+        crash_state: dict[str, object] = {}
+
+        def capture_crash_image() -> None:
+            crash_state["task"] = harness.store.get_task("task-1", 1)
+            nested_row = harness.store._connection.execute(
+                """
+                SELECT question_id, exchange_id, continuation_pause_id,
+                       pending_action_json, continuation_generation
+                FROM questions
+                WHERE task_id = ? AND revision = ? AND answer_text IS NULL
+                  AND nested_parent_kind IS NOT NULL
+                """,
+                ("task-1", 1),
+            ).fetchone()
+            assert nested_row is not None
+            crash_state["nested_row"] = dict(nested_row)
+            crash_state["question"] = harness.store.question(nested_row["question_id"])
+            crash_state["intervention"] = harness.store.intervention("nested-unknown")
+            crash_state["run"] = harness.store._connection.execute(
+                """
+                SELECT * FROM agent_runs
+                WHERE task_id = ? AND revision = ? AND agent = 'sol'
+                  AND run_id != ?
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                ("task-1", 1, source.run_id),
+            ).fetchone()
+            crash_state["reservation"] = harness.store._connection.execute(
+                "SELECT * FROM exchange_reservations WHERE question_id = ?",
+                (nested_row["question_id"],),
+            ).fetchone()
+            harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+            crash_state["events"] = tuple(
+                event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "conversation"
+                and event.payload.get("question_id") == nested_row["question_id"]
+            )
+            crash_connection = sqlite3.connect(crash_database)
+            harness.store._connection.backup(crash_connection)
+            crash_connection.close()
+            crash_captured.set()
         directed = DirectedAgentQuestion(
             addressed_to="sol",
             text="Which exact correction fact is verified?",
@@ -4693,63 +4741,73 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
             ),
         )
         harness.sol.hold_resume = None
-        harness.sol.hold_answer_fable_question = nested_provider_blocked
+        if crash_boundary == "during_provider":
+            harness.sol.hold_answer_fable_question = nested_provider_blocked
+        elif crash_boundary == "before_provider_spawn":
+            async def crash_before_provider_spawn(
+                question: object, **_: object,
+            ) -> None:
+                assert isinstance(question, store_module.QuestionRecord)
+                capture_crash_image()
+                await nested_provider_blocked.wait()
+
+            harness.coordinator.answer_directed_question = crash_before_provider_spawn  # type: ignore[method-assign]
+        else:
+            def crash_after_child_completion(**_: object) -> object:
+                capture_crash_image()
+                raise RuntimeError("controlled crash before nested answer CAS")
+
+            harness.store.answer_fable_clarification_evidence_question_and_resume = crash_after_child_completion  # type: ignore[method-assign]
         harness.fable.next_clarifications.append(
             _answer("I need one exact correction fact.", False, directed_question=directed)
         )
         continuing = asyncio.create_task(workflows.continue_intervention(prepared))
-        while not harness.sol.answer_fable_question_calls:
-            await asyncio.sleep(0)
+        if crash_boundary == "during_provider":
+            while not harness.sol.answer_fable_question_calls:
+                await asyncio.sleep(0)
+            capture_crash_image()
+        else:
+            await crash_captured.wait()
 
-        crash_task = harness.store.get_task("task-1", 1)
-        nested_row = harness.store._connection.execute(
-            """
-            SELECT question_id, continuation_pause_id, pending_action_json,
-                   continuation_generation
-            FROM questions
-            WHERE task_id = ? AND revision = ? AND answer_text IS NULL
-              AND nested_parent_kind IS NOT NULL
-            """,
-            ("task-1", 1),
-        ).fetchone()
-        assert nested_row is not None
-        nested_question_id = nested_row["question_id"]
-        nested_question = harness.store.question(nested_question_id)
-        nested_run = harness.store.active_run_for_task("task-1", 1)
-        crash_intervention = harness.store.intervention("nested-unknown")
-        assert nested_question is not None
-        assert nested_run is not None and nested_run.agent == "sol"
-        assert crash_intervention is not None
-        assert crash_intervention.status.value == "resuming"
-        assert crash_intervention.resume_run_id != nested_run.run_id
-        assert crash_task.state is TaskState.AWAITING_USER_INPUT
-        assert crash_task.continuation_state is TaskState.FABLE_CLARIFYING
-        assert nested_row["continuation_pause_id"] == harness.store._connection.execute(
-            """
-            SELECT continuation_pause_id FROM tasks
-            WHERE task_id = ? AND revision = ?
-            """,
-            ("task-1", 1),
-        ).fetchone()["continuation_pause_id"]
-        harness.store.set_setting("agent_bridge.active_session_id", "session-1")
-        question_events_before = tuple(
-            event for event in harness.store.events_after("session-1", 0)
-            if event.kind == "conversation"
-            and event.payload.get("question_id") == nested_question_id
-        )
-        assert len(question_events_before) == 1
-
-        crash_database = harness.database.with_name("nested-crash.sqlite3")
-        crash_connection = sqlite3.connect(crash_database)
-        harness.store._connection.backup(crash_connection)
-        crash_connection.close()
-
-        continuing.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await continuing
+        if not continuing.done():
+            continuing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await continuing
+        else:
+            with pytest.raises(RuntimeError, match="controlled crash"):
+                await continuing
         await approval
         harness.tracker.close()
         harness.store.close()
+
+        crash_task = crash_state["task"]
+        nested_row = crash_state["nested_row"]
+        nested_question = crash_state["question"]
+        crash_intervention = crash_state["intervention"]
+        raw_nested_run = crash_state["run"]
+        raw_reservation = crash_state["reservation"]
+        question_events_before = crash_state["events"]
+        assert isinstance(crash_task, TaskRecord)
+        assert isinstance(nested_row, dict)
+        assert isinstance(nested_question, store_module.QuestionRecord)
+        assert isinstance(crash_intervention, store_module.InterventionRecord)
+        assert isinstance(raw_nested_run, sqlite3.Row)
+        assert isinstance(raw_reservation, sqlite3.Row)
+        assert isinstance(question_events_before, tuple)
+        nested_question_id = nested_row["question_id"]
+        assert raw_nested_run["agent"] == "sol"
+        assert crash_intervention.status.value == "resuming"
+        assert crash_intervention.resume_run_id != raw_nested_run["run_id"]
+        assert crash_intervention.directed_binding is not None
+        assert crash_intervention.directed_binding.source_run_id == raw_nested_run["run_id"]
+        assert crash_intervention.directed_binding.question_id == nested_question_id
+        assert crash_intervention.directed_binding.exchange_id == raw_reservation["exchange_id"]
+        assert crash_task.state is TaskState.AWAITING_USER_INPUT
+        assert crash_task.continuation_state is TaskState.FABLE_CLARIFYING
+        assert nested_row["continuation_pause_id"] == crash_intervention.directed_binding.continuation_pause_id
+        assert raw_reservation["question_id"] == nested_question_id
+        assert raw_reservation["continuation_generation"] == nested_row["continuation_generation"]
+        assert len(question_events_before) == 1
 
         first = SQLiteStore(
             crash_database, clock=lambda: "2026-08-10T12:00:00Z",
@@ -4758,7 +4816,9 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         unknown = first.authenticated_intervention("nested-unknown")
         assert unknown is not None
         assert unknown.status.value == "resume_outcome_unknown"
-        assert first_summary == store_module.RecoverySummary(0, 1, 1)
+        assert first_summary == store_module.RecoverySummary(
+            0, 1, 0 if crash_boundary == "after_child_completion" else 1,
+        )
         first_task = first.get_task("task-1", 1)
         assert first_task.state is TaskState.INTERRUPTED
         assert first_task.continuation_state is TaskState.FABLE_CLARIFYING
@@ -4807,6 +4867,18 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert acknowledged.resume_generation == unknown.resume_generation + 1
         assert acknowledged_task.continuation_generation == acknowledged.resume_generation
         assert acknowledged_question.continuation_generation == acknowledged.resume_generation
+        acknowledged_reservation = second._connection.execute(
+            """
+            SELECT * FROM exchange_reservations
+            WHERE exchange_id = ? AND question_id = ?
+            """,
+            (raw_reservation["exchange_id"], nested_question_id),
+        ).fetchone()
+        assert acknowledged_reservation is not None
+        assert (
+            acknowledged_reservation["continuation_generation"]
+            == acknowledged.resume_generation
+        )
         assert second._connection.execute(
             """
             SELECT continuation_pause_id FROM tasks
@@ -4859,6 +4931,9 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert retry_store.agent_run(resumed.resume_run_id).agent == "sol"
         assert retry_store.agent_run(resumed.resume_run_id).status == "completed"
         assert len(retry_sol.answer_fable_question_calls) == 1
+        assert len(harness.sol.answer_fable_question_calls) == (
+            0 if crash_boundary == "before_provider_spawn" else 1
+        )
         assert retry_sol.answer_fable_question_calls[0][2] == (
             "Which exact correction fact is verified?"
             "\n\nIntervention guidance:\nKeep the correction bounded."

@@ -1016,6 +1016,12 @@ class _InterventionDirectedBinding:
     nested_parent_kind: str | None
     parent_question_id: str | None
     parent_continuation_pause_id: str | None
+    exchange_id: str | None
+    exchange_request_key: str | None
+    exchange_ordinal: int | None
+    parent_exchange_id: str | None
+    parent_exchange_request_key: str | None
+    parent_exchange_ordinal: int | None
 
     def __post_init__(self) -> None:
         if self.kind not in {"initial", "nested_resume"}:
@@ -1063,10 +1069,60 @@ class _InterventionDirectedBinding:
             )
         else:
             raise ValueError("intervention directed parent kind is invalid")
+        self._validate_reservation_identity(
+            exchange_id=self.exchange_id,
+            request_key=self.exchange_request_key,
+            ordinal=self.exchange_ordinal,
+            prefix="intervention directed",
+        )
+        self._validate_reservation_identity(
+            exchange_id=self.parent_exchange_id,
+            request_key=self.parent_exchange_request_key,
+            ordinal=self.parent_exchange_ordinal,
+            prefix="intervention directed parent",
+        )
+        if self.parent_question_id is None and self.parent_exchange_id is not None:
+            raise ValueError("intervention directed parent reservation is invalid")
         if self.kind == "initial" and self.nested_parent_kind is not None:
             raise ValueError("initial intervention directed binding cannot be nested")
         if self.kind == "nested_resume" and self.nested_parent_kind is None:
             raise ValueError("nested intervention directed binding is not nested")
+
+    def _validate_reservation_identity(
+        self,
+        *,
+        exchange_id: str | None,
+        request_key: str | None,
+        ordinal: int | None,
+        prefix: str,
+    ) -> None:
+        present = (exchange_id is not None, request_key is not None, ordinal is not None)
+        if any(present) and not all(present):
+            raise ValueError(f"{prefix} reservation identity is incomplete")
+        if exchange_id is None:
+            return
+        object.__setattr__(
+            self,
+            "exchange_id" if prefix == "intervention directed" else "parent_exchange_id",
+            _prepared_identifier(exchange_id, "exchange_id"),
+        )
+        object.__setattr__(
+            self,
+            (
+                "exchange_request_key"
+                if prefix == "intervention directed"
+                else "parent_exchange_request_key"
+            ),
+            _prepared_identifier(request_key, "request_key"),
+        )
+        parsed_ordinal = _require_integer(ordinal, "ordinal")
+        if parsed_ordinal < 1:
+            raise ValueError(f"{prefix} reservation ordinal is invalid")
+        object.__setattr__(
+            self,
+            "exchange_ordinal" if prefix == "intervention directed" else "parent_exchange_ordinal",
+            parsed_ordinal,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1233,7 +1289,7 @@ def _decode_mapping(raw: str, name: str) -> Mapping[str, JsonValue]:
     return frozen
 
 
-_INTERVENTION_DIRECTED_BINDING_KEYS = {
+_PREVIOUS_INTERVENTION_DIRECTED_BINDING_KEYS = {
     "kind",
     "question_id",
     "continuation_pause_id",
@@ -1248,6 +1304,15 @@ _INTERVENTION_DIRECTED_BINDING_KEYS = {
     "nested_parent_kind",
     "parent_question_id",
     "parent_continuation_pause_id",
+}
+
+_INTERVENTION_DIRECTED_BINDING_KEYS = _PREVIOUS_INTERVENTION_DIRECTED_BINDING_KEYS | {
+    "exchange_id",
+    "exchange_request_key",
+    "exchange_ordinal",
+    "parent_exchange_id",
+    "parent_exchange_request_key",
+    "parent_exchange_ordinal",
 }
 
 
@@ -1269,6 +1334,12 @@ def _encode_intervention_directed_binding(
         "nested_parent_kind": binding.nested_parent_kind,
         "parent_question_id": binding.parent_question_id,
         "parent_continuation_pause_id": binding.parent_continuation_pause_id,
+        "exchange_id": binding.exchange_id,
+        "exchange_request_key": binding.exchange_request_key,
+        "exchange_ordinal": binding.exchange_ordinal,
+        "parent_exchange_id": binding.parent_exchange_id,
+        "parent_exchange_request_key": binding.parent_exchange_request_key,
+        "parent_exchange_ordinal": binding.parent_exchange_ordinal,
     })
 
 
@@ -1298,6 +1369,12 @@ def _decode_intervention_directed_binding(
             nested_parent_kind=value["nested_parent_kind"],
             parent_question_id=value["parent_question_id"],
             parent_continuation_pause_id=value["parent_continuation_pause_id"],
+            exchange_id=value["exchange_id"],
+            exchange_request_key=value["exchange_request_key"],
+            exchange_ordinal=value["exchange_ordinal"],
+            parent_exchange_id=value["parent_exchange_id"],
+            parent_exchange_request_key=value["parent_exchange_request_key"],
+            parent_exchange_ordinal=value["parent_exchange_ordinal"],
         )
     except (TypeError, ValueError) as error:
         raise RuntimeError("persisted intervention directed binding is invalid") from error
@@ -1808,6 +1885,7 @@ class SQLiteStore:
             self._connection.execute(
                 "ALTER TABLE questions ADD COLUMN parent_continuation_pause_id TEXT"
             )
+        self._migrate_intervention_directed_bindings_in_transaction()
         self._validate_nested_question_rows_in_transaction()
         self._connection.execute("DROP INDEX IF EXISTS one_unanswered_question_per_task_revision")
         self._connection.execute(
@@ -1878,6 +1956,203 @@ class SQLiteStore:
             self._connection.execute(
                 "ALTER TABLE interventions ADD COLUMN directed_binding_json TEXT"
             )
+
+    def _migrate_intervention_directed_bindings_in_transaction(self) -> None:
+        """Backfill only exact preceding directed identities in bounded pages."""
+        if not self._connection.in_transaction:
+            raise RuntimeError("intervention binding migration requires a transaction")
+        last_rowid = 0
+        while True:
+            rows = self._connection.execute(
+                """
+                SELECT rowid, * FROM interventions
+                WHERE rowid > ? ORDER BY rowid LIMIT ?
+                """,
+                (last_rowid, _STARTUP_RECOVERY_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                last_rowid = int(row["rowid"])
+                try:
+                    migrated = self._migrate_intervention_directed_binding_row(row)
+                except (RuntimeError, TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        "intervention directed binding migration is unauthenticated"
+                    ) from error
+                if not migrated:
+                    continue
+                current = self._connection.execute(
+                    "SELECT * FROM interventions WHERE rowid = ?",
+                    (last_rowid,),
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError(
+                        "intervention directed binding migration is unauthenticated"
+                    )
+                record = self._intervention_from_row(current)
+                if not self._intervention_is_authenticated(
+                    record, current["acknowledgment_id"],
+                ):
+                    raise RuntimeError(
+                        "intervention directed binding migration is unauthenticated"
+                    )
+
+    def _migrate_intervention_directed_binding_row(self, row: sqlite3.Row) -> bool:
+        raw = row["directed_binding_json"]
+        if raw is not None:
+            if not isinstance(raw, str):
+                raise RuntimeError("persisted intervention directed binding is invalid")
+            value = _decode_mapping(raw, "intervention directed binding")
+            if set(value) == _INTERVENTION_DIRECTED_BINDING_KEYS:
+                _decode_intervention_directed_binding(raw)
+                return True
+            if set(value) != _PREVIOUS_INTERVENTION_DIRECTED_BINDING_KEYS:
+                raise RuntimeError("persisted intervention directed binding is invalid")
+            question_id = _prepared_identifier(value["question_id"], "question_id")
+            question = self.question(question_id)
+            if question is None:
+                raise RuntimeError("intervention directed question is missing")
+            exchange_id, request_key, ordinal = self._intervention_reservation_identity(
+                question,
+            )
+            parent_exchange_id: str | None = None
+            parent_request_key: str | None = None
+            parent_ordinal: int | None = None
+            if question.parent_question_id is not None:
+                parent = self.question(question.parent_question_id)
+                if parent is None:
+                    raise RuntimeError("intervention directed parent is missing")
+                parent_exchange_id, parent_request_key, parent_ordinal = (
+                    self._intervention_reservation_identity(parent)
+                )
+            upgraded = {
+                **value,
+                "exchange_id": exchange_id,
+                "exchange_request_key": request_key,
+                "exchange_ordinal": ordinal,
+                "parent_exchange_id": parent_exchange_id,
+                "parent_exchange_request_key": parent_request_key,
+                "parent_exchange_ordinal": parent_ordinal,
+            }
+            encoded = _encode_json(upgraded)
+            _decode_intervention_directed_binding(encoded)
+            cursor = self._connection.execute(
+                """
+                UPDATE interventions SET directed_binding_json = ?
+                WHERE rowid = ? AND directed_binding_json = ?
+                """,
+                (encoded, int(row["rowid"]), raw),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("intervention directed binding migration changed")
+            return True
+
+        record = self._intervention_from_row(row)
+        binding = self._infer_previous_intervention_directed_binding(record)
+        if binding is None:
+            return False
+        cursor = self._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = ?
+            WHERE rowid = ? AND directed_binding_json IS NULL
+            """,
+            (_encode_intervention_directed_binding(binding), int(row["rowid"])),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("intervention directed binding migration changed")
+        return True
+
+    def _infer_previous_intervention_directed_binding(
+        self, record: InterventionRecord,
+    ) -> _InterventionDirectedBinding | None:
+        task = self.get_task(record.task_id, record.revision)
+        source = self.agent_run(record.run_id)
+        nested_rows = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND continuation_generation = ? AND nested_parent_kind IS NOT NULL
+              AND answer_text IS NULL
+            ORDER BY rowid LIMIT 2
+            """,
+            (record.session_id, record.task_id, record.revision, record.resume_generation),
+        ).fetchall()
+        if nested_rows:
+            if (
+                len(nested_rows) != 1
+                or record.routed_to is not ConversationTarget.FABLE
+                or record.continuation_state not in _SOL_TASK_STATES
+                or record.status not in {
+                    InterventionStatus.RESUMING,
+                    InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+                    InterventionStatus.CANCELED_BY_STOP,
+                }
+            ):
+                raise RuntimeError("nested intervention migration is ambiguous")
+            question = self._question_from_row(nested_rows[0])
+            provider_id = (
+                task.fable_session_id
+                if question.routed_to is ConversationTarget.FABLE
+                else task.sol_thread_id
+            )
+            child_rows = self._connection.execute(
+                """
+                SELECT * FROM agent_runs
+                WHERE task_id = ? AND revision = ? AND agent = ?
+                  AND cli_session_id = ? AND run_id != ?
+                  AND (? IS NULL OR run_id != ?)
+                ORDER BY rowid LIMIT 2
+                """,
+                (
+                    record.task_id,
+                    record.revision,
+                    question.routed_to.value,
+                    provider_id,
+                    record.run_id,
+                    record.resume_run_id,
+                    record.resume_run_id,
+                ),
+            ).fetchall()
+            if len(child_rows) != 1:
+                raise RuntimeError("nested intervention child migration is ambiguous")
+            return self._make_intervention_directed_binding(
+                kind="nested_resume",
+                question=question,
+                continuation_pause_id=self._question_pause_id(question.question_id),
+                continuation_state=TaskState.FABLE_CLARIFYING,
+                source_run=self._agent_run_from_row(child_rows[0]),
+            )
+
+        top_level_rows = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND continuation_generation = ? AND nested_parent_kind IS NULL
+              AND routed_to = ? AND answer_text IS NULL
+            ORDER BY rowid LIMIT 2
+            """,
+            (
+                record.session_id,
+                record.task_id,
+                record.revision,
+                record.resume_generation,
+                source.agent,
+            ),
+        ).fetchall()
+        if len(top_level_rows) == 1:
+            question = self._question_from_row(top_level_rows[0])
+            return self._make_intervention_directed_binding(
+                kind="initial",
+                question=question,
+                continuation_pause_id=self._question_pause_id(question.question_id),
+                continuation_state=record.continuation_state,
+                source_run=source,
+            )
+        expected_source = _INTERVENTION_SOURCE_AGENTS.get(record.continuation_state)
+        if len(top_level_rows) > 1 or source.agent != expected_source:
+            raise RuntimeError("intervention directed migration is ambiguous")
+        return None
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[None]:
@@ -2404,6 +2679,8 @@ class SQLiteStore:
         request_key: str,
         text: str,
         event: ConversationEnvelope,
+        intervention_id: str | None = None,
+        child_run_id: str | None = None,
     ) -> tuple[ExchangeReservation, QuestionRecord]:
         """Reserve Fable's one Sol evidence question from an active clarification."""
         return self._reserve_nested_fable_evidence_question(
@@ -2411,6 +2688,7 @@ class SQLiteStore:
             expected_generation=expected_generation, question_id=question_id,
             request_key=request_key, text=text, event=event,
             parent_kind="clarification", outer_question_id=None,
+            intervention_id=intervention_id, child_run_id=child_run_id,
         )
 
     def reserve_fable_answer_evidence_question(
@@ -2425,6 +2703,8 @@ class SQLiteStore:
         request_key: str,
         text: str,
         event: ConversationEnvelope,
+        intervention_id: str | None = None,
+        child_run_id: str | None = None,
     ) -> tuple[ExchangeReservation, QuestionRecord]:
         """Reserve Fable's one Sol evidence question under one paused Sol question."""
         return self._reserve_nested_fable_evidence_question(
@@ -2432,6 +2712,7 @@ class SQLiteStore:
             expected_generation=expected_generation, question_id=question_id,
             request_key=request_key, text=text, event=event,
             parent_kind="question", outer_question_id=outer_question_id,
+            intervention_id=intervention_id, child_run_id=child_run_id,
         )
 
     def _reserve_nested_fable_evidence_question(
@@ -2447,12 +2728,19 @@ class SQLiteStore:
         event: ConversationEnvelope,
         parent_kind: Literal["clarification", "question"],
         outer_question_id: str | None,
+        intervention_id: str | None,
+        child_run_id: str | None,
     ) -> tuple[ExchangeReservation, QuestionRecord]:
         session_id, task_id, revision, expected_generation = self._directed_identity(
             session_id, task_id, revision, expected_generation,
         )
         question_id = _prepared_identifier(question_id, "question_id")
         request_key = _prepared_identifier(request_key, "request_key")
+        if (intervention_id is None) != (child_run_id is None):
+            raise ValueError("nested intervention preparation identity is incomplete")
+        if intervention_id is not None:
+            intervention_id = _prepared_identifier(intervention_id, "intervention_id")
+            child_run_id = _prepared_identifier(child_run_id, "child_run_id")
         if outer_question_id is not None:
             outer_question_id = _prepared_identifier(outer_question_id, "outer_question_id")
         self._validate_question_inputs(
@@ -2469,6 +2757,41 @@ class SQLiteStore:
                     expected_generation=expected_generation,
                 )
                 self._require_nested_agent_identity(task)
+                intervention: InterventionRecord | None = None
+                if intervention_id is not None:
+                    intervention = self.authenticated_intervention(intervention_id)
+                    binding = (
+                        None if intervention is None else intervention.directed_binding
+                    )
+                    if (
+                        intervention is None
+                        or intervention.task_id != task_id
+                        or intervention.revision != revision
+                        or intervention.session_id != session_id
+                        or intervention.status is not InterventionStatus.RESUMING
+                        or intervention.routed_to is not ConversationTarget.FABLE
+                        or intervention.continuation_state not in _SOL_TASK_STATES
+                        or intervention.resume_generation != expected_generation
+                        or intervention.resume_run_id is None
+                        or (
+                            binding is not None
+                            and (
+                                binding.kind != "nested_resume"
+                                or binding.question_id != question_id
+                                or binding.source_run_id != child_run_id
+                            )
+                        )
+                    ):
+                        raise RuntimeError("nested intervention preparation changed")
+                    parent_run = self.agent_run(intervention.resume_run_id)
+                    if (
+                        parent_run.task_id != task_id
+                        or parent_run.revision != revision
+                        or parent_run.agent != ConversationTarget.FABLE.value
+                        or parent_run.cli_session_id != task.fable_session_id
+                        or parent_run.status != "completed"
+                    ):
+                        raise RuntimeError("nested intervention parent run changed")
                 existing = self._reservation_for_request_key(
                     session_id=session_id, task_id=task_id, revision=revision,
                     request_key=request_key,
@@ -2491,7 +2814,17 @@ class SQLiteStore:
                         ) != self._question_pause_id(question.question_id)
                     ):
                         raise RuntimeError("nested evidence reservation changed")
+                    if intervention is not None:
+                        rebound = self._intervention_required(intervention.intervention_id)
+                        if (
+                            rebound.directed_binding is None
+                            or rebound.directed_binding.question_id != question.question_id
+                            or rebound.directed_binding.source_run_id != child_run_id
+                        ):
+                            raise RuntimeError("nested intervention reservation changed")
                     return existing
+                if intervention is not None and intervention.directed_binding is not None:
+                    raise RuntimeError("nested intervention reservation is missing")
                 if task.exchange_allowance <= 0:
                     raise RuntimeError("internal exchange allowance is exhausted")
                 active_nested = self._connection.execute(
@@ -2584,6 +2917,56 @@ class SQLiteStore:
                 )
                 if cursor.rowcount != 1:
                     raise RuntimeError("nested evidence question changed concurrently")
+                if intervention is not None:
+                    if task.sol_thread_id is None or child_run_id is None:
+                        raise RuntimeError("nested intervention child identity is missing")
+                    try:
+                        self._connection.execute(
+                            """
+                            INSERT INTO agent_runs (
+                                run_id, task_id, revision, agent, cli_session_id,
+                                started_at, status
+                            ) VALUES (?, ?, ?, 'sol', ?, ?, 'running')
+                            """,
+                            (
+                                child_run_id,
+                                task_id,
+                                revision,
+                                task.sol_thread_id,
+                                self._timestamp(),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        raise RuntimeError(
+                            "nested intervention child run changed concurrently"
+                        ) from error
+                    binding = self._make_intervention_directed_binding(
+                        kind="nested_resume",
+                        question=question,
+                        continuation_pause_id=pause_id,
+                        continuation_state=TaskState.FABLE_CLARIFYING,
+                        source_run=self.agent_run(child_run_id),
+                    )
+                    binding_cursor = self._connection.execute(
+                        """
+                        UPDATE interventions SET directed_binding_json = ?
+                        WHERE intervention_id = ? AND status = ?
+                          AND resume_generation = ? AND resume_attempt_id = ?
+                          AND resume_run_id = ? AND directed_binding_json IS NULL
+                        """,
+                        (
+                            _encode_intervention_directed_binding(binding),
+                            intervention.intervention_id,
+                            InterventionStatus.RESUMING.value,
+                            expected_generation,
+                            intervention.resume_attempt_id,
+                            intervention.resume_run_id,
+                        ),
+                    )
+                    if binding_cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "nested intervention binding changed concurrently"
+                        )
                 emitted.append(self._insert_conversation_event_in_transaction(
                     session_id=session_id, task_id=task_id, event=event,
                 ))
@@ -7124,6 +7507,52 @@ class SQLiteStore:
             raise RuntimeError("intervention binding is not authenticated")
         return record
 
+    def prepared_nested_intervention_run(
+        self, *, question_id: str, run_id: str | None = None,
+    ) -> AgentRunRecord | None:
+        """Return one atomically prepared nested child, authenticated to its question."""
+        question_id = _prepared_identifier(question_id, "question_id")
+        if run_id is not None:
+            run_id = _prepared_identifier(run_id, "run_id")
+        rows = self._connection.execute(
+            """
+            SELECT intervention.*
+            FROM interventions AS intervention
+            JOIN questions AS question
+              ON question.session_id = intervention.session_id
+             AND question.task_id = intervention.task_id
+             AND question.revision = intervention.revision
+            WHERE question.question_id = ? AND intervention.status = ?
+            ORDER BY intervention.intervention_id LIMIT 2
+            """,
+            (question_id, InterventionStatus.RESUMING.value),
+        ).fetchall()
+        matches: list[tuple[InterventionRecord, object]] = []
+        for row in rows:
+            record = self._intervention_from_row(row)
+            binding = record.directed_binding
+            if (
+                binding is not None
+                and binding.kind == "nested_resume"
+                and binding.question_id == question_id
+                and (run_id is None or binding.source_run_id == run_id)
+            ):
+                matches.append((record, row["acknowledgment_id"]))
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError("prepared nested intervention child is ambiguous")
+        record, acknowledgment_id = matches[0]
+        if not self._intervention_is_authenticated(record, acknowledgment_id):
+            raise RuntimeError("prepared nested intervention child is not authenticated")
+        binding = record.directed_binding
+        if binding is None:
+            raise RuntimeError("prepared nested intervention child binding is missing")
+        child = self.agent_run(binding.source_run_id)
+        if child.status != "running":
+            raise RuntimeError("prepared nested intervention child is not active")
+        return child
+
     def create_intervention_and_request_stop(
         self,
         *,
@@ -7797,20 +8226,13 @@ class SQLiteStore:
                 )
                 if question_cursor.rowcount != 1:
                     raise RuntimeError("intervention directed question changed")
-                self._connection.execute(
-                    """
-                    UPDATE exchange_reservations
-                    SET continuation_generation = continuation_generation + 1
-                    WHERE question_id = ? AND session_id = ? AND task_id = ?
-                      AND revision = ? AND continuation_generation = ?
-                    """,
-                    (
-                        binding.question_id,
-                        record.session_id,
-                        record.task_id,
-                        record.revision,
-                        expected_resume_generation,
-                    ),
+                self._advance_intervention_reservation_generation(
+                    record=record,
+                    question_id=binding.question_id,
+                    exchange_id=binding.exchange_id,
+                    request_key=binding.exchange_request_key,
+                    ordinal=binding.exchange_ordinal,
+                    expected_generation=expected_resume_generation,
                 )
                 if binding.parent_question_id is not None:
                     parent_cursor = self._connection.execute(
@@ -7833,20 +8255,13 @@ class SQLiteStore:
                     )
                     if parent_cursor.rowcount != 1:
                         raise RuntimeError("intervention directed parent question changed")
-                    self._connection.execute(
-                        """
-                        UPDATE exchange_reservations
-                        SET continuation_generation = continuation_generation + 1
-                        WHERE question_id = ? AND session_id = ? AND task_id = ?
-                          AND revision = ? AND continuation_generation = ?
-                        """,
-                        (
-                            binding.parent_question_id,
-                            record.session_id,
-                            record.task_id,
-                            record.revision,
-                            expected_resume_generation,
-                        ),
+                    self._advance_intervention_reservation_generation(
+                        record=record,
+                        question_id=binding.parent_question_id,
+                        exchange_id=binding.parent_exchange_id,
+                        request_key=binding.parent_exchange_request_key,
+                        ordinal=binding.parent_exchange_ordinal,
+                        expected_generation=expected_resume_generation,
                     )
             cursor = self._connection.execute(
                 """
@@ -7865,14 +8280,51 @@ class SQLiteStore:
                 raise RuntimeError("intervention retry authorization changed concurrently")
         return self._intervention_required(intervention_id)
 
+    def _advance_intervention_reservation_generation(
+        self,
+        *,
+        record: InterventionRecord,
+        question_id: str,
+        exchange_id: str | None,
+        request_key: str | None,
+        ordinal: int | None,
+        expected_generation: int,
+    ) -> None:
+        present = (exchange_id is not None, request_key is not None, ordinal is not None)
+        if not any(present):
+            return
+        if not all(present):
+            raise RuntimeError("intervention directed reservation identity is incomplete")
+        cursor = self._connection.execute(
+            """
+            UPDATE exchange_reservations
+            SET continuation_generation = continuation_generation + 1
+            WHERE exchange_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND question_id = ? AND request_key = ?
+              AND ordinal = ? AND continuation_generation = ?
+            """,
+            (
+                exchange_id,
+                record.session_id,
+                record.task_id,
+                record.revision,
+                question_id,
+                request_key,
+                ordinal,
+                expected_generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("intervention directed reservation changed")
+
     def _intervention_required(self, intervention_id: str) -> InterventionRecord:
         record = self.intervention(intervention_id)
         if record is None:
             raise RuntimeError("intervention not found")
         return record
 
-    @staticmethod
     def _make_intervention_directed_binding(
+        self,
         *,
         kind: str,
         question: QuestionRecord,
@@ -7886,6 +8338,19 @@ class SQLiteStore:
             source_agent = ConversationTarget(source_run.agent)
         except ValueError as error:
             raise RuntimeError("intervention directed source agent is invalid") from error
+        exchange_id, request_key, ordinal = self._intervention_reservation_identity(
+            question,
+        )
+        parent_exchange_id: str | None = None
+        parent_request_key: str | None = None
+        parent_ordinal: int | None = None
+        if question.parent_question_id is not None:
+            parent = self.question(question.parent_question_id)
+            if parent is None:
+                raise RuntimeError("intervention directed parent question is missing")
+            parent_exchange_id, parent_request_key, parent_ordinal = (
+                self._intervention_reservation_identity(parent)
+            )
         return _InterventionDirectedBinding(
             kind=kind,
             question_id=question.question_id,
@@ -7901,7 +8366,44 @@ class SQLiteStore:
             nested_parent_kind=question.nested_parent_kind,
             parent_question_id=question.parent_question_id,
             parent_continuation_pause_id=question.parent_continuation_pause_id,
+            exchange_id=exchange_id,
+            exchange_request_key=request_key,
+            exchange_ordinal=ordinal,
+            parent_exchange_id=parent_exchange_id,
+            parent_exchange_request_key=parent_request_key,
+            parent_exchange_ordinal=parent_ordinal,
         )
+
+    def _intervention_reservation_identity(
+        self, question: QuestionRecord,
+    ) -> tuple[str | None, str | None, int | None]:
+        if question.exchange_id is None:
+            return None, None, None
+        row = self._connection.execute(
+            """
+            SELECT * FROM exchange_reservations
+            WHERE exchange_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND question_id = ? AND continuation_generation = ?
+            """,
+            (
+                question.exchange_id,
+                question.session_id,
+                question.task_id,
+                question.revision,
+                question.question_id,
+                question.continuation_generation,
+            ),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("intervention directed reservation is missing")
+        try:
+            request_key = _prepared_identifier(row["request_key"], "request_key")
+            ordinal = _require_integer(row["ordinal"], "ordinal")
+        except ValueError as error:
+            raise RuntimeError("intervention directed reservation is invalid") from error
+        if ordinal < 1:
+            raise RuntimeError("intervention directed reservation is invalid")
+        return question.exchange_id, request_key, ordinal
 
     def _bind_nested_intervention_resume_in_transaction(
         self, record: InterventionRecord, task: TaskRecord,
@@ -8631,6 +9133,15 @@ class SQLiteStore:
         )
         if expected_provider != binding.source_provider_id:
             return False
+        if not self._intervention_reservation_is_authenticated(
+            record=record,
+            question=question,
+            exchange_id=binding.exchange_id,
+            request_key=binding.exchange_request_key,
+            ordinal=binding.exchange_ordinal,
+            expected_generation=expected_generation,
+        ):
+            return False
         if binding.kind == "initial":
             if (
                 binding.source_run_id != record.run_id
@@ -8652,6 +9163,14 @@ class SQLiteStore:
                 or parent.continuation_generation != expected_generation
                 or self._question_pause_id(parent.question_id)
                 != binding.parent_continuation_pause_id
+                or not self._intervention_reservation_is_authenticated(
+                    record=record,
+                    question=parent,
+                    exchange_id=binding.parent_exchange_id,
+                    request_key=binding.parent_exchange_request_key,
+                    ordinal=binding.parent_exchange_ordinal,
+                    expected_generation=expected_generation,
+                )
             ):
                 return False
         if (
@@ -8670,6 +9189,41 @@ class SQLiteStore:
         ):
             return False
         return True
+
+    def _intervention_reservation_is_authenticated(
+        self,
+        *,
+        record: InterventionRecord,
+        question: QuestionRecord,
+        exchange_id: str | None,
+        request_key: str | None,
+        ordinal: int | None,
+        expected_generation: int,
+    ) -> bool:
+        present = (exchange_id is not None, request_key is not None, ordinal is not None)
+        if not any(present):
+            return question.exchange_id is None
+        if not all(present) or question.exchange_id != exchange_id:
+            return False
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM exchange_reservations
+            WHERE exchange_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND question_id = ? AND request_key = ?
+              AND ordinal = ? AND continuation_generation = ?
+            """,
+            (
+                exchange_id,
+                record.session_id,
+                record.task_id,
+                record.revision,
+                question.question_id,
+                request_key,
+                ordinal,
+                expected_generation,
+            ),
+        ).fetchone()
+        return row is not None
 
     def _intervention_is_authenticated(
         self, record: InterventionRecord, acknowledgment_id: object,

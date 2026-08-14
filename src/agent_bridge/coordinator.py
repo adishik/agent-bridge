@@ -812,6 +812,9 @@ class Coordinator:
                     question_id, request_key = self._directed_question_identifiers(
                         task, ConversationActor.FABLE, claimed.payload.attempted_question,
                     )
+                    intervention_id, child_run_id = self._nested_intervention_preparation(
+                        task,
+                    )
                     _, question = self._store.reserve_fable_clarification_evidence_question(
                         session_id=task.session_id, task_id=task.task_id,
                         revision=task.revision,
@@ -827,8 +830,10 @@ class Coordinator:
                             continuation_generation=claimed.payload.continuation_generation,
                             question_id=question_id,
                         ),
+                        intervention_id=intervention_id,
+                        child_run_id=child_run_id,
                     )
-                    await self.answer_directed_question(question)
+                    await self.answer_directed_question(question, run_id=child_run_id)
                     return self._persist_terminal_prepared_outcome(
                         claimed, self._terminal_outcome_after_child(claimed),
                     )
@@ -2143,6 +2148,24 @@ class Coordinator:
         self._emit_state(self._store.get_task(current.task_id, current.revision))
         await self.answer_directed_question(question)
 
+    def _nested_intervention_preparation(
+        self, task: TaskRecord,
+    ) -> tuple[str | None, str | None]:
+        """Allocate a child identity only for the exact unbound cross-route resume."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        if (
+            intervention is None
+            or intervention.status is not InterventionStatus.RESUMING
+            or intervention.routed_to is not ConversationTarget.FABLE
+            or intervention.continuation_state not in _SOL_STATES
+            or intervention.resume_generation != task.continuation_generation
+            or intervention.directed_binding is not None
+        ):
+            return None, None
+        return intervention.intervention_id, self._ids.new_run_id()
+
     def _active_context_from_task(self, task: TaskRecord) -> object:
         pending = task.pending or {}
         if task.state in _SOL_STATES:
@@ -2278,6 +2301,12 @@ class Coordinator:
         if persisted.routed_to is ConversationTarget.SOL:
             if persisted.asked_by is not ConversationActor.FABLE:
                 raise RuntimeError("Sol may answer only Fable's exact question")
+            if run_id is None:
+                prepared_run = self._store.prepared_nested_intervention_run(
+                    question_id=persisted.question_id,
+                )
+                if prepared_run is not None:
+                    run_id = prepared_run.run_id
             await self._answer_fable_question_with_sol(
                 task,
                 persisted,
@@ -2369,6 +2398,7 @@ class Coordinator:
             question_id, request_key = self._directed_question_identifiers(
                 task, ConversationActor.FABLE, directed,
             )
+            intervention_id, child_run_id = self._nested_intervention_preparation(task)
             _, nested = self._store.reserve_fable_answer_evidence_question(
                 session_id=task.session_id, task_id=task.task_id, revision=task.revision,
                 expected_generation=question.continuation_generation,
@@ -2382,9 +2412,11 @@ class Coordinator:
                     continuation_generation=question.continuation_generation,
                     question_id=question_id,
                 ),
+                intervention_id=intervention_id,
+                child_run_id=child_run_id,
             )
             self._emit_state(self._store.get_task(task.task_id, task.revision))
-            await self.answer_directed_question(nested)
+            await self.answer_directed_question(nested, run_id=child_run_id)
             return
         answered = self._store.answer_question_and_prepare_resume(
             session_id=task.session_id,
@@ -2515,8 +2547,20 @@ class Coordinator:
         if task.sol_thread_id is None or task.brief is None:
             raise RuntimeError("Sol answer requires the exact approved thread and brief")
         run_id = self._ids.new_run_id() if run_id is None else run_id
-        self._store.start_agent_run(run_id, task.task_id, task.revision, "sol")
-        self._store.set_agent_run_session(run_id, task.sol_thread_id)
+        prepared_run = self._store.prepared_nested_intervention_run(
+            question_id=question.question_id,
+            run_id=run_id,
+        )
+        if prepared_run is None:
+            self._store.start_agent_run(run_id, task.task_id, task.revision, "sol")
+            self._store.set_agent_run_session(run_id, task.sol_thread_id)
+        elif (
+            prepared_run.task_id != task.task_id
+            or prepared_run.revision != task.revision
+            or prepared_run.agent != "sol"
+            or prepared_run.cli_session_id != task.sol_thread_id
+        ):
+            raise RuntimeError("prepared nested Sol child changed")
         completion = self._track_run(run_id)
         try:
             result = await self._sol.answer_fable_question(
@@ -2846,6 +2890,7 @@ class Coordinator:
                 )
                 self._emit_state(paused)
                 return
+            intervention_id, child_run_id = self._nested_intervention_preparation(task)
             _, question = self._store.reserve_fable_clarification_evidence_question(
                 session_id=task.session_id, task_id=task.task_id, revision=task.revision,
                 expected_generation=task.continuation_generation, question_id=question_id,
@@ -2858,9 +2903,11 @@ class Coordinator:
                     continuation_generation=task.continuation_generation,
                     question_id=question_id,
                 ),
+                intervention_id=intervention_id,
+                child_run_id=child_run_id,
             )
             self._emit_state(self._store.get_task(task.task_id, task.revision))
-            await self.answer_directed_question(question)
+            await self.answer_directed_question(question, run_id=child_run_id)
             return
         if clarification.status == "escalate_to_user":
             question = clarification.question_for_user

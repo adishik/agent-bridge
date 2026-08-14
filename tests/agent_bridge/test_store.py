@@ -3920,6 +3920,262 @@ def test_directed_intervention_binding_migration_is_additive_idempotent_and_pres
     assert path.read_bytes() == first_migration_bytes
 
 
+def _seed_previous_directed_intervention_families(
+    path: Path, valid_brief, *, binding_column: str,
+) -> tuple[tuple[object, ...], ...]:
+    """Create reachable directed rows, then restore the exact preceding schema shape."""
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    for status in (
+        store_module.InterventionStatus.PENDING_STOP,
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    ):
+        suffix = status.value
+        brief = replace(valid_brief, task_id=f"directed-{suffix}")
+        store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+        store.set_sol_thread(brief.task_id, brief.revision, f"sol-{suffix}")
+        store.set_fable_session(brief.task_id, brief.revision, f"fable-{suffix}")
+        _, question = store.reserve_internal_question(
+            session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+            expected_generation=1, question_id=f"question-{suffix}",
+            request_key=f"request-{suffix}", asked_by=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+            text=f"Which exact {suffix} fact applies?",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"sol_run_id": f"sol-run-{suffix}", "prompt": suffix},
+            event=ConversationEnvelope(
+                sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                message_type=ConversationMessageType.QUESTION,
+                text=f"Which exact {suffix} fact applies?", task_id=brief.task_id,
+                revision=brief.revision, continuation_generation=1,
+                question_id=f"question-{suffix}",
+            ),
+        )
+        assert question.exchange_id is not None
+        source_run_id = f"source-{suffix}"
+        store.start_agent_run(source_run_id, brief.task_id, brief.revision, "fable")
+        store.set_agent_run_session(source_run_id, f"fable-{suffix}")
+        created = store.create_intervention_and_request_stop(
+            intervention_id=f"intervention-{suffix}", session_id="session-1",
+            task_id=brief.task_id, revision=brief.revision,
+            expected_source_generation=1, message=f"Keep {suffix} exact.",
+            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+            run_id=source_run_id,
+        )
+        if status is store_module.InterventionStatus.PENDING_STOP:
+            continue
+        store.finish_agent_run(source_run_id, status="interrupted", exit_code=-15)
+        store.mark_intervention_ready(created.intervention_id, run_id=source_run_id)
+        if status is store_module.InterventionStatus.READY:
+            continue
+        store.begin_intervention_resume(
+            created.intervention_id, expected_resume_generation=created.resume_generation,
+            resume_attempt_id=f"attempt-{suffix}", resume_run_id=f"resume-{suffix}",
+        )
+        if status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN:
+            store.mark_resume_outcome_unknown(
+                created.intervention_id, resume_attempt_id=f"attempt-{suffix}",
+                resume_run_id=f"resume-{suffix}",
+            )
+            store._connection.execute(
+                """
+                UPDATE tasks SET state = ?
+                WHERE task_id = ? AND revision = ? AND state = ?
+                """,
+                (
+                    TaskState.INTERRUPTED.value,
+                    brief.task_id,
+                    brief.revision,
+                    TaskState.AWAITING_USER_INPUT.value,
+                ),
+            )
+    store.close()
+
+    preceding = sqlite3.connect(path)
+    if binding_column == "absent":
+        preceding.execute("ALTER TABLE interventions DROP COLUMN directed_binding_json")
+    else:
+        preceding.execute("UPDATE interventions SET directed_binding_json = NULL")
+    preceding.commit()
+    unchanged = tuple(
+        tuple(row) for row in preceding.execute(
+            """
+            SELECT intervention_id, session_id, task_id, revision, addressed_to,
+                   routed_to, message, run_id, continuation_state, source_generation,
+                   resume_generation, fable_session_id, sol_thread_id,
+                   resume_attempt_id, resume_run_id, acknowledgment_id, status, created_at
+            FROM interventions ORDER BY intervention_id
+            """
+        )
+    )
+    preceding.close()
+    return unchanged
+
+
+@pytest.mark.parametrize("binding_column", ("absent", "null"))
+def test_directed_intervention_binding_migration_backfills_each_live_family_exactly(
+    tmp_path, valid_brief, monkeypatch: pytest.MonkeyPatch, binding_column: str,
+) -> None:
+    """The immediately preceding schema backfills only complete directed identities."""
+    path = tmp_path / f"previous-directed-{binding_column}.sqlite3"
+    unchanged = _seed_previous_directed_intervention_families(
+        path, valid_brief, binding_column=binding_column,
+    )
+    before = sqlite3.connect(path)
+    unrelated_before = {
+        table: tuple(tuple(row) for row in before.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+        for table in (
+            "sessions", "tasks", "events", "agent_runs", "questions",
+            "exchange_reservations",
+        )
+    }
+    before.close()
+    monkeypatch.setattr(store_module, "_STARTUP_RECOVERY_BATCH_SIZE", 2)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    for status in (
+        store_module.InterventionStatus.PENDING_STOP,
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    ):
+        record = migrated.authenticated_intervention(f"intervention-{status.value}")
+        assert record is not None
+        assert record.status is status
+        assert record.directed_binding is not None
+        assert record.directed_binding.exchange_id is not None
+    assert tuple(
+        tuple(row) for row in migrated._connection.execute(
+            """
+            SELECT intervention_id, session_id, task_id, revision, addressed_to,
+                   routed_to, message, run_id, continuation_state, source_generation,
+                   resume_generation, fable_session_id, sol_thread_id,
+                   resume_attempt_id, resume_run_id, acknowledgment_id, status, created_at
+            FROM interventions ORDER BY intervention_id
+            """
+        )
+    ) == unchanged
+    assert {
+        table: tuple(
+            tuple(row) for row in migrated._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in unrelated_before
+    } == unrelated_before
+    migrated.close()
+
+    migrated_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    for status in (
+        store_module.InterventionStatus.PENDING_STOP,
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    ):
+        assert reopened.authenticated_intervention(
+            f"intervention-{status.value}"
+        ) is not None
+    reopened.close()
+    assert path.read_bytes() == migrated_bytes
+
+
+@pytest.mark.parametrize("binding_column", ("absent", "null"))
+@pytest.mark.parametrize("fault", ("incomplete", "ambiguous"))
+def test_directed_intervention_binding_migration_rejects_unsafe_rows_and_rolls_back(
+    tmp_path, valid_brief, binding_column: str, fault: str,
+) -> None:
+    """An incomplete or ambiguous binding rejects the whole migration transaction."""
+    path = tmp_path / f"{fault}-directed-{binding_column}.sqlite3"
+    _seed_previous_directed_intervention_families(
+        path, valid_brief, binding_column=binding_column,
+    )
+    preceding = sqlite3.connect(path)
+    if fault == "incomplete":
+        preceding.execute(
+            "DELETE FROM exchange_reservations WHERE question_id = ?",
+            ("question-ready",),
+        )
+    else:
+        preceding.execute("DROP INDEX one_unanswered_top_level_question_per_task_revision")
+        preceding.execute(
+            """
+            INSERT INTO questions (
+                question_id, session_id, task_id, revision, continuation_generation,
+                asked_by, addressed_to, routed_to, text, exchange_id,
+                continuation_state, pending_action_json, continuation_pause_id,
+                nested_parent_kind, parent_question_id, parent_continuation_pause_id,
+                answer_text, answered_by
+            )
+            SELECT
+                'ambiguous-question-ready', session_id, task_id, revision,
+                continuation_generation, asked_by, addressed_to, routed_to,
+                'Which other exact ready fact applies?', 'ambiguous-exchange-ready',
+                continuation_state, pending_action_json, continuation_pause_id,
+                nested_parent_kind, parent_question_id, parent_continuation_pause_id,
+                answer_text, answered_by
+            FROM questions WHERE question_id = 'question-ready'
+            """
+        )
+        preceding.execute(
+            """
+            INSERT INTO exchange_reservations (
+                exchange_id, session_id, task_id, revision, question_id,
+                request_key, ordinal, continuation_generation
+            )
+            SELECT
+                'ambiguous-exchange-ready', session_id, task_id, revision,
+                'ambiguous-question-ready', 'ambiguous-request-ready',
+                ordinal, continuation_generation
+            FROM exchange_reservations WHERE question_id = 'question-ready'
+            """
+        )
+    preceding.commit()
+    columns_before = tuple(
+        row[1] for row in preceding.execute("PRAGMA table_info(interventions)")
+    )
+    rows_before = tuple(
+        tuple(row) for row in preceding.execute(
+            "SELECT * FROM interventions ORDER BY intervention_id"
+        )
+    )
+    questions_before = tuple(
+        tuple(row) for row in preceding.execute("SELECT * FROM questions ORDER BY question_id")
+    )
+    reservations_before = tuple(
+        tuple(row) for row in preceding.execute(
+            "SELECT * FROM exchange_reservations ORDER BY question_id"
+        )
+    )
+    preceding.close()
+
+    with pytest.raises(RuntimeError, match="migration.*unauthenticated"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    assert tuple(
+        row[1] for row in inspected.execute("PRAGMA table_info(interventions)")
+    ) == columns_before
+    assert tuple(
+        tuple(row) for row in inspected.execute(
+            "SELECT * FROM interventions ORDER BY intervention_id"
+        )
+    ) == rows_before
+    assert tuple(
+        tuple(row) for row in inspected.execute("SELECT * FROM questions ORDER BY question_id")
+    ) == questions_before
+    assert tuple(
+        tuple(row) for row in inspected.execute(
+            "SELECT * FROM exchange_reservations ORDER BY question_id"
+        )
+    ) == reservations_before
+    inspected.close()
+
+
 def test_directed_intervention_binding_migration_rolls_back_with_outer_transaction(
     tmp_path, monkeypatch,
 ) -> None:
@@ -3982,6 +4238,84 @@ def test_intervention_migration_rolls_back_ddl_after_an_injected_failure(
     ).fetchone() is None
     assert inspected.execute("SELECT session_id FROM sessions").fetchone() == ("session-1",)
     inspected.close()
+
+
+def test_nested_intervention_reservation_exact_retry_reuses_atomic_child_binding(
+    tmp_path, valid_brief,
+) -> None:
+    """The pre-invocation transaction is exactly idempotent without duplicate events."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store._connection.execute(
+        """
+        UPDATE tasks SET approved_at = ?, baseline_id = ?, pending_json = ?
+        WHERE task_id = ? AND revision = ?
+        """,
+        (
+            "2026-08-10T12:00:00Z", "baseline-1",
+            store_module._encode_json({
+                "sol_run_id": "source-run-1", "prompt": "continue exactly",
+            }),
+            valid_brief.task_id, valid_brief.revision,
+        ),
+    )
+    store.start_agent_run(
+        "source-run-1", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="nested-reservation-intervention",
+        session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_source_generation=1,
+        message="Keep the nested evidence exact.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    store.finish_agent_run("source-run-1", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id="source-run-1")
+    store.begin_intervention_resume(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        resume_attempt_id="resume-attempt-1", resume_run_id="resume-run-1",
+    )
+    store.start_agent_run(
+        "resume-run-1", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("resume-run-1", "fable-session-1")
+    store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
+    event = ConversationEnvelope(
+        sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        message_type=ConversationMessageType.QUESTION,
+        text="Which exact evidence is verified?", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, continuation_generation=created.resume_generation,
+        question_id="nested-question-1",
+    )
+    arguments = {
+        "session_id": "session-1", "task_id": valid_brief.task_id,
+        "revision": valid_brief.revision,
+        "expected_generation": created.resume_generation,
+        "question_id": "nested-question-1", "request_key": "nested-request-1",
+        "text": "Which exact evidence is verified?", "event": event,
+        "intervention_id": created.intervention_id, "child_run_id": "child-run-1",
+    }
+
+    first = store.reserve_fable_clarification_evidence_question(**arguments)
+    second = store.reserve_fable_clarification_evidence_question(**arguments)
+
+    assert second == first
+    bound = store.authenticated_intervention(created.intervention_id)
+    assert bound is not None and bound.directed_binding is not None
+    assert bound.directed_binding.source_run_id == "child-run-1"
+    assert store.agent_run("child-run-1").status == "running"
+    assert len(tuple(
+        persisted for persisted in store.events_after("session-1", 0)
+        if persisted.kind == "conversation"
+        and persisted.payload.get("question_id") == "nested-question-1"
+    )) == 1
 
 
 def test_create_intervention_stops_exact_active_run_and_emits_one_user_message(
@@ -4224,10 +4558,11 @@ def _directed_intervention_claim_for_tamper_matrix(store, valid_brief):
     store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
     store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-1")
     store.set_fable_session(valid_brief.task_id, valid_brief.revision, "provider-1")
-    store.pause_for_question(
+    store.reserve_internal_question(
         session_id="session-1", task_id=valid_brief.task_id,
         revision=valid_brief.revision, expected_generation=1,
-        question_id="original-question", asked_by=ConversationActor.SOL,
+        question_id="original-question", request_key="original-request",
+        asked_by=ConversationActor.SOL,
         addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
         text="Which exact constraint applies?", continuation_state=TaskState.SOL_RUNNING,
         pending_action={"sol_run_id": "sol-run-1", "prompt": "continue exactly"},
@@ -4275,8 +4610,11 @@ def _tamper_directed_intervention_binding(store, mutation: str) -> None:
     elif mutation == "question":
         store._connection.execute(
             """
-            UPDATE questions SET question_id = 'substituted-question'
-            WHERE question_id = 'original-question'
+            UPDATE interventions
+            SET directed_binding_json = json_set(
+                directed_binding_json, '$.question_id', 'substituted-question'
+            )
+            WHERE intervention_id = 'directed-terminal'
             """
         )
     elif mutation == "pause":
@@ -4293,8 +4631,151 @@ def _tamper_directed_intervention_binding(store, mutation: str) -> None:
             WHERE question_id = 'original-question'
             """
         )
+    elif mutation == "reservation_missing":
+        store._connection.execute(
+            "DELETE FROM exchange_reservations WHERE question_id = 'original-question'"
+        )
+    elif mutation == "reservation_substituted":
+        store._connection.execute(
+            """
+            UPDATE questions SET exchange_id = 'substituted-exchange'
+            WHERE question_id = 'original-question'
+            """
+        )
+        store._connection.execute(
+            """
+            UPDATE exchange_reservations SET exchange_id = 'substituted-exchange'
+            WHERE question_id = 'original-question'
+            """
+        )
     else:
         raise AssertionError(f"unknown mutation {mutation}")
+
+
+def _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief):
+    """Build one live nested Sol child under an exact reserved outer question."""
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store._connection.execute(
+        """
+        UPDATE tasks SET approved_at = ?, baseline_id = ?
+        WHERE task_id = ? AND revision = ?
+        """,
+        ("2026-08-10T12:00:00Z", "baseline-1", valid_brief.task_id, valid_brief.revision),
+    )
+    store.start_agent_run(
+        "resume-run-1", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("resume-run-1", "provider-1")
+    store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
+    _, child = store.reserve_fable_answer_evidence_question(
+        session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_generation=created.resume_generation,
+        outer_question_id="original-question", question_id="nested-question",
+        request_key="nested-request", text="Which exact nested fact applies?",
+        event=ConversationEnvelope(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact nested fact applies?", task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            continuation_generation=created.resume_generation,
+            question_id="nested-question",
+        ),
+    )
+    store.start_agent_run(
+        "nested-source-run", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    store.set_agent_run_session("nested-source-run", "provider-1")
+    store._connection.execute(
+        "UPDATE interventions SET directed_binding_json = NULL WHERE intervention_id = ?",
+        (created.intervention_id,),
+    )
+    with store._immediate_transaction():
+        rebound = store._bind_nested_intervention_resume_in_transaction(
+            store.intervention(created.intervention_id),
+            store.get_task(valid_brief.task_id, valid_brief.revision),
+        )
+    store._connection.execute(
+        """
+        UPDATE agent_runs SET agent = 'sol', cli_session_id = 'provider-1'
+        WHERE run_id = 'original-source-run'
+        """
+    )
+    assert rebound.directed_binding is not None
+    assert rebound.directed_binding.parent_question_id == "original-question"
+    assert child.parent_question_id == "original-question"
+    return rebound
+
+
+@pytest.mark.parametrize("mutation", ("parent_reservation_missing", "parent_reservation_substituted"))
+@pytest.mark.parametrize("operation", ("acknowledge", "retry"))
+def test_nested_directed_unknown_flow_requires_exact_parent_reservation_and_rolls_back(
+    tmp_path, valid_brief, mutation: str, operation: str,
+) -> None:
+    """Nested acknowledgment and retry reject a wrong parent without mutation."""
+    store = SQLiteStore(
+        tmp_path / f"parent-{operation}-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    created = _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store.recover_active_tasks()
+    expected_generation = created.resume_generation
+    if operation == "retry":
+        acknowledged = store.authorize_retry_after_unknown(
+            created.intervention_id,
+            expected_resume_generation=created.resume_generation,
+            acknowledgment_id=f"ack-{mutation}",
+        )
+        expected_generation = acknowledged.resume_generation
+    if mutation == "parent_reservation_missing":
+        store._connection.execute(
+            "DELETE FROM exchange_reservations WHERE question_id = 'original-question'"
+        )
+    else:
+        store._connection.execute(
+            """
+            UPDATE questions SET exchange_id = 'substituted-parent-exchange'
+            WHERE question_id = 'original-question'
+            """
+        )
+        store._connection.execute(
+            """
+            UPDATE exchange_reservations SET exchange_id = 'substituted-parent-exchange'
+            WHERE question_id = 'original-question'
+            """
+        )
+    before = {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in ("tasks", "interventions", "questions", "exchange_reservations")
+    }
+
+    if operation == "acknowledge":
+        with pytest.raises(RuntimeError, match="binding is not authenticated"):
+            store.authorize_retry_after_unknown(
+                created.intervention_id,
+                expected_resume_generation=expected_generation,
+                acknowledgment_id=f"ack-{mutation}",
+            )
+    else:
+        with pytest.raises(RuntimeError, match="not ready to resume"):
+            store.begin_intervention_resume(
+                created.intervention_id,
+                expected_resume_generation=expected_generation,
+                resume_attempt_id="retry-attempt", resume_run_id="retry-run",
+            )
+
+    assert {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in before
+    } == before
 
 
 @pytest.mark.parametrize(
@@ -4307,7 +4788,10 @@ def _tamper_directed_intervention_binding(store, mutation: str) -> None:
     ),
 )
 @pytest.mark.parametrize(
-    "mutation", ("source_agent", "provider", "question", "pause", "route"),
+    "mutation", (
+        "source_agent", "provider", "question", "pause", "route",
+        "reservation_missing", "reservation_substituted",
+    ),
 )
 def test_directed_intervention_terminal_forms_authenticate_the_original_binding(
     tmp_path, valid_brief, status, mutation: str,
@@ -4333,6 +4817,85 @@ def test_directed_intervention_terminal_forms_authenticate_the_original_binding(
 
     with pytest.raises(RuntimeError, match="binding is not authenticated"):
         store.authenticated_intervention(created.intervention_id)
+
+
+@pytest.mark.parametrize("mutation", ("reservation_missing", "reservation_substituted"))
+def test_directed_unknown_ack_reservation_mismatch_rolls_back_every_generation(
+    tmp_path, valid_brief, mutation: str,
+) -> None:
+    """Unknown acknowledgment requires its exact reservation before changing generations."""
+    store = SQLiteStore(
+        tmp_path / f"ack-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store.recover_active_tasks()
+    _tamper_directed_intervention_binding(store, mutation)
+    before = {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in ("tasks", "interventions", "questions", "exchange_reservations")
+    }
+
+    with pytest.raises(RuntimeError, match="binding is not authenticated"):
+        store.authorize_retry_after_unknown(
+            created.intervention_id, expected_resume_generation=created.resume_generation,
+            acknowledgment_id=f"ack-{mutation}",
+        )
+
+    assert {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in before
+    } == before
+
+
+@pytest.mark.parametrize("mutation", ("reservation_missing", "reservation_substituted"))
+def test_directed_acknowledged_retry_rejects_reservation_mismatch_without_mutation(
+    tmp_path, valid_brief, mutation: str,
+) -> None:
+    """A prepared retry reauthenticates the reservation before claiming its new owner."""
+    store = SQLiteStore(
+        tmp_path / f"retry-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store.recover_active_tasks()
+    acknowledged = store.authorize_retry_after_unknown(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        acknowledgment_id=f"ack-{mutation}",
+    )
+    _tamper_directed_intervention_binding(store, mutation)
+    before = {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in ("tasks", "interventions", "questions", "exchange_reservations")
+    }
+
+    with pytest.raises(RuntimeError, match="not ready to resume"):
+        store.begin_intervention_resume(
+            created.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+            resume_attempt_id="retry-attempt", resume_run_id="retry-run",
+        )
+
+    assert {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in before
+    } == before
 
 
 def test_corrupt_ordinary_terminal_intervention_cannot_mimic_a_directed_binding(
