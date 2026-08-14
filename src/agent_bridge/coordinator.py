@@ -1529,8 +1529,8 @@ class Coordinator:
             return
         task = self._store.get_task(record.task_id, record.revision)
         if task.state is TaskState.AWAITING_USER_INPUT:
-            question = self._store.unanswered_question_for_task(task.task_id, task.revision)
-            if question is None or question.routed_to is not record.routed_to:
+            question = self._store.intervention_resume_question(intervention_id)
+            if question is None:
                 raise RuntimeError("intervention directed route changed")
             await self.answer_directed_question(
                 question,
@@ -2305,6 +2305,7 @@ class Coordinator:
             prompt = f"{prompt}\n\nIntervention guidance:\n{intervention_message}"
         run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+        self._store.set_agent_run_session(run_id, task.fable_session_id)
         completion = self._track_run(run_id)
         try:
             result = await self._fable.answer_sol_question(
@@ -2515,6 +2516,7 @@ class Coordinator:
             raise RuntimeError("Sol answer requires the exact approved thread and brief")
         run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "sol")
+        self._store.set_agent_run_session(run_id, task.sol_thread_id)
         completion = self._track_run(run_id)
         try:
             result = await self._sol.answer_fable_question(

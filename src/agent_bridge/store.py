@@ -999,6 +999,77 @@ class InterventionStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class _InterventionDirectedBinding:
+    """Exact persisted agent-question boundary owned by one intervention."""
+
+    kind: str
+    question_id: str
+    continuation_pause_id: str
+    continuation_state: TaskState
+    question_generation: int
+    source_run_id: str
+    source_agent: ConversationTarget
+    source_provider_id: str
+    asked_by: ConversationActor
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    nested_parent_kind: str | None
+    parent_question_id: str | None
+    parent_continuation_pause_id: str | None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"initial", "nested_resume"}:
+            raise ValueError("intervention directed binding kind is invalid")
+        for name in (
+            "question_id", "continuation_pause_id", "source_run_id", "source_provider_id",
+        ):
+            object.__setattr__(self, name, _prepared_identifier(getattr(self, name), name))
+        generation = _require_integer(self.question_generation, "question_generation")
+        if generation < 1:
+            raise ValueError("intervention directed question generation is invalid")
+        object.__setattr__(self, "question_generation", generation)
+        if not isinstance(self.continuation_state, TaskState):
+            raise ValueError("intervention directed continuation is invalid")
+        if self.source_agent not in {ConversationTarget.FABLE, ConversationTarget.SOL}:
+            raise ValueError("intervention directed source agent is invalid")
+        if not isinstance(self.asked_by, ConversationActor) or self.asked_by not in {
+            ConversationActor.FABLE, ConversationActor.SOL,
+        }:
+            raise ValueError("intervention directed question source is invalid")
+        if (
+            self.addressed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}
+            or self.routed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}
+            or self.routed_to is not self.source_agent
+        ):
+            raise ValueError("intervention directed route is invalid")
+        if self.nested_parent_kind is None:
+            if self.parent_question_id is not None or self.parent_continuation_pause_id is not None:
+                raise ValueError("intervention directed parent is invalid")
+        elif self.nested_parent_kind == "clarification":
+            if self.parent_question_id is not None or self.parent_continuation_pause_id is not None:
+                raise ValueError("intervention directed clarification parent is invalid")
+        elif self.nested_parent_kind == "question":
+            if self.parent_question_id is None or self.parent_continuation_pause_id is None:
+                raise ValueError("intervention directed question parent is invalid")
+            object.__setattr__(
+                self, "parent_question_id",
+                _prepared_identifier(self.parent_question_id, "parent_question_id"),
+            )
+            object.__setattr__(
+                self, "parent_continuation_pause_id",
+                _prepared_identifier(
+                    self.parent_continuation_pause_id, "parent_continuation_pause_id",
+                ),
+            )
+        else:
+            raise ValueError("intervention directed parent kind is invalid")
+        if self.kind == "initial" and self.nested_parent_kind is not None:
+            raise ValueError("initial intervention directed binding cannot be nested")
+        if self.kind == "nested_resume" and self.nested_parent_kind is None:
+            raise ValueError("nested intervention directed binding is not nested")
+
+
+@dataclass(frozen=True, slots=True)
 class InterventionRecord:
     """One durable request to stop an exact run before continuing it."""
 
@@ -1019,6 +1090,7 @@ class InterventionRecord:
     resume_run_id: str | None
     status: InterventionStatus
     created_at: str
+    directed_binding: _InterventionDirectedBinding | None = None
 
     def __post_init__(self) -> None:
         for name in ("intervention_id", "session_id", "task_id", "run_id"):
@@ -1050,6 +1122,10 @@ class InterventionRecord:
         if not isinstance(self.status, InterventionStatus):
             raise ValueError("intervention status is invalid")
         object.__setattr__(self, "created_at", _require_string(self.created_at, "created_at"))
+        if self.directed_binding is not None and not isinstance(
+            self.directed_binding, _InterventionDirectedBinding,
+        ):
+            raise ValueError("intervention directed binding is invalid")
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1231,76 @@ def _decode_mapping(raw: str, name: str) -> Mapping[str, JsonValue]:
     if not isinstance(frozen, Mapping):
         raise RuntimeError(f"persisted {name} must be an object")
     return frozen
+
+
+_INTERVENTION_DIRECTED_BINDING_KEYS = {
+    "kind",
+    "question_id",
+    "continuation_pause_id",
+    "continuation_state",
+    "question_generation",
+    "source_run_id",
+    "source_agent",
+    "source_provider_id",
+    "asked_by",
+    "addressed_to",
+    "routed_to",
+    "nested_parent_kind",
+    "parent_question_id",
+    "parent_continuation_pause_id",
+}
+
+
+def _encode_intervention_directed_binding(
+    binding: _InterventionDirectedBinding,
+) -> str:
+    return _encode_json({
+        "kind": binding.kind,
+        "question_id": binding.question_id,
+        "continuation_pause_id": binding.continuation_pause_id,
+        "continuation_state": binding.continuation_state.value,
+        "question_generation": binding.question_generation,
+        "source_run_id": binding.source_run_id,
+        "source_agent": binding.source_agent.value,
+        "source_provider_id": binding.source_provider_id,
+        "asked_by": binding.asked_by.value,
+        "addressed_to": binding.addressed_to.value,
+        "routed_to": binding.routed_to.value,
+        "nested_parent_kind": binding.nested_parent_kind,
+        "parent_question_id": binding.parent_question_id,
+        "parent_continuation_pause_id": binding.parent_continuation_pause_id,
+    })
+
+
+def _decode_intervention_directed_binding(
+    raw: object,
+) -> _InterventionDirectedBinding | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise RuntimeError("persisted intervention directed binding is invalid")
+    value = _decode_mapping(raw, "intervention directed binding")
+    if set(value) != _INTERVENTION_DIRECTED_BINDING_KEYS:
+        raise RuntimeError("persisted intervention directed binding is invalid")
+    try:
+        return _InterventionDirectedBinding(
+            kind=value["kind"],
+            question_id=value["question_id"],
+            continuation_pause_id=value["continuation_pause_id"],
+            continuation_state=TaskState(value["continuation_state"]),
+            question_generation=value["question_generation"],
+            source_run_id=value["source_run_id"],
+            source_agent=ConversationTarget(value["source_agent"]),
+            source_provider_id=value["source_provider_id"],
+            asked_by=ConversationActor(value["asked_by"]),
+            addressed_to=ConversationTarget(value["addressed_to"]),
+            routed_to=ConversationTarget(value["routed_to"]),
+            nested_parent_kind=value["nested_parent_kind"],
+            parent_question_id=value["parent_question_id"],
+            parent_continuation_pause_id=value["parent_continuation_pause_id"],
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("persisted intervention directed binding is invalid") from error
 
 
 _MIGRATION_STATEMENTS = (
@@ -1358,6 +1504,7 @@ _MIGRATION_STATEMENTS = (
         acknowledgment_id TEXT UNIQUE CHECK (
             acknowledgment_id IS NULL OR length(acknowledgment_id) BETWEEN 1 AND 128
         ),
+        directed_binding_json TEXT,
         status TEXT NOT NULL CHECK (status IN (
             'pending_stop', 'ready', 'resuming', 'resumed',
             'resume_outcome_unknown', 'canceled_by_stop', 'failed'
@@ -1515,8 +1662,8 @@ class SQLiteStore:
             for statement in _MIGRATION_STATEMENTS:
                 self._connection.execute(statement)
             self._migrate_session_chat_metadata()
-            self._migrate_directed_conversation_schema()
             self._migrate_intervention_schema()
+            self._migrate_directed_conversation_schema()
         except BaseException:
             self._connection.rollback()
             raise
@@ -1723,6 +1870,14 @@ class SQLiteStore:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'interventions'"
         ).fetchone() is None:
             raise RuntimeError("intervention migration did not create its table")
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(interventions)")
+        }
+        if "directed_binding_json" not in columns:
+            self._connection.execute(
+                "ALTER TABLE interventions ADD COLUMN directed_binding_json TEXT"
+            )
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[None]:
@@ -3428,15 +3583,79 @@ class SQLiteStore:
                 (task.state != ? AND NOT (
                     task.state = ? AND task.continuation_state = ?
                     AND EXISTS (
-                        SELECT 1 FROM interventions AS intervention
+                        SELECT 1
+                        FROM interventions AS intervention
+                        JOIN agent_runs AS bound_run
+                          ON bound_run.run_id = json_extract(
+                              intervention.directed_binding_json, '$.source_run_id'
+                          )
                         WHERE intervention.task_id = task.task_id
                           AND intervention.revision = task.revision
                           AND intervention.session_id = task.session_id
-                          AND intervention.status = ?
+                          AND intervention.status IN (?, ?, ?, ?)
                           AND intervention.routed_to = ?
                           AND intervention.continuation_state IN (?, ?)
-                          AND intervention.resume_attempt_id IS NOT NULL
-                          AND intervention.resume_run_id IS NOT NULL
+                          AND json_valid(intervention.directed_binding_json)
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.kind'
+                          ) = 'nested_resume'
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.question_id'
+                          ) = child.question_id
+                          AND json_extract(
+                              intervention.directed_binding_json,
+                              '$.continuation_pause_id'
+                          ) = child.continuation_pause_id
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.continuation_state'
+                          ) = task.continuation_state
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.asked_by'
+                          ) = child.asked_by
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.addressed_to'
+                          ) = child.addressed_to
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.routed_to'
+                          ) = child.routed_to
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.nested_parent_kind'
+                          ) IS child.nested_parent_kind
+                          AND json_extract(
+                              intervention.directed_binding_json, '$.parent_question_id'
+                          ) IS child.parent_question_id
+                          AND json_extract(
+                              intervention.directed_binding_json,
+                              '$.parent_continuation_pause_id'
+                          ) IS child.parent_continuation_pause_id
+                          AND bound_run.task_id = task.task_id
+                          AND bound_run.revision = task.revision
+                          AND bound_run.agent = child.routed_to
+                          AND bound_run.agent = json_extract(
+                              intervention.directed_binding_json, '$.source_agent'
+                          )
+                          AND bound_run.cli_session_id = json_extract(
+                              intervention.directed_binding_json, '$.source_provider_id'
+                          )
+                          AND (
+                              (intervention.acknowledgment_id IS NULL
+                               AND child.continuation_generation = json_extract(
+                                   intervention.directed_binding_json,
+                                   '$.question_generation'
+                               ))
+                              OR (intervention.acknowledgment_id IS NOT NULL
+                                  AND child.continuation_generation
+                                      = intervention.resume_generation)
+                          )
+                          AND (
+                              (intervention.status = ?
+                               AND intervention.acknowledgment_id IS NOT NULL
+                               AND intervention.resume_attempt_id IS NULL
+                               AND intervention.resume_run_id IS NULL)
+                              OR (intervention.status != ?
+                                  AND intervention.resume_attempt_id IS NOT NULL
+                                  AND intervention.resume_run_id IS NOT NULL)
+                          )
                     )
                 )) OR task.continuation_state != ?
                 OR task.continuation_generation != child.continuation_generation
@@ -3454,10 +3673,15 @@ class SQLiteStore:
                 TaskState.AWAITING_USER_INPUT.value,
                 TaskState.INTERRUPTED.value,
                 TaskState.FABLE_CLARIFYING.value,
+                InterventionStatus.RESUMING.value,
+                InterventionStatus.RESUME_OUTCOME_UNKNOWN.value,
+                InterventionStatus.READY.value,
                 InterventionStatus.CANCELED_BY_STOP.value,
                 ConversationTarget.FABLE.value,
                 TaskState.SOL_RUNNING.value,
                 TaskState.SOL_CORRECTING.value,
+                InterventionStatus.READY.value,
+                InterventionStatus.READY.value,
                 TaskState.FABLE_CLARIFYING.value,
                 TaskState.SOL_RUNNING.value,
                 TaskState.SOL_CORRECTING.value,
@@ -6965,6 +7189,7 @@ class SQLiteStore:
                 if source_run is None:
                     raise RuntimeError("intervention source run is not active")
                 source = self._agent_run_from_row(source_run)
+                directed_binding: _InterventionDirectedBinding | None = None
                 if directed_answer:
                     if task.continuation_state not in _ACTIVE_TASK_STATES:
                         raise RuntimeError("intervention directed answer continuation changed")
@@ -7009,6 +7234,13 @@ class SQLiteStore:
                         )
                     continuation_state = task.continuation_state
                     resume_generation = expected_source_generation
+                    directed_binding = self._make_intervention_directed_binding(
+                        kind="initial",
+                        question=question,
+                        continuation_pause_id=question_pause_id,
+                        continuation_state=continuation_state,
+                        source_run=source,
+                    )
                 else:
                     self._require_intervention_source_identity(
                         task=task,
@@ -7077,14 +7309,18 @@ class SQLiteStore:
                         intervention_id, session_id, task_id, revision,
                         addressed_to, routed_to, message, run_id, continuation_state,
                         source_generation, resume_generation, fable_session_id, sol_thread_id,
-                        status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        directed_binding_json, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         intervention_id, session_id, task_id, revision,
                         addressed_to.value, routed_to.value, message, run_id,
                         continuation_state.value, expected_source_generation, resume_generation,
                         task.fable_session_id, task.sol_thread_id,
+                        (
+                            None if directed_binding is None
+                            else _encode_intervention_directed_binding(directed_binding)
+                        ),
                         InterventionStatus.PENDING_STOP.value, self._timestamp(),
                     ),
                 )
@@ -7214,29 +7450,36 @@ class SQLiteStore:
                 raise RuntimeError("intervention is not ready to resume")
             task = self.get_task(record.task_id, record.revision)
             acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            directed_answer = self._intervention_is_directed_answer(record)
-            if directed_answer:
-                question = self._unanswered_question_for_task(record.task_id, record.revision)
+            binding = record.directed_binding
+            if binding is not None:
+                question = self.question(binding.question_id)
                 if (
                     question is None
                     or task.state is not TaskState.INTERRUPTED
-                    or task.continuation_state is not record.continuation_state
+                    or task.continuation_state is not binding.continuation_state
                 ):
                     raise RuntimeError("intervention directed answer changed")
-                if record.routed_to is ConversationTarget.FABLE:
+                if binding.kind == "nested_resume" or (
+                    binding.kind == "initial"
+                    and record.routed_to is ConversationTarget.FABLE
+                ):
                     cursor = self._connection.execute(
                         """
                         UPDATE tasks SET state = ?
                         WHERE task_id = ? AND revision = ? AND state = ?
                           AND continuation_state = ? AND continuation_generation = ?
+                          AND pending_json = ? AND continuation_pause_id = ?
                         """,
                         (
                             TaskState.AWAITING_USER_INPUT.value, record.task_id, record.revision,
-                            TaskState.INTERRUPTED.value, record.continuation_state.value,
+                            TaskState.INTERRUPTED.value, binding.continuation_state.value,
                             record.resume_generation,
+                            _encode_json(task.pending), binding.continuation_pause_id,
                         ),
                     )
                 elif (
+                    binding.kind == "initial"
+                    and
                     record.routed_to is ConversationTarget.SOL
                     and record.continuation_state in _SOL_TASK_STATES
                 ):
@@ -7402,6 +7645,7 @@ class SQLiteStore:
             }:
                 raise RuntimeError("intervention cannot be canceled")
             task = self.get_task(record.task_id, record.revision)
+            record = self._bind_nested_intervention_resume_in_transaction(record, task)
             if task.state in _ACTIVE_TASK_STATES:
                 cursor = self._connection.execute(
                     """
@@ -7502,6 +7746,11 @@ class SQLiteStore:
             ).fetchone()
             stored_acknowledgment = None if row is None else row["acknowledgment_id"]
             if (
+                record.directed_binding is not None
+                and not self._intervention_is_authenticated(record, stored_acknowledgment)
+            ):
+                raise RuntimeError("intervention binding is not authenticated")
+            if (
                 record.status is InterventionStatus.READY
                 and record.resume_generation == expected_resume_generation + 1
                 and stored_acknowledgment == acknowledgment_id
@@ -7528,16 +7777,18 @@ class SQLiteStore:
             )
             if task_cursor.rowcount != 1:
                 raise RuntimeError("intervention task generation changed")
-            if self._intervention_is_directed_answer(record):
+            binding = record.directed_binding
+            if binding is not None:
                 question_cursor = self._connection.execute(
                     """
                     UPDATE questions
                     SET continuation_generation = continuation_generation + 1
-                    WHERE session_id = ? AND task_id = ? AND revision = ?
-                      AND answer_text IS NULL AND nested_parent_kind IS NULL
+                    WHERE question_id = ? AND session_id = ? AND task_id = ?
+                      AND revision = ? AND answer_text IS NULL
                       AND continuation_generation = ?
                     """,
                     (
+                        binding.question_id,
                         record.session_id,
                         record.task_id,
                         record.revision,
@@ -7546,6 +7797,57 @@ class SQLiteStore:
                 )
                 if question_cursor.rowcount != 1:
                     raise RuntimeError("intervention directed question changed")
+                self._connection.execute(
+                    """
+                    UPDATE exchange_reservations
+                    SET continuation_generation = continuation_generation + 1
+                    WHERE question_id = ? AND session_id = ? AND task_id = ?
+                      AND revision = ? AND continuation_generation = ?
+                    """,
+                    (
+                        binding.question_id,
+                        record.session_id,
+                        record.task_id,
+                        record.revision,
+                        expected_resume_generation,
+                    ),
+                )
+                if binding.parent_question_id is not None:
+                    parent_cursor = self._connection.execute(
+                        """
+                        UPDATE questions
+                        SET continuation_generation = continuation_generation + 1
+                        WHERE question_id = ? AND session_id = ? AND task_id = ?
+                          AND revision = ? AND answer_text IS NULL
+                          AND continuation_generation = ?
+                          AND continuation_pause_id = ?
+                        """,
+                        (
+                            binding.parent_question_id,
+                            record.session_id,
+                            record.task_id,
+                            record.revision,
+                            expected_resume_generation,
+                            binding.parent_continuation_pause_id,
+                        ),
+                    )
+                    if parent_cursor.rowcount != 1:
+                        raise RuntimeError("intervention directed parent question changed")
+                    self._connection.execute(
+                        """
+                        UPDATE exchange_reservations
+                        SET continuation_generation = continuation_generation + 1
+                        WHERE question_id = ? AND session_id = ? AND task_id = ?
+                          AND revision = ? AND continuation_generation = ?
+                        """,
+                        (
+                            binding.parent_question_id,
+                            record.session_id,
+                            record.task_id,
+                            record.revision,
+                            expected_resume_generation,
+                        ),
+                    )
             cursor = self._connection.execute(
                 """
                 UPDATE interventions
@@ -7569,12 +7871,137 @@ class SQLiteStore:
             raise RuntimeError("intervention not found")
         return record
 
+    @staticmethod
+    def _make_intervention_directed_binding(
+        *,
+        kind: str,
+        question: QuestionRecord,
+        continuation_pause_id: str,
+        continuation_state: TaskState,
+        source_run: AgentRunRecord,
+    ) -> _InterventionDirectedBinding:
+        if source_run.cli_session_id is None:
+            raise RuntimeError("intervention directed provider identity is missing")
+        try:
+            source_agent = ConversationTarget(source_run.agent)
+        except ValueError as error:
+            raise RuntimeError("intervention directed source agent is invalid") from error
+        return _InterventionDirectedBinding(
+            kind=kind,
+            question_id=question.question_id,
+            continuation_pause_id=continuation_pause_id,
+            continuation_state=continuation_state,
+            question_generation=question.continuation_generation,
+            source_run_id=source_run.run_id,
+            source_agent=source_agent,
+            source_provider_id=source_run.cli_session_id,
+            asked_by=question.asked_by,
+            addressed_to=question.addressed_to,
+            routed_to=question.routed_to,
+            nested_parent_kind=question.nested_parent_kind,
+            parent_question_id=question.parent_question_id,
+            parent_continuation_pause_id=question.parent_continuation_pause_id,
+        )
+
+    def _bind_nested_intervention_resume_in_transaction(
+        self, record: InterventionRecord, task: TaskRecord,
+    ) -> InterventionRecord:
+        """Snapshot one exact active nested provider boundary before interrupting it."""
+        if record.directed_binding is not None:
+            return record
+        if (
+            record.status is not InterventionStatus.RESUMING
+            or record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state not in _SOL_TASK_STATES
+            or record.resume_attempt_id is None
+            or record.resume_run_id is None
+            or task.state is not TaskState.AWAITING_USER_INPUT
+            or task.continuation_state is not TaskState.FABLE_CLARIFYING
+            or task.continuation_generation != record.resume_generation
+        ):
+            return record
+        row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND answer_text IS NULL AND nested_parent_kind IS NOT NULL
+            """,
+            (record.session_id, record.task_id, record.revision),
+        ).fetchone()
+        active = self.active_run_for_task(record.task_id, record.revision)
+        if row is None or active is None:
+            return record
+        question = self._question_from_row(row)
+        _, continuation, pending, pause = self._question_exact(
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            expected_generation=record.resume_generation,
+            question_id=question.question_id,
+        )
+        task_pause = self._directed_pause_id(
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            expected_generation=record.resume_generation,
+        )
+        if (
+            continuation is not TaskState.FABLE_CLARIFYING
+            or pending != task.pending
+            or pause != task_pause
+            or question.routed_to.value != active.agent
+        ):
+            raise RuntimeError("nested intervention directed binding changed")
+        if active.agent == ConversationTarget.FABLE.value:
+            self._require_exact_intervention_provider_identity(
+                task.fable_session_id, active.cli_session_id,
+            )
+        elif active.agent == ConversationTarget.SOL.value:
+            self._require_exact_intervention_provider_identity(
+                task.sol_thread_id, active.cli_session_id,
+            )
+        else:
+            raise RuntimeError("nested intervention directed source agent changed")
+        binding = self._make_intervention_directed_binding(
+            kind="nested_resume",
+            question=question,
+            continuation_pause_id=pause,
+            continuation_state=continuation,
+            source_run=active,
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = ?
+            WHERE intervention_id = ? AND status = ?
+              AND resume_generation = ? AND resume_attempt_id = ? AND resume_run_id = ?
+              AND directed_binding_json IS NULL
+            """,
+            (
+                _encode_intervention_directed_binding(binding),
+                record.intervention_id,
+                InterventionStatus.RESUMING.value,
+                record.resume_generation,
+                record.resume_attempt_id,
+                record.resume_run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("nested intervention directed binding changed concurrently")
+        return self._intervention_required(record.intervention_id)
+
+    def intervention_resume_question(self, intervention_id: str) -> QuestionRecord | None:
+        """Return only the exact persisted question boundary owned by this resume."""
+        record = self.authenticated_intervention(intervention_id)
+        if record is None or record.directed_binding is None:
+            return None
+        question = self.question(record.directed_binding.question_id)
+        if question is None:
+            raise RuntimeError("intervention directed question changed")
+        return question
+
     def _intervention_is_directed_answer(self, record: InterventionRecord) -> bool:
-        """Identify a paused directed answer from its persisted source phase."""
-        expected_agent = _INTERVENTION_SOURCE_AGENTS.get(record.continuation_state)
-        if expected_agent is None:
-            return False
-        return self.agent_run(record.run_id).agent != expected_agent
+        """Use the immutable persisted discriminator, never mutable phase mismatch."""
+        return record.directed_binding is not None
 
     @staticmethod
     def _require_intervention_source_identity(
@@ -7726,12 +8153,15 @@ class SQLiteStore:
                 task = self.get_task(record.task_id, record.revision)
                 if task.state is TaskState.INTERRUPTED:
                     continue
-                directed_answer = self._intervention_is_directed_answer(record)
+                record = self._bind_nested_intervention_resume_in_transaction(record, task)
+                binding = record.directed_binding
                 continuation = (
+                    binding.continuation_state
+                    if binding is not None
+                    else
                     TaskState.FABLE_CLARIFYING
                     if (
-                        not directed_answer
-                        and record.routed_to is ConversationTarget.FABLE
+                        record.routed_to is ConversationTarget.FABLE
                         and record.continuation_state in _SOL_TASK_STATES
                     )
                     else record.continuation_state
@@ -8144,6 +8574,103 @@ class SQLiteStore:
 
         return reasons
 
+    def _intervention_directed_binding_is_authenticated(
+        self,
+        *,
+        record: InterventionRecord,
+        task: TaskRecord,
+        binding: _InterventionDirectedBinding,
+        acknowledgment_id: object,
+    ) -> bool:
+        question_row = self._connection.execute(
+            "SELECT * FROM questions WHERE question_id = ?", (binding.question_id,)
+        ).fetchone()
+        source_row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (binding.source_run_id,)
+        ).fetchone()
+        if question_row is None or source_row is None:
+            return False
+        try:
+            question = self._question_from_row(question_row)
+            source = self._agent_run_from_row(source_row)
+            expected_generation = (
+                binding.question_generation
+                if acknowledgment_id is None
+                else record.resume_generation
+            )
+            _, continuation, pending, pause = self._question_exact(
+                session_id=record.session_id,
+                task_id=record.task_id,
+                revision=record.revision,
+                expected_generation=expected_generation,
+                question_id=binding.question_id,
+            )
+        except (RuntimeError, ValueError):
+            return False
+        if (
+            question.continuation_generation != expected_generation
+            or question.asked_by is not binding.asked_by
+            or question.addressed_to is not binding.addressed_to
+            or question.routed_to is not binding.routed_to
+            or question.nested_parent_kind != binding.nested_parent_kind
+            or question.parent_question_id != binding.parent_question_id
+            or question.parent_continuation_pause_id != binding.parent_continuation_pause_id
+            or continuation is not binding.continuation_state
+            or pause != binding.continuation_pause_id
+            or source.run_id != binding.source_run_id
+            or source.task_id != record.task_id
+            or source.revision != record.revision
+            or source.agent != binding.source_agent.value
+            or source.cli_session_id != binding.source_provider_id
+        ):
+            return False
+        expected_provider = (
+            record.fable_session_id
+            if binding.source_agent is ConversationTarget.FABLE
+            else record.sol_thread_id
+        )
+        if expected_provider != binding.source_provider_id:
+            return False
+        if binding.kind == "initial":
+            if (
+                binding.source_run_id != record.run_id
+                or binding.continuation_state is not record.continuation_state
+            ):
+                return False
+        elif (
+            binding.kind != "nested_resume"
+            or record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state not in _SOL_TASK_STATES
+            or binding.continuation_state is not TaskState.FABLE_CLARIFYING
+            or binding.source_run_id == record.resume_run_id
+        ):
+            return False
+        if binding.parent_question_id is not None:
+            parent = self.question(binding.parent_question_id)
+            if (
+                parent is None
+                or parent.continuation_generation != expected_generation
+                or self._question_pause_id(parent.question_id)
+                != binding.parent_continuation_pause_id
+            ):
+                return False
+        if (
+            task.state in {TaskState.INTERRUPTED, TaskState.AWAITING_USER_INPUT}
+            and question.answer_text is None
+            and (
+                task.continuation_state is not binding.continuation_state
+                or task.pending != pending
+                or self._directed_pause_id(
+                    session_id=record.session_id,
+                    task_id=record.task_id,
+                    revision=record.revision,
+                    expected_generation=expected_generation,
+                ) != binding.continuation_pause_id
+            )
+        ):
+            return False
+        return True
+
     def _intervention_is_authenticated(
         self, record: InterventionRecord, acknowledgment_id: object,
     ) -> bool:
@@ -8184,54 +8711,8 @@ class SQLiteStore:
         has_resume_owner = (
             record.resume_attempt_id is not None and record.resume_run_id is not None
         )
-        expected_source_agent = _INTERVENTION_SOURCE_AGENTS.get(record.continuation_state)
-        directed_answer = (
-            expected_source_agent is not None and source_run.agent != expected_source_agent
-        )
-        initial_directed_pause = directed_answer and acknowledgment_id is None and (
-            record.status in {
-                InterventionStatus.PENDING_STOP,
-                InterventionStatus.READY,
-            }
-            or (
-                record.status is InterventionStatus.CANCELED_BY_STOP
-                and not has_resume_owner
-            )
-        )
-        if initial_directed_pause:
-            question = self._unanswered_question_for_task(record.task_id, record.revision)
-            if question is None:
-                return False
-            try:
-                pause = self._directed_pause_id(
-                    session_id=record.session_id, task_id=record.task_id,
-                    revision=record.revision,
-                    expected_generation=record.source_generation,
-                )
-                _, continuation, pending, question_pause = self._question_exact(
-                    session_id=record.session_id, task_id=record.task_id,
-                    revision=record.revision,
-                    expected_generation=record.source_generation,
-                    question_id=question.question_id,
-                )
-                if (
-                    question.routed_to.value != source_run.agent
-                    or continuation is not record.continuation_state
-                    or task.pending != pending
-                    or pause != question_pause
-                ):
-                    return False
-                if source_run.agent == "fable":
-                    self._require_exact_intervention_provider_identity(
-                        task.fable_session_id, source_run.cli_session_id,
-                    )
-                else:
-                    self._require_exact_intervention_provider_identity(
-                        task.sol_thread_id, source_run.cli_session_id,
-                    )
-            except (RuntimeError, ValueError):
-                return False
-        elif not directed_answer:
+        binding = record.directed_binding
+        if binding is None:
             if task.continuation_generation != record.resume_generation:
                 return False
             try:
@@ -8242,7 +8723,25 @@ class SQLiteStore:
                 )
             except RuntimeError:
                 return False
-        resumed_continuation = record.continuation_state if directed_answer else (
+        else:
+            if not self._intervention_directed_binding_is_authenticated(
+                record=record,
+                task=task,
+                binding=binding,
+                acknowledgment_id=acknowledgment_id,
+            ):
+                return False
+            if binding.kind == "nested_resume":
+                try:
+                    self._require_intervention_source_identity(
+                        task=task,
+                        source_state=record.continuation_state,
+                        source_run=source_run,
+                    )
+                except RuntimeError:
+                    return False
+        resumed_continuation = (
+            binding.continuation_state if binding is not None else
             TaskState.FABLE_CLARIFYING
             if (
                 record.routed_to is ConversationTarget.FABLE
@@ -8941,6 +9440,9 @@ class SQLiteStore:
                 resume_run_id=row["resume_run_id"],
                 status=InterventionStatus(row["status"]),
                 created_at=row["created_at"],
+                directed_binding=_decode_intervention_directed_binding(
+                    row["directed_binding_json"]
+                ),
             )
         except (TypeError, ValueError, OverflowError) as error:
             raise RuntimeError("persisted intervention is invalid") from error

@@ -4632,6 +4632,259 @@ def test_later_stop_cancels_cross_route_resuming_nested_sol_child_and_survives_r
     asyncio.run(scenario())
 
 
+def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_question(
+    harness: CoordinatorHarness,
+) -> None:
+    """A crash image at the nested provider boundary must reopen idempotently."""
+    async def scenario() -> None:
+        source_released = asyncio.Event()
+        nested_provider_blocked = asyncio.Event()
+        correction_started = asyncio.Event()
+        directed = DirectedAgentQuestion(
+            addressed_to="sol",
+            text="Which exact correction fact is verified?",
+            reason="Fable needs one bounded correction fact.",
+        )
+        harness.sol.queue(_completed())
+        harness.fable.next_verdicts.append(
+            _verdict(harness.fable.brief, status="corrections_required")
+        )
+        harness.sol.hold_resume = source_released
+        harness.sol.on_resume = correction_started.set
+        harness.runner.release_on_stop = source_released
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(
+            harness.coordinator.approve_task("task-1", revision=1)
+        )
+        await correction_started.wait()
+        source = harness.store.active_run_for_task("task-1", 1)
+        source_task = harness.store.get_task("task-1", 1)
+        assert source is not None
+        harness.store.set_agent_run_session(source.run_id, THREAD_ID)
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="nested-unknown", message="Keep the correction bounded.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=source_task.continuation_generation,
+            ),
+        )
+        harness.sol.hold_resume = None
+        harness.sol.hold_answer_fable_question = nested_provider_blocked
+        harness.fable.next_clarifications.append(
+            _answer("I need one exact correction fact.", False, directed_question=directed)
+        )
+        continuing = asyncio.create_task(workflows.continue_intervention(prepared))
+        while not harness.sol.answer_fable_question_calls:
+            await asyncio.sleep(0)
+
+        crash_task = harness.store.get_task("task-1", 1)
+        nested_row = harness.store._connection.execute(
+            """
+            SELECT question_id, continuation_pause_id, pending_action_json,
+                   continuation_generation
+            FROM questions
+            WHERE task_id = ? AND revision = ? AND answer_text IS NULL
+              AND nested_parent_kind IS NOT NULL
+            """,
+            ("task-1", 1),
+        ).fetchone()
+        assert nested_row is not None
+        nested_question_id = nested_row["question_id"]
+        nested_question = harness.store.question(nested_question_id)
+        nested_run = harness.store.active_run_for_task("task-1", 1)
+        crash_intervention = harness.store.intervention("nested-unknown")
+        assert nested_question is not None
+        assert nested_run is not None and nested_run.agent == "sol"
+        assert crash_intervention is not None
+        assert crash_intervention.status.value == "resuming"
+        assert crash_intervention.resume_run_id != nested_run.run_id
+        assert crash_task.state is TaskState.AWAITING_USER_INPUT
+        assert crash_task.continuation_state is TaskState.FABLE_CLARIFYING
+        assert nested_row["continuation_pause_id"] == harness.store._connection.execute(
+            """
+            SELECT continuation_pause_id FROM tasks
+            WHERE task_id = ? AND revision = ?
+            """,
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"]
+        harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+        question_events_before = tuple(
+            event for event in harness.store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload.get("question_id") == nested_question_id
+        )
+        assert len(question_events_before) == 1
+
+        crash_database = harness.database.with_name("nested-crash.sqlite3")
+        crash_connection = sqlite3.connect(crash_database)
+        harness.store._connection.backup(crash_connection)
+        crash_connection.close()
+
+        continuing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await continuing
+        await approval
+        harness.tracker.close()
+        harness.store.close()
+
+        first = SQLiteStore(
+            crash_database, clock=lambda: "2026-08-10T12:00:00Z",
+        )
+        first_summary = first.recover_active_tasks()
+        unknown = first.authenticated_intervention("nested-unknown")
+        assert unknown is not None
+        assert unknown.status.value == "resume_outcome_unknown"
+        assert first_summary == store_module.RecoverySummary(0, 1, 1)
+        first_task = first.get_task("task-1", 1)
+        assert first_task.state is TaskState.INTERRUPTED
+        assert first_task.continuation_state is TaskState.FABLE_CLARIFYING
+        assert first.question(nested_question_id) == nested_question
+        first.audit_legacy_project_ownership(str(harness.repo))
+        first.close()
+
+        second = SQLiteStore(
+            crash_database, clock=lambda: "2026-08-10T12:00:00Z",
+        )
+        assert second.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+        second_unknown = second.authenticated_intervention("nested-unknown")
+        assert second_unknown == unknown
+        second_task = second.get_task("task-1", 1)
+        assert second_task.pending == first_task.pending
+        assert second._connection.execute(
+            """
+            SELECT continuation_pause_id FROM tasks
+            WHERE task_id = ? AND revision = ?
+            """,
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"] == nested_row["continuation_pause_id"]
+        assert tuple(
+            event for event in second.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload.get("question_id") == nested_question_id
+        ) == question_events_before
+        second.audit_legacy_project_ownership(str(harness.repo))
+
+        acknowledged = second.authorize_retry_after_unknown(
+            "nested-unknown", expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id="nested-acknowledgment-1",
+        )
+        assert second.authorize_retry_after_unknown(
+            "nested-unknown", expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id="nested-acknowledgment-1",
+        ) == acknowledged
+        with pytest.raises(RuntimeError, match="generation changed"):
+            second.authorize_retry_after_unknown(
+                "nested-unknown", expected_resume_generation=unknown.resume_generation,
+                acknowledgment_id="nested-acknowledgment-2",
+            )
+        acknowledged_task = second.get_task("task-1", 1)
+        acknowledged_question = second.question(nested_question_id)
+        assert acknowledged_question is not None
+        assert acknowledged.resume_generation == unknown.resume_generation + 1
+        assert acknowledged_task.continuation_generation == acknowledged.resume_generation
+        assert acknowledged_question.continuation_generation == acknowledged.resume_generation
+        assert second._connection.execute(
+            """
+            SELECT continuation_pause_id FROM tasks
+            WHERE task_id = ? AND revision = ?
+            """,
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"] == nested_row["continuation_pause_id"]
+        second.close()
+
+        retry_store = SQLiteStore(
+            crash_database, clock=lambda: "2026-08-10T12:00:00Z",
+        )
+        retry_tracker = RepositoryTracker(
+            harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+        )
+        retry_fable = FakeFable(harness.fable.brief)
+        retry_sol = FakeSol()
+        retry_sol.queue(_completed(summary="The exact correction fact is verified."))
+        recreated = Coordinator(
+            store=retry_store, repository=retry_tracker, runner=RecordingRunner(),
+            fable=retry_fable, sol=retry_sol,
+            ids=DeterministicIds(task_number=1, run_number=80), repo_root=harness.repo,
+            repo_context="Binding AGENTS instructions.",
+            trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+        )
+        retry_runtime = SimpleNamespace(
+            project_id=recreated.project_id, store=retry_store, coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        retry_lease = ActiveAgentLease()
+        retry_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((retry_runtime,)), lease=retry_lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        retry = retry_workflows.prepare_recovery_resume(
+            project_id=recreated.project_id, session_id="session-1",
+            intervention_id="nested-unknown",
+            expected_resume_generation=acknowledged.resume_generation,
+        )
+        await retry_workflows.continue_intervention(retry)
+
+        resumed = retry_store.authenticated_intervention("nested-unknown")
+        assert resumed is not None
+        assert resumed.status.value == "resumed"
+        assert resumed.resume_generation == acknowledged.resume_generation
+        assert resumed.resume_run_id is not None
+        assert retry_store.agent_run(resumed.resume_run_id).agent == "sol"
+        assert retry_store.agent_run(resumed.resume_run_id).status == "completed"
+        assert len(retry_sol.answer_fable_question_calls) == 1
+        assert retry_sol.answer_fable_question_calls[0][2] == (
+            "Which exact correction fact is verified?"
+            "\n\nIntervention guidance:\nKeep the correction bounded."
+        )
+        answered_question = retry_store.question(nested_question_id)
+        assert answered_question is not None
+        assert answered_question.answer_text == "The exact correction fact is verified."
+        question_events_after = tuple(
+            event for event in retry_store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload.get("question_id") == nested_question_id
+        )
+        assert len(question_events_after) == 1
+        assert len(tuple(
+            event for event in retry_store.events_after("session-1", 0)
+            if event.kind == "conversation"
+            and event.payload.get("reply_to_question_id") == nested_question_id
+        )) == 1
+        assert retry_lease.snapshot() is None
+        retry_store.audit_legacy_project_ownership(str(harness.repo))
+        retry_tracker.close()
+        retry_store.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("route", "intervention_id"),
     (

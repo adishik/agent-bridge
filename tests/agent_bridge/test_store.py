@@ -3874,6 +3874,87 @@ def test_intervention_migration_is_additive_idempotent_and_preserves_current_row
     assert path.read_bytes() == first_migration_bytes
 
 
+def test_directed_intervention_binding_migration_is_additive_idempotent_and_preserves_rows(
+    tmp_path, valid_brief,
+) -> None:
+    """An existing intervention table gains only the durable directed discriminator."""
+    path = tmp_path / "pre-directed-binding.sqlite3"
+    initial = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    initial.create_session("session-1", "/repo")
+    initial.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    initial.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-1")
+    initial.start_agent_run(
+        "source-run-1", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    initial.set_agent_run_session("source-run-1", "provider-1")
+    created = initial.create_intervention_and_request_stop(
+        intervention_id="intervention-1", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Keep the exact direction.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    initial.close()
+
+    legacy = sqlite3.connect(path)
+    columns = {
+        row[1] for row in legacy.execute("PRAGMA table_info(interventions)")
+    }
+    if "directed_binding_json" in columns:
+        legacy.execute("ALTER TABLE interventions DROP COLUMN directed_binding_json")
+        legacy.commit()
+    legacy.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert {
+        row["name"] for row in migrated._connection.execute(
+            "PRAGMA table_info(interventions)"
+        )
+    } >= {"directed_binding_json"}
+    assert migrated.intervention(created.intervention_id) == created
+    migrated.close()
+
+    first_migration_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    reopened.close()
+    assert path.read_bytes() == first_migration_bytes
+
+
+def test_directed_intervention_binding_migration_rolls_back_with_outer_transaction(
+    tmp_path, monkeypatch,
+) -> None:
+    """A failure after the additive column leaves the pre-migration schema intact."""
+    path = tmp_path / "directed-binding-rollback.sqlite3"
+    initial = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    initial.close()
+    legacy = sqlite3.connect(path)
+    columns = {
+        row[1] for row in legacy.execute("PRAGMA table_info(interventions)")
+    }
+    if "directed_binding_json" in columns:
+        legacy.execute("ALTER TABLE interventions DROP COLUMN directed_binding_json")
+        legacy.commit()
+    legacy.close()
+
+    migrate = SQLiteStore._migrate_intervention_schema
+
+    def migrate_then_fail(self) -> None:
+        migrate(self)
+        raise sqlite3.IntegrityError("injected directed binding migration failure")
+
+    monkeypatch.setattr(SQLiteStore, "_migrate_intervention_schema", migrate_then_fail)
+    with pytest.raises(
+        sqlite3.IntegrityError, match="injected directed binding migration failure",
+    ):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+
+    inspected = sqlite3.connect(path)
+    assert "directed_binding_json" not in {
+        row[1] for row in inspected.execute("PRAGMA table_info(interventions)")
+    }
+    inspected.close()
+
+
 def test_intervention_migration_rolls_back_ddl_after_an_injected_failure(
     tmp_path, monkeypatch,
 ) -> None:
@@ -4136,6 +4217,167 @@ def test_intervention_rejects_mismatched_directed_answer_identity_without_mutati
 
     assert store.intervention("directed-answer-intervention") is None
     assert store.get_task(valid_brief.task_id, valid_brief.revision) == before
+
+
+def _directed_intervention_claim_for_tamper_matrix(store, valid_brief):
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "provider-1")
+    store.pause_for_question(
+        session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_generation=1,
+        question_id="original-question", asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        text="Which exact constraint applies?", continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "continue exactly"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact constraint applies?", task_id=valid_brief.task_id,
+            revision=valid_brief.revision, continuation_generation=1,
+            question_id="original-question",
+        ),
+    )
+    store.start_agent_run(
+        "original-source-run", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("original-source-run", "provider-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="directed-terminal", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Keep the exact directed answer.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="original-source-run",
+    )
+    store.finish_agent_run("original-source-run", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.begin_intervention_resume(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    return created
+
+
+def _tamper_directed_intervention_binding(store, mutation: str) -> None:
+    if mutation == "source_agent":
+        store._connection.execute(
+            "UPDATE agent_runs SET agent = 'sol' WHERE run_id = 'original-source-run'"
+        )
+    elif mutation == "provider":
+        store._connection.execute(
+            """
+            UPDATE agent_runs SET cli_session_id = 'substituted-provider'
+            WHERE run_id = 'original-source-run'
+            """
+        )
+    elif mutation == "question":
+        store._connection.execute(
+            """
+            UPDATE questions SET question_id = 'substituted-question'
+            WHERE question_id = 'original-question'
+            """
+        )
+    elif mutation == "pause":
+        store._connection.execute(
+            """
+            UPDATE questions SET continuation_pause_id = 'substituted-pause'
+            WHERE question_id = 'original-question'
+            """
+        )
+    elif mutation == "route":
+        store._connection.execute(
+            """
+            UPDATE questions SET addressed_to = 'sol', routed_to = 'sol'
+            WHERE question_id = 'original-question'
+            """
+        )
+    else:
+        raise AssertionError(f"unknown mutation {mutation}")
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
+    ),
+)
+@pytest.mark.parametrize(
+    "mutation", ("source_agent", "provider", "question", "pause", "route"),
+)
+def test_directed_intervention_terminal_forms_authenticate_the_original_binding(
+    tmp_path, valid_brief, status, mutation: str,
+) -> None:
+    """Every post-claim form rejects substitution of its original directed boundary."""
+    store = SQLiteStore(
+        tmp_path / f"{status.value}-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    if status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN:
+        store.recover_active_tasks()
+    elif status is store_module.InterventionStatus.RESUMED:
+        store.complete_intervention(
+            created.intervention_id, expected_resume_generation=created.resume_generation,
+            resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+        )
+    elif status is store_module.InterventionStatus.CANCELED_BY_STOP:
+        store.cancel_intervention_by_stop(
+            created.intervention_id, expected_resume_generation=created.resume_generation,
+        )
+    _tamper_directed_intervention_binding(store, mutation)
+
+    with pytest.raises(RuntimeError, match="binding is not authenticated"):
+        store.authenticated_intervention(created.intervention_id)
+
+
+def test_corrupt_ordinary_terminal_intervention_cannot_mimic_a_directed_binding(
+    tmp_path, valid_brief,
+) -> None:
+    """A terminal ordinary row stays ordinary after a source phase-mismatch substitution."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-sol")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "provider-fable")
+    store.start_agent_run(
+        "ordinary-source", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    store.set_agent_run_session("ordinary-source", "provider-sol")
+    store.set_pending_context(
+        valid_brief.task_id, valid_brief.revision, expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "ordinary-source", "prompt": "continue exactly"},
+    )
+    created = store.create_intervention_and_request_stop(
+        intervention_id="ordinary-terminal", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Keep the ordinary continuation.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="ordinary-source",
+    )
+    store.finish_agent_run("ordinary-source", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.begin_intervention_resume(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    store.complete_intervention(
+        created.intervention_id, expected_resume_generation=created.resume_generation,
+        resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
+    )
+    store._connection.execute(
+        """
+        UPDATE agent_runs SET agent = 'fable', cli_session_id = 'provider-fable'
+        WHERE run_id = 'ordinary-source'
+        """
+    )
+
+    with pytest.raises(RuntimeError, match="binding is not authenticated"):
+        store.authenticated_intervention(created.intervention_id)
 
 
 @pytest.mark.parametrize(
