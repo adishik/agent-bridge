@@ -1717,6 +1717,39 @@ def test_prepare_intervention_commits_exact_stop_intent_without_signaling(harnes
     asyncio.run(scenario())
 
 
+def test_continue_intervention_marks_ready_only_after_exact_source_finalization(harness) -> None:
+    """A durable intervention remains pending until its own source completion ends."""
+    async def scenario() -> None:
+        release = asyncio.Event()
+        harness.sol.hold_start = release
+        harness.runner.release_on_stop = release
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await asyncio.sleep(0)
+        active = harness.store.active_run_for_task("task-1", 1)
+        assert active is not None
+        harness.store.set_sol_thread("task-1", 1, THREAD_ID)
+        harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+        prepared = harness.coordinator.prepare_intervention(
+            "task-1",
+            InterventionIntent(
+                intervention_id="intervention-1", message="Pause here.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=1,
+            ),
+        )
+
+        await harness.coordinator.continue_intervention(prepared.intervention_id)
+        await approval
+
+        ready = harness.store.intervention(prepared.intervention_id)
+        assert ready is not None
+        assert ready.status.value == "ready"
+        assert harness.runner.stops == [active.run_id]
+
+    asyncio.run(scenario())
+
+
 def test_stop_wins_after_sol_run_finishes_before_outcome_route(
     harness, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

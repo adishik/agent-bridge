@@ -23,7 +23,12 @@ from agent_bridge.coordinator import Coordinator, IdFactory, InterventionIntent
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.repository import RepositoryTracker
-from agent_bridge.store import InterventionRecord, PreparedActionRecord, SQLiteStore
+from agent_bridge.store import (
+    InterventionRecord,
+    InterventionStatus,
+    PreparedActionRecord,
+    SQLiteStore,
+)
 
 
 _FABLE_STATUSES = frozenset({
@@ -532,6 +537,68 @@ class HubWorkflowOrchestrator:
             record=record,
             lease_token=token,
             lease_origin=InterventionLeaseOrigin.BORROWED_SOURCE,
+        )
+
+    async def continue_intervention(self, prepared: PreparedIntervention) -> None:
+        """Continue the committed stop while its sole lease remains pinned."""
+        if not isinstance(prepared, PreparedIntervention):
+            raise ValueError("prepared must be a PreparedIntervention")
+        if self._lease.snapshot() != prepared.lease_token:
+            raise RuntimeError("intervention no longer owns the active lease")
+        runtime = self._runtime_for_session(
+            prepared.lease_token.project_id, prepared.lease_token.session_id,
+        )
+        await runtime.coordinator.continue_intervention(prepared.record.intervention_id)
+
+    def abort_prepared_intervention(
+        self, prepared: PreparedIntervention, *, reason: str,
+    ) -> InterventionRecord:
+        """Undo only a failed recovery installation; a borrowed source stays pinned."""
+        if not isinstance(prepared, PreparedIntervention):
+            raise ValueError("prepared must be a PreparedIntervention")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be non-empty")
+        runtime = self._runtime_for_session(
+            prepared.lease_token.project_id, prepared.lease_token.session_id,
+        )
+        record = runtime.store.intervention(prepared.record.intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        if prepared.lease_origin is InterventionLeaseOrigin.RECOVERY_ACQUIRED:
+            self._lease.release(prepared.lease_token)
+        return record
+
+    def prepare_recovery_resume(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        intervention_id: str,
+        expected_resume_generation: int,
+    ) -> PreparedIntervention:
+        """Acquire a fresh lease for an installed recovery continuation only."""
+        self._require_positive_integer(
+            expected_resume_generation, "expected_resume_generation",
+        )
+        runtime = self._runtime_for_session(project_id, session_id)
+        record = runtime.store.intervention(intervention_id)
+        if (
+            record is None
+            or record.session_id != session_id
+            or record.resume_generation != expected_resume_generation
+            or record.status not in {
+                InterventionStatus.PENDING_STOP,
+                InterventionStatus.READY,
+            }
+        ):
+            raise RuntimeError("intervention recovery is unavailable")
+        token = self._lease.acquire(
+            project_id=project_id, session_id=session_id, task_id=record.task_id,
+        )
+        return PreparedIntervention(
+            record=record,
+            lease_token=token,
+            lease_origin=InterventionLeaseOrigin.RECOVERY_ACQUIRED,
         )
 
     async def prepare_new_request(

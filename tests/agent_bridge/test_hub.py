@@ -65,6 +65,7 @@ class _RuntimeStore:
     removed_listener_tokens: list[int] | None = None
     closed: bool = False
     prepared_rows: dict[str, PreparedActionRecord] | None = None
+    intervention_rows: dict[str, InterventionRecord] | None = None
 
     def __post_init__(self) -> None:
         if self.task_rows is None:
@@ -75,6 +76,8 @@ class _RuntimeStore:
             self.removed_listener_tokens = []
         if self.prepared_rows is None:
             self.prepared_rows = {}
+        if self.intervention_rows is None:
+            self.intervention_rows = {}
 
     def session_exists(self, session_id: str) -> bool:
         return session_id in self.sessions
@@ -84,6 +87,9 @@ class _RuntimeStore:
 
     def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None:
         return self.prepared_rows.get(preparation_id)
+
+    def intervention(self, intervention_id: str) -> InterventionRecord | None:
+        return self.intervention_rows.get(intervention_id)
 
     def latest_prepared_action_for_task(
         self, *, project_id: str, session_id: str, task_id: str, revision: int,
@@ -376,7 +382,7 @@ class _RuntimeCoordinator:
     ) -> InterventionRecord:
         task = next(task for (candidate, _), task in self.store.task_rows.items() if candidate == task_id)
         task.state = TaskState.INTERRUPTED
-        return InterventionRecord(
+        record = InterventionRecord(
             intervention_id=intent.intervention_id,
             session_id=task.session_id,
             task_id=task_id,
@@ -395,6 +401,8 @@ class _RuntimeCoordinator:
             status=InterventionStatus.PENDING_STOP,
             created_at="2026-08-10T12:00:00Z",
         )
+        self.store.intervention_rows[intent.intervention_id] = record
+        return record
 
 
 @dataclass
@@ -1273,6 +1281,39 @@ def test_hub_prepare_intervention_borrows_the_exact_live_source_lease() -> None:
         assert runtime.coordinator.stops == []
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("status", (InterventionStatus.PENDING_STOP, InterventionStatus.READY))
+def test_recovery_preparation_acquires_and_abort_releases_only_its_new_lease(
+    status: InterventionStatus,
+) -> None:
+    """A rejected recovery installation must leave its durable record untouched."""
+    runtime = _runtime("project-a")
+    runtime.store.intervention_rows["intervention-1"] = InterventionRecord(
+        intervention_id="intervention-1", session_id="chat-1", task_id="task-1",
+        revision=0, addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, message="Pause here.", run_id="source-run-1",
+        continuation_state=TaskState.FABLE_PLANNING, source_generation=1,
+        resume_generation=1, fable_session_id=None, sol_thread_id=None,
+        resume_attempt_id=None, resume_run_id=None, status=status,
+        created_at="2026-08-10T12:00:00Z",
+    )
+    lease = ActiveAgentLease()
+    workflows = HubWorkflowOrchestrator(
+        registry=ProjectRegistry((runtime,)), lease=lease,
+        usage_credits_acknowledged=lambda: True,
+    )
+
+    prepared = workflows.prepare_recovery_resume(
+        project_id="project-a", session_id="chat-1", intervention_id="intervention-1",
+        expected_resume_generation=1,
+    )
+    aborted = workflows.abort_prepared_intervention(prepared, reason="scheduler_unavailable")
+
+    assert prepared.lease_origin.value == "recovery_acquired"
+    assert aborted.status is status
+    assert runtime.store.intervention("intervention-1") == aborted
+    assert lease.snapshot() is None
 
 
 def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() -> None:
