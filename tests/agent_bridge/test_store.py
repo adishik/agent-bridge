@@ -6042,7 +6042,7 @@ def test_staged_scope_checkpoint_migration_authenticates_inverse_exact_identity(
             (prepared.preparation_id,),
         )
     elif fault == "substituted_preparation":
-        clone_preparation("substituted-preparation", project_id="b" * 32)
+        clone_preparation("substituted-preparation")
         preceding.execute(
             "UPDATE directed_fable_answer_checkpoints SET preparation_id = ?",
             ("substituted-preparation",),
@@ -6082,15 +6082,6 @@ def test_staged_scope_checkpoint_migration_authenticates_inverse_exact_identity(
         )
     elif fault == "duplicate_preparation":
         clone_preparation("duplicate-preparation")
-        preceding.execute(
-            """
-            INSERT INTO directed_fable_answer_checkpoints
-            SELECT 'duplicate-preparation', project_id, session_id, task_id,
-                   revision, question_id, continuation_generation,
-                   clarification_json, status
-            FROM directed_fable_answer_checkpoints
-            """
-        )
     else:
         raise AssertionError(f"unknown inverse migration fault {fault}")
     preceding.commit()
@@ -6171,12 +6162,19 @@ def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidate
         )
         and "continuation_generation =" in statement
     ]
+    preparation_reads = [
+        statement for statement in statements
+        if statement.lstrip().startswith("SELECT rowid, * FROM prepared_actions")
+        and "action = 'approval'" in statement
+    ]
     assert len(page_reads) == 4
     assert all("LIMIT 2" in statement for statement in page_reads)
     assert candidate_reads
     assert all("LIMIT 2" in statement for statement in candidate_reads)
     assert inverse_reads
     assert all("LIMIT 2" in statement for statement in inverse_reads)
+    assert preparation_reads
+    assert all("ORDER BY rowid LIMIT 2" in statement for statement in preparation_reads)
 
 
 def test_child_answer_cas_preallocates_the_exact_next_fable_run(

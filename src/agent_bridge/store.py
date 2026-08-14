@@ -6669,17 +6669,18 @@ class SQLiteStore:
         ).fetchall()
         if len(inverse_rows) != 1 or int(inverse_rows[0]["rowid"]) != int(row["rowid"]):
             return False
-        prepared_row = self._connection.execute(
+        prepared_rows = self._connection.execute(
             """
             SELECT rowid, * FROM prepared_actions
-            WHERE preparation_id = ? AND project_id = ? AND session_id = ?
-              AND task_id = ? AND revision = ?
+            WHERE project_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND action = 'approval'
+            ORDER BY rowid LIMIT 2
             """,
             (
-                row["preparation_id"], row["project_id"], row["session_id"],
-                row["task_id"], row["revision"],
+                row["project_id"], row["session_id"], row["task_id"],
+                row["revision"],
             ),
-        ).fetchone()
+        ).fetchall()
         question_row = self._connection.execute(
             """
             SELECT * FROM questions
@@ -6691,8 +6692,13 @@ class SQLiteStore:
                 row["revision"], row["continuation_generation"],
             ),
         ).fetchone()
-        if prepared_row is None or question_row is None:
+        if (
+            len(prepared_rows) != 1
+            or prepared_rows[0]["preparation_id"] != row["preparation_id"]
+            or question_row is None
+        ):
             return False
+        prepared_row = prepared_rows[0]
         try:
             prepared = self._prepared_action_from_row(prepared_row)
             question = self._question_from_row(question_row)
