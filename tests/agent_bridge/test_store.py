@@ -17,6 +17,7 @@ from agent_bridge.contracts import (
     ConversationMessageType,
     ConversationTarget,
     DirectedAgentQuestion,
+    FableClarification,
 )
 from agent_bridge.projects import project_id_for_root
 from agent_bridge.state_machine import TaskState
@@ -4434,6 +4435,266 @@ def test_nested_intervention_reservation_exact_retry_reuses_atomic_child_binding
     )) == 1
 
 
+def _seed_predecessorless_active_nested_intervention(
+    path: Path,
+    valid_brief,
+    *,
+    binding_shape: str,
+    acknowledged: bool,
+) -> None:
+    """Create the exact pre-predecessor active-child crash image."""
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00.500000Z")
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store._connection.execute(
+        """
+        UPDATE tasks SET approved_at = ?, baseline_id = ?, pending_json = ?
+        WHERE task_id = ? AND revision = ?
+        """,
+        (
+            "2026-08-10T12:00:00.500000Z",
+            "baseline-1",
+            store_module._encode_json({
+                "sol_run_id": "source-run-1", "prompt": "continue exactly",
+            }),
+            valid_brief.task_id,
+            valid_brief.revision,
+        ),
+    )
+    store.start_agent_run(
+        "source-run-1", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    store.set_agent_run_session("source-run-1", "sol-thread-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="legacy-active-child",
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_source_generation=1,
+        message="Keep the nested evidence exact.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="source-run-1",
+    )
+    store.finish_agent_run("source-run-1", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id="source-run-1")
+    store.begin_intervention_resume(
+        created.intervention_id,
+        expected_resume_generation=created.resume_generation,
+        resume_attempt_id="fable-attempt-1",
+        resume_run_id="fable-predecessor-1",
+    )
+    store.start_agent_run(
+        "fable-predecessor-1", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("fable-predecessor-1", "fable-session-1")
+    store.finish_agent_run("fable-predecessor-1", status="completed", exit_code=0)
+    store.reserve_fable_clarification_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=created.resume_generation,
+        question_id="legacy-active-question",
+        request_key="legacy-active-request",
+        text="Which exact fact is verified?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=created.resume_generation,
+            question_id="legacy-active-question",
+            text="Which exact fact is verified?",
+        ),
+        intervention_id=created.intervention_id,
+        child_run_id="legacy-sol-child-1",
+    )
+    store._connection.execute(
+        "UPDATE agent_runs SET started_at = ? WHERE run_id = ?",
+        ("2026-08-10T12:00:00.600000Z", "fable-predecessor-1"),
+    )
+    store._connection.execute(
+        "UPDATE agent_runs SET started_at = ? WHERE run_id = ?",
+        ("2026-08-10T12:00:00.800000Z", "legacy-sol-child-1"),
+    )
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 1)
+    unknown = store.authenticated_intervention(created.intervention_id)
+    assert unknown is not None
+    if acknowledged:
+        ready = store.authorize_retry_after_unknown(
+            created.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id="legacy-active-ack",
+        )
+        assert ready.status is store_module.InterventionStatus.READY
+    store.close()
+
+    preceding = sqlite3.connect(path)
+    if binding_shape == "absent":
+        preceding.execute("ALTER TABLE interventions DROP COLUMN directed_binding_json")
+    elif binding_shape == "null":
+        preceding.execute(
+            "UPDATE interventions SET directed_binding_json = NULL "
+            "WHERE intervention_id = 'legacy-active-child'"
+        )
+    elif binding_shape == "stage_less":
+        row = preceding.execute(
+            "SELECT directed_binding_json FROM interventions "
+            "WHERE intervention_id = 'legacy-active-child'"
+        ).fetchone()
+        assert row is not None
+        binding = json.loads(row[0])
+        for key in (
+            "stage", "next_attempt_id", "next_predecessor_run_id", "next_run_id",
+            "next_provider_id", "next_task_state", "next_continuation_state",
+        ):
+            binding.pop(key)
+        preceding.execute(
+            "UPDATE interventions SET directed_binding_json = ? "
+            "WHERE intervention_id = 'legacy-active-child'",
+            (json.dumps(binding, sort_keys=True, separators=(",", ":")),),
+        )
+    else:
+        raise AssertionError(f"unknown binding shape {binding_shape}")
+    preceding.commit()
+    preceding.close()
+
+
+@pytest.mark.parametrize("binding_shape", ("absent", "null", "stage_less"))
+@pytest.mark.parametrize("acknowledged", (False, True))
+def test_active_question_migration_retains_exact_fable_predecessor_through_sol_retry(
+    tmp_path,
+    valid_brief,
+    binding_shape: str,
+    acknowledged: bool,
+) -> None:
+    """A retried Sol child can never become its own next-Fable predecessor."""
+    path = tmp_path / f"active-predecessor-{binding_shape}-{acknowledged}.sqlite3"
+    _seed_predecessorless_active_nested_intervention(
+        path, valid_brief, binding_shape=binding_shape, acknowledged=acknowledged,
+    )
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    record = migrated.authenticated_intervention("legacy-active-child")
+    assert record is not None and record.directed_binding is not None
+    assert record.directed_binding.stage == "active_question"
+    assert record.directed_binding.next_predecessor_run_id == "fable-predecessor-1"
+    if not acknowledged:
+        record = migrated.authorize_retry_after_unknown(
+            record.intervention_id,
+            expected_resume_generation=record.resume_generation,
+            acknowledgment_id="legacy-active-ack",
+        )
+    migrated.begin_intervention_resume(
+        record.intervention_id,
+        expected_resume_generation=record.resume_generation,
+        resume_attempt_id="sol-retry-attempt",
+        resume_run_id="sol-retry-run",
+    )
+    migrated.start_agent_run(
+        "sol-retry-run", valid_brief.task_id, valid_brief.revision, "sol",
+    )
+    migrated.set_agent_run_session("sol-retry-run", "sol-thread-1")
+    migrated.finish_agent_run("sol-retry-run", status="completed", exit_code=0)
+    migrated.answer_fable_clarification_evidence_question_and_resume(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        question_id="legacy-active-question",
+        expected_generation=record.resume_generation,
+        answer_text="The exact fact is verified.",
+        next_fable_run_id="next-fable-after-sol-retry",
+        event=_conversation_answer(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=record.resume_generation,
+            question_id="legacy-active-question",
+            text="The exact fact is verified.",
+        ),
+    )
+
+    promoted = migrated.authenticated_intervention(record.intervention_id)
+    assert promoted is not None and promoted.directed_binding is not None
+    assert promoted.directed_binding.stage == "next_fable"
+    assert promoted.directed_binding.next_predecessor_run_id == "fable-predecessor-1"
+    assert promoted.directed_binding.next_predecessor_run_id != "sol-retry-run"
+
+
+@pytest.mark.parametrize("fault", ("missing", "two", "provider", "status"))
+def test_active_question_predecessor_migration_fails_closed_and_rolls_back(
+    tmp_path,
+    valid_brief,
+    fault: str,
+) -> None:
+    """Only one exact terminal Fable owner may authenticate an old active child."""
+    path = tmp_path / f"active-predecessor-{fault}.sqlite3"
+    _seed_predecessorless_active_nested_intervention(
+        path, valid_brief, binding_shape="null", acknowledged=True,
+    )
+    preceding = sqlite3.connect(path)
+    if fault == "missing":
+        preceding.execute("DELETE FROM agent_runs WHERE run_id = 'fable-predecessor-1'")
+    elif fault == "two":
+        child_rowid = preceding.execute(
+            "SELECT rowid FROM agent_runs WHERE run_id = 'legacy-sol-child-1'"
+        ).fetchone()[0]
+        preceding.execute(
+            "UPDATE agent_runs SET rowid = ? WHERE run_id = 'legacy-sol-child-1'",
+            (child_rowid + 2,),
+        )
+        preceding.execute(
+            """
+            INSERT INTO agent_runs (
+                rowid,
+                run_id, task_id, revision, agent, cli_session_id,
+                started_at, ended_at, exit_code, status
+            ) VALUES (?, 'second-fable-predecessor', ?, ?, 'fable', 'fable-session-1',
+                      '2026-08-10T12:00:00.700000Z',
+                      '2026-08-10T12:00:00.750000Z', 0, 'completed')
+            """,
+            (child_rowid + 1, valid_brief.task_id, valid_brief.revision),
+        )
+    elif fault == "provider":
+        preceding.execute(
+            "UPDATE agent_runs SET cli_session_id = 'wrong-provider' "
+            "WHERE run_id = 'fable-predecessor-1'"
+        )
+    elif fault == "status":
+        preceding.execute(
+            "UPDATE agent_runs SET status = 'running', ended_at = NULL, exit_code = NULL "
+            "WHERE run_id = 'fable-predecessor-1'"
+        )
+    else:
+        raise AssertionError(f"unknown predecessor fault {fault}")
+    preceding.commit()
+    tables = ("tasks", "interventions", "agent_runs", "questions", "exchange_reservations")
+    before = {
+        table: tuple(tuple(row) for row in preceding.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+    preceding.close()
+
+    with pytest.raises(RuntimeError, match="migration"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+
+    inspected = sqlite3.connect(path)
+    assert {
+        table: tuple(tuple(row) for row in inspected.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    } == before
+    inspected.close()
+
+
 def test_create_intervention_stops_exact_active_run_and_emits_one_user_message(
     tmp_path, valid_brief,
 ) -> None:
@@ -4898,6 +5159,204 @@ def test_completed_next_fable_stage_atomically_terminalizes_its_intervention(
     assert store.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
 
 
+def test_next_fable_directed_result_atomically_reserves_its_exact_sol_child(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """The accepted Fable stage cannot terminalize before a durable child owner exists."""
+    store = SQLiteStore(
+        tmp_path / "next-fable-directed-child.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    store.start_next_fable_intervention_stage(
+        stage.intervention_id, run_id=binding.next_run_id,
+    )
+    directed = DirectedAgentQuestion(
+        addressed_to="sol",
+        text="Which exact downstream fact is verified?",
+        reason="Fable needs one bounded fact.",
+    )
+    event = _conversation_question(
+        sender=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=stage.resume_generation,
+        question_id="second-sol-child-question",
+        text=directed.text,
+    )
+
+    first = store.reserve_fable_answer_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=stage.resume_generation,
+        outer_question_id="original-question",
+        question_id="second-sol-child-question",
+        request_key="second-sol-child-request",
+        text=directed.text,
+        event=event,
+        intervention_id=stage.intervention_id,
+        child_run_id="second-sol-child-run",
+        completed_next_fable_intervention_id=stage.intervention_id,
+        completed_next_fable_run_id=binding.next_run_id,
+        completed_next_fable_exit_code=0,
+        clarification=FableClarification.from_dict({
+            "status": "answered",
+            "answer": "One more exact fact is required.",
+            "reasoning": "The bounded evidence needs one successor.",
+            "confidence": 0.9,
+            "scope_changed": False,
+            "revised_brief": None,
+            "question_for_user": None,
+            "directed_question": directed.to_dict(),
+        }),
+    )
+    second = store.reserve_fable_answer_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=stage.resume_generation,
+        outer_question_id="original-question",
+        question_id="second-sol-child-question",
+        request_key="second-sol-child-request",
+        text=directed.text,
+        event=event,
+        intervention_id=stage.intervention_id,
+        child_run_id="second-sol-child-run",
+        completed_next_fable_intervention_id=stage.intervention_id,
+        completed_next_fable_run_id=binding.next_run_id,
+        completed_next_fable_exit_code=0,
+        clarification=FableClarification.from_dict({
+            "status": "answered",
+            "answer": "One more exact fact is required.",
+            "reasoning": "The bounded evidence needs one successor.",
+            "confidence": 0.9,
+            "scope_changed": False,
+            "revised_brief": None,
+            "question_for_user": None,
+            "directed_question": directed.to_dict(),
+        }),
+    )
+
+    assert second == first
+    rebound = store.authenticated_intervention(stage.intervention_id)
+    assert rebound is not None and rebound.directed_binding is not None
+    assert rebound.status is store_module.InterventionStatus.RESUMING
+    assert rebound.directed_binding.stage == "active_question"
+    assert rebound.directed_binding.question_id == "second-sol-child-question"
+    assert rebound.directed_binding.source_run_id == "second-sol-child-run"
+    assert rebound.directed_binding.next_predecessor_run_id == binding.next_run_id
+    assert store.agent_run(binding.next_run_id).status == "completed"
+    child = store.agent_run("second-sol-child-run")
+    assert child.agent == "sol"
+    assert child.cli_session_id == "provider-1"
+    assert child.status == "running"
+    assert len(tuple(
+        persisted for persisted in store.events_after("session-1", 0)
+        if persisted.kind == "conversation"
+        and persisted.payload.get("question_id") == "second-sol-child-question"
+    )) == 1
+
+
+def test_next_fable_answer_permission_pause_orders_cause_before_status_and_retries_after_rollback(
+    tmp_path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Fable result precedes its derived warning, with rollback leaving neither."""
+    store = SQLiteStore(
+        tmp_path / "permission-order-answer.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    store.start_next_fable_intervention_stage(
+        stage.intervention_id, run_id=binding.next_run_id,
+    )
+    store._connection.execute(
+        "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+        (valid_brief.task_id, valid_brief.revision),
+    )
+    directed = DirectedAgentQuestion(
+        addressed_to="sol",
+        text="Which exact downstream fact is verified?",
+        reason="Fable needs one bounded fact.",
+    )
+    clarification = FableClarification.from_dict({
+        "status": "answered",
+        "answer": "One more exact fact is required.",
+        "reasoning": "The bounded evidence needs one successor.",
+        "confidence": 0.9,
+        "scope_changed": False,
+        "revised_brief": None,
+        "question_for_user": None,
+        "directed_question": directed.to_dict(),
+    })
+    before = {
+        table: tuple(tuple(row) for row in store._connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in (
+            "tasks", "interventions", "agent_runs", "events", "exchange_permissions",
+        )
+    }
+    insert_status = store._insert_conversation_event_in_transaction
+
+    def fail_status_insert(**_: object) -> object:
+        raise RuntimeError("injected permission status failure")
+
+    monkeypatch.setattr(store, "_insert_conversation_event_in_transaction", fail_status_insert)
+    common = {
+        "session_id": "session-1",
+        "task_id": valid_brief.task_id,
+        "revision": valid_brief.revision,
+        "expected_generation": stage.resume_generation,
+        "attempted_question": directed,
+        "event": _conversation_permission(
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=stage.resume_generation,
+        ),
+        "completed_next_fable_intervention_id": stage.intervention_id,
+        "completed_next_fable_run_id": binding.next_run_id,
+        "completed_next_fable_exit_code": 0,
+        "clarification": clarification,
+    }
+    pause = store.pause_fable_answer_evidence_permission
+    common["outer_question_id"] = "original-question"
+    with pytest.raises(RuntimeError, match="injected permission status failure"):
+        pause(**common)
+    assert {
+        table: tuple(tuple(row) for row in store._connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in before
+    } == before
+
+    monkeypatch.setattr(store, "_insert_conversation_event_in_transaction", insert_status)
+    pause(**common)
+
+    causal = tuple(
+        event for event in store.events_after("session-1", 0)
+        if (
+            event.kind == "clarification"
+            and event.payload.get("answer") == clarification.answer
+        )
+        or (
+            event.kind == "conversation"
+            and event.payload.get("message_type") == "status"
+        )
+    )
+    assert [event.kind for event in causal] == ["clarification", "conversation"]
+    assert len(causal) == 2
+
+
 def _seed_pre_stage_answered_nested_intervention(
     path: Path, valid_brief, *, outcome: str, binding_shape: str,
     preserve_successor: bool = False,
@@ -5189,6 +5648,58 @@ def test_pre_stage_answered_migration_filters_historical_fable_runs_before_uniqu
     assert migrated.agent_run("historical-plan-run").status == "completed"
     assert migrated.agent_run("historical-clarification-run").status == "completed"
     migrated.close()
+
+
+def test_pre_stage_successor_migration_preserves_fractional_order_within_one_second(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A completed earlier fraction cannot hide the later structural successor."""
+    path = tmp_path / "pre-stage-fractional-successor.sqlite3"
+    _seed_pre_stage_answered_nested_intervention(
+        path,
+        valid_brief,
+        outcome="unknown",
+        binding_shape="absent",
+        preserve_successor=True,
+    )
+    preceding = sqlite3.connect(path)
+    preceding.execute(
+        "UPDATE interventions SET created_at = '2026-08-10T12:00:00.500000Z' "
+        "WHERE intervention_id = 'directed-terminal'"
+    )
+    preceding.execute(
+        "UPDATE agent_runs SET started_at = '2026-08-10T12:00:00.600000Z' "
+        "WHERE run_id = 'nested-source-run'"
+    )
+    preceding.execute(
+        "UPDATE agent_runs SET started_at = '2026-08-10T12:00:00.550000Z' "
+        "WHERE run_id = 'resume-run-1'"
+    )
+    preceding.execute(
+        "UPDATE agent_runs SET started_at = '2026-08-10T12:00:00.700000Z' "
+        "WHERE run_id = 'next-fable-run'"
+    )
+    preceding.execute(
+        """
+        INSERT INTO agent_runs (
+            run_id, task_id, revision, agent, cli_session_id,
+            started_at, ended_at, exit_code, status
+        ) VALUES ('same-second-historical-fable', ?, ?, 'fable', 'provider-1',
+                  '2026-08-10T12:00:00.100000Z',
+                  '2026-08-10T12:00:00.200000Z', 0, 'completed')
+        """,
+        (valid_brief.task_id, valid_brief.revision),
+    )
+    preceding.commit()
+    preceding.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+
+    record = migrated.authenticated_intervention("directed-terminal")
+    assert record is not None and record.directed_binding is not None
+    assert record.directed_binding.next_run_id == "next-fable-run"
+    assert migrated.agent_run("same-second-historical-fable").status == "completed"
 
 
 @pytest.mark.parametrize("mutation", ("two_candidates", "provider", "session", "status"))

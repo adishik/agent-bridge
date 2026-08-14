@@ -642,7 +642,12 @@ class Coordinator:
                 task_id=task_id,
                 revision=revision,
             )
-        if task.state is not TaskState.INTERRUPTED:
+        unanswered_scope_checkpoint = (
+            predecessor is not None
+            and task.state is TaskState.AWAITING_USER_INPUT
+            and self._store.directed_fable_answer_checkpoint(predecessor) is not None
+        )
+        if task.state is not TaskState.INTERRUPTED and not unanswered_scope_checkpoint:
             raise ValueError("only an interrupted task may be resumed")
         if task.continuation_state is None:
             raise RuntimeError("interrupted task has no persisted continuation")
@@ -748,13 +753,54 @@ class Coordinator:
                         or question.revision != claimed.revision
                         or question.continuation_generation
                         != checkpoint.continuation_generation
-                        or question.answer_text != checkpoint.clarification.answer
+                    ):
+                        raise RuntimeError("Fable answer checkpoint changed")
+                    unanswered_scope_parent = (
+                        checkpoint.clarification.scope_changed
+                        and question.answer_text is None
+                        and question.answered_by is None
+                        and task.state is TaskState.AWAITING_USER_INPUT
+                        and task.continuation_state is not None
+                        and task.pending is not None
+                    )
+                    if not unanswered_scope_parent and (
+                        question.answer_text != checkpoint.clarification.answer
                         or question.answered_by is not ConversationActor.FABLE
                     ):
                         raise RuntimeError("Fable answer checkpoint changed")
                     if checkpoint.clarification.scope_changed:
+                        answer_event = None
+                        answered_pending = None
+                        recovered_stage = None
+                        if unanswered_scope_parent:
+                            recovered_stage = self._store.recoverable_next_fable_scope_stage(
+                                predecessor,
+                            )
+                            answer_event = ConversationEnvelope(
+                                sender=ConversationActor.FABLE,
+                                addressed_to=ConversationTarget.SOL,
+                                routed_to=ConversationTarget.SOL,
+                                message_type=ConversationMessageType.ANSWER,
+                                text=checkpoint.clarification.answer,
+                                task_id=claimed.task_id,
+                                revision=claimed.revision,
+                                continuation_generation=checkpoint.continuation_generation,
+                                reply_to_question_id=question.question_id,
+                            )
+                            answered_pending = dict(task.pending)
                         await self._route_directed_fable_answer(
-                            task, checkpoint.clarification, checkpoint_record=predecessor,
+                            task,
+                            checkpoint.clarification,
+                            checkpoint_record=predecessor,
+                            answered_question=(question if unanswered_scope_parent else None),
+                            answered_pending=answered_pending,
+                            answer_event=answer_event,
+                            completed_next_fable_intervention_id=(
+                                None if recovered_stage is None else recovered_stage[0]
+                            ),
+                            completed_next_fable_run_id=(
+                                None if recovered_stage is None else recovered_stage[1]
+                            ),
                         )
                     else:
                         handed_off = self._store.handoff_directed_fable_answer_same_scope(
@@ -2203,6 +2249,11 @@ class Coordinator:
             and binding.kind == "initial"
             and binding.question_id == outer_question_id
             and binding.source_agent is ConversationTarget.FABLE
+        ) and not (
+            binding.kind == "nested_resume"
+            and binding.stage == "next_fable"
+            and binding.next_run_id is not None
+            and binding.next_provider_id == task.fable_session_id
         ):
             return None, None
         return intervention.intervention_id, self._ids.new_run_id()
@@ -2555,6 +2606,58 @@ class Coordinator:
             self._emit_state(self._store.get_task(task.task_id, task.revision))
             await self.answer_directed_question(nested, run_id=child_run_id)
             return
+        answer_event = ConversationEnvelope(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.ANSWER,
+            text=clarification.answer,
+            task_id=task.task_id,
+            revision=task.revision,
+            continuation_generation=question.continuation_generation,
+            reply_to_question_id=question.question_id,
+        )
+        answer_pending = self._pending_for_directed_context(task, continuation)
+        if clarification.scope_changed:
+            checkpoint_record = (
+                None if self._claimed_preparation_id is None
+                else self._store.prepared_action(self._claimed_preparation_id)
+            )
+            if self._claimed_preparation_id is not None and checkpoint_record is None:
+                raise RuntimeError("Fable answer checkpoint preparation is missing")
+            if (
+                checkpoint_record is None
+                and completed_next_fable_intervention_id is not None
+            ):
+                checkpoint_record = self._store.latest_prepared_action_for_task(
+                    project_id=self.project_id,
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                    revision=task.revision,
+                )
+                if checkpoint_record is None:
+                    raise RuntimeError("staged Fable answer checkpoint preparation is missing")
+            if checkpoint_record is not None:
+                self._store.checkpoint_directed_fable_scope_answer(
+                    checkpoint_record,
+                    question_id=question.question_id,
+                    continuation_generation=question.continuation_generation,
+                    clarification=clarification,
+                )
+            await self._route_directed_fable_answer(
+                task,
+                clarification,
+                checkpoint_record=checkpoint_record,
+                completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+                completed_next_fable_run_id=(
+                    run_id if completed_next_fable_intervention_id is not None else None
+                ),
+                completed_next_fable_exit_code=completed_next_fable_exit_code,
+                answered_question=question,
+                answered_pending=answer_pending,
+                answer_event=answer_event,
+            )
+            return
         answered = self._store.answer_question_and_prepare_resume(
             session_id=task.session_id,
             task_id=task.task_id,
@@ -2563,36 +2666,20 @@ class Coordinator:
             expected_generation=question.continuation_generation,
             answer_text=clarification.answer,
             answered_by=ConversationActor.FABLE,
-            pending_action=self._pending_for_directed_context(task, continuation),
-            event=ConversationEnvelope(
-                sender=ConversationActor.FABLE,
-                addressed_to=ConversationTarget.SOL,
-                routed_to=ConversationTarget.SOL,
-                message_type=ConversationMessageType.ANSWER,
-                text=clarification.answer,
-                task_id=task.task_id,
-                revision=task.revision,
-                continuation_generation=question.continuation_generation,
-                reply_to_question_id=question.question_id,
-            ),
+            pending_action=answer_pending,
+            event=answer_event,
             fable_checkpoint=(
                 clarification if self._claimed_preparation_id is not None else None
             ),
             checkpoint_preparation_id=self._claimed_preparation_id,
-            completed_next_fable_intervention_id=(
-                None if clarification.scope_changed
-                else completed_next_fable_intervention_id
-            ),
+            completed_next_fable_intervention_id=completed_next_fable_intervention_id,
             completed_next_fable_run_id=(
                 run_id
-                if (
-                    completed_next_fable_intervention_id is not None
-                    and not clarification.scope_changed
-                )
+                if completed_next_fable_intervention_id is not None
                 else None
             ),
             completed_next_fable_exit_code=(
-                None if clarification.scope_changed else completed_next_fable_exit_code
+                completed_next_fable_exit_code
             ),
         )
         if answered.answered_by is not ConversationActor.FABLE:
@@ -2605,34 +2692,10 @@ class Coordinator:
             handed_off = self._store.handoff_directed_fable_answer_same_scope(claimed)
             await self._resume_sol(handed_off, clarification.answer or "")
             return
-        checkpoint_record = (
-            None if self._claimed_preparation_id is None
-            else self._store.prepared_action(self._claimed_preparation_id)
-        )
         await self._route_directed_fable_answer(
             resumed,
             clarification,
-            checkpoint_record=checkpoint_record,
-            completed_next_fable_intervention_id=(
-                completed_next_fable_intervention_id if clarification.scope_changed else None
-            ),
-            completed_next_fable_run_id=(
-                run_id
-                if (
-                    completed_next_fable_intervention_id is not None
-                    and clarification.scope_changed
-                )
-                else None
-            ),
-            completed_next_fable_exit_code=(
-                completed_next_fable_exit_code if clarification.scope_changed else None
-            ),
         )
-        if self._claimed_preparation_id is not None and checkpoint_record is None:
-            claimed = self._store.prepared_action(self._claimed_preparation_id)
-            if claimed is None:
-                raise RuntimeError("Fable answer checkpoint preparation is missing")
-            self._store.consume_directed_fable_answer_checkpoint(claimed, question_id=question.question_id)
 
     async def _route_directed_fable_answer(
         self, task: TaskRecord, clarification: FableClarification,
@@ -2640,9 +2703,27 @@ class Coordinator:
         completed_next_fable_intervention_id: str | None = None,
         completed_next_fable_run_id: str | None = None,
         completed_next_fable_exit_code: int | None = None,
+        answered_question: QuestionRecord | None = None,
+        answered_pending: Mapping[str, object] | None = None,
+        answer_event: ConversationEnvelope | None = None,
     ) -> None:
         current = self._store.get_task(task.task_id, task.revision)
-        if current.state not in _SOL_STATES or current.approved_at is None:
+        has_scope_answer = answered_question is not None
+        if has_scope_answer != (answered_pending is not None) or has_scope_answer != (
+            answer_event is not None
+        ):
+            raise ValueError("directed scope answer identity is incomplete")
+        if (
+            current.approved_at is None
+            or (
+                has_scope_answer
+                and (
+                    current.state is not TaskState.AWAITING_USER_INPUT
+                    or current.continuation_state not in _SOL_STATES
+                )
+            )
+            or (not has_scope_answer and current.state not in _SOL_STATES)
+        ):
             raise RuntimeError("directed Fable answer continuation changed")
         if clarification.scope_changed:
             revised = clarification.revised_brief
@@ -2665,7 +2746,9 @@ class Coordinator:
                     fable_session_id=current.fable_session_id,
                     sol_thread_id=current.sol_thread_id,
                     correction_count=current.correction_count,
-                    continuation_state=current.state,
+                    continuation_state=(
+                        current.continuation_state if has_scope_answer else current.state
+                    ),
                     pending={
                         "answer": clarification.answer,
                         "sol_run_id": sol_run_id,
@@ -2681,38 +2764,25 @@ class Coordinator:
                         ),
                     ),
                     directed_checkpoint=checkpoint_record,
-                    clarification=(
-                        clarification
-                        if (
-                            checkpoint_record is not None
-                            or completed_next_fable_intervention_id is not None
-                        )
-                        else None
-                    ),
+                    clarification=clarification,
                     completed_next_fable_intervention_id=completed_next_fable_intervention_id,
                     completed_next_fable_run_id=completed_next_fable_run_id,
                     completed_next_fable_exit_code=completed_next_fable_exit_code,
+                    answered_question_id=(
+                        None if answered_question is None else answered_question.question_id
+                    ),
+                    answered_question_generation=(
+                        None
+                        if answered_question is None
+                        else answered_question.continuation_generation
+                    ),
+                    answered_pending=answered_pending,
+                    answer_event=answer_event,
                 )
             except BaseException:
                 self._repository.discard_widening(original_baseline, widened_baseline)
                 raise
-            if (
-                checkpoint_record is None
-                and completed_next_fable_intervention_id is None
-            ):
-                self._store.append_event(
-                    saved.session_id,
-                    saved.task_id,
-                    "fable",
-                    "task_brief",
-                    {"brief": revised.to_dict()},
-                )
             self._emit_state(saved)
-            if (
-                checkpoint_record is None
-                and completed_next_fable_intervention_id is None
-            ):
-                self._emit_clarification(saved, clarification)
             return
         resumed = self._store.clear_pending_context(
             current.task_id,
@@ -3212,11 +3282,7 @@ class Coordinator:
                     completed_next_fable_intervention_id=directed_outcome_intervention_id,
                     completed_next_fable_run_id=directed_outcome_run_id,
                     completed_next_fable_exit_code=directed_outcome_exit_code,
-                    clarification=(
-                        clarification
-                        if directed_outcome_intervention_id is not None
-                        else None
-                    ),
+                    clarification=clarification,
                 )
             self._emit_state(task)
             if directed_outcome_intervention_id is None:
@@ -3269,28 +3335,14 @@ class Coordinator:
                     completed_next_fable_intervention_id=directed_outcome_intervention_id,
                     completed_next_fable_run_id=directed_outcome_run_id,
                     completed_next_fable_exit_code=directed_outcome_exit_code,
-                    clarification=(
-                        clarification
-                        if directed_outcome_intervention_id is not None
-                        else None
-                    ),
+                    clarification=clarification,
                 )
             except BaseException:
                 self._repository.discard_widening(
                     original_baseline, widened_baseline
                 )
                 raise
-            if directed_outcome_intervention_id is None:
-                self._store.append_event(
-                    saved.session_id,
-                    saved.task_id,
-                    "fable",
-                    "task_brief",
-                    {"brief": revised.to_dict()},
-                )
             self._emit_state(saved)
-            if directed_outcome_intervention_id is None:
-                self._emit_clarification(saved, clarification)
             return
         if handoff_intervention_id is not None:
             if handoff_run_id is None:

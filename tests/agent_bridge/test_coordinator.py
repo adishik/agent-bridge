@@ -366,6 +366,7 @@ class FakeSol:
     resume_threads: list[str] = field(default_factory=list)
     resume_run_ids: list[str] = field(default_factory=list)
     answer_fable_question_calls: list[tuple[str, TaskBrief, str]] = field(default_factory=list)
+    answer_fable_question_run_ids: list[str] = field(default_factory=list)
     next_outcomes: deque[tuple[SolOutcome, tuple[Mapping[str, object], ...]]] = field(
         default_factory=deque
     )
@@ -440,6 +441,7 @@ class FakeSol:
         brief: TaskBrief,
         prompt: str,
     ) -> AgentRunResult:
+        self.answer_fable_question_run_ids.append(run_id)
         self.answer_fable_question_calls.append((thread_id, brief, prompt))
         if self.hold_answer_fable_question is not None:
             await self.hold_answer_fable_question.wait()
@@ -5237,8 +5239,197 @@ def test_next_fable_handoff_persists_one_normal_sol_continuation_before_spawn(
     asyncio.run(scenario())
 
 
+async def _recover_next_fable_reserved_child_once(
+    *,
+    harness: CoordinatorHarness,
+    crash_database: Path,
+    intervention_id: str,
+    question_text: str,
+    child_run_id: str,
+    exchange_consumed: int,
+) -> None:
+    """Reopen one staged handoff and invoke only its acknowledged Sol retry owner."""
+    recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+    assert recovered.recover_active_tasks() == store_module.RecoverySummary(0, 1, 1)
+    unknown = recovered.authenticated_intervention(intervention_id)
+    assert unknown is not None
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    assert unknown.directed_binding is not None
+    assert unknown.directed_binding.stage == "active_question"
+    assert unknown.directed_binding.source_run_id == child_run_id
+    assert recovered.agent_run(child_run_id).status == "interrupted"
+    questions = recovered._connection.execute(
+        "SELECT question_id FROM questions WHERE task_id = ? AND revision = ? AND text = ?",
+        ("task-1", 1, question_text),
+    ).fetchall()
+    assert len(questions) == 1
+    question_id = questions[0]["question_id"]
+    assert len(tuple(
+        event for event in recovered.events_after("session-1", 0)
+        if event.kind == "conversation"
+        and event.payload.get("question_id") == question_id
+    )) == 1
+    assert recovered.get_task("task-1", 1).exchange_consumed == exchange_consumed
+    acknowledged = recovered.authorize_retry_after_unknown(
+        intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id=f"{intervention_id}-acknowledgment",
+    )
+    recovered.close()
+
+    retry_store = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+    retry_tracker = RepositoryTracker(
+        harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+    )
+    retry_fable = FakeFable(harness.fable.brief)
+    retry_sol = FakeSol()
+    retry_sol.queue(_completed(summary="The exact downstream fact is verified."))
+    retry_sol.queue(_completed())
+    recreated = Coordinator(
+        store=retry_store, repository=retry_tracker, runner=RecordingRunner(),
+        fable=retry_fable, sol=retry_sol,
+        ids=DeterministicIds(task_number=1, run_number=90), repo_root=harness.repo,
+        repo_context="Binding AGENTS instructions.",
+        trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+    )
+
+    async def fable_probe() -> tuple[bool, str]:
+        return True, "subscription_ready"
+
+    async def sol_probe() -> str:
+        return "ready"
+
+    retry_lease = ActiveAgentLease()
+    workflows = HubWorkflowOrchestrator(
+        registry=ProjectRegistry((SimpleNamespace(
+            project_id=recreated.project_id,
+            store=retry_store,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        ),)),
+        lease=retry_lease,
+        usage_credits_acknowledged=lambda: True,
+    )
+    retry = workflows.prepare_recovery_resume(
+        project_id=recreated.project_id,
+        session_id="session-1",
+        intervention_id=intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+    )
+    await workflows.continue_intervention(retry)
+
+    resumed = retry_store.authenticated_intervention(intervention_id)
+    assert resumed is not None
+    assert resumed.status is store_module.InterventionStatus.RESUMED
+    assert resumed.resume_run_id is not None
+    assert retry_sol.answer_fable_question_run_ids == [resumed.resume_run_id]
+    assert len(retry_store._connection.execute(
+        "SELECT 1 FROM questions WHERE task_id = ? AND revision = ? AND text = ?",
+        ("task-1", 1, question_text),
+    ).fetchall()) == 1
+    assert retry_store.get_task("task-1", 1).exchange_consumed == exchange_consumed
+    assert len(tuple(
+        event for event in retry_store.events_after("session-1", 0)
+        if event.kind == "conversation"
+        and event.payload.get("question_id") == question_id
+    )) == 1
+    assert retry_lease.snapshot() is None
+    retry_store.audit_legacy_project_ownership(str(harness.repo))
+    retry_tracker.close()
+    retry_store.close()
+
+
+async def _recover_accepted_next_fable_scope_once(
+    *,
+    harness: CoordinatorHarness,
+    crash_database: Path,
+    intervention_id: str,
+    parent_text: str,
+) -> None:
+    """Resume one accepted staged scope result without replaying its Fable owner."""
+    recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+    recovered.audit_legacy_project_ownership(str(harness.repo))
+    assert recovered.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+    staged = recovered.authenticated_intervention(intervention_id)
+    assert staged is not None
+    assert staged.status is store_module.InterventionStatus.RESUMING
+    assert staged.directed_binding is not None
+    assert staged.directed_binding.stage == "next_fable"
+    staged_run_id = staged.directed_binding.next_run_id
+    assert staged_run_id is not None
+    assert recovered.agent_run(staged_run_id).status == "running"
+    parent = recovered._connection.execute(
+        "SELECT question_id, answer_text, answered_by FROM questions "
+        "WHERE task_id = ? AND revision = ? AND text = ?",
+        ("task-1", 1, parent_text),
+    ).fetchone()
+    assert parent is not None
+    assert tuple(parent)[1:] == (None, None)
+
+    tracker = RepositoryTracker(
+        harness.repo, harness.artifacts, git_executable=GIT_EXECUTABLE,
+    )
+    fable = FakeFable(harness.fable.brief)
+    sol = FakeSol()
+    recreated = Coordinator(
+        store=recovered, repository=tracker, runner=RecordingRunner(),
+        fable=fable, sol=sol,
+        ids=DeterministicIds(task_number=1, run_number=95), repo_root=harness.repo,
+        repo_context="Binding AGENTS instructions.",
+        trusted_shells={"bash": "/bin/bash", "sh": "/bin/sh"},
+    )
+
+    async def fable_probe() -> tuple[bool, str]:
+        return True, "subscription_ready"
+
+    async def sol_probe() -> str:
+        return "ready"
+
+    workflows = HubWorkflowOrchestrator(
+        registry=ProjectRegistry((SimpleNamespace(
+            project_id=recreated.project_id,
+            store=recovered,
+            coordinator=recreated,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        ),)),
+        lease=ActiveAgentLease(),
+        usage_credits_acknowledged=lambda: True,
+    )
+    resumed = await workflows.prepare_resume(
+        project_id=recreated.project_id,
+        session_id="session-1",
+        task_id="task-1",
+        revision=1,
+    )
+    await workflows.run(resumed)
+
+    assert fable.answer_sol_question_prompts == []
+    assert recovered.get_task("task-1", 1).state is TaskState.SOL_RUNNING
+    assert recovered.get_task("task-1", 2).state is TaskState.AWAITING_SCOPE_APPROVAL
+    completed = recovered.authenticated_intervention(intervention_id)
+    assert completed is not None
+    assert completed.status is store_module.InterventionStatus.RESUMED
+    assert recovered.agent_run(staged_run_id).status == "completed"
+    answered = recovered.question(parent["question_id"])
+    assert answered is not None
+    assert answered.answer_text == "Add the explicitly bounded scope path."
+    assert answered.answered_by is ConversationActor.FABLE
+    assert recovered.get_setting("agent_bridge.baseline.task-1.2") is not None
+    recovered.audit_legacy_project_ownership(str(harness.repo))
+    tracker.close()
+    recovered.close()
+
+
 @pytest.mark.parametrize(
-    "branch", ("permission", "reservation", "scope"),
+    "branch", ("permission", "reservation_before_spawn", "reservation_during_sol", "scope"),
 )
 def test_next_fable_outer_branch_consumes_its_stage_before_crash(
     harness: CoordinatorHarness,
@@ -5246,9 +5437,16 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
 ) -> None:
     """Each outer next-Fable branch commits its result with the staged terminalization."""
     async def scenario() -> None:
+        reservation_branch = branch.startswith("reservation_")
         crash_database = harness.database.with_name(f"outer-{branch}-branch.sqlite3")
+        accepted_scope_database = harness.database.with_name(
+            "outer-scope-accepted-before-commit.sqlite3"
+        )
         source_started = asyncio.Event()
         source_released = asyncio.Event()
+        child_released = asyncio.Event()
+        crash_captured = asyncio.Event()
+        crash_state: dict[str, object] = {}
         outer_text = "Which exact approved constraint applies?"
         child_text = "Which focused test proves that constraint?"
         followup_text = "Which exact downstream fact is still needed?"
@@ -5269,7 +5467,7 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
                 False,
                 directed_question=followup,
             )
-            if branch in {"permission", "reservation"}
+            if branch == "permission" or reservation_branch
             else _answer("Add the explicitly bounded scope path.", True, revised_brief=revised)
         )
         harness.sol.queue(_directed_sol_question(outer_text))
@@ -5357,10 +5555,14 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
             final,
         ))
 
-        def capture_after_branch() -> None:
+        def capture_after_branch(*, raise_after: bool = True) -> None:
             terminal = harness.store.intervention(prepared.record.intervention_id)
             assert terminal is not None
-            assert terminal.status is store_module.InterventionStatus.RESUMED
+            assert terminal.status is (
+                store_module.InterventionStatus.RESUMING
+                if reservation_branch
+                else store_module.InterventionStatus.RESUMED
+            )
             events = tuple(
                 event for event in harness.store.events_after("session-1", 0)
                 if event.kind == "clarification" and event.actor == "fable"
@@ -5371,12 +5573,21 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
                 assert paused.state is TaskState.AWAITING_USER_INPUT
                 assert paused.pending is not None
                 assert paused.pending["attempted_question"] == followup.to_dict()
-            elif branch == "reservation":
+            elif reservation_branch:
                 nested_rows = harness.store._connection.execute(
                     "SELECT question_id FROM questions WHERE task_id = ? AND revision = ? AND text = ?",
                     ("task-1", 1, followup_text),
                 ).fetchall()
                 assert len(nested_rows) == 1
+                assert terminal.directed_binding is not None
+                assert terminal.directed_binding.stage == "active_question"
+                assert terminal.directed_binding.question_id == nested_rows[0]["question_id"]
+                child = harness.store.agent_run(terminal.directed_binding.source_run_id)
+                assert child.agent == "sol" and child.status == "running"
+                crash_state["child_run_id"] = child.run_id
+                crash_state["exchange_consumed"] = harness.store.get_task(
+                    "task-1", 1,
+                ).exchange_consumed
             else:
                 saved = harness.store.latest_task("task-1")
                 assert saved is not None
@@ -5386,7 +5597,8 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
             copied = sqlite3.connect(crash_database)
             harness.store._connection.backup(copied)
             copied.close()
-            raise RuntimeError("controlled crash after outer next-Fable branch CAS")
+            if raise_after:
+                raise RuntimeError("controlled crash after outer next-Fable branch CAS")
 
         if branch == "permission":
             original_pause = harness.store.pause_fable_answer_evidence_permission
@@ -5397,44 +5609,185 @@ def test_next_fable_outer_branch_consumes_its_stage_before_crash(
                 return result
 
             harness.store.pause_fable_answer_evidence_permission = crash_after_pause  # type: ignore[method-assign]
-        elif branch == "reservation":
+        elif reservation_branch:
             original_reserve = harness.store.reserve_fable_answer_evidence_question
 
             def crash_after_reservation(**kwargs: object) -> object:
                 result = original_reserve(**kwargs)
-                if kwargs["completed_next_fable_intervention_id"] is not None:
-                    capture_after_branch()
+                if (
+                    kwargs["completed_next_fable_intervention_id"] is not None
+                ):
+                    capture_after_branch(raise_after=False)
+                    if branch == "reservation_during_sol":
+                        harness.sol.hold_answer_fable_question = child_released
+                    crash_captured.set()
                 return result
 
             harness.store.reserve_fable_answer_evidence_question = crash_after_reservation  # type: ignore[method-assign]
+            if branch == "reservation_before_spawn":
+                original_answer_directed = harness.coordinator.answer_directed_question
+
+                async def hold_before_child_spawn(
+                    question: store_module.QuestionRecord,
+                    **kwargs: object,
+                ) -> None:
+                    if question.text != followup_text:
+                        await original_answer_directed(question, **kwargs)
+                        return
+                    await child_released.wait()
+
+                harness.coordinator.answer_directed_question = hold_before_child_spawn  # type: ignore[method-assign]
         else:
             original_scope = harness.store.save_scope_revision
 
             def crash_after_scope(*args: object, **kwargs: object) -> object:
+                harness.store.set_setting(
+                    "agent_bridge.active_session_id", "session-1",
+                )
+                accepted_copy = sqlite3.connect(accepted_scope_database)
+                harness.store._connection.backup(accepted_copy)
+                accepted_copy.close()
+                outer = harness.store._connection.execute(
+                    "SELECT answer_text FROM questions WHERE task_id = ? AND text = ?",
+                    ("task-1", outer_text),
+                ).fetchone()
+                assert outer is not None
+                assert outer["answer_text"] is None
+                staged = harness.store.intervention(prepared.record.intervention_id)
+                assert staged is not None
+                assert staged.status is store_module.InterventionStatus.RESUMING
+                tables = (
+                    "tasks", "interventions", "agent_runs", "questions", "events", "settings",
+                )
+                before = {
+                    table: tuple(tuple(row) for row in harness.store._connection.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ))
+                    for table in tables
+                }
+                insert_event = harness.store._insert_event_in_transaction
+
+                def fail_scope_event(
+                    session_id: str,
+                    task_id: str,
+                    actor: str,
+                    kind: str,
+                    payload: Mapping[str, object],
+                ) -> object:
+                    if kind == "task_brief":
+                        raise RuntimeError("injected scope transaction failure")
+                    return insert_event(session_id, task_id, actor, kind, payload)
+
+                harness.store._insert_event_in_transaction = fail_scope_event  # type: ignore[method-assign]
+                try:
+                    with pytest.raises(RuntimeError, match="injected scope transaction failure"):
+                        original_scope(*args, **kwargs)
+                finally:
+                    harness.store._insert_event_in_transaction = insert_event  # type: ignore[method-assign]
+                assert {
+                    table: tuple(tuple(row) for row in harness.store._connection.execute(
+                        f"SELECT * FROM {table} ORDER BY rowid"
+                    ))
+                    for table in tables
+                } == before
+                rolled_back_outer = harness.store._connection.execute(
+                    "SELECT answer_text FROM questions WHERE task_id = ? AND text = ?",
+                    ("task-1", outer_text),
+                ).fetchone()
+                assert rolled_back_outer is not None
+                assert rolled_back_outer["answer_text"] is None
+                rolled_back_stage = harness.store.intervention(prepared.record.intervention_id)
+                assert rolled_back_stage is not None
+                assert rolled_back_stage.status is store_module.InterventionStatus.RESUMING
                 result = original_scope(*args, **kwargs)
                 capture_after_branch()
                 return result
 
             harness.store.save_scope_revision = crash_after_scope  # type: ignore[method-assign]
 
-        with pytest.raises(RuntimeError, match="controlled crash after outer next-Fable branch CAS"):
-            await workflows.continue_intervention(prepared)
+        if reservation_branch:
+            continuing = asyncio.create_task(workflows.continue_intervention(prepared))
+            await crash_captured.wait()
+            if branch == "reservation_during_sol":
+                while len(harness.sol.answer_fable_question_run_ids) < 2:
+                    await asyncio.sleep(0)
+            child_run_id = crash_state["child_run_id"]
+            assert isinstance(child_run_id, str)
+            harness.runner.release_on_stop = child_released
+            await harness.coordinator.stop_task("task-1")
+            assert harness.runner.stops[-1] == child_run_id
+            await continuing
+        else:
+            with pytest.raises(RuntimeError, match="controlled crash after outer next-Fable branch CAS"):
+                await workflows.continue_intervention(prepared)
         await approval
         assert lease.snapshot() is None
         harness.tracker.close()
         harness.store.close()
 
-        recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
-        assert recovered.recover_active_tasks().tasks_interrupted == 0
-        terminal = recovered.authenticated_intervention(prepared.record.intervention_id)
-        assert terminal is not None
-        assert terminal.status is store_module.InterventionStatus.RESUMED
-        assert len(tuple(
-            event for event in recovered.events_after("session-1", 0)
-            if event.kind == "clarification" and event.actor == "fable"
-        )) == 1
-        recovered.audit_legacy_project_ownership(str(harness.repo))
-        recovered.close()
+        if reservation_branch:
+            child_run_id = crash_state["child_run_id"]
+            exchange_consumed = crash_state["exchange_consumed"]
+            assert isinstance(child_run_id, str)
+            assert isinstance(exchange_consumed, int)
+            await _recover_next_fable_reserved_child_once(
+                harness=harness,
+                crash_database=crash_database,
+                intervention_id=prepared.record.intervention_id,
+                question_text=followup_text,
+                child_run_id=child_run_id,
+                exchange_consumed=exchange_consumed,
+            )
+        else:
+            recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+            assert recovered.recover_active_tasks().tasks_interrupted == 0
+            terminal = recovered.authenticated_intervention(prepared.record.intervention_id)
+            assert terminal is not None
+            assert terminal.status is store_module.InterventionStatus.RESUMED
+            assert len(tuple(
+                event for event in recovered.events_after("session-1", 0)
+                if event.kind == "clarification" and event.actor == "fable"
+            )) == 1
+            if branch == "scope":
+                parent = recovered._connection.execute(
+                    "SELECT answer_text, answered_by FROM questions "
+                    "WHERE task_id = ? AND revision = ? AND text = ?",
+                    ("task-1", 1, outer_text),
+                ).fetchone()
+                assert parent is not None
+                assert tuple(parent) == (
+                    "Add the explicitly bounded scope path.", "fable",
+                )
+                assert recovered.get_task("task-1", 1).state is TaskState.SOL_RUNNING
+                scoped = recovered.get_task("task-1", 2)
+                assert scoped.state is TaskState.AWAITING_SCOPE_APPROVAL
+                assert recovered.get_setting("agent_bridge.baseline.task-1.2") is not None
+                assert terminal.directed_binding is not None
+                assert terminal.directed_binding.next_run_id is not None
+                assert recovered.agent_run(
+                    terminal.directed_binding.next_run_id,
+                ).status == "completed"
+                assert len(tuple(
+                    event for event in recovered.events_after("session-1", 0)
+                    if event.kind == "task_brief"
+                    and event.payload.get("brief", {}).get("revision") == 2
+                )) == 1
+                assert len(tuple(
+                    event for event in recovered.events_after("session-1", 0)
+                    if event.kind == "conversation"
+                    and event.payload.get("reply_to_question_id") is not None
+                    and event.payload.get("text")
+                    == "Add the explicitly bounded scope path."
+                )) == 1
+            recovered.audit_legacy_project_ownership(str(harness.repo))
+            recovered.close()
+            if branch == "scope":
+                await _recover_accepted_next_fable_scope_once(
+                    harness=harness,
+                    crash_database=accepted_scope_database,
+                    intervention_id=prepared.record.intervention_id,
+                    parent_text=outer_text,
+                )
 
     asyncio.run(scenario())
 
@@ -5688,14 +6041,21 @@ def test_next_fable_outer_answer_is_not_terminal_before_its_answer_cas(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("outcome", ("directed", "escalation", "scope", "permission"))
+@pytest.mark.parametrize(
+    "outcome",
+    ("directed_before_spawn", "directed_during_sol", "escalation", "scope", "permission"),
+)
 def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durable(
     harness: CoordinatorHarness,
     outcome: str,
 ) -> None:
     """A staged accepted Fable result cannot terminalize before its branch CAS."""
     async def scenario() -> None:
+        directed_outcome = outcome.startswith("directed_")
         source_released = asyncio.Event()
+        child_released = asyncio.Event()
+        crash_captured = asyncio.Event()
+        crash_state: dict[str, object] = {}
         correction_started = asyncio.Event()
         crash_database = harness.database.with_name("next-directed-outcome.sqlite3")
         first_directed = DirectedAgentQuestion(
@@ -5714,7 +6074,7 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
             allowed_paths=("bridge-output.txt", "scope-extra.txt"),
         )
         (harness.repo / "scope-extra.txt").write_text("scope fixture\n", encoding="utf-8")
-        if outcome in {"directed", "permission"}:
+        if directed_outcome or outcome == "permission":
             second_clarification = _answer(
                 "I need one exact downstream fact.",
                 False,
@@ -5807,6 +6167,52 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
                 return started
 
             harness.store.start_next_fable_intervention_stage = exhaust_after_starting_next_fable_stage  # type: ignore[method-assign]
+        if directed_outcome:
+            original_reserve = harness.store.reserve_fable_clarification_evidence_question
+
+            def capture_directed_reservation(**kwargs: object) -> object:
+                result = original_reserve(**kwargs)
+                if kwargs["completed_next_fable_intervention_id"] is None:
+                    return result
+                current = harness.store.authenticated_intervention(
+                    "next-directed-outcome",
+                )
+                assert current is not None
+                assert current.status is store_module.InterventionStatus.RESUMING
+                assert current.directed_binding is not None
+                assert current.directed_binding.stage == "active_question"
+                assert current.directed_binding.question_id == result[1].question_id
+                child = harness.store.agent_run(current.directed_binding.source_run_id)
+                assert child.agent == "sol" and child.status == "running"
+                crash_state["child_run_id"] = child.run_id
+                crash_state["exchange_consumed"] = harness.store.get_task(
+                    "task-1", 1,
+                ).exchange_consumed
+                harness.store.set_setting(
+                    "agent_bridge.active_session_id", "session-1",
+                )
+                copied = sqlite3.connect(crash_database)
+                harness.store._connection.backup(copied)
+                copied.close()
+                if outcome == "directed_during_sol":
+                    harness.sol.hold_answer_fable_question = child_released
+                crash_captured.set()
+                return result
+
+            harness.store.reserve_fable_clarification_evidence_question = capture_directed_reservation  # type: ignore[method-assign]
+            if outcome == "directed_before_spawn":
+                original_answer_directed = harness.coordinator.answer_directed_question
+
+                async def hold_before_child_spawn(
+                    question: store_module.QuestionRecord,
+                    **kwargs: object,
+                ) -> None:
+                    if question.text != second_directed.text:
+                        await original_answer_directed(question, **kwargs)
+                        return
+                    await child_released.wait()
+
+                harness.coordinator.answer_directed_question = hold_before_child_spawn  # type: ignore[method-assign]
         original_route = harness.coordinator._route_clarification
 
         async def route_after_accepted_result(*args: object, **kwargs: object) -> None:
@@ -5820,36 +6226,13 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
                 return
             assert staged.status is store_module.InterventionStatus.RESUMING
 
-            if outcome == "directed":
-                async def prevent_downstream_spawn(question: object, **_: object) -> None:
-                    assert isinstance(question, store_module.QuestionRecord)
-                    assert question.text == second_directed.text
-
-                harness.coordinator.answer_directed_question = prevent_downstream_spawn  # type: ignore[method-assign]
             await original_route(*args, **kwargs)
+            if directed_outcome:
+                return
             terminal = harness.store.intervention("next-directed-outcome")
             assert terminal is not None
             assert terminal.status is store_module.InterventionStatus.RESUMED
-            if outcome == "directed":
-                task = harness.store.get_task("task-1", 1)
-                nested_row = harness.store._connection.execute(
-                    "SELECT question_id FROM questions WHERE task_id = ? AND revision = ? AND text = ?",
-                    ("task-1", 1, second_directed.text),
-                ).fetchone()
-                assert nested_row is not None
-                nested = harness.store.question(nested_row["question_id"])
-                assert nested is not None
-                assert task.state is TaskState.AWAITING_USER_INPUT
-                assert task.continuation_state is TaskState.FABLE_CLARIFYING
-                assert nested.answer_text is None
-                matching_events = tuple(
-                    event for event in harness.store.events_after("session-1", 0)
-                    if event.kind == "clarification"
-                    and event.actor == "fable"
-                    and event.payload.get("directed_question", {}).get("text")
-                    == second_directed.text
-                )
-            elif outcome == "permission":
+            if outcome == "permission":
                 task = harness.store.get_task("task-1", 1)
                 assert task.state is TaskState.AWAITING_USER_INPUT
                 assert task.continuation_state is TaskState.FABLE_CLARIFYING
@@ -5862,6 +6245,13 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
                     and event.payload.get("directed_question", {}).get("text")
                     == second_directed.text
                 )
+                permission_events = tuple(
+                    event for event in harness.store.events_after("session-1", 0)
+                    if event.kind == "conversation"
+                    and event.payload.get("message_type") == "status"
+                )
+                assert len(permission_events) == 1
+                assert matching_events[0].sequence < permission_events[0].sequence
             elif outcome == "escalation":
                 task = harness.store.get_task("task-1", 1)
                 assert task.state is TaskState.AWAITING_USER_INPUT
@@ -5897,23 +6287,50 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
             _answer("I need one exact correction fact.", False, directed_question=first_directed),
             second_clarification,
         ))
-        with pytest.raises(RuntimeError, match="controlled crash"):
-            await workflows.continue_intervention(prepared)
+        if directed_outcome:
+            continuing = asyncio.create_task(workflows.continue_intervention(prepared))
+            await crash_captured.wait()
+            if outcome == "directed_during_sol":
+                while len(harness.sol.answer_fable_question_run_ids) < 2:
+                    await asyncio.sleep(0)
+            child_run_id = crash_state["child_run_id"]
+            assert isinstance(child_run_id, str)
+            harness.runner.release_on_stop = child_released
+            await harness.coordinator.stop_task("task-1")
+            assert harness.runner.stops[-1] == child_run_id
+            await continuing
+        else:
+            with pytest.raises(RuntimeError, match="controlled crash"):
+                await workflows.continue_intervention(prepared)
         await approval
         harness.tracker.close()
         harness.store.close()
 
-        recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
-        assert recovered.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
-        terminal = recovered.authenticated_intervention("next-directed-outcome")
-        assert terminal is not None
-        assert terminal.status is store_module.InterventionStatus.RESUMED
-        if outcome == "scope":
-            assert recovered.latest_task("task-1").state is TaskState.AWAITING_SCOPE_APPROVAL  # type: ignore[union-attr]
+        if directed_outcome:
+            child_run_id = crash_state["child_run_id"]
+            exchange_consumed = crash_state["exchange_consumed"]
+            assert isinstance(child_run_id, str)
+            assert isinstance(exchange_consumed, int)
+            await _recover_next_fable_reserved_child_once(
+                harness=harness,
+                crash_database=crash_database,
+                intervention_id="next-directed-outcome",
+                question_text=second_directed.text,
+                child_run_id=child_run_id,
+                exchange_consumed=exchange_consumed,
+            )
         else:
-            assert recovered.get_task("task-1", 1).state is TaskState.AWAITING_USER_INPUT
-        recovered.audit_legacy_project_ownership(str(harness.repo))
-        recovered.close()
+            recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+            assert recovered.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+            terminal = recovered.authenticated_intervention("next-directed-outcome")
+            assert terminal is not None
+            assert terminal.status is store_module.InterventionStatus.RESUMED
+            if outcome == "scope":
+                assert recovered.latest_task("task-1").state is TaskState.AWAITING_SCOPE_APPROVAL  # type: ignore[union-attr]
+            else:
+                assert recovered.get_task("task-1", 1).state is TaskState.AWAITING_USER_INPUT
+            recovered.audit_legacy_project_ownership(str(harness.repo))
+            recovered.close()
 
     asyncio.run(scenario())
 
@@ -6710,7 +7127,14 @@ def test_recovered_directed_fable_scope_checkpoint_hub_resume_consumes_once(
             task_id="task-1", revision=1,
         )
         assert prior is not None
-        assert harness.store.directed_fable_answer_checkpoint(prior) is not None
+        checkpoint = harness.store.directed_fable_answer_checkpoint(prior)
+        assert checkpoint is not None
+        parent = harness.store.question(checkpoint.question_id)
+        assert parent is not None
+        assert parent.answer_text is None and parent.answered_by is None
+        paused = harness.store.get_task("task-1", 1)
+        assert paused.state is TaskState.AWAITING_USER_INPUT
+        assert paused.continuation_state is TaskState.SOL_RUNNING
         harness.tracker.close()
         harness.store.close()
         reopened_store = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
