@@ -4634,7 +4634,13 @@ def test_later_stop_cancels_cross_route_resuming_nested_sol_child_and_survives_r
 
 @pytest.mark.parametrize(
     "crash_boundary",
-    ("before_provider_spawn", "during_provider", "after_child_completion"),
+    (
+        "before_provider_spawn",
+        "during_provider",
+        "after_child_completion",
+        "after_child_answer_before_next_fable",
+        "during_next_fable",
+    ),
 )
 def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_question(
     harness: CoordinatorHarness,
@@ -4656,7 +4662,7 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
                 SELECT question_id, exchange_id, continuation_pause_id,
                        pending_action_json, continuation_generation
                 FROM questions
-                WHERE task_id = ? AND revision = ? AND answer_text IS NULL
+                WHERE task_id = ? AND revision = ?
                   AND nested_parent_kind IS NOT NULL
                 """,
                 ("task-1", 1),
@@ -4752,12 +4758,34 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
                 await nested_provider_blocked.wait()
 
             harness.coordinator.answer_directed_question = crash_before_provider_spawn  # type: ignore[method-assign]
-        else:
+        elif crash_boundary == "after_child_completion":
             def crash_after_child_completion(**_: object) -> object:
                 capture_crash_image()
                 raise RuntimeError("controlled crash before nested answer CAS")
 
             harness.store.answer_fable_clarification_evidence_question_and_resume = crash_after_child_completion  # type: ignore[method-assign]
+        elif crash_boundary == "after_child_answer_before_next_fable":
+            answer_child = harness.store.answer_fable_clarification_evidence_question_and_resume
+
+            def crash_after_child_answer(**kwargs: object) -> object:
+                answered = answer_child(**kwargs)
+                capture_crash_image()
+                raise RuntimeError("controlled crash after nested answer CAS")
+
+            harness.store.answer_fable_clarification_evidence_question_and_resume = crash_after_child_answer  # type: ignore[method-assign]
+        else:
+            clarify = harness.fable.clarify
+            clarification_calls = 0
+
+            async def crash_during_next_fable(**kwargs: object) -> AgentRunResult:
+                nonlocal clarification_calls
+                clarification_calls += 1
+                if clarification_calls == 2:
+                    capture_crash_image()
+                    raise RuntimeError("controlled crash during next Fable provider")
+                return await clarify(**kwargs)
+
+            harness.fable.clarify = crash_during_next_fable  # type: ignore[method-assign]
         harness.fable.next_clarifications.append(
             _answer("I need one exact correction fact.", False, directed_question=directed)
         )
@@ -4799,11 +4827,29 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert crash_intervention.status.value == "resuming"
         assert crash_intervention.resume_run_id != raw_nested_run["run_id"]
         assert crash_intervention.directed_binding is not None
-        assert crash_intervention.directed_binding.source_run_id == raw_nested_run["run_id"]
+        if crash_boundary in {
+            "after_child_answer_before_next_fable", "during_next_fable",
+        }:
+            # The child answer CAS must consume the Sol-child stage and bind the
+            # exact preallocated Fable continuation before that provider starts.
+            assert crash_intervention.directed_binding.stage == "next_fable"
+            assert crash_intervention.directed_binding.next_run_id is not None
+            assert crash_intervention.directed_binding.next_provider_id == "fable-session-1"
+            assert crash_intervention.directed_binding.source_run_id == raw_nested_run["run_id"]
+            assert nested_question.answer_text is not None
+        else:
+            assert crash_intervention.directed_binding.source_run_id == raw_nested_run["run_id"]
+            assert nested_question.answer_text is None
         assert crash_intervention.directed_binding.question_id == nested_question_id
         assert crash_intervention.directed_binding.exchange_id == raw_reservation["exchange_id"]
-        assert crash_task.state is TaskState.AWAITING_USER_INPUT
-        assert crash_task.continuation_state is TaskState.FABLE_CLARIFYING
+        if crash_boundary in {
+            "after_child_answer_before_next_fable", "during_next_fable",
+        }:
+            assert crash_task.state is TaskState.FABLE_CLARIFYING
+            assert crash_task.continuation_state is None
+        else:
+            assert crash_task.state is TaskState.AWAITING_USER_INPUT
+            assert crash_task.continuation_state is TaskState.FABLE_CLARIFYING
         assert nested_row["continuation_pause_id"] == crash_intervention.directed_binding.continuation_pause_id
         assert raw_reservation["question_id"] == nested_question_id
         assert raw_reservation["continuation_generation"] == nested_row["continuation_generation"]
@@ -4817,7 +4863,11 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert unknown is not None
         assert unknown.status.value == "resume_outcome_unknown"
         assert first_summary == store_module.RecoverySummary(
-            0, 1, 0 if crash_boundary == "after_child_completion" else 1,
+            0,
+            1,
+            0 if crash_boundary in {
+                "after_child_completion", "after_child_answer_before_next_fable",
+            } else 1,
         )
         first_task = first.get_task("task-1", 1)
         assert first_task.state is TaskState.INTERRUPTED
@@ -4840,7 +4890,13 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
             WHERE task_id = ? AND revision = ?
             """,
             ("task-1", 1),
-        ).fetchone()["continuation_pause_id"] == nested_row["continuation_pause_id"]
+        ).fetchone()["continuation_pause_id"] == (
+            None
+            if crash_boundary in {
+                "after_child_answer_before_next_fable", "during_next_fable",
+            }
+            else nested_row["continuation_pause_id"]
+        )
         assert tuple(
             event for event in second.events_after("session-1", 0)
             if event.kind == "conversation"
@@ -4866,7 +4922,11 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert acknowledged_question is not None
         assert acknowledged.resume_generation == unknown.resume_generation + 1
         assert acknowledged_task.continuation_generation == acknowledged.resume_generation
-        assert acknowledged_question.continuation_generation == acknowledged.resume_generation
+        assert acknowledged_question.continuation_generation == (
+            unknown.resume_generation
+            if crash_boundary in {"after_child_answer_before_next_fable", "during_next_fable"}
+            else acknowledged.resume_generation
+        )
         acknowledged_reservation = second._connection.execute(
             """
             SELECT * FROM exchange_reservations
@@ -4875,9 +4935,10 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
             (raw_reservation["exchange_id"], nested_question_id),
         ).fetchone()
         assert acknowledged_reservation is not None
-        assert (
-            acknowledged_reservation["continuation_generation"]
-            == acknowledged.resume_generation
+        assert acknowledged_reservation["continuation_generation"] == (
+            unknown.resume_generation
+            if crash_boundary in {"after_child_answer_before_next_fable", "during_next_fable"}
+            else acknowledged.resume_generation
         )
         assert second._connection.execute(
             """
@@ -4885,7 +4946,13 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
             WHERE task_id = ? AND revision = ?
             """,
             ("task-1", 1),
-        ).fetchone()["continuation_pause_id"] == nested_row["continuation_pause_id"]
+        ).fetchone()["continuation_pause_id"] == (
+            None
+            if crash_boundary in {
+                "after_child_answer_before_next_fable", "during_next_fable",
+            }
+            else nested_row["continuation_pause_id"]
+        )
         second.close()
 
         retry_store = SQLiteStore(
@@ -4928,19 +4995,32 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
         assert resumed.status.value == "resumed"
         assert resumed.resume_generation == acknowledged.resume_generation
         assert resumed.resume_run_id is not None
-        assert retry_store.agent_run(resumed.resume_run_id).agent == "sol"
+        assert retry_store.agent_run(resumed.resume_run_id).agent == (
+            "fable"
+            if crash_boundary in {"after_child_answer_before_next_fable", "during_next_fable"}
+            else "sol"
+        )
         assert retry_store.agent_run(resumed.resume_run_id).status == "completed"
-        assert len(retry_sol.answer_fable_question_calls) == 1
+        assert len(retry_sol.answer_fable_question_calls) == (
+            0 if crash_boundary in {"after_child_answer_before_next_fable", "during_next_fable"} else 1
+        )
         assert len(harness.sol.answer_fable_question_calls) == (
             0 if crash_boundary == "before_provider_spawn" else 1
         )
-        assert retry_sol.answer_fable_question_calls[0][2] == (
-            "Which exact correction fact is verified?"
-            "\n\nIntervention guidance:\nKeep the correction bounded."
-        )
+        if crash_boundary not in {
+            "after_child_answer_before_next_fable", "during_next_fable",
+        }:
+            assert retry_sol.answer_fable_question_calls[0][2] == (
+                "Which exact correction fact is verified?"
+                "\n\nIntervention guidance:\nKeep the correction bounded."
+            )
         answered_question = retry_store.question(nested_question_id)
         assert answered_question is not None
-        assert answered_question.answer_text == "The exact correction fact is verified."
+        assert answered_question.answer_text == (
+            nested_question.answer_text
+            if crash_boundary in {"after_child_answer_before_next_fable", "during_next_fable"}
+            else "The exact correction fact is verified."
+        )
         question_events_after = tuple(
             event for event in retry_store.events_after("session-1", 0)
             if event.kind == "conversation"

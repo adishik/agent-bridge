@@ -3931,6 +3931,8 @@ def _seed_previous_directed_intervention_families(
         store_module.InterventionStatus.READY,
         store_module.InterventionStatus.RESUMING,
         store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
     ):
         suffix = status.value
         brief = replace(valid_brief, task_id=f"directed-{suffix}")
@@ -3992,6 +3994,35 @@ def _seed_previous_directed_intervention_families(
                     TaskState.AWAITING_USER_INPUT.value,
                 ),
             )
+        elif status in {
+            store_module.InterventionStatus.RESUMED,
+            store_module.InterventionStatus.CANCELED_BY_STOP,
+        }:
+            # The immediately preceding bytes can contain a completed directed
+            # exchange whose durable binding column has not yet been added.
+            store._connection.execute(
+                """
+                UPDATE questions
+                SET answer_text = ?, answered_by = ?
+                WHERE question_id = ? AND answer_text IS NULL
+                """,
+                (
+                    f"Exact {suffix} answer.", ConversationActor.FABLE.value,
+                    f"question-{suffix}",
+                ),
+            )
+            if status is store_module.InterventionStatus.RESUMED:
+                store.complete_intervention(
+                    created.intervention_id,
+                    expected_resume_generation=created.resume_generation,
+                    resume_attempt_id=f"attempt-{suffix}",
+                    resume_run_id=f"resume-{suffix}",
+                )
+            else:
+                store.cancel_intervention_by_stop(
+                    created.intervention_id,
+                    expected_resume_generation=created.resume_generation,
+                )
     store.close()
 
     preceding = sqlite3.connect(path)
@@ -4042,6 +4073,8 @@ def test_directed_intervention_binding_migration_backfills_each_live_family_exac
         store_module.InterventionStatus.READY,
         store_module.InterventionStatus.RESUMING,
         store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
     ):
         record = migrated.authenticated_intervention(f"intervention-{status.value}")
         assert record is not None
@@ -4076,6 +4109,8 @@ def test_directed_intervention_binding_migration_backfills_each_live_family_exac
         store_module.InterventionStatus.READY,
         store_module.InterventionStatus.RESUMING,
         store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
     ):
         assert reopened.authenticated_intervention(
             f"intervention-{status.value}"
@@ -4085,7 +4120,9 @@ def test_directed_intervention_binding_migration_backfills_each_live_family_exac
 
 
 @pytest.mark.parametrize("binding_column", ("absent", "null"))
-@pytest.mark.parametrize("fault", ("incomplete", "ambiguous"))
+@pytest.mark.parametrize(
+    "fault", ("incomplete", "ambiguous", "foreign_provider", "foreign_question"),
+)
 def test_directed_intervention_binding_migration_rejects_unsafe_rows_and_rolls_back(
     tmp_path, valid_brief, binding_column: str, fault: str,
 ) -> None:
@@ -4099,6 +4136,20 @@ def test_directed_intervention_binding_migration_rejects_unsafe_rows_and_rolls_b
         preceding.execute(
             "DELETE FROM exchange_reservations WHERE question_id = ?",
             ("question-ready",),
+        )
+    elif fault == "foreign_provider":
+        preceding.execute(
+            """
+            UPDATE agent_runs SET cli_session_id = 'foreign-provider'
+            WHERE run_id = 'source-ready'
+            """
+        )
+    elif fault == "foreign_question":
+        preceding.execute(
+            """
+            UPDATE questions SET routed_to = 'sol'
+            WHERE question_id = 'question-ready'
+            """
         )
     else:
         preceding.execute("DROP INDEX one_unanswered_top_level_question_per_task_revision")
@@ -4705,6 +4756,185 @@ def _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief):
     assert rebound.directed_binding.parent_question_id == "original-question"
     assert child.parent_question_id == "original-question"
     return rebound
+
+
+def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
+    """Advance one exact nested Sol child through the child-answer CAS only."""
+    created = _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store.finish_agent_run("nested-source-run", status="completed", exit_code=0)
+    store.answer_fable_answer_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        outer_question_id="original-question",
+        question_id="nested-question",
+        expected_generation=created.resume_generation,
+        answer_text="The exact nested fact is verified.",
+        next_fable_run_id="next-fable-run",
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.ANSWER,
+            text="The exact nested fact is verified.",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            continuation_generation=created.resume_generation,
+            reply_to_question_id="nested-question",
+        ),
+    )
+    stage = store.intervention(created.intervention_id)
+    assert stage is not None and stage.directed_binding is not None
+    assert stage.directed_binding.stage == "next_fable"
+    return stage
+
+
+def _tamper_next_fable_intervention_stage(store, mutation: str) -> None:
+    if mutation == "run":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.next_run_id', 'nested-source-run'
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif mutation == "provider":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.next_provider_id', 'substituted-provider'
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif mutation == "session":
+        store._connection.execute(
+            """
+            UPDATE tasks SET fable_session_id = 'substituted-session'
+            WHERE task_id = ? AND revision = ?
+            """,
+            ("task-1", 1),
+        )
+    elif mutation == "question":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.question_id', 'original-question'
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif mutation == "parent":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.parent_question_id', 'nested-question'
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif mutation == "route":
+        store._connection.execute(
+            """
+            UPDATE questions SET addressed_to = 'fable', routed_to = 'fable'
+            WHERE question_id = 'nested-question'
+            """
+        )
+    elif mutation == "generation":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.question_generation', 999
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    elif mutation == "attempt":
+        store._connection.execute(
+            """
+            UPDATE interventions SET directed_binding_json = json_set(
+                directed_binding_json, '$.next_attempt_id', 'substituted-attempt'
+            ) WHERE intervention_id = 'directed-terminal'
+            """
+        )
+    else:
+        raise AssertionError(f"unknown next-stage mutation {mutation}")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("run", "provider", "session", "question", "parent", "route", "generation", "attempt"),
+)
+@pytest.mark.parametrize("operation", ("invoke", "retry"))
+def test_next_fable_intervention_stage_tampering_fails_before_invoke_or_retry_and_rolls_back(
+    tmp_path, valid_brief, mutation: str, operation: str,
+) -> None:
+    """The consumed child permits only its exact next Fable stage."""
+    store = SQLiteStore(
+        tmp_path / f"next-{operation}-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    if operation == "retry":
+        store.recover_active_tasks()
+    _tamper_next_fable_intervention_stage(store, mutation)
+    before = {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in ("tasks", "interventions", "questions", "exchange_reservations", "agent_runs")
+    }
+
+    if operation == "invoke":
+        with pytest.raises(RuntimeError, match="binding is not authenticated"):
+            store.start_next_fable_intervention_stage(
+                stage.intervention_id, run_id="next-fable-run",
+            )
+    else:
+        with pytest.raises(RuntimeError, match="binding is not authenticated"):
+            store.authorize_retry_after_unknown(
+                stage.intervention_id,
+                expected_resume_generation=stage.resume_generation,
+                acknowledgment_id=f"ack-{mutation}",
+            )
+
+    assert {
+        table: tuple(
+            tuple(row) for row in store._connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in before
+    } == before
+
+
+@pytest.mark.parametrize("after_acknowledgment", (False, True))
+def test_stop_authenticates_the_staged_next_fable_continuation(
+    tmp_path, valid_brief, after_acknowledgment: bool,
+) -> None:
+    """Stop remains exact before invocation and after UNKNOWN acknowledgment."""
+    store = SQLiteStore(
+        tmp_path / f"next-stop-{after_acknowledgment}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    if after_acknowledgment:
+        unknown = store.recover_active_tasks()
+        assert unknown.tasks_interrupted == 1
+        stage = store.authorize_retry_after_unknown(
+            stage.intervention_id,
+            expected_resume_generation=stage.resume_generation,
+            acknowledgment_id="next-stop-ack",
+        )
+    canceled = store.cancel_intervention_by_stop(
+        stage.intervention_id,
+        expected_resume_generation=stage.resume_generation,
+    )
+    assert canceled.status is store_module.InterventionStatus.CANCELED_BY_STOP
+    assert canceled.directed_binding is not None
+    assert canceled.directed_binding.stage == "next_fable"
+    assert store.authenticated_intervention(stage.intervention_id) == canceled
+    task = store.get_task(valid_brief.task_id, valid_brief.revision)
+    assert task.state is TaskState.INTERRUPTED
+    assert task.continuation_state is TaskState.SOL_RUNNING
 
 
 @pytest.mark.parametrize("mutation", ("parent_reservation_missing", "parent_reservation_substituted"))

@@ -1533,7 +1533,32 @@ class Coordinator:
         ):
             return
         task = self._store.get_task(record.task_id, record.revision)
-        if task.state is TaskState.AWAITING_USER_INPUT:
+        binding = record.directed_binding
+        if binding is not None and binding.stage == "next_fable":
+            self._store.start_next_fable_intervention_stage(
+                intervention_id, run_id=resume_run_id,
+            )
+            task = self._store.get_task(record.task_id, record.revision)
+            child = self._store.question(binding.question_id)
+            if child is None or child.answer_text is None:
+                raise RuntimeError("intervention next Fable child changed")
+            if binding.parent_question_id is not None:
+                outer = self._store.question(binding.parent_question_id)
+                if outer is None:
+                    raise RuntimeError("intervention next Fable parent changed")
+                await self._answer_sol_question_with_fable(
+                    task, outer, self._context_from_task(task), run_id=resume_run_id,
+                )
+            else:
+                context = self._context_from_task(
+                    replace(task, continuation_state=task.state),
+                )
+                if context is None:
+                    raise RuntimeError("intervention next Fable context changed")
+                await self._run_context(
+                    task, context, child.answer_text, answer_source="sol", run_id=resume_run_id,
+                )
+        elif task.state is TaskState.AWAITING_USER_INPUT:
             question = self._store.intervention_resume_question(intervention_id)
             if question is None:
                 raise RuntimeError("intervention directed route changed")
@@ -2166,6 +2191,28 @@ class Coordinator:
             return None, None
         return intervention.intervention_id, self._ids.new_run_id()
 
+    def _nested_intervention_next_fable_stage(
+        self, task: TaskRecord, question: QuestionRecord,
+    ) -> tuple[str | None, str | None]:
+        """Preallocate only the immediate Fable stage after one bound Sol child."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        binding = None if intervention is None else intervention.directed_binding
+        if (
+            intervention is None
+            or intervention.status is not InterventionStatus.RESUMING
+            or intervention.routed_to is not ConversationTarget.FABLE
+            or binding is None
+            or binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.question_id != question.question_id
+            or binding.source_agent is not ConversationTarget.SOL
+            or binding.source_run_id == intervention.resume_run_id
+        ):
+            return None, None
+        return intervention.intervention_id, self._ids.new_run_id()
+
     def _active_context_from_task(self, task: TaskRecord) -> object:
         pending = task.pending or {}
         if task.state in _SOL_STATES:
@@ -2317,6 +2364,27 @@ class Coordinator:
             return
         raise RuntimeError("directed question has no exact answering agent")
 
+    def _start_or_reuse_fable_run(
+        self, task: TaskRecord, run_id: str | None,
+    ) -> str:
+        """Reuse only a Store-prepared Fable stage; ordinary calls allocate a run."""
+        run_id = self._ids.new_run_id() if run_id is None else run_id
+        try:
+            existing = self._store.agent_run(run_id)
+        except RuntimeError:
+            self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+            self._store.set_agent_run_session(run_id, task.fable_session_id)
+            return run_id
+        if (
+            existing.task_id != task.task_id
+            or existing.revision != task.revision
+            or existing.agent != "fable"
+            or existing.cli_session_id != task.fable_session_id
+            or existing.status != "running"
+        ):
+            raise RuntimeError("prepared Fable stage changed")
+        return run_id
+
     async def _answer_sol_question_with_fable(
         self,
         task: TaskRecord,
@@ -2332,9 +2400,7 @@ class Coordinator:
         prompt = question.text if evidence is None else f"{question.text}\nSol evidence: {evidence}"
         if intervention_message is not None:
             prompt = f"{prompt}\n\nIntervention guidance:\n{intervention_message}"
-        run_id = self._ids.new_run_id() if run_id is None else run_id
-        self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
-        self._store.set_agent_run_session(run_id, task.fable_session_id)
+        run_id = self._start_or_reuse_fable_run(task, run_id)
         completion = self._track_run(run_id)
         try:
             result = await self._fable.answer_sol_question(
@@ -2605,11 +2671,15 @@ class Coordinator:
         finally:
             self._complete_run(run_id, completion)
         if question.nested_parent_kind == "clarification":
+            intervention_id, next_fable_run_id = self._nested_intervention_next_fable_stage(
+                task, question,
+            )
             answered = self._store.answer_fable_clarification_evidence_question_and_resume(
                 session_id=task.session_id, task_id=task.task_id, revision=task.revision,
                 question_id=question.question_id,
                 expected_generation=question.continuation_generation,
                 answer_text=outcome.summary,
+                next_fable_run_id=next_fable_run_id,
                 event=ConversationEnvelope(
                     sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
                     routed_to=ConversationTarget.FABLE,
@@ -2622,18 +2692,27 @@ class Coordinator:
             if answered.answered_by is not ConversationActor.SOL:
                 raise RuntimeError("nested directed Sol answer changed")
             resumed = self._store.get_task(task.task_id, task.revision)
+            if intervention_id is not None and next_fable_run_id is not None:
+                self._store.start_next_fable_intervention_stage(
+                    intervention_id, run_id=next_fable_run_id,
+                )
             await self._run_context(
                 resumed, continuation, outcome.summary, answer_source="sol",
+                run_id=next_fable_run_id,
             )
             return
         if question.nested_parent_kind == "question":
             if question.parent_question_id is None:
                 raise RuntimeError("nested Fable evidence parent is missing")
+            intervention_id, next_fable_run_id = self._nested_intervention_next_fable_stage(
+                task, question,
+            )
             answered = self._store.answer_fable_answer_evidence_question(
                 session_id=task.session_id, task_id=task.task_id, revision=task.revision,
                 outer_question_id=question.parent_question_id, question_id=question.question_id,
                 expected_generation=question.continuation_generation,
                 answer_text=outcome.summary,
+                next_fable_run_id=next_fable_run_id,
                 event=ConversationEnvelope(
                     sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
                     routed_to=ConversationTarget.FABLE,
@@ -2649,8 +2728,12 @@ class Coordinator:
             if outer is None:
                 raise RuntimeError("nested Fable evidence parent changed")
             resumed = self._store.get_task(task.task_id, task.revision)
+            if intervention_id is not None and next_fable_run_id is not None:
+                self._store.start_next_fable_intervention_stage(
+                    intervention_id, run_id=next_fable_run_id,
+                )
             await self._answer_sol_question_with_fable(
-                resumed, outer, self._context_from_task(resumed),
+                resumed, outer, self._context_from_task(resumed), run_id=next_fable_run_id,
             )
             return
         answered = self._store.answer_question_and_prepare_resume(
@@ -2779,8 +2862,7 @@ class Coordinator:
                     "prompt": underlying_continuation.prompt,
                 },
             )
-        run_id = self._ids.new_run_id() if run_id is None else run_id
-        self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+        run_id = self._start_or_reuse_fable_run(task, run_id)
         completion = self._track_run(run_id)
         try:
             result = await self._fable.clarify(
