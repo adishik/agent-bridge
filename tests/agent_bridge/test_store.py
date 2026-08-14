@@ -5094,6 +5094,103 @@ def test_pre_stage_answered_nested_migration_reuses_one_exact_existing_successor
     reopened.close()
 
 
+@pytest.mark.parametrize(
+    ("outcome", "preserve_successor", "second_eligible", "expects_migration"),
+    (
+        ("resuming", True, False, True),
+        ("unknown", True, False, True),
+        ("resuming", False, False, True),
+        ("unknown", True, True, False),
+    ),
+)
+def test_pre_stage_answered_migration_filters_historical_fable_runs_before_uniqueness(
+    tmp_path,
+    valid_brief,
+    outcome: str,
+    preserve_successor: bool,
+    second_eligible: bool,
+    expects_migration: bool,
+) -> None:
+    """Only exact eligible successor runs participate in predecessor migration."""
+    path = tmp_path / (
+        "pre-stage-filtered-"
+        f"{outcome}-{preserve_successor}-{second_eligible}.sqlite3"
+    )
+    _seed_pre_stage_answered_nested_intervention(
+        path,
+        valid_brief,
+        outcome=outcome,
+        binding_shape="absent",
+        preserve_successor=preserve_successor,
+    )
+    preceding = sqlite3.connect(path)
+    for run_id in ("historical-plan-run", "historical-clarification-run"):
+        preceding.execute(
+            """
+            INSERT INTO agent_runs (
+                run_id, task_id, revision, agent, cli_session_id, started_at,
+                ended_at, exit_code, status
+            ) VALUES (?, ?, ?, 'fable', ?, ?, ?, 0, 'completed')
+            """,
+            (
+                run_id,
+                valid_brief.task_id,
+                valid_brief.revision,
+                "provider-1",
+                "2026-08-09T12:00:00Z",
+                "2026-08-09T12:05:00Z",
+            ),
+        )
+    if second_eligible:
+        preceding.execute(
+            """
+            INSERT INTO agent_runs (
+                run_id, task_id, revision, agent, cli_session_id, started_at,
+                ended_at, exit_code, status
+            ) VALUES ('second-eligible-successor', ?, ?, 'fable', ?, ?, ?, -15, 'interrupted')
+            """,
+            (
+                valid_brief.task_id,
+                valid_brief.revision,
+                "provider-1",
+                "2026-08-10T12:00:00Z",
+                "2026-08-10T12:01:00Z",
+            ),
+        )
+    preceding.commit()
+    before = tuple(
+        tuple(row)
+        for row in preceding.execute("SELECT * FROM agent_runs ORDER BY rowid")
+    )
+    preceding.close()
+
+    if not expects_migration:
+        with pytest.raises(RuntimeError, match="migration"):
+            SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+        after_connection = sqlite3.connect(path)
+        after = tuple(
+            tuple(row)
+            for row in after_connection.execute("SELECT * FROM agent_runs ORDER BY rowid")
+        )
+        after_connection.close()
+        assert after == before
+        return
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    record = migrated.authenticated_intervention("directed-terminal")
+    assert record is not None and record.directed_binding is not None
+    binding = record.directed_binding
+    assert binding.stage == "next_fable"
+    if preserve_successor:
+        assert binding.next_run_id == "next-fable-run"
+    else:
+        assert binding.next_run_id is not None
+        assert binding.next_run_id.startswith("migration-next-fable-")
+    assert migrated.agent_run("historical-plan-run").status == "completed"
+    assert migrated.agent_run("historical-clarification-run").status == "completed"
+    migrated.close()
+
+
 @pytest.mark.parametrize("mutation", ("two_candidates", "provider", "session", "status"))
 def test_pre_stage_answered_nested_migration_rejects_an_ambiguous_or_mismatched_successor(
     tmp_path, valid_brief, mutation: str,
@@ -5380,7 +5477,7 @@ def test_stop_authenticates_the_staged_next_fable_continuation(
 
 
 @pytest.mark.parametrize("operation", ("retry", "stop"))
-@pytest.mark.parametrize("mutation", ("attempt", "run"))
+@pytest.mark.parametrize("mutation", ("attempt", "run", "compatible_run"))
 def test_acknowledged_next_fable_stage_retains_and_authenticates_its_predecessor_owner(
     tmp_path, valid_brief, operation: str, mutation: str,
 ) -> None:
@@ -5408,10 +5505,32 @@ def test_acknowledged_next_fable_stage_retains_and_authenticates_its_predecessor
             (acknowledged.intervention_id,),
         )
     else:
+        if mutation == "compatible_run":
+            store._connection.execute(
+                """
+                INSERT INTO agent_runs (
+                    run_id, task_id, revision, agent, cli_session_id, started_at,
+                    ended_at, exit_code, status
+                ) VALUES ('compatible-historical-fable', ?, ?, 'fable', ?, ?, ?, 0, 'completed')
+                """,
+                (
+                    valid_brief.task_id,
+                    valid_brief.revision,
+                    "provider-1",
+                    "2026-08-09T12:00:00Z",
+                    "2026-08-09T12:05:00Z",
+                ),
+            )
         store._connection.execute(
-            "UPDATE interventions SET resume_run_id = 'substituted-run' "
+            "UPDATE interventions SET resume_run_id = ? "
             "WHERE intervention_id = ?",
-            (acknowledged.intervention_id,),
+            (
+                (
+                    "compatible-historical-fable"
+                    if mutation == "compatible_run" else "substituted-run"
+                ),
+                acknowledged.intervention_id,
+            ),
         )
     before = {
         table: tuple(tuple(row) for row in store._connection.execute(
@@ -5434,6 +5553,59 @@ def test_acknowledged_next_fable_stage_retains_and_authenticates_its_predecessor
                 acknowledged.intervention_id,
                 expected_resume_generation=acknowledged.resume_generation,
             )
+
+    assert {
+        table: tuple(tuple(row) for row in store._connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in before
+    } == before
+
+
+def test_unknown_next_fable_stage_rejects_a_compatible_substituted_predecessor_run(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """UNKNOWN cannot replace its exact owner with compatible terminal Fable history."""
+    store = SQLiteStore(
+        tmp_path / "next-unknown-compatible-predecessor.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 1)
+    store._connection.execute(
+        """
+        INSERT INTO agent_runs (
+            run_id, task_id, revision, agent, cli_session_id, started_at,
+            ended_at, exit_code, status
+        ) VALUES ('compatible-historical-fable', ?, ?, 'fable', ?, ?, ?, 0, 'completed')
+        """,
+        (
+            valid_brief.task_id,
+            valid_brief.revision,
+            "provider-1",
+            "2026-08-09T12:00:00Z",
+            "2026-08-09T12:05:00Z",
+        ),
+    )
+    store._connection.execute(
+        "UPDATE interventions SET resume_run_id = 'compatible-historical-fable' "
+        "WHERE intervention_id = ?",
+        (stage.intervention_id,),
+    )
+    before = {
+        table: tuple(tuple(row) for row in store._connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in ("tasks", "interventions", "questions", "exchange_reservations", "agent_runs")
+    }
+
+    with pytest.raises(RuntimeError, match="binding is not authenticated"):
+        store.authorize_retry_after_unknown(
+            stage.intervention_id,
+            expected_resume_generation=stage.resume_generation,
+            acknowledgment_id="compatible-predecessor-ack",
+        )
 
     assert {
         table: tuple(tuple(row) for row in store._connection.execute(

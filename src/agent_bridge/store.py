@@ -1024,6 +1024,7 @@ class _InterventionDirectedBinding:
     parent_exchange_request_key: str | None
     parent_exchange_ordinal: int | None
     next_attempt_id: str | None
+    next_predecessor_run_id: str | None
     next_run_id: str | None
     next_provider_id: str | None
     next_task_state: TaskState | None
@@ -1095,7 +1096,7 @@ class _InterventionDirectedBinding:
             raise ValueError("initial intervention directed binding cannot be nested")
         if self.kind == "nested_resume" and self.nested_parent_kind is None:
             raise ValueError("nested intervention directed binding is not nested")
-        next_identity = (
+        next_stage_identity = (
             self.next_attempt_id,
             self.next_run_id,
             self.next_provider_id,
@@ -1103,19 +1104,42 @@ class _InterventionDirectedBinding:
             self.next_continuation_state,
         )
         if self.stage == "active_question":
-            if any(value is not None for value in next_identity):
+            if any(value is not None for value in next_stage_identity):
                 raise ValueError("active intervention directed binding has a next stage")
+            if self.next_predecessor_run_id is not None:
+                if (
+                    self.kind != "nested_resume"
+                    or self.source_agent is not ConversationTarget.SOL
+                ):
+                    raise ValueError("active intervention predecessor is invalid")
+                object.__setattr__(
+                    self,
+                    "next_predecessor_run_id",
+                    _prepared_identifier(
+                        self.next_predecessor_run_id,
+                        "next_predecessor_run_id",
+                    ),
+                )
             return
         if self.kind != "nested_resume" or self.source_agent is not ConversationTarget.SOL:
             raise ValueError("next Fable intervention stage is invalid")
         if (
             self.next_attempt_id is None
+            or self.next_predecessor_run_id is None
             or self.next_run_id is None
             or self.next_provider_id is None
         ):
             raise ValueError("next Fable intervention stage identity is incomplete")
         object.__setattr__(
             self, "next_attempt_id", _prepared_identifier(self.next_attempt_id, "next_attempt_id"),
+        )
+        object.__setattr__(
+            self,
+            "next_predecessor_run_id",
+            _prepared_identifier(
+                self.next_predecessor_run_id,
+                "next_predecessor_run_id",
+            ),
         )
         object.__setattr__(
             self, "next_run_id", _prepared_identifier(self.next_run_id, "next_run_id"),
@@ -1359,14 +1383,28 @@ _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS = _PREVIOUS_INTERVENTION_DIRECTED_
     "parent_exchange_ordinal",
 }
 
-_INTERVENTION_DIRECTED_BINDING_KEYS = _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS | {
+_PRE_STAGE_WITH_PREDECESSOR_INTERVENTION_DIRECTED_BINDING_KEYS = (
+    _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS | {
+        "next_predecessor_run_id",
+    }
+)
+
+_PRE_PREDECESSOR_INTERVENTION_DIRECTED_BINDING_KEYS = (
+    _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS | {
     "stage",
     "next_attempt_id",
     "next_run_id",
     "next_provider_id",
     "next_task_state",
     "next_continuation_state",
-}
+    }
+)
+
+_INTERVENTION_DIRECTED_BINDING_KEYS = (
+    _PRE_PREDECESSOR_INTERVENTION_DIRECTED_BINDING_KEYS | {
+        "next_predecessor_run_id",
+    }
+)
 
 
 def _encode_intervention_directed_binding(
@@ -1395,6 +1433,7 @@ def _encode_intervention_directed_binding(
         "parent_exchange_request_key": binding.parent_exchange_request_key,
         "parent_exchange_ordinal": binding.parent_exchange_ordinal,
         "next_attempt_id": binding.next_attempt_id,
+        "next_predecessor_run_id": binding.next_predecessor_run_id,
         "next_run_id": binding.next_run_id,
         "next_provider_id": binding.next_provider_id,
         "next_task_state": (
@@ -1442,6 +1481,7 @@ def _decode_intervention_directed_binding(
             parent_exchange_request_key=value["parent_exchange_request_key"],
             parent_exchange_ordinal=value["parent_exchange_ordinal"],
             next_attempt_id=value["next_attempt_id"],
+            next_predecessor_run_id=value["next_predecessor_run_id"],
             next_run_id=value["next_run_id"],
             next_provider_id=value["next_provider_id"],
             next_task_state=(
@@ -2089,6 +2129,37 @@ class SQLiteStore:
             if set(value) == _INTERVENTION_DIRECTED_BINDING_KEYS:
                 _decode_intervention_directed_binding(raw)
                 return True
+            if set(value) == _PRE_PREDECESSOR_INTERVENTION_DIRECTED_BINDING_KEYS:
+                predecessor_run_id = (
+                    None
+                    if value["stage"] == "active_question"
+                    else record.resume_run_id
+                )
+                upgraded = {
+                    **value,
+                    "next_predecessor_run_id": predecessor_run_id,
+                }
+                binding = _decode_intervention_directed_binding(_encode_json(upgraded))
+                if binding is None:
+                    raise RuntimeError("intervention directed binding is missing")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE interventions SET directed_binding_json = ?
+                    WHERE rowid = ? AND directed_binding_json = ?
+                    """,
+                    (_encode_intervention_directed_binding(binding), int(row["rowid"]), raw),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention directed binding migration changed")
+                return True
+            if set(value) == _PRE_STAGE_WITH_PREDECESSOR_INTERVENTION_DIRECTED_BINDING_KEYS:
+                if value["next_predecessor_run_id"] != record.resume_run_id:
+                    raise RuntimeError("intervention directed binding predecessor changed")
+                value = {
+                    key: item
+                    for key, item in value.items()
+                    if key != "next_predecessor_run_id"
+                }
             if set(value) == _PRE_STAGE_INTERVENTION_DIRECTED_BINDING_KEYS:
                 question_id = _prepared_identifier(value["question_id"], "question_id")
                 question = self.question(question_id)
@@ -2098,6 +2169,7 @@ class SQLiteStore:
                     **value,
                     "stage": "active_question",
                     "next_attempt_id": None,
+                    "next_predecessor_run_id": None,
                     "next_run_id": None,
                     "next_provider_id": None,
                     "next_task_state": None,
@@ -2150,6 +2222,7 @@ class SQLiteStore:
                 "parent_exchange_ordinal": parent_ordinal,
                 "stage": "active_question",
                 "next_attempt_id": None,
+                "next_predecessor_run_id": None,
                 "next_run_id": None,
                 "next_provider_id": None,
                 "next_task_state": None,
@@ -2404,17 +2477,44 @@ class SQLiteStore:
             """
             SELECT * FROM agent_runs
             WHERE task_id = ? AND revision = ? AND agent = 'fable'
+              AND cli_session_id = ? AND status = ?
+              AND datetime(started_at) >= datetime(?)
               AND run_id != ? AND (? IS NULL OR run_id != ?)
             ORDER BY rowid LIMIT 2
             """,
             (
                 record.task_id,
                 record.revision,
+                task.fable_session_id,
+                expected_successor_status,
+                record.created_at,
                 record.run_id,
                 record.resume_run_id,
                 record.resume_run_id,
             ),
         ).fetchall()
+        conflicting_successor = self._connection.execute(
+            """
+            SELECT 1 FROM agent_runs
+            WHERE task_id = ? AND revision = ? AND agent = 'fable'
+              AND datetime(started_at) >= datetime(?)
+              AND run_id != ? AND (? IS NULL OR run_id != ?)
+              AND (cli_session_id != ? OR status != ?)
+            LIMIT 1
+            """,
+            (
+                record.task_id,
+                record.revision,
+                record.created_at,
+                record.run_id,
+                record.resume_run_id,
+                record.resume_run_id,
+                task.fable_session_id,
+                expected_successor_status,
+            ),
+        ).fetchone()
+        if conflicting_successor is not None:
+            raise RuntimeError("answered nested intervention successor changed")
         if len(successor_rows) > 1:
             raise RuntimeError("answered nested intervention successor is ambiguous")
         if successor_rows:
@@ -2452,6 +2552,7 @@ class SQLiteStore:
             binding,
             stage="next_fable",
             next_attempt_id=record.resume_attempt_id,
+            next_predecessor_run_id=record.resume_run_id,
             next_run_id=next_run_id,
             next_provider_id=task.fable_session_id,
             next_task_state=next_task_state,
@@ -3064,6 +3165,10 @@ class SQLiteStore:
         event: ConversationEnvelope,
         intervention_id: str | None = None,
         child_run_id: str | None = None,
+        completed_next_fable_intervention_id: str | None = None,
+        completed_next_fable_run_id: str | None = None,
+        completed_next_fable_exit_code: int | None = None,
+        clarification: FableClarification | None = None,
     ) -> tuple[ExchangeReservation, QuestionRecord]:
         """Reserve Fable's one Sol evidence question under one paused Sol question."""
         return self._reserve_nested_fable_evidence_question(
@@ -3072,6 +3177,10 @@ class SQLiteStore:
             request_key=request_key, text=text, event=event,
             parent_kind="question", outer_question_id=outer_question_id,
             intervention_id=intervention_id, child_run_id=child_run_id,
+            completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+            completed_next_fable_run_id=completed_next_fable_run_id,
+            completed_next_fable_exit_code=completed_next_fable_exit_code,
+            clarification=clarification,
         )
 
     def _reserve_nested_fable_evidence_question(
@@ -3358,6 +3467,7 @@ class SQLiteStore:
                         continuation_pause_id=pause_id,
                         continuation_state=TaskState.FABLE_CLARIFYING,
                         source_run=self.agent_run(child_run_id),
+                        next_predecessor_run_id=intervention.resume_run_id,
                     )
                     binding_cursor = self._connection.execute(
                         """
@@ -3534,6 +3644,20 @@ class SQLiteStore:
                 if intervention is not None and binding is not None and owns_nested_child:
                     if task.fable_session_id is None:
                         raise RuntimeError("nested intervention next Fable provider is missing")
+                    current_source = self.agent_run(intervention.resume_run_id)
+                    if current_source.agent == ConversationTarget.SOL.value:
+                        if (
+                            current_source.task_id != task_id
+                            or current_source.revision != revision
+                            or current_source.cli_session_id != task.sol_thread_id
+                            or current_source.status not in _TERMINAL_RUN_STATUSES
+                        ):
+                            raise RuntimeError("nested intervention retry source changed")
+                        next_source = current_source
+                    else:
+                        next_source = self.agent_run(binding.source_run_id)
+                        if next_source.status not in _TERMINAL_RUN_STATUSES:
+                            raise RuntimeError("nested intervention source changed")
                     self._preallocate_next_fable_intervention_run(
                         run_id=next_fable_run_id,
                         task_id=task_id,
@@ -3544,7 +3668,13 @@ class SQLiteStore:
                         binding,
                         stage="next_fable",
                         question_generation=question.continuation_generation,
+                        source_run_id=next_source.run_id,
+                        source_provider_id=next_source.cli_session_id,
                         next_attempt_id=intervention.resume_attempt_id,
+                        next_predecessor_run_id=(
+                            binding.next_predecessor_run_id
+                            or intervention.resume_run_id
+                        ),
                         next_run_id=next_fable_run_id,
                         next_provider_id=task.fable_session_id,
                         next_task_state=(
@@ -3872,6 +4002,10 @@ class SQLiteStore:
         expected_generation: int,
         attempted_question: DirectedAgentQuestion,
         event: ConversationEnvelope,
+        completed_next_fable_intervention_id: str | None = None,
+        completed_next_fable_run_id: str | None = None,
+        completed_next_fable_exit_code: int | None = None,
+        clarification: FableClarification | None = None,
     ) -> TaskRecord:
         """Persist the one grantable nested-clarification pause without changing parent."""
         session_id, task_id, revision, expected_generation = self._directed_identity(
@@ -3886,6 +4020,23 @@ class SQLiteStore:
             event=event, task_id=task_id, revision=revision,
             expected_generation=expected_generation,
         )
+        if (completed_next_fable_intervention_id is None) != (completed_next_fable_run_id is None):
+            raise ValueError("next Fable completion identity is incomplete")
+        if completed_next_fable_intervention_id is not None:
+            completed_next_fable_intervention_id = _prepared_identifier(
+                completed_next_fable_intervention_id, "completed_next_fable_intervention_id",
+            )
+            completed_next_fable_run_id = _prepared_identifier(
+                completed_next_fable_run_id, "completed_next_fable_run_id",
+            )
+            if completed_next_fable_exit_code is not None:
+                completed_next_fable_exit_code = _require_integer(
+                    completed_next_fable_exit_code, "completed_next_fable_exit_code",
+                )
+            if not isinstance(clarification, FableClarification):
+                raise ValueError("next Fable completion clarification is invalid")
+        elif clarification is not None or completed_next_fable_exit_code is not None:
+            raise ValueError("next Fable completion is incomplete")
         emitted: list[StreamEvent] = []
         with self._event_listener_lock:
             with self._immediate_transaction():
@@ -3894,6 +4045,18 @@ class SQLiteStore:
                     expected_generation=expected_generation,
                 )
                 self._require_nested_agent_identity(task)
+                completed_stage: InterventionRecord | None = None
+                if completed_next_fable_intervention_id is not None:
+                    completed_stage = self._validated_next_fable_intervention_stage(
+                        completed_next_fable_intervention_id,
+                        run_id=completed_next_fable_run_id,
+                    )
+                    if (
+                        completed_stage.task_id != task_id
+                        or completed_stage.revision != revision
+                        or completed_stage.session_id != session_id
+                    ):
+                        raise RuntimeError("next Fable completion changed")
                 if (
                     task.state is not TaskState.FABLE_CLARIFYING
                     or task.continuation_state not in {None, TaskState.SOL_RUNNING}
@@ -3934,6 +4097,15 @@ class SQLiteStore:
                 emitted.append(self._insert_conversation_event_in_transaction(
                     session_id=session_id, task_id=task_id, event=event,
                 ))
+                if completed_stage is not None:
+                    emitted.append(self._insert_event_in_transaction(
+                        session_id, task_id, "fable", "clarification", clarification.to_dict(),
+                    ))
+                    self._complete_validated_next_fable_intervention_stage(
+                        completed_stage,
+                        run_id=completed_next_fable_run_id,
+                        exit_code=completed_next_fable_exit_code,
+                    )
             self._publish_committed_events(emitted)
         return self.get_task(task_id, revision)
 
@@ -3941,6 +4113,10 @@ class SQLiteStore:
         self, *, session_id: str, task_id: str, revision: int,
         expected_generation: int, outer_question_id: str,
         attempted_question: DirectedAgentQuestion, event: ConversationEnvelope,
+        completed_next_fable_intervention_id: str | None = None,
+        completed_next_fable_run_id: str | None = None,
+        completed_next_fable_exit_code: int | None = None,
+        clarification: FableClarification | None = None,
     ) -> TaskRecord:
         """Pause one exact outer Sol question before Fable can seek Sol evidence."""
         session_id, task_id, revision, expected_generation = self._directed_identity(
@@ -3950,10 +4126,39 @@ class SQLiteStore:
         if not isinstance(attempted_question, DirectedAgentQuestion) or attempted_question.addressed_to != "sol":
             raise ValueError("nested attempted question is invalid")
         self._validate_permission_event_binding(event=event, task_id=task_id, revision=revision, expected_generation=expected_generation)
+        if (completed_next_fable_intervention_id is None) != (completed_next_fable_run_id is None):
+            raise ValueError("next Fable completion identity is incomplete")
+        if completed_next_fable_intervention_id is not None:
+            completed_next_fable_intervention_id = _prepared_identifier(
+                completed_next_fable_intervention_id, "completed_next_fable_intervention_id",
+            )
+            completed_next_fable_run_id = _prepared_identifier(
+                completed_next_fable_run_id, "completed_next_fable_run_id",
+            )
+            if completed_next_fable_exit_code is not None:
+                completed_next_fable_exit_code = _require_integer(
+                    completed_next_fable_exit_code, "completed_next_fable_exit_code",
+                )
+            if not isinstance(clarification, FableClarification):
+                raise ValueError("next Fable completion clarification is invalid")
+        elif clarification is not None or completed_next_fable_exit_code is not None:
+            raise ValueError("next Fable completion is incomplete")
         emitted: list[StreamEvent] = []
         with self._event_listener_lock:
             with self._immediate_transaction():
                 task = self._directed_task_exact(session_id=session_id, task_id=task_id, revision=revision, expected_generation=expected_generation)
+                completed_stage: InterventionRecord | None = None
+                if completed_next_fable_intervention_id is not None:
+                    completed_stage = self._validated_next_fable_intervention_stage(
+                        completed_next_fable_intervention_id,
+                        run_id=completed_next_fable_run_id,
+                    )
+                    if (
+                        completed_stage.task_id != task_id
+                        or completed_stage.revision != revision
+                        or completed_stage.session_id != session_id
+                    ):
+                        raise RuntimeError("next Fable completion changed")
                 outer, outer_state, pending, outer_pause_id = self._question_exact(
                     session_id=session_id, task_id=task_id, revision=revision,
                     expected_generation=expected_generation, question_id=outer_question_id,
@@ -3986,6 +4191,15 @@ class SQLiteStore:
                     (permission_id, session_id, task_id, revision, expected_generation, pause_id),
                 )
                 emitted.append(self._insert_conversation_event_in_transaction(session_id=session_id, task_id=task_id, event=event))
+                if completed_stage is not None:
+                    emitted.append(self._insert_event_in_transaction(
+                        session_id, task_id, "fable", "clarification", clarification.to_dict(),
+                    ))
+                    self._complete_validated_next_fable_intervention_stage(
+                        completed_stage,
+                        run_id=completed_next_fable_run_id,
+                        exit_code=completed_next_fable_exit_code,
+                    )
             self._publish_committed_events(emitted)
         return self.get_task(task_id, revision)
 
@@ -8226,13 +8440,30 @@ class SQLiteStore:
             raise RuntimeError("intervention not found")
         binding = record.directed_binding
         task = self.get_task(record.task_id, record.revision)
+        parent = (
+            None
+            if binding is None or binding.parent_question_id is None
+            else self.question(binding.parent_question_id)
+        )
+        post_answer_scope_handoff = (
+            parent is not None
+            and parent.answer_text is not None
+            and parent.answered_by is ConversationActor.FABLE
+            and task.state is record.continuation_state
+            and task.continuation_state is None
+        )
         if (
             binding is None
             or binding.stage != "next_fable"
             or binding.next_run_id != run_id
             or binding.next_attempt_id != record.resume_attempt_id
-            or task.state is not binding.next_task_state
-            or task.continuation_state is not binding.next_continuation_state
+            or (
+                not post_answer_scope_handoff
+                and (
+                    task.state is not binding.next_task_state
+                    or task.continuation_state is not binding.next_continuation_state
+                )
+            )
             or record.status is not InterventionStatus.RESUMING
         ):
             raise RuntimeError("nested intervention next Fable stage changed")
@@ -9406,6 +9637,7 @@ class SQLiteStore:
         continuation_state: TaskState,
         source_run: AgentRunRecord,
         next_attempt_id: str | None = None,
+        next_predecessor_run_id: str | None = None,
         next_run_id: str | None = None,
         next_provider_id: str | None = None,
         next_task_state: TaskState | None = None,
@@ -9453,6 +9685,7 @@ class SQLiteStore:
             parent_exchange_request_key=parent_request_key,
             parent_exchange_ordinal=parent_ordinal,
             next_attempt_id=next_attempt_id,
+            next_predecessor_run_id=next_predecessor_run_id,
             next_run_id=next_run_id,
             next_provider_id=next_provider_id,
             next_task_state=next_task_state,
@@ -9555,6 +9788,7 @@ class SQLiteStore:
             continuation_pause_id=pause,
             continuation_state=continuation,
             source_run=active,
+            next_predecessor_run_id=record.resume_run_id,
         )
         cursor = self._connection.execute(
             """
@@ -10227,6 +10461,25 @@ class SQLiteStore:
         )
         if expected_provider != binding.source_provider_id:
             return False
+        if binding.next_predecessor_run_id is not None:
+            predecessor_row = self._connection.execute(
+                "SELECT * FROM agent_runs WHERE run_id = ?",
+                (binding.next_predecessor_run_id,),
+            ).fetchone()
+            if predecessor_row is None:
+                return False
+            try:
+                predecessor = self._agent_run_from_row(predecessor_row)
+            except RuntimeError:
+                return False
+            if (
+                predecessor.task_id != record.task_id
+                or predecessor.revision != record.revision
+                or predecessor.agent != ConversationTarget.FABLE.value
+                or predecessor.cli_session_id != record.fable_session_id
+                or predecessor.status not in _TERMINAL_RUN_STATUSES
+            ):
+                return False
         if not self._intervention_reservation_is_authenticated(
             record=record,
             question=question,
@@ -10250,6 +10503,7 @@ class SQLiteStore:
             or binding.source_run_id == record.resume_run_id
         ):
             return False
+        post_answer_scope_handoff = False
         if binding.parent_question_id is not None:
             parent = self.question(binding.parent_question_id)
             if (
@@ -10299,11 +10553,11 @@ class SQLiteStore:
             or record.routed_to is not ConversationTarget.FABLE
             or record.continuation_state not in _SOL_TASK_STATES
             or binding.continuation_state is not TaskState.FABLE_CLARIFYING
-            or binding.source_run_id == record.resume_run_id
             or binding.next_provider_id != record.fable_session_id
             or binding.next_provider_id != task.fable_session_id
             or binding.next_run_id is None
             or binding.next_attempt_id is None
+            or binding.next_predecessor_run_id is None
             or binding.next_task_state is None
         ):
             return False
@@ -10371,6 +10625,7 @@ class SQLiteStore:
             expected_generation=binding.question_generation,
         ):
             return False
+        post_answer_scope_handoff = False
         if binding.parent_question_id is not None:
             try:
                 parent, _, _, parent_pause = self._question_exact(
@@ -10387,8 +10642,19 @@ class SQLiteStore:
                 and parent.answer_text is not None
                 and parent.answered_by is ConversationActor.FABLE
             )
+            post_answer_scope_handoff = (
+                record.status is InterventionStatus.RESUMING
+                and parent.answer_text is not None
+                and parent.answered_by is ConversationActor.FABLE
+                and task.state is record.continuation_state
+                and task.continuation_state is None
+            )
             if (
-                (parent.answer_text is not None and not parent_is_terminal_answer)
+                (
+                    parent.answer_text is not None
+                    and not parent_is_terminal_answer
+                    and not post_answer_scope_handoff
+                )
                 or parent.continuation_generation != binding.question_generation
                 or parent_pause != binding.parent_continuation_pause_id
                 or not self._intervention_reservation_is_authenticated(
@@ -10417,24 +10683,30 @@ class SQLiteStore:
             or successor.cli_session_id != binding.next_provider_id
         ):
             return False
-        if record.status is InterventionStatus.READY and acknowledgment_id is not None:
-            if record.resume_attempt_id is None or record.resume_run_id is None:
-                return False
-            predecessor_row = self._connection.execute(
-                "SELECT * FROM agent_runs WHERE run_id = ?", (record.resume_run_id,),
-            ).fetchone()
-            if predecessor_row is None:
-                return False
-            try:
-                predecessor = self._agent_run_from_row(predecessor_row)
-            except RuntimeError:
-                return False
-            if (
-                predecessor.task_id != record.task_id
-                or predecessor.revision != record.revision
-                or predecessor.agent != ConversationTarget.FABLE.value
-                or predecessor.cli_session_id != record.fable_session_id
-                or predecessor.status not in _TERMINAL_RUN_STATUSES
+        predecessor_row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?",
+            (binding.next_predecessor_run_id,),
+        ).fetchone()
+        if predecessor_row is None:
+            return False
+        try:
+            predecessor = self._agent_run_from_row(predecessor_row)
+        except RuntimeError:
+            return False
+        if (
+            predecessor.task_id != record.task_id
+            or predecessor.revision != record.revision
+            or predecessor.agent != ConversationTarget.FABLE.value
+            or predecessor.cli_session_id != record.fable_session_id
+        ):
+            return False
+        if record.resume_run_id != binding.next_run_id:
+            if record.resume_run_id == binding.next_predecessor_run_id:
+                if predecessor.status not in _TERMINAL_RUN_STATUSES:
+                    return False
+            elif (
+                record.resume_run_id != binding.source_run_id
+                or source.status not in _TERMINAL_RUN_STATUSES
             ):
                 return False
         resumed_continuation = (
@@ -10443,6 +10715,8 @@ class SQLiteStore:
         if record.status is InterventionStatus.RESUMING:
             if task.state is TaskState.INTERRUPTED:
                 return task.continuation_state is resumed_continuation
+            if post_answer_scope_handoff:
+                return True
             return (
                 task.state is binding.next_task_state
                 and task.continuation_state is binding.next_continuation_state

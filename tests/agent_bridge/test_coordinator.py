@@ -5238,6 +5238,208 @@ def test_next_fable_handoff_persists_one_normal_sol_continuation_before_spawn(
 
 
 @pytest.mark.parametrize(
+    "branch", ("permission", "reservation", "scope"),
+)
+def test_next_fable_outer_branch_consumes_its_stage_before_crash(
+    harness: CoordinatorHarness,
+    branch: str,
+) -> None:
+    """Each outer next-Fable branch commits its result with the staged terminalization."""
+    async def scenario() -> None:
+        crash_database = harness.database.with_name(f"outer-{branch}-branch.sqlite3")
+        source_started = asyncio.Event()
+        source_released = asyncio.Event()
+        outer_text = "Which exact approved constraint applies?"
+        child_text = "Which focused test proves that constraint?"
+        followup_text = "Which exact downstream fact is still needed?"
+        followup = DirectedAgentQuestion(
+            addressed_to="sol",
+            text=followup_text,
+            reason="Fable needs one exact downstream fact.",
+        )
+        revised = replace(
+            harness.fable.brief,
+            revision=2,
+            allowed_paths=("bridge-output.txt", "scope-extra.txt"),
+        )
+        (harness.repo / "scope-extra.txt").write_text("scope fixture\n", encoding="utf-8")
+        final = (
+            _answer(
+                "I need one exact downstream fact.",
+                False,
+                directed_question=followup,
+            )
+            if branch in {"permission", "reservation"}
+            else _answer("Add the explicitly bounded scope path.", True, revised_brief=revised)
+        )
+        harness.sol.queue(_directed_sol_question(outer_text))
+        harness.sol.queue(_completed(summary="The focused test proves it."))
+        harness.fable.hold_answer_sol_question = source_released
+        harness.fable.on_answer_sol_question = source_started.set
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(
+            harness.coordinator.approve_task("task-1", revision=1)
+        )
+        await source_started.wait()
+        task = harness.store.get_task("task-1", 1)
+        source = harness.store.active_run_for_task("task-1", 1)
+        assert source is not None and source.agent == "fable"
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe,
+                sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(
+            project_id=runtime.project_id,
+            session_id="session-1",
+            task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id,
+            session_id="session-1",
+            task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id=f"outer-{branch}-branch",
+                message="Keep the original question bounded.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=1,
+                continuation_generation=task.continuation_generation,
+            ),
+        )
+        harness.runner.release_on_stop = source_released
+        harness.fable.hold_answer_sol_question = None
+
+        def exhaust_on_final_fable_answer() -> None:
+            if len(harness.fable.answer_sol_question_run_ids) == 3:
+                staged = harness.store.intervention(prepared.record.intervention_id)
+                assert staged is not None
+                assert staged.status is store_module.InterventionStatus.RESUMING
+                assert staged.directed_binding is not None
+                assert staged.directed_binding.stage == "next_fable"
+                assert staged.directed_binding.next_run_id == (
+                    harness.fable.answer_sol_question_run_ids[-1]
+                )
+            if branch == "permission" and len(harness.fable.answer_sol_question_run_ids) == 3:
+                harness.store._connection.execute(
+                    "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+                    ("task-1", 1),
+                )
+
+        harness.fable.on_answer_sol_question = exhaust_on_final_fable_answer
+        harness.fable.next_clarifications.extend((
+            _answer(
+                "I need one focused test before answering.",
+                False,
+                directed_question=DirectedAgentQuestion(
+                    addressed_to="sol",
+                    text=child_text,
+                    reason="Fable needs one exact evidence fact.",
+                ),
+            ),
+            final,
+        ))
+
+        def capture_after_branch() -> None:
+            terminal = harness.store.intervention(prepared.record.intervention_id)
+            assert terminal is not None
+            assert terminal.status is store_module.InterventionStatus.RESUMED
+            events = tuple(
+                event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "clarification" and event.actor == "fable"
+            )
+            assert len(events) == 1
+            if branch == "permission":
+                paused = harness.store.get_task("task-1", 1)
+                assert paused.state is TaskState.AWAITING_USER_INPUT
+                assert paused.pending is not None
+                assert paused.pending["attempted_question"] == followup.to_dict()
+            elif branch == "reservation":
+                nested_rows = harness.store._connection.execute(
+                    "SELECT question_id FROM questions WHERE task_id = ? AND revision = ? AND text = ?",
+                    ("task-1", 1, followup_text),
+                ).fetchall()
+                assert len(nested_rows) == 1
+            else:
+                saved = harness.store.latest_task("task-1")
+                assert saved is not None
+                assert saved.revision == 2
+                assert saved.state is TaskState.AWAITING_SCOPE_APPROVAL
+            harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+            copied = sqlite3.connect(crash_database)
+            harness.store._connection.backup(copied)
+            copied.close()
+            raise RuntimeError("controlled crash after outer next-Fable branch CAS")
+
+        if branch == "permission":
+            original_pause = harness.store.pause_fable_answer_evidence_permission
+
+            def crash_after_pause(**kwargs: object) -> object:
+                result = original_pause(**kwargs)
+                capture_after_branch()
+                return result
+
+            harness.store.pause_fable_answer_evidence_permission = crash_after_pause  # type: ignore[method-assign]
+        elif branch == "reservation":
+            original_reserve = harness.store.reserve_fable_answer_evidence_question
+
+            def crash_after_reservation(**kwargs: object) -> object:
+                result = original_reserve(**kwargs)
+                if kwargs["completed_next_fable_intervention_id"] is not None:
+                    capture_after_branch()
+                return result
+
+            harness.store.reserve_fable_answer_evidence_question = crash_after_reservation  # type: ignore[method-assign]
+        else:
+            original_scope = harness.store.save_scope_revision
+
+            def crash_after_scope(*args: object, **kwargs: object) -> object:
+                result = original_scope(*args, **kwargs)
+                capture_after_branch()
+                return result
+
+            harness.store.save_scope_revision = crash_after_scope  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="controlled crash after outer next-Fable branch CAS"):
+            await workflows.continue_intervention(prepared)
+        await approval
+        assert lease.snapshot() is None
+        harness.tracker.close()
+        harness.store.close()
+
+        recovered = SQLiteStore(crash_database, clock=lambda: "2026-08-10T12:00:00Z")
+        assert recovered.recover_active_tasks().tasks_interrupted == 0
+        terminal = recovered.authenticated_intervention(prepared.record.intervention_id)
+        assert terminal is not None
+        assert terminal.status is store_module.InterventionStatus.RESUMED
+        assert len(tuple(
+            event for event in recovered.events_after("session-1", 0)
+            if event.kind == "clarification" and event.actor == "fable"
+        )) == 1
+        recovered.audit_legacy_project_ownership(str(harness.repo))
+        recovered.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
     "crash_boundary", ("before_outer_answer_cas", "after_outer_answer_cas"),
 )
 def test_next_fable_outer_answer_is_not_terminal_before_its_answer_cas(
@@ -5486,7 +5688,7 @@ def test_next_fable_outer_answer_is_not_terminal_before_its_answer_cas(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("outcome", ("directed", "escalation", "scope"))
+@pytest.mark.parametrize("outcome", ("directed", "escalation", "scope", "permission"))
 def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durable(
     harness: CoordinatorHarness,
     outcome: str,
@@ -5512,7 +5714,7 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
             allowed_paths=("bridge-output.txt", "scope-extra.txt"),
         )
         (harness.repo / "scope-extra.txt").write_text("scope fixture\n", encoding="utf-8")
-        if outcome == "directed":
+        if outcome in {"directed", "permission"}:
             second_clarification = _answer(
                 "I need one exact downstream fact.",
                 False,
@@ -5585,6 +5787,26 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
             ),
         )
         harness.sol.hold_resume = None
+        if outcome == "permission":
+            original_start_next_fable_stage = (
+                harness.store.start_next_fable_intervention_stage
+            )
+
+            def exhaust_after_starting_next_fable_stage(
+                intervention_id: str, *, run_id: str,
+            ) -> store_module.AgentRunRecord:
+                started = original_start_next_fable_stage(
+                    intervention_id, run_id=run_id,
+                )
+                if intervention_id == "next-directed-outcome":
+                    harness.store._connection.execute(
+                        "UPDATE tasks SET exchange_allowance = 0 "
+                        "WHERE task_id = ? AND revision = ?",
+                        ("task-1", 1),
+                    )
+                return started
+
+            harness.store.start_next_fable_intervention_stage = exhaust_after_starting_next_fable_stage  # type: ignore[method-assign]
         original_route = harness.coordinator._route_clarification
 
         async def route_after_accepted_result(*args: object, **kwargs: object) -> None:
@@ -5620,6 +5842,19 @@ def test_next_fable_result_stays_resuming_until_its_outcome_and_event_are_durabl
                 assert task.state is TaskState.AWAITING_USER_INPUT
                 assert task.continuation_state is TaskState.FABLE_CLARIFYING
                 assert nested.answer_text is None
+                matching_events = tuple(
+                    event for event in harness.store.events_after("session-1", 0)
+                    if event.kind == "clarification"
+                    and event.actor == "fable"
+                    and event.payload.get("directed_question", {}).get("text")
+                    == second_directed.text
+                )
+            elif outcome == "permission":
+                task = harness.store.get_task("task-1", 1)
+                assert task.state is TaskState.AWAITING_USER_INPUT
+                assert task.continuation_state is TaskState.FABLE_CLARIFYING
+                assert task.pending is not None
+                assert task.pending["attempted_question"] == second_directed.to_dict()
                 matching_events = tuple(
                     event for event in harness.store.events_after("session-1", 0)
                     if event.kind == "clarification"
