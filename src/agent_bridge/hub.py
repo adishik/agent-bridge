@@ -540,7 +540,7 @@ class HubWorkflowOrchestrator:
         )
 
     async def continue_intervention(self, prepared: PreparedIntervention) -> None:
-        """Continue the committed stop while its sole lease remains pinned."""
+        """Stop, freshly gate, and dispatch one durable intervention while leased."""
         if not isinstance(prepared, PreparedIntervention):
             raise ValueError("prepared must be a PreparedIntervention")
         if self._lease.snapshot() != prepared.lease_token:
@@ -548,7 +548,39 @@ class HubWorkflowOrchestrator:
         runtime = self._runtime_for_session(
             prepared.lease_token.project_id, prepared.lease_token.session_id,
         )
-        await runtime.coordinator.continue_intervention(prepared.record.intervention_id)
+        release = prepared.lease_origin is InterventionLeaseOrigin.RECOVERY_ACQUIRED
+        try:
+            await runtime.coordinator.continue_intervention(prepared.record.intervention_id)
+            current = runtime.store.authenticated_intervention(
+                prepared.record.intervention_id,
+            )
+            if current is None or current.status is InterventionStatus.CANCELED_BY_STOP:
+                release = True
+                return
+            if current.status is not InterventionStatus.READY:
+                return
+            release = True
+            try:
+                await runtime.readiness.require_model_start_ready(
+                    usage_credits_acknowledged=self._usage_credits_acknowledged(),
+                )
+            except RuntimeError:
+                runtime.store.append_event(
+                    current.session_id, current.task_id, "coordinator", "intervention_waiting",
+                    {"status": "runtime_unavailable"},
+                )
+                return
+            current = runtime.store.authenticated_intervention(
+                prepared.record.intervention_id,
+            )
+            if current is None or current.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            if current.status is not InterventionStatus.READY:
+                raise RuntimeError("intervention readiness changed")
+            await runtime.coordinator.dispatch_ready_intervention(current.intervention_id)
+        finally:
+            if release and self._lease.snapshot() == prepared.lease_token:
+                self._lease.release(prepared.lease_token)
 
     def abort_prepared_intervention(
         self, prepared: PreparedIntervention, *, reason: str,

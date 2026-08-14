@@ -4611,6 +4611,7 @@ class SQLiteStore:
             if task.pending is not None and (
                 task.continuation_state is not record.active_state
                 or "sol_run_id" in task.pending
+                or isinstance(task.pending.get("intervention"), Mapping)
             ):
                 pending = task.pending
             else:
@@ -6084,6 +6085,66 @@ class SQLiteStore:
                 raise RuntimeError("task state changed concurrently")
         return self.get_task(task_id, revision)
 
+    def interrupt_directed_answer_for_stop(
+        self, task_id: str, revision: int, *, run_id: str,
+    ) -> TaskRecord:
+        """Interrupt only an in-flight routed answer without consuming its pause."""
+        task_id = _require_string(task_id, "task_id")
+        revision = _require_integer(revision, "revision")
+        run_id = _prepared_identifier(run_id, "run_id")
+        with self._immediate_transaction():
+            task = self.get_task(task_id, revision)
+            question = self._unanswered_question_for_task(task_id, revision)
+            if (
+                task.state is not TaskState.AWAITING_USER_INPUT
+                or task.continuation_state not in _ACTIVE_TASK_STATES
+                or question is None
+                or question.routed_to not in {
+                    ConversationTarget.FABLE, ConversationTarget.SOL,
+                }
+                or question.continuation_generation != task.continuation_generation
+            ):
+                raise RuntimeError("directed answer identity changed")
+            source = self.agent_run(run_id)
+            if (
+                source.task_id != task_id
+                or source.revision != revision
+                or source.status != "running"
+                or source.agent != question.routed_to.value
+            ):
+                raise RuntimeError("directed answer identity changed")
+            _, continuation, pending, question_pause = self._question_exact(
+                session_id=task.session_id, task_id=task_id, revision=revision,
+                expected_generation=task.continuation_generation,
+                question_id=question.question_id,
+            )
+            pause = self._directed_pause_id(
+                session_id=task.session_id, task_id=task_id, revision=revision,
+                expected_generation=task.continuation_generation,
+            )
+            if (
+                continuation is not task.continuation_state
+                or pending != task.pending
+                or pause != question_pause
+            ):
+                raise RuntimeError("directed answer identity changed")
+            cursor = self._connection.execute(
+                """
+                UPDATE tasks SET state = ?
+                WHERE task_id = ? AND revision = ? AND state = ?
+                  AND continuation_state = ? AND continuation_generation = ?
+                  AND pending_json = ? AND continuation_pause_id = ?
+                """,
+                (
+                    TaskState.INTERRUPTED.value, task_id, revision,
+                    TaskState.AWAITING_USER_INPUT.value, continuation.value,
+                    task.continuation_generation, _encode_json(task.pending), pause,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("directed answer identity changed")
+        return self.get_task(task_id, revision)
+
     def interrupt_fable_login_expired(
         self,
         *,
@@ -6777,6 +6838,39 @@ class SQLiteStore:
         ).fetchone()
         return None if row is None else self._intervention_from_row(row)
 
+    def authenticated_intervention(self, intervention_id: str) -> InterventionRecord | None:
+        """Return one intervention only when its current durable binding is intact."""
+        row = self._connection.execute(
+            "SELECT * FROM interventions WHERE intervention_id = ?",
+            (_prepared_identifier(intervention_id, "intervention_id"),),
+        ).fetchone()
+        if row is None:
+            return None
+        record = self._intervention_from_row(row)
+        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+            raise RuntimeError("intervention binding is not authenticated")
+        return record
+
+    def active_intervention_for_task(
+        self, task_id: str, revision: int,
+    ) -> InterventionRecord | None:
+        """Return the sole Stop-capable intervention for one exact task revision."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM interventions
+            WHERE task_id = ? AND revision = ?
+              AND status IN ('pending_stop', 'ready', 'resuming')
+            ORDER BY created_at DESC, intervention_id DESC LIMIT 1
+            """,
+            (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
+        ).fetchone()
+        if row is None:
+            return None
+        record = self._intervention_from_row(row)
+        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+            raise RuntimeError("intervention binding is not authenticated")
+        return record
+
     def create_intervention_and_request_stop(
         self,
         *,
@@ -7059,6 +7153,122 @@ class SQLiteStore:
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention resume claim changed concurrently")
         return self._intervention_required(intervention_id)
+
+    def begin_intervention_resume(
+        self,
+        intervention_id: str,
+        *,
+        expected_resume_generation: int,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> TaskRecord:
+        """Claim one ready intervention and restore only its persisted continuation."""
+        intervention_id = _prepared_identifier(intervention_id, "intervention_id")
+        expected_resume_generation = _require_integer(
+            expected_resume_generation, "expected_resume_generation",
+        )
+        resume_attempt_id = _prepared_identifier(resume_attempt_id, "resume_attempt_id")
+        resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
+        with self._immediate_transaction():
+            record = self._intervention_required(intervention_id)
+            row = self._connection.execute(
+                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+                (intervention_id,),
+            ).fetchone()
+            if (
+                record.resume_generation != expected_resume_generation
+                or record.status is not InterventionStatus.READY
+                or not self._intervention_is_authenticated(
+                    record, None if row is None else row["acknowledgment_id"],
+                )
+            ):
+                raise RuntimeError("intervention is not ready to resume")
+            task = self.get_task(record.task_id, record.revision)
+            directed_answer = record.resume_generation == record.source_generation
+            if directed_answer:
+                question = self._unanswered_question_for_task(record.task_id, record.revision)
+                if (
+                    question is None
+                    or task.state is not TaskState.INTERRUPTED
+                    or task.continuation_state is not record.continuation_state
+                ):
+                    raise RuntimeError("intervention directed answer changed")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                      AND continuation_state = ? AND continuation_generation = ?
+                    """,
+                    (
+                        TaskState.AWAITING_USER_INPUT.value, record.task_id, record.revision,
+                        TaskState.INTERRUPTED.value, record.continuation_state.value,
+                        record.resume_generation,
+                    ),
+                )
+            else:
+                pending = task.pending or {}
+                stopped = pending.get("intervention")
+                if (
+                    task.state is not TaskState.INTERRUPTED
+                    or task.continuation_state is not record.continuation_state
+                    or not isinstance(stopped, Mapping)
+                    or stopped.get("intervention_id") != record.intervention_id
+                    or stopped.get("source_generation") != record.source_generation
+                    or stopped.get("source_run_id") != record.run_id
+                ):
+                    raise RuntimeError("intervention continuation changed")
+                continuation = stopped.get("continuation")
+                if continuation is not None and not isinstance(continuation, Mapping):
+                    raise RuntimeError("intervention continuation changed")
+                cross_route = (
+                    record.routed_to is ConversationTarget.FABLE
+                    and record.continuation_state in _SOL_TASK_STATES
+                )
+                if cross_route:
+                    if not isinstance(continuation, Mapping):
+                        raise RuntimeError("intervention continuation changed")
+                    restored_state = TaskState.FABLE_CLARIFYING
+                    restored_pending = {
+                        **continuation,
+                        "clarification_prompt": record.message,
+                    }
+                else:
+                    restored_state = record.continuation_state
+                    restored_pending = (
+                        None if record.routed_to is ConversationTarget.SOL else continuation
+                    )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = ?, continuation_state = NULL, pending_json = ?,
+                        continuation_pause_id = NULL
+                    WHERE task_id = ? AND revision = ? AND state = ?
+                      AND continuation_state = ? AND continuation_generation = ?
+                    """,
+                    (
+                        restored_state.value,
+                        None if restored_pending is None else _encode_json(restored_pending),
+                        record.task_id, record.revision, TaskState.INTERRUPTED.value,
+                        record.continuation_state.value, record.resume_generation,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise RuntimeError("intervention continuation changed")
+            cursor = self._connection.execute(
+                """
+                UPDATE interventions
+                SET status = ?, resume_attempt_id = ?, resume_run_id = ?
+                WHERE intervention_id = ? AND resume_generation = ? AND status = ?
+                  AND resume_attempt_id IS NULL AND resume_run_id IS NULL
+                """,
+                (
+                    InterventionStatus.RESUMING.value, resume_attempt_id, resume_run_id,
+                    intervention_id, expected_resume_generation, InterventionStatus.READY.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("intervention resume claim changed concurrently")
+        return self.get_task(record.task_id, record.revision)
 
     def complete_intervention(
         self,
@@ -7790,7 +8000,6 @@ class SQLiteStore:
             or source_run.revision != record.revision
             or task.fable_session_id != record.fable_session_id
             or task.sol_thread_id != record.sol_thread_id
-            or task.continuation_generation != record.source_generation + 1
             or record.status not in {
                 InterventionStatus.PENDING_STOP,
                 InterventionStatus.READY,
@@ -7802,18 +8011,66 @@ class SQLiteStore:
             }
         ):
             return False
-        try:
-            self._require_intervention_source_identity(
-                task=task,
-                source_state=record.continuation_state,
-                source_run=source_run,
-            )
-        except RuntimeError:
-            return False
-        if record.status is not InterventionStatus.RESUMED and (
+        directed_answer = record.resume_generation == record.source_generation
+        if directed_answer:
+            question = self._unanswered_question_for_task(record.task_id, record.revision)
+            if question is None:
+                return False
+            try:
+                pause = self._directed_pause_id(
+                    session_id=record.session_id, task_id=record.task_id,
+                    revision=record.revision,
+                    expected_generation=record.source_generation,
+                )
+                _, continuation, pending, question_pause = self._question_exact(
+                    session_id=record.session_id, task_id=record.task_id,
+                    revision=record.revision,
+                    expected_generation=record.source_generation,
+                    question_id=question.question_id,
+                )
+                if (
+                    question.routed_to.value != source_run.agent
+                    or continuation is not record.continuation_state
+                    or task.pending != pending
+                    or pause != question_pause
+                ):
+                    return False
+                if source_run.agent == "fable":
+                    self._require_exact_intervention_provider_identity(
+                        task.fable_session_id, source_run.cli_session_id,
+                    )
+                else:
+                    self._require_exact_intervention_provider_identity(
+                        task.sol_thread_id, source_run.cli_session_id,
+                    )
+            except (RuntimeError, ValueError):
+                return False
+        else:
+            if task.continuation_generation != record.source_generation + 1:
+                return False
+            try:
+                self._require_intervention_source_identity(
+                    task=task,
+                    source_state=record.continuation_state,
+                    source_run=source_run,
+                )
+            except RuntimeError:
+                return False
+        if record.status in {
+            InterventionStatus.PENDING_STOP,
+            InterventionStatus.READY,
+            InterventionStatus.CANCELED_BY_STOP,
+            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        } and (
             task.state is not TaskState.INTERRUPTED
             or task.continuation_state is not record.continuation_state
         ):
+            return False
+        if record.status is InterventionStatus.RESUMING and task.state not in {
+            TaskState.INTERRUPTED,
+            TaskState.AWAITING_USER_INPUT,
+            *_ACTIVE_TASK_STATES,
+        }:
             return False
         if not self._intervention_conversation_event_exists(record):
             return False

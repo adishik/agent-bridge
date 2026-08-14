@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Protocol
 from uuid import UUID
@@ -283,6 +283,7 @@ class Coordinator:
         self._run_completions: dict[str, asyncio.Event] = {}
         self._terminal_retries: dict[str, PreparedActionOutcome] = {}
         self._compatibility_errors: dict[str, RuntimeError] = {}
+        self._intervention_completions: dict[str, asyncio.Event] = {}
         self._claimed_preparation_id: str | None = None
         # A prepared row is never proof that a child is still alive after a
         # process restart.  Recover before this coordinator can be admitted to
@@ -294,6 +295,7 @@ class Coordinator:
         self._run_completions.clear()
         self._terminal_retries.clear()
         self._compatibility_errors.clear()
+        self._intervention_completions.clear()
         self._claimed_preparation_id = None
 
     @property
@@ -1219,23 +1221,27 @@ class Coordinator:
         answer: str | None,
         *,
         answer_source: Literal["user", "sol"] = "user",
+        run_id: str | None = None,
     ) -> None:
         if isinstance(context, AnswerContext):
             await self._run_context(
                 task, context.underlying_continuation, context.answer,
-                answer_source=answer_source,
+                answer_source=answer_source, run_id=run_id,
             )
             return
         if isinstance(context, SolResumeContext):
-            await self._resume_sol(task, answer if answer is not None else context.prompt)
+            await self._resume_sol(
+                task, answer if answer is not None else context.prompt, run_id=run_id,
+            )
             return
         if isinstance(context, ScopeApprovalContext):
             if context.underlying_continuation is None:
-                await self._start_sol(task)
+                await self._start_sol(task, run_id=run_id)
             else:
                 await self._resume_sol(
                     task,
                     answer if answer is not None else context.underlying_continuation.prompt,
+                    run_id=run_id,
                 )
             return
         if isinstance(context, ReviewContext):
@@ -1243,7 +1249,7 @@ class Coordinator:
             if answer is not None:
                 prompt = f"{prompt}\n{'User answer' if answer_source == 'user' else 'Sol evidence'}: {answer}"
             await self._call_fable_review(
-                task, prompt, completion_allowed=context.completion_allowed,
+                task, prompt, completion_allowed=context.completion_allowed, run_id=run_id,
             )
             return
         if isinstance(context, ClarificationContext):
@@ -1254,7 +1260,7 @@ class Coordinator:
             if not isinstance(underlying, SolResumeContext):
                 raise RuntimeError("clarification has no exact Sol continuation")
             await self._call_fable_clarification(
-                task, prompt, underlying_continuation=underlying,
+                task, prompt, underlying_continuation=underlying, run_id=run_id,
             )
             return
         if context is None:
@@ -1262,6 +1268,7 @@ class Coordinator:
                 task,
                 self._original_user_message(task.session_id, task.task_id),
                 resume_session_id=task.fable_session_id,
+                run_id=run_id,
             )
             return
         raise RuntimeError("prepared continuation is invalid")
@@ -1394,6 +1401,18 @@ class Coordinator:
         """Commit one exact stop intent without signaling its source process."""
         if not isinstance(intent, InterventionIntent):
             raise ValueError("intent must be an InterventionIntent")
+        existing = self._store.authenticated_intervention(intent.intervention_id)
+        if existing is not None:
+            if (
+                existing.task_id == task_id
+                and existing.revision == intent.revision
+                and existing.source_generation == intent.continuation_generation
+                and existing.message == intent.message
+                and existing.addressed_to is intent.addressed_to
+                and existing.routed_to is intent.addressed_to
+            ):
+                return existing
+            raise RuntimeError("intervention identifier is already bound differently")
         task = self._latest_required(task_id)
         if task.revision != intent.revision:
             raise RuntimeError("intervention revision changed")
@@ -1402,9 +1421,15 @@ class Coordinator:
         active = self._store.active_run_for_task(task.task_id, task.revision)
         if active is None:
             raise RuntimeError("intervention source run is not active")
+        effective_phase = (
+            task.continuation_state
+            if task.state is TaskState.AWAITING_USER_INPUT
+            else task.state
+        )
         if intent.addressed_to is ConversationTarget.SOL and (
-            task.state not in _SOL_STATES
+            effective_phase not in _SOL_STATES
             or task.approved_at is None
+            or task.baseline_id is None
             or task.sol_thread_id is None
         ):
             raise RuntimeError("intervention Sol recipient is not eligible")
@@ -1422,32 +1447,51 @@ class Coordinator:
 
     async def continue_intervention(self, intervention_id: str) -> None:
         """Signal and finalize only the source run committed by an intervention."""
+        existing = self._intervention_completions.get(intervention_id)
+        if existing is not None:
+            await existing.wait()
+            return
+        intervention_completion = asyncio.Event()
+        self._intervention_completions[intervention_id] = intervention_completion
         record = self._store.intervention(intervention_id)
-        if record is None:
-            raise RuntimeError("intervention not found")
-        if record.status is not InterventionStatus.PENDING_STOP:
-            if record.status is InterventionStatus.READY:
-                return
-            raise RuntimeError("intervention is not pending stop")
         try:
+            if record is None:
+                raise RuntimeError("intervention not found")
+            if record.status is not InterventionStatus.PENDING_STOP:
+                if record.status is InterventionStatus.READY:
+                    return
+                raise RuntimeError("intervention is not pending stop")
             receipt = await self._runner.stop(
                 record.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
             )
             if not receipt.process_exited:
                 raise TimeoutError("intervention source process did not exit")
-            completion = self._run_completions.get(record.run_id)
-            if completion is not None:
-                await completion.wait()
+            run_completion = self._run_completions.get(record.run_id)
+            if run_completion is not None:
+                await run_completion.wait()
             source = self._store.agent_run(record.run_id)
             if source.status == "running":
                 raise RuntimeError("intervention source completion is not final")
-            self._store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+            current = self._store.intervention(record.intervention_id)
+            if current is not None and current.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            try:
+                self._store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+            except RuntimeError:
+                current = self._store.intervention(record.intervention_id)
+                if current is None or current.status is not InterventionStatus.CANCELED_BY_STOP:
+                    raise
         except BaseException:
-            self._store.append_event(
-                record.session_id, record.task_id, "coordinator", "stop_error",
-                {"run_id": record.run_id},
-            )
+            if record is not None:
+                self._store.append_event(
+                    record.session_id, record.task_id, "coordinator", "stop_error",
+                    {"run_id": record.run_id},
+                )
             raise
+        finally:
+            intervention_completion.set()
+            if self._intervention_completions.get(intervention_id) is intervention_completion:
+                del self._intervention_completions[intervention_id]
 
     async def resume_intervention(
         self,
@@ -1456,19 +1500,167 @@ class Coordinator:
         resume_attempt_id: str,
         resume_run_id: str,
     ) -> None:
-        """Persist resume ownership before a later exact-agent invocation."""
+        """Claim and restore one authenticated continuation before its invocation."""
         record = self._store.intervention(intervention_id)
         if record is None:
             raise RuntimeError("intervention not found")
-        self._store.claim_intervention_resume(
+        self._store.begin_intervention_resume(
             intervention_id,
             expected_resume_generation=record.resume_generation,
             resume_attempt_id=resume_attempt_id,
             resume_run_id=resume_run_id,
         )
 
+    async def run_intervention_resume(
+        self,
+        intervention_id: str,
+        *,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        """Dispatch one claimed continuation through its existing routed adapter."""
+        record = self._store.intervention(intervention_id)
+        if (
+            record is None
+            or record.status is not InterventionStatus.RESUMING
+            or record.resume_attempt_id != resume_attempt_id
+            or record.resume_run_id != resume_run_id
+        ):
+            return
+        task = self._store.get_task(record.task_id, record.revision)
+        if task.state is TaskState.AWAITING_USER_INPUT:
+            question = self._store.unanswered_question_for_task(task.task_id, task.revision)
+            if question is None or question.routed_to is not record.routed_to:
+                raise RuntimeError("intervention directed route changed")
+            await self.answer_directed_question(question)
+        elif record.routed_to is ConversationTarget.SOL:
+            if task.state not in _SOL_STATES:
+                raise RuntimeError("intervention Sol route changed")
+            await self._resume_sol(task, record.message, run_id=resume_run_id)
+        elif record.routed_to is ConversationTarget.FABLE:
+            context_task = replace(task, continuation_state=task.state)
+            context = self._context_from_task(context_task)
+            if context is None:
+                await self._run_planning(
+                    task, self._original_user_message(task.session_id, task.task_id),
+                    resume_session_id=task.fable_session_id, run_id=resume_run_id,
+                )
+            else:
+                await self._run_context(
+                    task, context, record.message, run_id=resume_run_id,
+                )
+        else:
+            raise RuntimeError("intervention route changed")
+        current = self._store.intervention(intervention_id)
+        if (
+            current is not None
+            and current.status is InterventionStatus.RESUMING
+            and current.resume_attempt_id == resume_attempt_id
+            and current.resume_run_id == resume_run_id
+        ):
+            self._store.complete_intervention(
+                intervention_id,
+                expected_resume_generation=current.resume_generation,
+                resume_attempt_id=resume_attempt_id,
+                resume_run_id=resume_run_id,
+            )
+
+    async def dispatch_ready_intervention(self, intervention_id: str) -> None:
+        """Allocate one durable owner and invoke its resumed adapter exactly once."""
+        record = self._store.authenticated_intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        if record.status is not InterventionStatus.READY:
+            if record.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            raise RuntimeError("intervention is not ready to resume")
+        resume_run_id = self._ids.new_run_id()
+        resume_attempt_id = f"intervention-{resume_run_id}"
+        await self.resume_intervention(
+            intervention_id,
+            resume_attempt_id=resume_attempt_id,
+            resume_run_id=resume_run_id,
+        )
+        try:
+            await self.run_intervention_resume(
+                intervention_id,
+                resume_attempt_id=resume_attempt_id,
+                resume_run_id=resume_run_id,
+            )
+        except BaseException:
+            current = self._store.intervention(intervention_id)
+            if (
+                current is not None
+                and current.status is InterventionStatus.RESUMING
+                and current.resume_attempt_id == resume_attempt_id
+                and current.resume_run_id == resume_run_id
+            ):
+                self._store.mark_resume_outcome_unknown(
+                    intervention_id,
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
+            raise
+
     async def stop_task(self, task_id: str) -> None:
         task = self._latest_required(task_id)
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        if intervention is not None:
+            canceled = self._store.cancel_intervention_by_stop(
+                intervention.intervention_id,
+                expected_resume_generation=intervention.resume_generation,
+            )
+            run_id = canceled.resume_run_id if (
+                intervention.status is InterventionStatus.RESUMING
+            ) else canceled.run_id
+            try:
+                active = self._store.agent_run(run_id)
+            except RuntimeError:
+                active = None
+            if active is not None and active.status == "running":
+                receipt = await self._runner.stop(
+                    run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                )
+                if not receipt.process_exited:
+                    raise TimeoutError("stop process did not exit")
+                completion = self._run_completions.get(run_id)
+                if completion is not None:
+                    await completion.wait()
+            return
+        if task.state is TaskState.INTERRUPTED:
+            pending = task.pending or {}
+            intervention_data = pending.get("intervention")
+            intervention_id = (
+                intervention_data.get("intervention_id")
+                if isinstance(intervention_data, Mapping)
+                else None
+            )
+            if not isinstance(intervention_id, str):
+                raise ValueError("task has no active phase to stop")
+            record = self._store.intervention(intervention_id)
+            if record is None or record.task_id != task.task_id:
+                raise ValueError("task has no active phase to stop")
+            canceled = self._store.cancel_intervention_by_stop(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+            )
+            run_id = canceled.resume_run_id or canceled.run_id
+            try:
+                active = self._store.agent_run(run_id)
+            except RuntimeError:
+                active = None
+            if active is not None and active.status == "running":
+                receipt = await self._runner.stop(
+                    run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                )
+                if not receipt.process_exited:
+                    raise TimeoutError("stop process did not exit")
+                completion = self._run_completions.get(run_id)
+                if completion is not None:
+                    await completion.wait()
+            return
         if task.state is TaskState.AWAITING_USER_INPUT:
             question = self._store.unanswered_question_for_task(
                 task.task_id, task.revision,
@@ -1483,14 +1675,16 @@ class Coordinator:
                 or active.agent != question.routed_to.value
             ):
                 raise ValueError("task has no active phase to stop")
+            interrupted = self._store.interrupt_directed_answer_for_stop(
+                task.task_id, task.revision, run_id=active.run_id,
+            )
+            self._emit_state(interrupted)
             try:
                 receipt = await self._runner.stop(
                     active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
                 )
                 if not receipt.process_exited:
                     raise TimeoutError("stop process did not exit")
-                # The durable run status is the stop-wins guard while the
-                # task deliberately retains its unanswered question and pause.
                 self._finish_interrupted_run(active.run_id, exit_code=-1)
             except BaseException:
                 self._store.append_event(
@@ -1562,8 +1756,9 @@ class Coordinator:
         prompt: str,
         *,
         resume_session_id: str | None,
+        run_id: str | None = None,
     ) -> None:
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
@@ -1664,7 +1859,7 @@ class Coordinator:
         finally:
             self._complete_run(run_id, completion)
 
-    async def _start_sol(self, task: TaskRecord) -> None:
+    async def _start_sol(self, task: TaskRecord, *, run_id: str | None = None) -> None:
         if task.state is not TaskState.SOL_RUNNING:
             raise RuntimeError("Sol start requires persisted SOL_RUNNING state")
         if task.approved_at is None or task.baseline_id is None or task.brief is None:
@@ -1673,14 +1868,17 @@ class Coordinator:
             task,
             resume_prompt=None,
             context=f"{self._repo_context()}\nApproved baseline: {task.baseline_id}",
+            run_id=run_id,
         )
 
-    async def _resume_sol(self, task: TaskRecord, prompt: str) -> None:
+    async def _resume_sol(
+        self, task: TaskRecord, prompt: str, *, run_id: str | None = None,
+    ) -> None:
         if task.state not in _SOL_STATES:
             raise RuntimeError("Sol resume requires a persisted Sol state")
         if task.sol_thread_id is None:
             raise RuntimeError("Sol resume requires the exact persisted thread ID")
-        await self._invoke_sol(task, resume_prompt=prompt, context=None)
+        await self._invoke_sol(task, resume_prompt=prompt, context=None, run_id=run_id)
 
     async def _invoke_sol(
         self,
@@ -1688,10 +1886,11 @@ class Coordinator:
         *,
         resume_prompt: str | None,
         context: str | None,
+        run_id: str | None = None,
     ) -> None:
         async with self._writing_lock:
             routed = await self._invoke_sol_locked(
-                task, resume_prompt=resume_prompt, context=context
+                task, resume_prompt=resume_prompt, context=context, run_id=run_id,
             )
         if routed is not None:
             await self._route_sol_outcome(routed[0], routed[1], routed[2])
@@ -1702,12 +1901,13 @@ class Coordinator:
         *,
         resume_prompt: str | None,
         context: str | None,
+        run_id: str | None = None,
     ) -> tuple[
         TaskRecord, SolOutcome, tuple[Mapping[str, object], ...]
     ] | None:
         if not self._writing_lock.locked():
             raise RuntimeError("Sol invocation requires the shared writer lock")
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         completion: asyncio.Event | None = None
         try:
             current = self._store.get_task(task.task_id, task.revision)
@@ -2473,6 +2673,7 @@ class Coordinator:
         prompt: str,
         *,
         underlying_continuation: SolResumeContext | None = None,
+        run_id: str | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("clarification requires the exact Fable session")
@@ -2487,7 +2688,7 @@ class Coordinator:
                     "prompt": underlying_continuation.prompt,
                 },
             )
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
@@ -2757,6 +2958,7 @@ class Coordinator:
         prompt: str,
         *,
         completion_allowed: bool,
+        run_id: str | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("review requires the exact Fable session")
@@ -2770,7 +2972,7 @@ class Coordinator:
                     "completion_allowed": completion_allowed,
                 },
             )
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:

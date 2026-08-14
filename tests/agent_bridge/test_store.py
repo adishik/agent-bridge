@@ -4044,6 +4044,53 @@ def test_intervention_stops_only_the_exact_active_directed_answer_without_losing
     assert question.question_id == "question-1"
 
 
+def test_directed_answer_intervention_recovery_authenticates_the_preserved_pause(
+    tmp_path, valid_brief,
+) -> None:
+    """Removing directed-answer recovery authentication would reject this exact paused form on reopen."""
+    path = tmp_path / "directed-intervention-recovery.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store.pause_for_question(
+        session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_generation=1, question_id="question-1",
+        asked_by=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, text="Which exact constraint applies?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "continue exactly"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, message_type=ConversationMessageType.QUESTION,
+            text="Which exact constraint applies?", task_id=valid_brief.task_id,
+            revision=valid_brief.revision, continuation_generation=1, question_id="question-1",
+        ),
+    )
+    store.start_agent_run("fable-answer-run-1", valid_brief.task_id, valid_brief.revision, "fable")
+    store.set_agent_run_session("fable-answer-run-1", "fable-session-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="directed-answer-intervention", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Pause the answer.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="fable-answer-run-1",
+    )
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.recover_active_tasks().agent_runs_interrupted == 1
+    recovered = reopened.authenticated_intervention(created.intervention_id)
+    assert recovered is not None
+    assert recovered.status is store_module.InterventionStatus.READY
+    task = reopened.get_task(valid_brief.task_id, valid_brief.revision)
+    question = reopened.unanswered_question_for_task(valid_brief.task_id, valid_brief.revision)
+    assert task.state is TaskState.INTERRUPTED
+    assert task.continuation_state is TaskState.SOL_RUNNING
+    assert question is not None and question.question_id == "question-1"
+
+
 @pytest.mark.parametrize(
     ("run_id", "agent", "provider_id"),
     (
