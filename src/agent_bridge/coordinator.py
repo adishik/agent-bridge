@@ -64,6 +64,8 @@ from agent_bridge.store import (
     RecoverySummary,
     ScopeApprovalContext,
     SolResumeContext,
+    InterventionRecord,
+    InterventionStatus,
     SQLiteStore,
     TaskRecord,
     ApprovalPayload,
@@ -114,6 +116,7 @@ _EXCHANGE_PERMISSION_TEXT = (
 _FABLE_LOGIN_EXPIRED_TEXT = (
     "Fable login expired. Run claude auth login on the host, then Resume."
 )
+_STOP_TIMEOUT_SECONDS = 10.0
 
 
 class RoutingMode(str, Enum):
@@ -140,6 +143,31 @@ class RoutingError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("conversation routing is unavailable")
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionIntent:
+    """One authenticated request to interrupt an exact active agent run."""
+
+    intervention_id: str
+    message: str
+    addressed_to: ConversationTarget
+    revision: int
+    continuation_generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intervention_id, str) or not self.intervention_id:
+            raise ValueError("intervention_id must be non-empty")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("message must be non-empty")
+        if self.addressed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}:
+            raise ValueError("addressed_to must be Fable or Sol")
+        for value, name, minimum in (
+            (self.revision, "revision", 0),
+            (self.continuation_generation, "continuation_generation", 1),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"{name} is invalid")
 
 
 def route_user_intent(
@@ -1360,8 +1388,120 @@ class Coordinator:
         )
         await self._run_compatibility_prepared(prepared.preparation_id)
 
+    def prepare_intervention(
+        self, task_id: str, intent: InterventionIntent,
+    ) -> InterventionRecord:
+        """Commit one exact stop intent without signaling its source process."""
+        if not isinstance(intent, InterventionIntent):
+            raise ValueError("intent must be an InterventionIntent")
+        task = self._latest_required(task_id)
+        if task.revision != intent.revision:
+            raise RuntimeError("intervention revision changed")
+        if task.continuation_generation != intent.continuation_generation:
+            raise RuntimeError("intervention source generation changed")
+        active = self._store.active_run_for_task(task.task_id, task.revision)
+        if active is None:
+            raise RuntimeError("intervention source run is not active")
+        if intent.addressed_to is ConversationTarget.SOL and (
+            task.state not in _SOL_STATES
+            or task.approved_at is None
+            or task.sol_thread_id is None
+        ):
+            raise RuntimeError("intervention Sol recipient is not eligible")
+        return self._store.create_intervention_and_request_stop(
+            intervention_id=intent.intervention_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_source_generation=intent.continuation_generation,
+            message=intent.message,
+            addressed_to=intent.addressed_to,
+            routed_to=intent.addressed_to,
+            run_id=active.run_id,
+        )
+
+    async def continue_intervention(self, intervention_id: str) -> None:
+        """Signal and finalize only the source run committed by an intervention."""
+        record = self._store.intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        if record.status is not InterventionStatus.PENDING_STOP:
+            if record.status is InterventionStatus.READY:
+                return
+            raise RuntimeError("intervention is not pending stop")
+        try:
+            receipt = await self._runner.stop(
+                record.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+            )
+            if not receipt.process_exited:
+                raise TimeoutError("intervention source process did not exit")
+            completion = self._run_completions.get(record.run_id)
+            if completion is not None:
+                await completion.wait()
+            source = self._store.agent_run(record.run_id)
+            if source.status == "running":
+                raise RuntimeError("intervention source completion is not final")
+            self._store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+        except BaseException:
+            self._store.append_event(
+                record.session_id, record.task_id, "coordinator", "stop_error",
+                {"run_id": record.run_id},
+            )
+            raise
+
+    async def resume_intervention(
+        self,
+        intervention_id: str,
+        *,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        """Persist resume ownership before a later exact-agent invocation."""
+        record = self._store.intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        self._store.claim_intervention_resume(
+            intervention_id,
+            expected_resume_generation=record.resume_generation,
+            resume_attempt_id=resume_attempt_id,
+            resume_run_id=resume_run_id,
+        )
+
     async def stop_task(self, task_id: str) -> None:
         task = self._latest_required(task_id)
+        if task.state is TaskState.AWAITING_USER_INPUT:
+            question = self._store.unanswered_question_for_task(
+                task.task_id, task.revision,
+            )
+            active = self._store.active_run_for_task(task.task_id, task.revision)
+            if (
+                question is None
+                or active is None
+                or question.routed_to not in {
+                    ConversationTarget.FABLE, ConversationTarget.SOL,
+                }
+                or active.agent != question.routed_to.value
+            ):
+                raise ValueError("task has no active phase to stop")
+            try:
+                receipt = await self._runner.stop(
+                    active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                )
+                if not receipt.process_exited:
+                    raise TimeoutError("stop process did not exit")
+                # The durable run status is the stop-wins guard while the
+                # task deliberately retains its unanswered question and pause.
+                self._finish_interrupted_run(active.run_id, exit_code=-1)
+            except BaseException:
+                self._store.append_event(
+                    task.session_id, task.task_id, "coordinator", "stop_error",
+                    {"run_id": active.run_id},
+                )
+                raise
+            completion = self._run_completions.get(active.run_id)
+            if completion is not None:
+                await completion.wait()
+            return
         if task.state not in _ACTIVE_STATES:
             raise ValueError("task has no active phase to stop")
         active = self._store.active_run_for_task(task.task_id, task.revision)
@@ -1385,9 +1525,12 @@ class Coordinator:
         )
         self._emit_state(interrupted)
         try:
-            await self._runner.stop(active.run_id)
+            receipt = await self._runner.stop(
+                active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+            )
+            if not receipt.process_exited:
+                raise TimeoutError("stop process did not exit")
         except BaseException:
-            self._finish_interrupted_run(active.run_id, exit_code=-1)
             self._store.append_event(
                 interrupted.session_id,
                 interrupted.task_id,

@@ -22,8 +22,10 @@ from agent_bridge.hub import (
     RuntimeReadiness,
     RuntimeStatus,
     PreparedWorkflow,
+    PreparedIntervention,
     StopReservation,
 )
+from agent_bridge.coordinator import InterventionIntent
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
@@ -31,6 +33,8 @@ from agent_bridge.store import (
     ApprovalPayload,
     ContinuationMessagePayload,
     ExchangeGrantPayload,
+    InterventionRecord,
+    InterventionStatus,
     NewRequestPayload,
     PreparedActionOutcome,
     PreparedActionRecord,
@@ -366,6 +370,31 @@ class _RuntimeCoordinator:
         for key, task in self.store.task_rows.items():
             if key[0] == task_id:
                 task.state = TaskState.INTERRUPTED
+
+    def prepare_intervention(
+        self, task_id: str, intent: InterventionIntent,
+    ) -> InterventionRecord:
+        task = next(task for (candidate, _), task in self.store.task_rows.items() if candidate == task_id)
+        task.state = TaskState.INTERRUPTED
+        return InterventionRecord(
+            intervention_id=intent.intervention_id,
+            session_id=task.session_id,
+            task_id=task_id,
+            revision=intent.revision,
+            addressed_to=intent.addressed_to,
+            routed_to=intent.addressed_to,
+            message=intent.message,
+            run_id="source-run-1",
+            continuation_state=TaskState.FABLE_PLANNING,
+            source_generation=intent.continuation_generation,
+            resume_generation=intent.continuation_generation + 1,
+            fable_session_id=None,
+            sol_thread_id=None,
+            resume_attempt_id=None,
+            resume_run_id=None,
+            status=InterventionStatus.PENDING_STOP,
+            created_at="2026-08-10T12:00:00Z",
+        )
 
 
 @dataclass
@@ -1211,6 +1240,37 @@ def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
         assert terminal.reason == "stop"
         assert runtime.coordinator.stops == ["task-1"]
         assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_hub_prepare_intervention_borrows_the_exact_live_source_lease() -> None:
+    """Preparation must commit guidance without releasing or signaling its source lease."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="intervention-1", message="Pause here.",
+                addressed_to=ConversationTarget.FABLE, revision=0,
+                continuation_generation=source.token.generation,
+            ),
+        )
+
+        assert isinstance(prepared, PreparedIntervention)
+        assert prepared.lease_token == source.token
+        assert prepared.lease_origin.value == "borrowed_source"
+        assert lease.snapshot() == source.token
+        assert runtime.coordinator.stops == []
 
     asyncio.run(exercise())
 

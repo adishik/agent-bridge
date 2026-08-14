@@ -36,6 +36,7 @@ from agent_bridge.contracts import (
 )
 from agent_bridge.coordinator import (
     Coordinator,
+    InterventionIntent,
     PreparedActionFailed,
     ResumeDriftBlocked,
     RoutingDecision,
@@ -43,7 +44,7 @@ from agent_bridge.coordinator import (
     RoutingMode,
     route_user_intent,
 )
-from agent_bridge.process import ProcessRunner
+from agent_bridge.process import ProcessRunner, StopReceipt
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -433,7 +434,8 @@ class RecordingRunner(ProcessRunner):
         self.on_stop: Callable[[str], None] | None = None
         self.stop_error: BaseException | None = None
 
-    async def stop(self, run_id: str) -> None:
+    async def stop(self, run_id: str, *, timeout_seconds: float) -> StopReceipt:
+        assert timeout_seconds > 0
         self.stops.append(run_id)
         if self.on_stop is not None:
             self.on_stop(run_id)
@@ -441,6 +443,7 @@ class RecordingRunner(ProcessRunner):
             self.release_on_stop.set()
         if self.stop_error is not None:
             raise self.stop_error
+        return StopReceipt(run_id=run_id, was_running=True, process_exited=True)
 
 
 @dataclass
@@ -1674,6 +1677,42 @@ def test_stop_uses_persisted_exact_run_and_only_explicit_resume_continues(harnes
         assert completed is not None
         assert completed.state is TaskState.COMPLETED
         assert harness.sol.resume_threads == [THREAD_ID]
+
+    asyncio.run(scenario())
+
+
+def test_prepare_intervention_commits_exact_stop_intent_without_signaling(harness) -> None:
+    """Preparation must persist the source binding before any runner Stop call."""
+    async def scenario() -> None:
+        release = asyncio.Event()
+        harness.sol.hold_start = release
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await asyncio.sleep(0)
+        active = harness.store.active_run_for_task("task-1", 1)
+        assert active is not None
+        harness.store.set_sol_thread("task-1", 1, THREAD_ID)
+        harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+
+        record = harness.coordinator.prepare_intervention(
+            "task-1",
+            InterventionIntent(
+                intervention_id="intervention-1",
+                message="Pause and review this exact guidance.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=1,
+                continuation_generation=1,
+            ),
+        )
+
+        assert record.run_id == active.run_id
+        assert record.status.value == "pending_stop"
+        assert harness.runner.stops == []
+        task = harness.store.latest_task("task-1")
+        assert task is not None
+        assert task.state is TaskState.INTERRUPTED
+        release.set()
+        await approval
 
     asyncio.run(scenario())
 
@@ -3423,6 +3462,40 @@ def test_directed_answer_post_provider_state_change_cannot_resume_sol(
             if event.kind == "conversation"
             and event.payload["message_type"] == "answer"
         ]
+
+    asyncio.run(scenario())
+
+
+def test_stop_wins_while_a_reserved_directed_agent_answer_is_in_flight(harness) -> None:
+    """Stop must retain, rather than detach, the exact unanswered directed question."""
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        harness.sol.queue(_directed_sol_question("Which exact rule applies?"))
+        harness.fable.on_answer_sol_question = entered.set
+        harness.fable.hold_answer_sol_question = release
+        harness.runner.release_on_stop = release
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await entered.wait()
+        waiting = harness.store.get_task("task-1", 1)
+        question = harness.store.unanswered_question_for_task("task-1", 1)
+        active = harness.store.active_run_for_task("task-1", 1)
+        assert waiting.state is TaskState.AWAITING_USER_INPUT
+        assert question is not None
+        assert active is not None
+
+        await harness.coordinator.stop_task("task-1")
+        await approval
+
+        preserved = harness.store.get_task("task-1", 1)
+        assert preserved.state is TaskState.AWAITING_USER_INPUT
+        assert preserved.continuation_state is waiting.continuation_state
+        unanswered = harness.store.unanswered_question_for_task("task-1", 1)
+        assert unanswered is not None
+        assert unanswered.question_id == question.question_id
+        assert harness.sol.resume_threads == []
 
     asyncio.run(scenario())
 

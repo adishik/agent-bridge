@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
 import fcntl
 import os
 from pathlib import Path
@@ -18,11 +19,11 @@ from agent_bridge.adapters.claude_cli import (
 )
 from agent_bridge.app import EventBroadcaster
 from agent_bridge.contracts import ConversationTarget
-from agent_bridge.coordinator import Coordinator, IdFactory
+from agent_bridge.coordinator import Coordinator, IdFactory, InterventionIntent
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.repository import RepositoryTracker
-from agent_bridge.store import PreparedActionRecord, SQLiteStore
+from agent_bridge.store import InterventionRecord, PreparedActionRecord, SQLiteStore
 
 
 _FABLE_STATUSES = frozenset({
@@ -419,6 +420,18 @@ class PreparedWorkflow:
     revision: int = 0
 
 
+class InterventionLeaseOrigin(str, Enum):
+    BORROWED_SOURCE = "borrowed_source"
+    RECOVERY_ACQUIRED = "recovery_acquired"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedIntervention:
+    record: InterventionRecord
+    lease_token: LeaseToken
+    lease_origin: InterventionLeaseOrigin
+
+
 class HubWorkflowOrchestrator:
     """The sole owner of leases across preparation and model execution."""
 
@@ -490,6 +503,36 @@ class HubWorkflowOrchestrator:
     def cancel_stop_reservation(self, reservation: StopReservation) -> None:
         """Release a failed Stop installation without disturbing its workflow."""
         self._lease.cancel_stop_reservation(reservation)
+
+    def prepare_intervention(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        intent: InterventionIntent,
+    ) -> PreparedIntervention:
+        """Commit an intervention while retaining its exact live source lease."""
+        if not isinstance(intent, InterventionIntent):
+            raise ValueError("intent must be an InterventionIntent")
+        token = self.require_exact_stop_owner(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
+        runtime = self._runtime_for_session(project_id, session_id)
+        record = runtime.coordinator.prepare_intervention(task_id, intent)
+        if (
+            record.session_id != session_id
+            or record.task_id != task_id
+            or record.revision != intent.revision
+            or record.source_generation != intent.continuation_generation
+            or self._lease.snapshot() != token
+        ):
+            raise RuntimeError("intervention does not match the active lease")
+        return PreparedIntervention(
+            record=record,
+            lease_token=token,
+            lease_origin=InterventionLeaseOrigin.BORROWED_SOURCE,
+        )
 
     async def prepare_new_request(
         self,

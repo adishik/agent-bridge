@@ -3975,6 +3975,122 @@ def test_create_intervention_stops_exact_active_run_and_emits_one_user_message(
     assert store.events_after("session-1", 0) == events
 
 
+def test_intervention_stops_only_the_exact_active_directed_answer_without_losing_pause(
+    tmp_path, valid_brief,
+) -> None:
+    """A Stop during an answer must retain the unanswered question's exact pause."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store.pause_for_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=1,
+        question_id="question-1",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="Which exact constraint applies?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "continue exactly"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact constraint applies?",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            continuation_generation=1,
+            question_id="question-1",
+        ),
+    )
+    before = store.get_task(valid_brief.task_id, valid_brief.revision)
+    before_pause = store._connection.execute(
+        "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+        (valid_brief.task_id, valid_brief.revision),
+    ).fetchone()["continuation_pause_id"]
+    store.start_agent_run("fable-answer-run-1", valid_brief.task_id, valid_brief.revision, "fable")
+    store.set_agent_run_session("fable-answer-run-1", "fable-session-1")
+
+    created = store.create_intervention_and_request_stop(
+        intervention_id="directed-answer-intervention",
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_source_generation=1,
+        message="Pause the answer and consider this guidance.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="fable-answer-run-1",
+    )
+
+    interrupted = store.get_task(valid_brief.task_id, valid_brief.revision)
+    assert created.continuation_state is TaskState.SOL_RUNNING
+    assert created.source_generation == created.resume_generation == 1
+    assert interrupted.state is TaskState.INTERRUPTED
+    assert interrupted.continuation_state is TaskState.SOL_RUNNING
+    assert interrupted.pending == before.pending
+    after_pause = store._connection.execute(
+        "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+        (valid_brief.task_id, valid_brief.revision),
+    ).fetchone()["continuation_pause_id"]
+    assert after_pause == before_pause
+    question = store.unanswered_question_for_task(valid_brief.task_id, valid_brief.revision)
+    assert question is not None
+    assert question.question_id == "question-1"
+
+
+@pytest.mark.parametrize(
+    ("run_id", "agent", "provider_id"),
+    (
+        ("wrong-answer-run", "sol", "sol-thread-1"),
+        ("wrong-provider-run", "fable", "other-fable-session"),
+    ),
+)
+def test_intervention_rejects_mismatched_directed_answer_identity_without_mutation(
+    tmp_path, valid_brief, run_id: str, agent: str, provider_id: str,
+) -> None:
+    """A different paused-answer worker must not consume this question's identity."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store.pause_for_question(
+        session_id="session-1", task_id=valid_brief.task_id,
+        revision=valid_brief.revision, expected_generation=1, question_id="question-1",
+        asked_by=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, text="Which exact constraint applies?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "sol-run-1", "prompt": "continue exactly"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE, message_type=ConversationMessageType.QUESTION,
+            text="Which exact constraint applies?", task_id=valid_brief.task_id,
+            revision=valid_brief.revision, continuation_generation=1, question_id="question-1",
+        ),
+    )
+    store.start_agent_run(run_id, valid_brief.task_id, valid_brief.revision, agent)
+    store.set_agent_run_session(run_id, provider_id)
+    before = store.get_task(valid_brief.task_id, valid_brief.revision)
+
+    with pytest.raises(RuntimeError, match="directed answer|provider identity"):
+        store.create_intervention_and_request_stop(
+            intervention_id="directed-answer-intervention", session_id="session-1",
+            task_id=valid_brief.task_id, revision=valid_brief.revision,
+            expected_source_generation=1, message="Pause the answer.",
+            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+            run_id=run_id,
+        )
+
+    assert store.intervention("directed-answer-intervention") is None
+    assert store.get_task(valid_brief.task_id, valid_brief.revision) == before
+
+
 @pytest.mark.parametrize(
     ("state", "expected_agent"),
     (
