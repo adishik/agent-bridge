@@ -2183,7 +2183,7 @@ class Coordinator:
         await self.answer_directed_question(question)
 
     def _nested_intervention_preparation(
-        self, task: TaskRecord,
+        self, task: TaskRecord, *, outer_question_id: str | None = None,
     ) -> tuple[str | None, str | None]:
         """Allocate a child identity only for the exact unbound cross-route resume."""
         intervention = self._store.active_intervention_for_task(
@@ -2195,7 +2195,14 @@ class Coordinator:
             or intervention.routed_to is not ConversationTarget.FABLE
             or intervention.continuation_state not in _SOL_STATES
             or intervention.resume_generation != task.continuation_generation
-            or intervention.directed_binding is not None
+        ):
+            return None, None
+        binding = intervention.directed_binding
+        if binding is not None and not (
+            outer_question_id is not None
+            and binding.kind == "initial"
+            and binding.question_id == outer_question_id
+            and binding.source_agent is ConversationTarget.FABLE
         ):
             return None, None
         return intervention.intervention_id, self._ids.new_run_id()
@@ -2432,6 +2439,8 @@ class Coordinator:
             prompt = f"{prompt}\n\nIntervention guidance:\n{intervention_message}"
         run_id = self._start_or_reuse_fable_run(task, run_id)
         completion = self._track_run(run_id)
+        completed_next_fable_intervention_id: str | None = None
+        completed_next_fable_exit_code: int | None = None
         try:
             result = await self._fable.answer_sol_question(
                 run_id=run_id,
@@ -2455,7 +2464,21 @@ class Coordinator:
             clarification = FableClarification.from_dict(result.payload)
             if clarification.status != "answered" or clarification.answer is None:
                 raise RuntimeError("Fable did not answer Sol's exact question")
-            self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
+            intervention = self._store.active_intervention_for_task(
+                task.task_id, task.revision,
+            )
+            binding = None if intervention is None else intervention.directed_binding
+            if (
+                intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                completed_next_fable_intervention_id = intervention.intervention_id
+                completed_next_fable_exit_code = result.exit_code
+            else:
+                self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
         except asyncio.CancelledError:
             self._finish_interrupted_run(run_id, exit_code=-1)
             raise
@@ -2492,7 +2515,9 @@ class Coordinator:
             question_id, request_key = self._directed_question_identifiers(
                 task, ConversationActor.FABLE, directed,
             )
-            intervention_id, child_run_id = self._nested_intervention_preparation(task)
+            intervention_id, child_run_id = self._nested_intervention_preparation(
+                task, outer_question_id=question.question_id,
+            )
             _, nested = self._store.reserve_fable_answer_evidence_question(
                 session_id=task.session_id, task_id=task.task_id, revision=task.revision,
                 expected_generation=question.continuation_generation,
@@ -2536,6 +2561,11 @@ class Coordinator:
                 clarification if self._claimed_preparation_id is not None else None
             ),
             checkpoint_preparation_id=self._claimed_preparation_id,
+            completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+            completed_next_fable_run_id=(
+                run_id if completed_next_fable_intervention_id is not None else None
+            ),
+            completed_next_fable_exit_code=completed_next_fable_exit_code,
         )
         if answered.answered_by is not ConversationActor.FABLE:
             raise RuntimeError("directed Fable answer changed")
@@ -2893,6 +2923,7 @@ class Coordinator:
         run_id = self._start_or_reuse_fable_run(task, run_id)
         completion = self._track_run(run_id)
         handoff_intervention_id: str | None = None
+        directed_outcome_intervention_id: str | None = None
         try:
             result = await self._fable.clarify(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
@@ -2940,6 +2971,19 @@ class Coordinator:
                 and binding.next_run_id == run_id
             ):
                 handoff_intervention_id = intervention.intervention_id
+            elif (
+                (
+                    (clarification.directed_question is not None and not clarification.scope_changed)
+                    or clarification.status == "escalate_to_user"
+                    or clarification.scope_changed
+                )
+                and intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                directed_outcome_intervention_id = intervention.intervention_id
             else:
                 self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
         except asyncio.CancelledError:
@@ -2985,6 +3029,13 @@ class Coordinator:
             handoff_intervention_id=handoff_intervention_id,
             handoff_run_id=run_id if handoff_intervention_id is not None else None,
             handoff_exit_code=result.exit_code if handoff_intervention_id is not None else None,
+            directed_outcome_intervention_id=directed_outcome_intervention_id,
+            directed_outcome_run_id=(
+                run_id if directed_outcome_intervention_id is not None else None
+            ),
+            directed_outcome_exit_code=(
+                result.exit_code if directed_outcome_intervention_id is not None else None
+            ),
         )
 
     async def _route_clarification(
@@ -2996,6 +3047,9 @@ class Coordinator:
         handoff_intervention_id: str | None = None,
         handoff_run_id: str | None = None,
         handoff_exit_code: int | None = None,
+        directed_outcome_intervention_id: str | None = None,
+        directed_outcome_run_id: str | None = None,
+        directed_outcome_exit_code: int | None = None,
     ) -> None:
         current = self._store.get_task(task.task_id, task.revision)
         if current.state is not TaskState.FABLE_CLARIFYING:
@@ -3004,7 +3058,8 @@ class Coordinator:
         if clarification.directed_question is not None and not clarification.scope_changed:
             if task.approved_at is None or task.baseline_id is None:
                 raise RuntimeError("Fable evidence request requires exact approval")
-            self._emit_clarification(task, clarification)
+            if directed_outcome_intervention_id is None:
+                self._emit_clarification(task, clarification)
             directed = clarification.directed_question
             if directed.addressed_to != ConversationTarget.SOL.value:
                 raise RuntimeError("Fable clarification evidence must target exact Sol")
@@ -3042,6 +3097,14 @@ class Coordinator:
                 ),
                 intervention_id=intervention_id,
                 child_run_id=child_run_id,
+                completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                completed_next_fable_run_id=directed_outcome_run_id,
+                completed_next_fable_exit_code=directed_outcome_exit_code,
+                clarification=(
+                    clarification
+                    if directed_outcome_intervention_id is not None
+                    else None
+                ),
             )
             self._emit_state(self._store.get_task(task.task_id, task.revision))
             await self.answer_directed_question(question, run_id=child_run_id)
@@ -3072,11 +3135,22 @@ class Coordinator:
                     task.revision,
                     expected=TaskState.FABLE_CLARIFYING,
                     target=TaskState.AWAITING_USER_INPUT,
-                    continuation_state=TaskState.FABLE_CLARIFYING,
+                    continuation_state=(
+                        task.continuation_state or TaskState.SOL_RUNNING
+                    ),
                     pending=pending,
+                    completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                    completed_next_fable_run_id=directed_outcome_run_id,
+                    completed_next_fable_exit_code=directed_outcome_exit_code,
+                    clarification=(
+                        clarification
+                        if directed_outcome_intervention_id is not None
+                        else None
+                    ),
                 )
             self._emit_state(task)
-            self._emit_clarification(task, clarification)
+            if directed_outcome_intervention_id is None:
+                self._emit_clarification(task, clarification)
             return
         if clarification.answer is None:
             raise RuntimeError("answered clarification is missing its answer")
@@ -3122,21 +3196,31 @@ class Coordinator:
                             task.task_id, revised.revision, widened_baseline
                         ),
                     ),
+                    completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                    completed_next_fable_run_id=directed_outcome_run_id,
+                    completed_next_fable_exit_code=directed_outcome_exit_code,
+                    clarification=(
+                        clarification
+                        if directed_outcome_intervention_id is not None
+                        else None
+                    ),
                 )
             except BaseException:
                 self._repository.discard_widening(
                     original_baseline, widened_baseline
                 )
                 raise
-            self._store.append_event(
-                saved.session_id,
-                saved.task_id,
-                "fable",
-                "task_brief",
-                {"brief": revised.to_dict()},
-            )
+            if directed_outcome_intervention_id is None:
+                self._store.append_event(
+                    saved.session_id,
+                    saved.task_id,
+                    "fable",
+                    "task_brief",
+                    {"brief": revised.to_dict()},
+                )
             self._emit_state(saved)
-            self._emit_clarification(saved, clarification)
+            if directed_outcome_intervention_id is None:
+                self._emit_clarification(saved, clarification)
             return
         if handoff_intervention_id is not None:
             if handoff_run_id is None:
@@ -3146,6 +3230,7 @@ class Coordinator:
                 run_id=handoff_run_id,
                 exit_code=handoff_exit_code,
                 answer=clarification.answer,
+                clarification=clarification,
             )
         elif underlying_continuation is None:
             resumed = self._store.resume_continuation(
@@ -3159,7 +3244,8 @@ class Coordinator:
                 target=TaskState.SOL_RUNNING,
             )
         self._emit_state(resumed)
-        self._emit_clarification(resumed, clarification)
+        if handoff_intervention_id is None:
+            self._emit_clarification(resumed, clarification)
         await self._resume_sol(resumed, clarification.answer)
 
     async def _review(
