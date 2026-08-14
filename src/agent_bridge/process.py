@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 import os
 from pathlib import Path
 import signal
@@ -18,6 +20,7 @@ MAX_PROCESS_STREAM_LINES = 4_096
 MAX_PROCESS_STREAM_BYTES = 256 * 1024
 MAX_PROCESS_TOTAL_LINES = 8_192
 MAX_PROCESS_TOTAL_BYTES = 512 * 1024
+MAX_TERMINAL_PROCESS_EXITS = 128
 _OUTPUT_LIMIT_ERROR = "provider process output exceeded configured bounds"
 
 
@@ -61,13 +64,25 @@ class ProcessResult:
     interrupted: bool
 
 
+@dataclass(frozen=True, slots=True)
+class StopReceipt:
+    """The exact local child state observed for one stop request."""
+
+    run_id: str
+    was_running: bool
+    process_exited: bool
+
+
 @dataclass
 class _ActiveRun:
     process: asyncio.subprocess.Process | None
     process_group_id: int | None
     launch_finished: asyncio.Event
+    process_exited: asyncio.Event
     stop_lock: asyncio.Lock
     stop_requested: bool = False
+    termination_started: bool = False
+    kill_sent: bool = False
     stop_completed: bool = False
     interrupted: bool = False
 
@@ -83,6 +98,7 @@ class ProcessRunner:
         self._stop_grace_seconds = stop_grace_seconds
         self._active_runs: dict[str, _ActiveRun] = {}
         self._start_events: dict[str, asyncio.Event] = {}
+        self._terminal_process_exits: OrderedDict[str, asyncio.Event] = OrderedDict()
 
     async def run(
         self,
@@ -120,8 +136,12 @@ class ProcessRunner:
             raise ValueError("stdin must be bytes or None")
         if not callable(on_line):
             raise ValueError("on_line must be callable")
-        if run_id in self._active_runs or run_id in self._start_events:
-            raise ValueError(f"run_id is already active: {run_id}")
+        if (
+            run_id in self._active_runs
+            or run_id in self._start_events
+            or run_id in self._terminal_process_exits
+        ):
+            raise ValueError(f"run_id is active or retained: {run_id}")
 
         started = asyncio.Event()
         process: asyncio.subprocess.Process | None = None
@@ -129,6 +149,7 @@ class ProcessRunner:
             process=None,
             process_group_id=None,
             launch_finished=started,
+            process_exited=asyncio.Event(),
             stop_lock=asyncio.Lock(),
         )
         stdout: list[str] = []
@@ -172,7 +193,7 @@ class ProcessRunner:
                     self._drain("stderr", process.stderr, stderr, on_line, output_budget)
                 ),
                 asyncio.create_task(self._write_stdin(process.stdin, stdin)),
-                asyncio.create_task(process.wait()),
+                asyncio.create_task(self._observe_process_exit(active, process)),
             )
             try:
                 await asyncio.gather(*execution_tasks)
@@ -203,21 +224,52 @@ class ProcessRunner:
         finally:
             if not started.is_set():
                 started.set()
+            active.process_exited.set()
             if self._active_runs.get(run_id) is active:
                 del self._active_runs[run_id]
             self._start_events.pop(run_id, None)
+            if process is not None:
+                self._remember_terminal_process_exit(run_id, active.process_exited)
 
-    async def stop(self, run_id: str) -> None:
+    async def stop(self, run_id: str, *, timeout_seconds: float) -> StopReceipt:
         """Interrupt precisely the process group owned by ``run_id``."""
+        self._validate_run_id(run_id)
+        self._validate_timeout(timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
         active = self._active_runs.get(run_id)
         if active is None:
-            raise KeyError(run_id)
+            return StopReceipt(run_id=run_id, was_running=False, process_exited=True)
         active.stop_requested = True
         active.interrupted = True
-        await active.launch_finished.wait()
-        if active.process is None:
-            return
-        await self._stop_active(active)
+        if not await self._wait_for_event_until(active.launch_finished, deadline):
+            return StopReceipt(
+                run_id=run_id,
+                was_running=True,
+                process_exited=active.process_exited.is_set(),
+            )
+        if active.process is not None:
+            await self._stop_active(active, deadline=deadline)
+        return StopReceipt(
+            run_id=run_id,
+            was_running=True,
+            process_exited=await self._wait_for_event_until(active.process_exited, deadline),
+        )
+
+    async def wait_process_exit(self, run_id: str, *, timeout_seconds: float) -> None:
+        """Wait only for the exact local child registered under ``run_id``."""
+        self._validate_run_id(run_id)
+        self._validate_timeout(timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        active = self._active_runs.get(run_id)
+        process_exited = (
+            active.process_exited
+            if active is not None
+            else self._terminal_process_exits.get(run_id)
+        )
+        if process_exited is None:
+            raise KeyError(run_id)
+        if not await self._wait_for_event_until(process_exited, deadline):
+            raise TimeoutError(run_id)
 
     async def wait_until_started(self, run_id: str) -> None:
         """Wait until a scheduled ``run`` has registered its exact child."""
@@ -235,33 +287,106 @@ class ProcessRunner:
         active = self._active_runs.get(run_id)
         return active is not None and active.process is not None
 
-    async def _stop_active(self, active: _ActiveRun) -> None:
-        async with active.stop_lock:
+    async def _stop_active(
+        self, active: _ActiveRun, *, deadline: float | None = None,
+    ) -> None:
+        if deadline is None:
+            await active.stop_lock.acquire()
+        elif not await self._acquire_stop_lock_until(active.stop_lock, deadline):
+            return
+        try:
             active.interrupted = True
             if active.stop_completed:
                 return
             if active.process is None or active.process_group_id is None:
                 return
-            try:
-                os.killpg(active.process_group_id, signal.SIGTERM)
-            except ProcessLookupError:
-                await active.process.wait()
-                active.stop_completed = True
-                return
-            if not await self._wait_for_process_group_exit(active.process_group_id):
+            if not active.termination_started:
+                active.termination_started = True
+                try:
+                    os.killpg(active.process_group_id, signal.SIGTERM)
+                except ProcessLookupError:
+                    if deadline is None:
+                        await self._observe_process_exit(active, active.process)
+                        active.stop_completed = True
+                    return
+            grace_deadline = asyncio.get_running_loop().time() + self._stop_grace_seconds
+            if deadline is not None:
+                grace_deadline = min(grace_deadline, deadline)
+            if not active.kill_sent and not await self._wait_for_process_group_exit(
+                active.process_group_id, deadline=grace_deadline,
+            ):
                 with suppress(ProcessLookupError):
                     os.killpg(active.process_group_id, signal.SIGKILL)
-            await active.process.wait()
-            active.stop_completed = True
+                    active.kill_sent = True
+            if deadline is None:
+                await self._observe_process_exit(active, active.process)
+                active.stop_completed = True
+        finally:
+            active.stop_lock.release()
 
-    async def _wait_for_process_group_exit(self, process_group_id: int) -> bool:
-        deadline = asyncio.get_running_loop().time() + self._stop_grace_seconds
+    async def _wait_for_process_group_exit(
+        self, process_group_id: int, *, deadline: float,
+    ) -> bool:
         while self._process_group_exists(process_group_id):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return False
             await asyncio.sleep(min(remaining, 0.01))
         return True
+
+    async def _wait_for_event_until(
+        self, event: asyncio.Event, deadline: float,
+    ) -> bool:
+        if event.is_set():
+            return True
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+        except TimeoutError:
+            return event.is_set()
+        return True
+
+    async def _acquire_stop_lock_until(self, lock: asyncio.Lock, deadline: float) -> bool:
+        if not lock.locked():
+            await lock.acquire()
+            return True
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=remaining)
+        except TimeoutError:
+            return False
+        return True
+
+    def _remember_terminal_process_exit(self, run_id: str, process_exited: asyncio.Event) -> None:
+        self._terminal_process_exits[run_id] = process_exited
+        while len(self._terminal_process_exits) > MAX_TERMINAL_PROCESS_EXITS:
+            self._terminal_process_exits.popitem(last=False)
+
+    @staticmethod
+    async def _observe_process_exit(
+        active: _ActiveRun, process: asyncio.subprocess.Process,
+    ) -> None:
+        await process.wait()
+        active.process_exited.set()
+
+    @staticmethod
+    def _validate_timeout(timeout_seconds: float) -> None:
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not isfinite(timeout_seconds)
+            or timeout_seconds < 0
+        ):
+            raise ValueError("timeout_seconds must be a finite number >= 0")
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
 
     @staticmethod
     def _process_group_exists(process_group_id: int) -> bool:
