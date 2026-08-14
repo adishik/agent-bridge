@@ -2197,6 +2197,12 @@ class SQLiteStore:
                     owner = self._next_fable_scope_stage_owner(
                         candidates[0], preparation_id=str(row["preparation_id"]),
                     )
+                    if not self._legacy_staged_checkpoint_is_authenticated(
+                        row, owner=owner,
+                    ):
+                        raise RuntimeError(
+                            "Fable answer checkpoint stage migration is unauthenticated"
+                        )
                     stage_kind = "next_fable"
                     stage_owner_json = _encode_json(owner.to_dict())
                 elif self._legacy_prepared_answer_checkpoint_is_authenticated(row):
@@ -6640,6 +6646,102 @@ class SQLiteStore:
             row["status"] == "CONSUMED"
             and question.answer_text == clarification.answer
             and question.answered_by is ConversationActor.FABLE
+        )
+
+    def _legacy_staged_checkpoint_is_authenticated(
+        self,
+        row: sqlite3.Row,
+        *,
+        owner: _NextFableScopeStageOwner,
+    ) -> bool:
+        """Authenticate one inverse checkpoint/preparation/stage relationship."""
+        inverse_rows = self._connection.execute(
+            """
+            SELECT rowid FROM directed_fable_answer_checkpoints
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND question_id = ? AND continuation_generation = ?
+            ORDER BY rowid LIMIT 2
+            """,
+            (
+                row["session_id"], row["task_id"], row["revision"],
+                row["question_id"], row["continuation_generation"],
+            ),
+        ).fetchall()
+        if len(inverse_rows) != 1 or int(inverse_rows[0]["rowid"]) != int(row["rowid"]):
+            return False
+        prepared_row = self._connection.execute(
+            """
+            SELECT rowid, * FROM prepared_actions
+            WHERE preparation_id = ? AND project_id = ? AND session_id = ?
+              AND task_id = ? AND revision = ?
+            """,
+            (
+                row["preparation_id"], row["project_id"], row["session_id"],
+                row["task_id"], row["revision"],
+            ),
+        ).fetchone()
+        question_row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE question_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND continuation_generation = ?
+            """,
+            (
+                row["question_id"], row["session_id"], row["task_id"],
+                row["revision"], row["continuation_generation"],
+            ),
+        ).fetchone()
+        if prepared_row is None or question_row is None:
+            return False
+        try:
+            prepared = self._prepared_action_from_row(prepared_row)
+            question = self._question_from_row(question_row)
+            clarification = FableClarification.from_dict(
+                _decode_mapping(
+                    str(row["clarification_json"]), "Fable answer checkpoint",
+                )
+            )
+            checkpoint = DirectedFableAnswerCheckpoint(
+                preparation_id=str(row["preparation_id"]),
+                question_id=str(row["question_id"]),
+                continuation_generation=int(row["continuation_generation"]),
+                clarification=clarification,
+                stage_kind="next_fable",
+                stage_owner=owner,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        revised = clarification.revised_brief
+        if (
+            not self._legacy_prepared_action_is_authenticated(
+                prepared, int(prepared_row["rowid"]),
+            )
+            or question.nested_parent_kind is not None
+            or question.asked_by is not ConversationActor.SOL
+            or question.routed_to is not ConversationTarget.FABLE
+            or not clarification.scope_changed
+            or clarification.status != "answered"
+            or clarification.answer is None
+            or revised is None
+            or revised.task_id != row["task_id"]
+            or revised.revision != int(row["revision"]) + 1
+            or not self._checkpoint_stage_history_is_authenticated(
+                row=row, checkpoint=checkpoint, prepared=prepared,
+            )
+        ):
+            return False
+        if row["status"] == "PENDING":
+            return question.answer_text is None and question.answered_by is None
+        if row["status"] != "CONSUMED":
+            return False
+        if question.answer_text == clarification.answer:
+            return question.answered_by is ConversationActor.FABLE
+        stopped = self.intervention(owner.intervention_id)
+        return (
+            question.answer_text is None
+            and question.answered_by is None
+            and stopped is not None
+            and stopped.status is InterventionStatus.CANCELED_BY_STOP
         )
 
     def _matching_next_fable_scope_stages(

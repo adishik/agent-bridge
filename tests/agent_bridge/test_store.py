@@ -5348,15 +5348,20 @@ def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
     return stage
 
 
-def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief):
+def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief, *, prefix: str = ""):
     """Build one accepted scope checkpoint with a still-running exact Fable owner."""
-    store.create_session("session-1", "/repo")
-    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
-    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-1")
-    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "provider-1")
+    def owned(value: str) -> str:
+        return value if not prefix else f"{prefix}-{value}"
+
+    session_id = owned("session-1")
+    provider_id = owned("provider-1")
+    store.create_session(session_id, "/repo")
+    store.save_task(session_id, valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, provider_id)
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, provider_id)
     prepared = store.prepare_approval_action(
         project_id="a" * 32,
-        session_id="session-1",
+        session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
         generation=41,
@@ -5369,14 +5374,14 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief):
     prepared = store.claim_prepared_action(
         prepared.preparation_id, generation=prepared.generation,
     )
-    parent_pending = {"sol_run_id": "sol-run-1", "prompt": "continue exactly"}
+    parent_pending = {"sol_run_id": owned("sol-run-1"), "prompt": "continue exactly"}
     _, parent = store.reserve_internal_question(
-        session_id="session-1",
+        session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
         expected_generation=1,
-        question_id="scope-owner-parent",
-        request_key="scope-owner-parent-request",
+        question_id=owned("scope-owner-parent"),
+        request_key=owned("scope-owner-parent-request"),
         asked_by=ConversationActor.SOL,
         addressed_to=ConversationTarget.FABLE,
         routed_to=ConversationTarget.FABLE,
@@ -5390,46 +5395,50 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief):
             task_id=valid_brief.task_id,
             revision=valid_brief.revision,
             generation=1,
-            question_id="scope-owner-parent",
+            question_id=owned("scope-owner-parent"),
             text="May the bounded scope include one exact path?",
         ),
     )
     store.start_agent_run(
-        "scope-owner-source", valid_brief.task_id, valid_brief.revision, "fable",
+        owned("scope-owner-source"), valid_brief.task_id, valid_brief.revision, "fable",
     )
-    store.set_agent_run_session("scope-owner-source", "provider-1")
+    store.set_agent_run_session(owned("scope-owner-source"), provider_id)
     created = store.create_intervention_and_request_stop(
-        intervention_id="scope-owner-intervention",
-        session_id="session-1",
+        intervention_id=owned("scope-owner-intervention"),
+        session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
         expected_source_generation=1,
         message="Keep the scope answer exact.",
         addressed_to=ConversationTarget.FABLE,
         routed_to=ConversationTarget.FABLE,
-        run_id="scope-owner-source",
+        run_id=owned("scope-owner-source"),
     )
-    store.finish_agent_run("scope-owner-source", status="interrupted", exit_code=-15)
+    store.finish_agent_run(
+        owned("scope-owner-source"), status="interrupted", exit_code=-15,
+    )
     store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
     store.begin_intervention_resume(
         created.intervention_id,
         expected_resume_generation=created.resume_generation,
-        resume_attempt_id="scope-owner-attempt",
-        resume_run_id="scope-owner-resume",
+        resume_attempt_id=owned("scope-owner-attempt"),
+        resume_run_id=owned("scope-owner-resume"),
     )
     store.start_agent_run(
-        "scope-owner-resume", valid_brief.task_id, valid_brief.revision, "fable",
+        owned("scope-owner-resume"), valid_brief.task_id, valid_brief.revision, "fable",
     )
-    store.set_agent_run_session("scope-owner-resume", "provider-1")
-    store.finish_agent_run("scope-owner-resume", status="completed", exit_code=0)
+    store.set_agent_run_session(owned("scope-owner-resume"), provider_id)
+    store.finish_agent_run(
+        owned("scope-owner-resume"), status="completed", exit_code=0,
+    )
     _, child = store.reserve_fable_answer_evidence_question(
-        session_id="session-1",
+        session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
         expected_generation=created.resume_generation,
         outer_question_id=parent.question_id,
-        question_id="scope-owner-child",
-        request_key="scope-owner-child-request",
+        question_id=owned("scope-owner-child"),
+        request_key=owned("scope-owner-child-request"),
         text="Which exact fact permits that bounded path?",
         event=_conversation_question(
             sender=ConversationActor.FABLE,
@@ -5438,22 +5447,24 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief):
             task_id=valid_brief.task_id,
             revision=valid_brief.revision,
             generation=created.resume_generation,
-            question_id="scope-owner-child",
+            question_id=owned("scope-owner-child"),
             text="Which exact fact permits that bounded path?",
         ),
         intervention_id=created.intervention_id,
-        child_run_id="scope-owner-child-run",
+        child_run_id=owned("scope-owner-child-run"),
     )
-    store.finish_agent_run("scope-owner-child-run", status="completed", exit_code=0)
+    store.finish_agent_run(
+        owned("scope-owner-child-run"), status="completed", exit_code=0,
+    )
     store.answer_fable_answer_evidence_question(
-        session_id="session-1",
+        session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
         outer_question_id=parent.question_id,
         question_id=child.question_id,
         expected_generation=created.resume_generation,
         answer_text="The exact fact permits only the bounded path.",
-        next_fable_run_id="scope-owner-next-fable",
+        next_fable_run_id=owned("scope-owner-next-fable"),
         event=_conversation_answer(
             sender=ConversationActor.SOL,
             addressed_to=ConversationTarget.FABLE,
@@ -5970,6 +5981,146 @@ def test_staged_scope_checkpoint_migration_requires_unique_positive_history(
     assert path.read_bytes() == bytes_before
 
 
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "missing_preparation",
+        "substituted_preparation",
+        "wrong_project",
+        "wrong_task",
+        "wrong_revision",
+        "wrong_generation",
+        "wrong_question",
+        "wrong_clarification",
+        "duplicate_checkpoint",
+        "duplicate_preparation",
+    ),
+)
+def test_staged_scope_checkpoint_migration_authenticates_inverse_exact_identity(
+    tmp_path,
+    valid_brief,
+    fault: str,
+) -> None:
+    """One legacy checkpoint and one exact preparation may own one exact stage."""
+    path = tmp_path / f"scope-owner-inverse-{fault}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, _, _, _, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store, valid_brief,
+    )
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+
+    preceding = sqlite3.connect(path)
+    prepared_row = preceding.execute(
+        "SELECT * FROM prepared_actions WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert prepared_row is not None
+    prepared_columns = tuple(
+        row[1] for row in preceding.execute("PRAGMA table_info(prepared_actions)")
+    )
+
+    def clone_preparation(
+        preparation_id: str, *, project_id: str | None = None,
+    ) -> None:
+        values = list(prepared_row)
+        values[prepared_columns.index("preparation_id")] = preparation_id
+        values[prepared_columns.index("status")] = "INTERRUPTED"
+        values[prepared_columns.index("reason")] = "adapter_interrupted"
+        if project_id is not None:
+            values[prepared_columns.index("project_id")] = project_id
+        placeholders = ", ".join("?" for _ in prepared_columns)
+        preceding.execute(
+            f"INSERT INTO prepared_actions ({', '.join(prepared_columns)}) "
+            f"VALUES ({placeholders})",
+            tuple(values),
+        )
+
+    if fault == "missing_preparation":
+        preceding.execute(
+            "DELETE FROM prepared_actions WHERE preparation_id = ?",
+            (prepared.preparation_id,),
+        )
+    elif fault == "substituted_preparation":
+        clone_preparation("substituted-preparation", project_id="b" * 32)
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints SET preparation_id = ?",
+            ("substituted-preparation",),
+        )
+    elif fault == "wrong_project":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints SET project_id = ?",
+            ("b" * 32,),
+        )
+    elif fault == "wrong_task":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints SET task_id = 'wrong-task'"
+        )
+    elif fault == "wrong_revision":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints SET revision = 999"
+        )
+    elif fault == "wrong_generation":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET continuation_generation = continuation_generation + 10"
+        )
+    elif fault == "wrong_question":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET question_id = 'scope-owner-child'"
+        )
+    elif fault == "wrong_clarification":
+        preceding.execute(
+            "UPDATE directed_fable_answer_checkpoints SET clarification_json = json_set("
+            "clarification_json, '$.revised_brief.task_id', 'wrong-task')"
+        )
+    elif fault == "duplicate_checkpoint":
+        preceding.execute(
+            "INSERT INTO directed_fable_answer_checkpoints "
+            "SELECT * FROM directed_fable_answer_checkpoints"
+        )
+    elif fault == "duplicate_preparation":
+        clone_preparation("duplicate-preparation")
+        preceding.execute(
+            """
+            INSERT INTO directed_fable_answer_checkpoints
+            SELECT 'duplicate-preparation', project_id, session_id, task_id,
+                   revision, question_id, continuation_generation,
+                   clarification_json, status
+            FROM directed_fable_answer_checkpoints
+            """
+        )
+    else:
+        raise AssertionError(f"unknown inverse migration fault {fault}")
+    preceding.commit()
+    schema_before = tuple(
+        row[1] for row in preceding.execute(
+            "PRAGMA table_info(directed_fable_answer_checkpoints)"
+        )
+    )
+    events_before = tuple(
+        tuple(row) for row in preceding.execute("SELECT * FROM events ORDER BY sequence")
+    )
+    preceding.close()
+    bytes_before = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="migration|checkpoint|preparation"):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+
+    inspected = sqlite3.connect(path)
+    assert tuple(
+        row[1] for row in inspected.execute(
+            "PRAGMA table_info(directed_fable_answer_checkpoints)"
+        )
+    ) == schema_before
+    assert tuple(
+        tuple(row) for row in inspected.execute("SELECT * FROM events ORDER BY sequence")
+    ) == events_before
+    inspected.close()
+    assert path.read_bytes() == bytes_before
+
+
 def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidates(
     tmp_path,
     valid_brief,
@@ -5978,53 +6129,14 @@ def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidate
     """Migration retains no unbounded row or ambiguity collection."""
     path = tmp_path / "paged-scope-owner-migration.sqlite3"
     store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
-    prepared, stage, _, clarification, parent_pending = (
-        _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
-    )
-    _consume_staged_scope_checkpoint(
-        store,
-        valid_brief,
-        prepared=prepared,
-        stage=stage,
-        clarification=clarification,
-        parent_pending=parent_pending,
-    )
+    for index in range(6):
+        _staged_scope_checkpoint_for_owner_matrix(
+            store,
+            replace(valid_brief, task_id=f"paged-task-{index}"),
+            prefix=f"paged-{index}",
+        )
     store.close()
     _restore_pre_stage_owner_checkpoint_schema(path)
-    preceding = sqlite3.connect(path)
-    source = preceding.execute(
-        "SELECT * FROM directed_fable_answer_checkpoints"
-    ).fetchone()
-    prepared_source = preceding.execute(
-        "SELECT * FROM prepared_actions WHERE preparation_id = ?",
-        (prepared.preparation_id,),
-    ).fetchone()
-    assert source is not None
-    assert prepared_source is not None
-    prepared_columns = tuple(
-        row[1] for row in preceding.execute("PRAGMA table_info(prepared_actions)")
-    )
-    prepared_placeholders = ", ".join("?" for _ in prepared_columns)
-    for index in range(5):
-        preparation_id = f"compatible-preparation-{index}"
-        prepared_values = list(prepared_source)
-        prepared_values[prepared_columns.index("preparation_id")] = preparation_id
-        preceding.execute(
-            f"INSERT INTO prepared_actions ({', '.join(prepared_columns)}) "
-            f"VALUES ({prepared_placeholders})",
-            tuple(prepared_values),
-        )
-        preceding.execute(
-            """
-            INSERT INTO directed_fable_answer_checkpoints
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                preparation_id, *source[1:],
-            ),
-        )
-    preceding.commit()
-    preceding.close()
 
     statements: list[str] = []
     original_connect = store_module.sqlite3.connect
@@ -6052,10 +6164,19 @@ def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidate
         and "json_extract" in statement
         and "canceled_by_stop" in statement
     ]
+    inverse_reads = [
+        statement for statement in statements
+        if statement.lstrip().startswith(
+            "SELECT rowid FROM directed_fable_answer_checkpoints"
+        )
+        and "continuation_generation =" in statement
+    ]
     assert len(page_reads) == 4
     assert all("LIMIT 2" in statement for statement in page_reads)
     assert candidate_reads
     assert all("LIMIT 2" in statement for statement in candidate_reads)
+    assert inverse_reads
+    assert all("LIMIT 2" in statement for statement in inverse_reads)
 
 
 def test_child_answer_cas_preallocates_the_exact_next_fable_run(

@@ -1729,6 +1729,23 @@ class Coordinator:
         if completion is not None:
             await completion.wait()
 
+    async def _retire_terminal_retryable_stop_before(self, run_id: str | None) -> None:
+        """Clear only a different retry target with a proven exact local exit."""
+        retryable = self._retryable_stop_run_id
+        if retryable is None or retryable == run_id:
+            return
+        try:
+            await self._runner.wait_process_exit(
+                retryable, timeout_seconds=0,
+            )
+        except (KeyError, TimeoutError) as error:
+            raise RuntimeError(
+                "another exact Stop signal remains retryable"
+            ) from error
+        if self._runner.is_running(retryable):
+            raise RuntimeError("another exact Stop signal remains retryable")
+        self._retryable_stop_run_id = None
+
     async def stop_task(self, task_id: str) -> None:
         task = self._latest_required(task_id)
         intervention = self._store.active_intervention_for_task(
@@ -1740,6 +1757,7 @@ class Coordinator:
             )
         if intervention is not None:
             stop_run_id = self._intervention_stop_run_id(intervention)
+            await self._retire_terminal_retryable_stop_before(stop_run_id)
             if (
                 self._retryable_stop_run_id is not None
                 and self._retryable_stop_run_id != stop_run_id
@@ -4159,6 +4177,8 @@ class Coordinator:
         completion.set()
         if self._run_completions.get(run_id) is completion:
             del self._run_completions[run_id]
+        if self._retryable_stop_run_id == run_id:
+            self._retryable_stop_run_id = None
 
     def _interrupt_if_active(
         self,

@@ -4810,6 +4810,33 @@ def _provider_invocation_projection(harness: CoordinatorHarness) -> tuple[object
     )
 
 
+def _seed_later_running_stop_owner(
+    harness: CoordinatorHarness,
+    valid_brief: TaskBrief,
+) -> tuple[str, str, str]:
+    """Persist a second exact running source without invoking either provider."""
+    task_id = "later-stop-task"
+    run_id = "later-stop-run"
+    intervention_id = "later-stop-intervention"
+    brief = replace(valid_brief, task_id=task_id)
+    harness.store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+    harness.store.set_sol_thread(task_id, brief.revision, THREAD_ID)
+    harness.store.start_agent_run(run_id, task_id, brief.revision, "sol")
+    harness.store.set_agent_run_session(run_id, THREAD_ID)
+    harness.store.create_intervention_and_request_stop(
+        intervention_id=intervention_id,
+        session_id="session-1",
+        task_id=task_id,
+        revision=brief.revision,
+        expected_source_generation=1,
+        message="Stop only this later exact run.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id=run_id,
+    )
+    return task_id, run_id, intervention_id
+
+
 @pytest.mark.parametrize("boundary", ("accepted_scope", "reserved_sol_child"))
 @pytest.mark.parametrize("local_process", (False, True))
 def test_hub_stop_retires_preallocated_owner_and_reopens_idempotently(
@@ -5007,6 +5034,171 @@ def test_failed_exact_local_stop_is_retryable_and_retains_hub_lease(
             if runner.is_running(stop_run_id):
                 await ProcessRunner.stop(runner, stop_run_id, timeout_seconds=1)
             await asyncio.gather(local_child, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "first_outcome", ("timeout", "exception", "process_exited_false"),
+)
+def test_natural_exact_exit_retires_only_its_failed_stop_authority(
+    harness: CoordinatorHarness,
+    valid_brief: TaskBrief,
+    first_outcome: str,
+) -> None:
+    """Terminal run A cannot strand Stop authority or consume running run B."""
+    async def scenario() -> None:
+        crash = _seed_hub_stop_preallocated_boundary(harness, boundary="accepted_scope")
+        old_run_id = crash["stop_run_id"]
+        assert isinstance(old_run_id, str)
+        runner = RetryableExactLocalRunner(first_outcome)
+        harness.coordinator._runner = runner  # type: ignore[assignment] # noqa: SLF001
+        natural_exit = harness.repo / f"natural-exit-{first_outcome}"
+        old_child = asyncio.create_task(runner.run(
+            run_id=old_run_id,
+            argv=(
+                sys.executable,
+                "-c",
+                "import pathlib,sys,time\n"
+                "marker=pathlib.Path(sys.argv[1])\n"
+                "while not marker.exists(): time.sleep(0.01)\n",
+                str(natural_exit),
+            ),
+            cwd=harness.repo,
+            env=dict(os.environ),
+            stdin=None,
+            on_line=lambda stream, line: None,
+        ))
+        await runner.wait_until_started(old_run_id)
+        provider_before = _provider_invocation_projection(harness)
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+        )
+        lease = ActiveAgentLease()
+        old_token = lease.acquire(
+            project_id=runtime.project_id,
+            session_id="session-1",
+            task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        later_child: asyncio.Task[object] | None = None
+        try:
+            first = workflows.reserve_stop(
+                project_id=runtime.project_id,
+                session_id="session-1",
+                task_id="task-1",
+            )
+            expected_error = TimeoutError if first_outcome != "exception" else RuntimeError
+            with pytest.raises(expected_error, match="Stop|stop|exit"):
+                await workflows.stop(reservation=first)
+            assert lease.snapshot() == old_token
+            assert runner.is_running(old_run_id) is True
+
+            later_task_id, later_run_id, later_intervention_id = (
+                _seed_later_running_stop_owner(harness, valid_brief)
+            )
+            with pytest.raises(RuntimeError, match="retryable"):
+                await harness.coordinator.stop_task(later_task_id)
+            assert harness.store.agent_run(later_run_id).status == "running"
+            assert harness.store.intervention(later_intervention_id).status is (  # type: ignore[union-attr]
+                store_module.InterventionStatus.PENDING_STOP
+            )
+            assert lease.snapshot() == old_token
+
+            historical = await runner.run(
+                run_id="historical-local-run",
+                argv=(sys.executable, "-c", "pass"),
+                cwd=harness.repo,
+                env=dict(os.environ),
+                stdin=None,
+                on_line=lambda stream, line: None,
+            )
+            assert historical.exit_code == 0
+            with pytest.raises(RuntimeError, match="retryable"):
+                await harness.coordinator.stop_task(later_task_id)
+            assert harness.store.agent_run(later_run_id).status == "running"
+
+            natural_exit.write_text("exit\n", encoding="utf-8")
+            old_result = await old_child
+            assert old_result.interrupted is False
+            assert runner.is_running(old_run_id) is False
+            lease.release(old_token)
+            assert lease.snapshot() is None
+
+            later_child = asyncio.create_task(runner.run(
+                run_id=later_run_id,
+                argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+                cwd=harness.repo,
+                env=dict(os.environ),
+                stdin=None,
+                on_line=lambda stream, line: None,
+            ))
+            await runner.wait_until_started(later_run_id)
+            later_token = lease.acquire(
+                project_id=runtime.project_id,
+                session_id="session-1",
+                task_id=later_task_id,
+            )
+            later_stop = workflows.reserve_stop(
+                project_id=runtime.project_id,
+                session_id="session-1",
+                task_id=later_task_id,
+            )
+            await workflows.stop(reservation=later_stop)
+            later_result = await later_child
+            assert later_result.interrupted is True
+            assert runner.stops == [old_run_id, later_run_id]
+            assert lease.snapshot() is None
+            assert later_token.task_id == later_task_id
+            assert harness.store.agent_run(later_run_id).status == "interrupted"
+            assert harness.store.intervention(later_intervention_id).status is (  # type: ignore[union-attr]
+                store_module.InterventionStatus.CANCELED_BY_STOP
+            )
+            assert _provider_invocation_projection(harness) == provider_before
+        finally:
+            if runner.is_running(old_run_id):
+                await ProcessRunner.stop(runner, old_run_id, timeout_seconds=1)
+            if runner.is_running("later-stop-run"):
+                await ProcessRunner.stop(
+                    runner, "later-stop-run", timeout_seconds=1,
+                )
+            await asyncio.gather(old_child, return_exceptions=True)
+            if later_child is not None:
+                await asyncio.gather(later_child, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_no_local_failed_stop_target_cannot_authorize_a_different_run(
+    harness: CoordinatorHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    """Missing process-local terminal evidence must retain old Stop authority."""
+    async def scenario() -> None:
+        _seed_hub_stop_preallocated_boundary(harness, boundary="accepted_scope")
+        failing = RecordingRunner()
+        failing.stop_error = TimeoutError("injected no-local Stop timeout")
+        harness.coordinator._runner = failing  # type: ignore[assignment] # noqa: SLF001
+        with pytest.raises(TimeoutError, match="no-local Stop timeout"):
+            await harness.coordinator.stop_task("task-1")
+
+        later_task_id, later_run_id, later_intervention_id = (
+            _seed_later_running_stop_owner(harness, valid_brief)
+        )
+        harness.coordinator._runner = ProcessRunner(  # noqa: SLF001
+            stop_grace_seconds=0,
+        )
+        with pytest.raises(RuntimeError, match="retryable"):
+            await harness.coordinator.stop_task(later_task_id)
+        assert harness.store.agent_run(later_run_id).status == "running"
+        assert harness.store.intervention(later_intervention_id).status is (  # type: ignore[union-attr]
+            store_module.InterventionStatus.PENDING_STOP
+        )
 
     asyncio.run(scenario())
 
