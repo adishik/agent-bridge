@@ -284,6 +284,7 @@ class Coordinator:
         self._terminal_retries: dict[str, PreparedActionOutcome] = {}
         self._compatibility_errors: dict[str, RuntimeError] = {}
         self._intervention_completions: dict[str, asyncio.Event] = {}
+        self._retryable_stop_run_id: str | None = None
         self._claimed_preparation_id: str | None = None
         # A prepared row is never proof that a child is still alive after a
         # process restart.  Recover before this coordinator can be admitted to
@@ -296,6 +297,7 @@ class Coordinator:
         self._terminal_retries.clear()
         self._compatibility_errors.clear()
         self._intervention_completions.clear()
+        self._retryable_stop_run_id = None
         self._claimed_preparation_id = None
 
     @property
@@ -1738,6 +1740,11 @@ class Coordinator:
             )
         if intervention is not None:
             stop_run_id = self._intervention_stop_run_id(intervention)
+            if (
+                self._retryable_stop_run_id is not None
+                and self._retryable_stop_run_id != stop_run_id
+            ):
+                raise RuntimeError("another exact Stop signal remains retryable")
             stop_run_was_running = False
             if stop_run_id is not None:
                 try:
@@ -1750,8 +1757,23 @@ class Coordinator:
                 intervention.intervention_id,
                 expected_resume_generation=intervention.resume_generation,
             )
-            if stop_run_id is not None and stop_run_was_running:
-                await self._signal_intervention_stop_run(stop_run_id)
+            should_signal = stop_run_id is not None and (
+                stop_run_was_running
+                or self._retryable_stop_run_id == stop_run_id
+                or self._runner.is_running(stop_run_id)
+            )
+            if should_signal:
+                try:
+                    await self._signal_intervention_stop_run(stop_run_id)
+                except BaseException:
+                    self._retryable_stop_run_id = stop_run_id
+                    self._store.append_event(
+                        task.session_id, task.task_id, "coordinator", "stop_error",
+                        {"run_id": stop_run_id},
+                    )
+                    raise
+                else:
+                    self._retryable_stop_run_id = None
             return
         if task.state is TaskState.INTERRUPTED:
             pending = task.pending or {}

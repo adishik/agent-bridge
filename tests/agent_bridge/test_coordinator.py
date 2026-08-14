@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -471,6 +472,27 @@ class RecordingRunner(ProcessRunner):
         if self.stop_error is not None:
             raise self.stop_error
         return StopReceipt(run_id=run_id, was_running=True, process_exited=True)
+
+
+class RetryableExactLocalRunner(ProcessRunner):
+    """Keep one real exact local child alive across an injected first Stop failure."""
+
+    def __init__(self, first_outcome: str) -> None:
+        super().__init__(stop_grace_seconds=0)
+        self.first_outcome = first_outcome
+        self.stops: list[str] = []
+
+    async def stop(self, run_id: str, *, timeout_seconds: float) -> StopReceipt:
+        self.stops.append(run_id)
+        if len(self.stops) == 1:
+            if self.first_outcome == "timeout":
+                raise TimeoutError("injected exact Stop timeout")
+            if self.first_outcome == "exception":
+                raise RuntimeError("injected exact Stop exception")
+            if self.first_outcome == "process_exited_false":
+                return StopReceipt(run_id, was_running=True, process_exited=False)
+            raise AssertionError(f"unknown first Stop outcome {self.first_outcome}")
+        return await super().stop(run_id, timeout_seconds=timeout_seconds)
 
 
 @dataclass
@@ -4895,6 +4917,96 @@ def test_hub_stop_retires_preallocated_owner_and_reopens_idempotently(
         assert reopened.authenticated_intervention(crash["intervention_id"]) == terminal
         reopened.audit_legacy_project_ownership(str(harness.repo))
         reopened.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ("accepted_scope", "reserved_sol_child"))
+@pytest.mark.parametrize(
+    "first_outcome", ("timeout", "exception", "process_exited_false"),
+)
+def test_failed_exact_local_stop_is_retryable_and_retains_hub_lease(
+    harness: CoordinatorHarness,
+    boundary: str,
+    first_outcome: str,
+) -> None:
+    """A committed logical Stop keeps exact signal authority until child exit."""
+    async def scenario() -> None:
+        crash = _seed_hub_stop_preallocated_boundary(harness, boundary=boundary)
+        stop_run_id = crash["stop_run_id"]
+        assert isinstance(stop_run_id, str)
+        runner = RetryableExactLocalRunner(first_outcome)
+        harness.coordinator._runner = runner  # type: ignore[assignment] # noqa: SLF001
+        local_child = asyncio.create_task(runner.run(
+            run_id=stop_run_id,
+            argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+            cwd=harness.repo,
+            env=dict(os.environ),
+            stdin=None,
+            on_line=lambda stream, line: None,
+        ))
+        await runner.wait_until_started(stop_run_id)
+        provider_before = _provider_invocation_projection(harness)
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+        )
+        lease = ActiveAgentLease()
+        token = lease.acquire(
+            project_id=runtime.project_id,
+            session_id="session-1",
+            task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        try:
+            first = workflows.reserve_stop(
+                project_id=runtime.project_id,
+                session_id="session-1",
+                task_id="task-1",
+            )
+            # The workflow owner can finish after the logical interruption, but
+            # its release must stay deferred while this local child may live.
+            lease.release(token)
+            expected_error = TimeoutError if first_outcome != "exception" else RuntimeError
+            with pytest.raises(expected_error, match="Stop|stop|exit"):
+                await workflows.stop(reservation=first)
+
+            terminal = harness.store.intervention(crash["intervention_id"])
+            assert terminal is not None
+            assert terminal.status is store_module.InterventionStatus.CANCELED_BY_STOP
+            assert harness.store.agent_run(stop_run_id).status == "interrupted"
+            assert runner.is_running(stop_run_id) is True
+            assert runner.stops == [stop_run_id]
+            assert lease.snapshot() == token
+            assert _provider_invocation_projection(harness) == provider_before
+            stop_errors = [
+                event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "stop_error"
+                and event.payload == {"run_id": stop_run_id}
+            ]
+            assert len(stop_errors) == 1
+
+            repeated = workflows.reserve_stop(
+                project_id=runtime.project_id,
+                session_id="session-1",
+                task_id="task-1",
+            )
+            await workflows.stop(reservation=repeated)
+            result = await local_child
+            assert result.interrupted is True
+            assert runner.stops == [stop_run_id, stop_run_id]
+            assert runner.is_running(stop_run_id) is False
+            assert lease.snapshot() is None
+            assert harness.store.intervention(crash["intervention_id"]) == terminal
+            assert _provider_invocation_projection(harness) == provider_before
+        finally:
+            if runner.is_running(stop_run_id):
+                await ProcessRunner.stop(runner, stop_run_id, timeout_seconds=1)
+            await asyncio.gather(local_child, return_exceptions=True)
 
     asyncio.run(scenario())
 

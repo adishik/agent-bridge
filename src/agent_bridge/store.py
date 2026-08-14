@@ -2172,40 +2172,50 @@ class SQLiteStore:
         )
 
     def _migrate_fable_checkpoint_stage_owners_in_transaction(self) -> None:
-        """Backfill only an exact live next-Fable owner from the preceding schema."""
+        """Backfill one positively authenticated live or terminal stage owner."""
         if not self._connection.in_transaction:
             raise RuntimeError("Fable answer checkpoint migration requires a transaction")
-        rows = self._connection.execute(
-            "SELECT rowid, * FROM directed_fable_answer_checkpoints ORDER BY rowid"
-        ).fetchall()
-        for row in rows:
-            candidates = self._matching_next_fable_scope_stages(
-                session_id=str(row["session_id"]),
-                task_id=str(row["task_id"]),
-                revision=int(row["revision"]),
-                parent_question_id=str(row["question_id"]),
-            )
-            if len(candidates) > 1:
-                raise RuntimeError("Fable answer checkpoint stage migration is ambiguous")
-            if candidates:
-                owner = self._next_fable_scope_stage_owner(
-                    candidates[0], preparation_id=str(row["preparation_id"]),
-                )
-                stage_kind = "next_fable"
-                stage_owner_json = _encode_json(owner.to_dict())
-            else:
-                stage_kind = "prepared_answer"
-                stage_owner_json = None
-            cursor = self._connection.execute(
+        last_rowid = 0
+        while True:
+            rows = self._connection.execute(
                 """
-                UPDATE directed_fable_answer_checkpoints
-                SET stage_kind = ?, stage_owner_json = ?
-                WHERE rowid = ? AND stage_kind IS NULL AND stage_owner_json IS NULL
+                SELECT rowid, * FROM directed_fable_answer_checkpoints
+                WHERE rowid > ? ORDER BY rowid LIMIT ?
                 """,
-                (stage_kind, stage_owner_json, int(row["rowid"])),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("Fable answer checkpoint stage migration changed")
+                (last_rowid, _STARTUP_RECOVERY_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                last_rowid = int(row["rowid"])
+                candidates = self._matching_checkpoint_scope_stage_history(row)
+                if len(candidates) > 1:
+                    raise RuntimeError(
+                        "Fable answer checkpoint stage migration is ambiguous"
+                    )
+                if candidates:
+                    owner = self._next_fable_scope_stage_owner(
+                        candidates[0], preparation_id=str(row["preparation_id"]),
+                    )
+                    stage_kind = "next_fable"
+                    stage_owner_json = _encode_json(owner.to_dict())
+                elif self._legacy_prepared_answer_checkpoint_is_authenticated(row):
+                    stage_kind = "prepared_answer"
+                    stage_owner_json = None
+                else:
+                    raise RuntimeError(
+                        "Fable answer checkpoint stage migration is unauthenticated"
+                    )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE directed_fable_answer_checkpoints
+                    SET stage_kind = ?, stage_owner_json = ?
+                    WHERE rowid = ? AND stage_kind IS NULL AND stage_owner_json IS NULL
+                    """,
+                    (stage_kind, stage_owner_json, last_rowid),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Fable answer checkpoint stage migration changed")
 
     def _migrate_intervention_schema(self) -> None:
         """Keep intervention migration inside the same rollback boundary as all DDL."""
@@ -6492,6 +6502,146 @@ class SQLiteStore:
             preparation_id=preparation_id,
         )
 
+    def _matching_checkpoint_scope_stage_history(
+        self, row: sqlite3.Row,
+    ) -> tuple[InterventionRecord, ...]:
+        """Return at most two exact structural owners for one legacy checkpoint."""
+        candidates: list[InterventionRecord] = []
+        intervention_rows = self._connection.execute(
+            """
+            SELECT * FROM interventions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND status IN (?, ?, ?)
+              AND json_extract(directed_binding_json, '$.stage') = 'next_fable'
+              AND json_extract(directed_binding_json, '$.parent_question_id') = ?
+            ORDER BY rowid LIMIT 2
+            """,
+            (
+                str(row["session_id"]),
+                str(row["task_id"]),
+                int(row["revision"]),
+                InterventionStatus.RESUMING.value,
+                InterventionStatus.RESUMED.value,
+                InterventionStatus.CANCELED_BY_STOP.value,
+                str(row["question_id"]),
+            ),
+        ).fetchall()
+        for intervention_row in intervention_rows:
+            record = self._intervention_from_row(intervention_row)
+            if not self._intervention_is_authenticated(
+                record, intervention_row["acknowledgment_id"],
+            ):
+                raise RuntimeError(
+                    "Fable answer checkpoint stage migration is unauthenticated"
+                )
+            owner = self._next_fable_scope_stage_owner(
+                record, preparation_id=str(row["preparation_id"]),
+            )
+            run_row = self._connection.execute(
+                "SELECT * FROM agent_runs WHERE run_id = ?", (owner.run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError(
+                    "Fable answer checkpoint stage migration is unauthenticated"
+                )
+            run = self._agent_run_from_row(run_row)
+            live = (
+                row["status"] == "PENDING"
+                and record.status is InterventionStatus.RESUMING
+                and run.status == "running"
+            )
+            terminal = row["status"] == "CONSUMED" and (
+                (
+                    record.status is InterventionStatus.RESUMED
+                    and run.status == "completed"
+                )
+                or (
+                    record.status is InterventionStatus.CANCELED_BY_STOP
+                    and run.status == "interrupted"
+                )
+            )
+            if (
+                not (live or terminal)
+                or run.task_id != owner.task_id
+                or run.revision != owner.revision
+                or run.agent != ConversationTarget.FABLE.value
+                or run.cli_session_id != owner.provider_id
+            ):
+                raise RuntimeError(
+                    "Fable answer checkpoint stage migration is unauthenticated"
+                )
+            candidates.append(record)
+        return tuple(candidates)
+
+    def _legacy_prepared_answer_checkpoint_is_authenticated(
+        self, row: sqlite3.Row,
+    ) -> bool:
+        """Recognize an ordinary legacy checkpoint from its positive structure."""
+        prepared_row = self._connection.execute(
+            """
+            SELECT rowid, * FROM prepared_actions
+            WHERE preparation_id = ? AND project_id = ? AND session_id = ?
+              AND task_id = ? AND revision = ?
+            """,
+            (
+                row["preparation_id"], row["project_id"], row["session_id"],
+                row["task_id"], row["revision"],
+            ),
+        ).fetchone()
+        question_row = self._connection.execute(
+            """
+            SELECT * FROM questions
+            WHERE question_id = ? AND session_id = ? AND task_id = ?
+              AND revision = ? AND continuation_generation = ?
+            """,
+            (
+                row["question_id"], row["session_id"], row["task_id"],
+                row["revision"], row["continuation_generation"],
+            ),
+        ).fetchone()
+        if prepared_row is None or question_row is None:
+            return False
+        try:
+            clarification = FableClarification.from_dict(
+                _decode_mapping(
+                    str(row["clarification_json"]), "Fable answer checkpoint",
+                )
+            )
+            prepared = self._prepared_action_from_row(prepared_row)
+            question = self._question_from_row(question_row)
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        if (
+            prepared.preparation_id != row["preparation_id"]
+            or not self._legacy_prepared_action_is_authenticated(
+                prepared, int(prepared_row["rowid"]),
+            )
+            or question.nested_parent_kind is not None
+            or question.asked_by is not ConversationActor.SOL
+            or question.routed_to is not ConversationTarget.FABLE
+        ):
+            return False
+        if clarification.scope_changed and self._connection.execute(
+            """
+            SELECT 1 FROM questions
+            WHERE session_id = ? AND task_id = ? AND revision = ?
+              AND parent_question_id = ? AND nested_parent_kind IS NOT NULL
+            LIMIT 1
+            """,
+            (
+                row["session_id"], row["task_id"], row["revision"],
+                row["question_id"],
+            ),
+        ).fetchone() is not None:
+            return False
+        if row["status"] == "PENDING":
+            return question.answer_text is None and question.answered_by is None
+        return (
+            row["status"] == "CONSUMED"
+            and question.answer_text == clarification.answer
+            and question.answered_by is ConversationActor.FABLE
+        )
+
     def _matching_next_fable_scope_stages(
         self,
         *,
@@ -6506,10 +6656,13 @@ class SQLiteStore:
             """
             SELECT * FROM interventions
             WHERE session_id = ? AND task_id = ? AND revision = ? AND status = ?
-            ORDER BY rowid
+              AND json_extract(directed_binding_json, '$.stage') = 'next_fable'
+              AND json_extract(directed_binding_json, '$.parent_question_id') = ?
+            ORDER BY rowid LIMIT 2
             """,
             (
                 session_id, task_id, revision, InterventionStatus.RESUMING.value,
+                parent_question_id,
             ),
         ):
             record = self._intervention_from_row(row)
@@ -10193,7 +10346,7 @@ class SQLiteStore:
             """
             SELECT * FROM directed_fable_answer_checkpoints
             WHERE session_id = ? AND task_id = ? AND revision = ? AND question_id = ?
-            ORDER BY rowid
+            ORDER BY rowid LIMIT 2
             """,
             (
                 record.session_id, record.task_id, record.revision,
@@ -10276,7 +10429,12 @@ class SQLiteStore:
         if run.agent != expected_agent.value or run.cli_session_id != expected_provider:
             raise RuntimeError("intervention Stop run owner changed")
         if record.status is InterventionStatus.CANCELED_BY_STOP:
-            if run.status != "interrupted":
+            preserved_terminal_source = (
+                binding is not None
+                and binding.stage == "active_question"
+                and run.status in _TERMINAL_RUN_STATUSES
+            )
+            if run.status != "interrupted" and not preserved_terminal_source:
                 raise RuntimeError("intervention Stop run is not terminal")
         elif run.status != "running":
             terminal_directed_source = (
@@ -10409,7 +10567,7 @@ class SQLiteStore:
                 SELECT * FROM prepared_actions
                 WHERE session_id = ? AND task_id = ? AND revision = ?
                   AND status IN ('PREPARED', 'CLAIMED', 'RECOVERED')
-                ORDER BY rowid
+                ORDER BY rowid LIMIT 2
                 """,
                 (record.session_id, record.task_id, record.revision),
             ).fetchall()
@@ -11357,9 +11515,14 @@ class SQLiteStore:
                 """
                 SELECT * FROM interventions
                 WHERE session_id = ? AND task_id = ? AND revision = ?
-                ORDER BY rowid
+                  AND json_extract(directed_binding_json, '$.stage') = 'next_fable'
+                  AND json_extract(directed_binding_json, '$.parent_question_id') = ?
+                ORDER BY rowid LIMIT 2
                 """,
-                (prepared.session_id, prepared.task_id, prepared.revision),
+                (
+                    prepared.session_id, prepared.task_id, prepared.revision,
+                    checkpoint.question_id,
+                ),
             ):
                 candidate = self._intervention_from_row(intervention_row)
                 binding = candidate.directed_binding

@@ -336,7 +336,7 @@ class ActiveAgentLease:
             return reservation._token
 
     def cancel_stop_reservation(self, reservation: StopReservation) -> None:
-        """Cancel only this reservation and apply any deferred owner release."""
+        """Clear this failed claim while retaining its exact owner for retry."""
         if not isinstance(reservation, StopReservation):
             raise ValueError("stop reservation is invalid")
         with self._lock:
@@ -346,8 +346,6 @@ class ActiveAgentLease:
                 raise RuntimeError("stop requires the exact active workflow")
             if self._active != reservation._token:
                 raise RuntimeError("stop requires the exact active workflow")
-            if self._pending_owner_release:
-                self._active = None
             self._stop_reservation = None
             self._pending_owner_release = False
 

@@ -5815,6 +5815,249 @@ def test_staged_scope_checkpoint_owner_migration_is_exact_and_byte_idempotent(
     assert path.read_bytes() == migrated_bytes
 
 
+def _restore_pre_stage_owner_checkpoint_schema(path: Path) -> None:
+    """Restore only the immediately preceding checkpoint table shape."""
+    preceding = sqlite3.connect(path)
+    preceding.execute(
+        """
+        CREATE TABLE preceding_directed_fable_answer_checkpoints AS
+        SELECT preparation_id, project_id, session_id, task_id, revision,
+               question_id, continuation_generation, clarification_json, status
+        FROM directed_fable_answer_checkpoints
+        """
+    )
+    preceding.execute("DROP TABLE directed_fable_answer_checkpoints")
+    preceding.execute(
+        "ALTER TABLE preceding_directed_fable_answer_checkpoints "
+        "RENAME TO directed_fable_answer_checkpoints"
+    )
+    preceding.commit()
+    preceding.close()
+
+
+@pytest.mark.parametrize("terminal", ("resumed", "canceled_by_stop"))
+def test_terminal_staged_scope_checkpoint_migration_preserves_exact_owner(
+    tmp_path,
+    valid_brief,
+    terminal: str,
+) -> None:
+    """Consumed staged checkpoints retain their one authenticated terminal owner."""
+    path = tmp_path / f"terminal-scope-owner-{terminal}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, _, clarification, parent_pending = (
+        _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    )
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    if terminal == "resumed":
+        _consume_staged_scope_checkpoint(
+            store,
+            valid_brief,
+            prepared=prepared,
+            stage=stage,
+            clarification=clarification,
+            parent_pending=parent_pending,
+        )
+        expected_status = store_module.InterventionStatus.RESUMED
+        expected_run_status = "completed"
+    else:
+        store.cancel_intervention_by_stop(
+            stage.intervention_id,
+            expected_resume_generation=stage.resume_generation,
+        )
+        expected_status = store_module.InterventionStatus.CANCELED_BY_STOP
+        expected_run_status = "interrupted"
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    row = migrated._connection.execute(  # noqa: SLF001 - migration contract
+        "SELECT stage_kind, stage_owner_json, status "
+        "FROM directed_fable_answer_checkpoints WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert row is not None
+    assert (row["stage_kind"], row["status"]) == ("next_fable", "CONSUMED")
+    owner = json.loads(row["stage_owner_json"])
+    assert owner["intervention_id"] == stage.intervention_id
+    assert owner["run_id"] == binding.next_run_id
+    assert migrated.authenticated_intervention(stage.intervention_id).status is expected_status  # type: ignore[union-attr]
+    assert migrated.agent_run(binding.next_run_id).status == expected_run_status
+    assert migrated._directed_fable_answer_checkpoint_reasons("a" * 32) == set()  # noqa: SLF001
+    migrated.close()
+
+    migrated_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:02Z")
+    assert reopened._directed_fable_answer_checkpoint_reasons("a" * 32) == set()  # noqa: SLF001
+    reopened.close()
+    assert path.read_bytes() == migrated_bytes
+
+
+@pytest.mark.parametrize(
+    "fault", ("missing_history", "missing_run", "ambiguous_history"),
+)
+def test_staged_scope_checkpoint_migration_requires_unique_positive_history(
+    tmp_path,
+    valid_brief,
+    fault: str,
+) -> None:
+    """No live match is not evidence of an ordinary prepared-answer checkpoint."""
+    path = tmp_path / f"scope-owner-migration-{fault}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    _, stage, _, _, _ = _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+
+    preceding = sqlite3.connect(path)
+    if fault == "missing_history":
+        preceding.execute(
+            "DELETE FROM interventions WHERE intervention_id = ?",
+            (stage.intervention_id,),
+        )
+    elif fault == "missing_run":
+        assert stage.directed_binding is not None
+        preceding.execute(
+            "DELETE FROM agent_runs WHERE run_id = ?",
+            (stage.directed_binding.next_run_id,),
+        )
+    else:
+        preceding.execute(
+            """
+            INSERT INTO interventions (
+                intervention_id, session_id, task_id, revision, addressed_to,
+                routed_to, message, run_id, continuation_state, source_generation,
+                resume_generation, fable_session_id, sol_thread_id,
+                resume_attempt_id, resume_run_id, acknowledgment_id, status,
+                directed_binding_json, created_at
+            )
+            SELECT 'ambiguous-scope-owner', session_id, task_id, revision,
+                   addressed_to, routed_to, message, run_id, continuation_state,
+                   source_generation, resume_generation, fable_session_id,
+                   sol_thread_id, resume_attempt_id, resume_run_id,
+                   acknowledgment_id, status, directed_binding_json, created_at
+            FROM interventions WHERE intervention_id = ?
+            """,
+            (stage.intervention_id,),
+        )
+    preceding.commit()
+    schema_before = tuple(
+        row[1] for row in preceding.execute(
+            "PRAGMA table_info(directed_fable_answer_checkpoints)"
+        )
+    )
+    unrelated_before = tuple(
+        tuple(row) for row in preceding.execute("SELECT * FROM events ORDER BY sequence")
+    )
+    preceding.close()
+    bytes_before = path.read_bytes()
+
+    with pytest.raises(
+        RuntimeError,
+        match="checkpoint stage migration|migration is unauthenticated",
+    ):
+        SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+
+    inspected = sqlite3.connect(path)
+    assert tuple(
+        row[1] for row in inspected.execute(
+            "PRAGMA table_info(directed_fable_answer_checkpoints)"
+        )
+    ) == schema_before
+    assert tuple(
+        tuple(row) for row in inspected.execute("SELECT * FROM events ORDER BY sequence")
+    ) == unrelated_before
+    inspected.close()
+    assert path.read_bytes() == bytes_before
+
+
+def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidates(
+    tmp_path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Migration retains no unbounded row or ambiguity collection."""
+    path = tmp_path / "paged-scope-owner-migration.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, _, clarification, parent_pending = (
+        _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    )
+    _consume_staged_scope_checkpoint(
+        store,
+        valid_brief,
+        prepared=prepared,
+        stage=stage,
+        clarification=clarification,
+        parent_pending=parent_pending,
+    )
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+    preceding = sqlite3.connect(path)
+    source = preceding.execute(
+        "SELECT * FROM directed_fable_answer_checkpoints"
+    ).fetchone()
+    prepared_source = preceding.execute(
+        "SELECT * FROM prepared_actions WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert source is not None
+    assert prepared_source is not None
+    prepared_columns = tuple(
+        row[1] for row in preceding.execute("PRAGMA table_info(prepared_actions)")
+    )
+    prepared_placeholders = ", ".join("?" for _ in prepared_columns)
+    for index in range(5):
+        preparation_id = f"compatible-preparation-{index}"
+        prepared_values = list(prepared_source)
+        prepared_values[prepared_columns.index("preparation_id")] = preparation_id
+        preceding.execute(
+            f"INSERT INTO prepared_actions ({', '.join(prepared_columns)}) "
+            f"VALUES ({prepared_placeholders})",
+            tuple(prepared_values),
+        )
+        preceding.execute(
+            """
+            INSERT INTO directed_fable_answer_checkpoints
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                preparation_id, *source[1:],
+            ),
+        )
+    preceding.commit()
+    preceding.close()
+
+    statements: list[str] = []
+    original_connect = store_module.sqlite3.connect
+
+    def observed_connect(*args, **kwargs):
+        observed = original_connect(*args, **kwargs)
+        observed.set_trace_callback(statements.append)
+        return observed
+
+    monkeypatch.setattr(store_module, "_STARTUP_RECOVERY_BATCH_SIZE", 2)
+    monkeypatch.setattr(store_module.sqlite3, "connect", observed_connect)
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    assert migrated._directed_fable_answer_checkpoint_reasons("a" * 32) == set()  # noqa: SLF001
+    migrated.close()
+
+    page_reads = [
+        statement for statement in statements
+        if "FROM directed_fable_answer_checkpoints" in statement
+        and "WHERE rowid >" in statement
+    ]
+    candidate_reads = [
+        statement for statement in statements
+        if statement.lstrip().startswith("SELECT * FROM interventions")
+        and "status IN" in statement
+        and "json_extract" in statement
+        and "canceled_by_stop" in statement
+    ]
+    assert len(page_reads) == 4
+    assert all("LIMIT 2" in statement for statement in page_reads)
+    assert candidate_reads
+    assert all("LIMIT 2" in statement for statement in candidate_reads)
+
+
 def test_child_answer_cas_preallocates_the_exact_next_fable_run(
     tmp_path, valid_brief,
 ) -> None:
@@ -6685,6 +6928,147 @@ def test_stop_authenticates_the_staged_next_fable_continuation(
     task = store.get_task(valid_brief.task_id, valid_brief.revision)
     assert task.state is TaskState.INTERRUPTED
     assert task.continuation_state is TaskState.SOL_RUNNING
+
+
+@pytest.mark.parametrize("source_status", ("completed", "failed", "interrupted"))
+def test_repeated_and_reopened_stop_accepts_authenticated_terminal_directed_source(
+    tmp_path,
+    valid_brief,
+    source_status: str,
+) -> None:
+    """The first Stop deliberately preserves a terminal active-question source."""
+    path = tmp_path / f"terminal-source-stop-{source_status}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store._connection.execute(  # noqa: SLF001 - exact terminal source matrix
+        "UPDATE agent_runs SET status = ?, ended_at = ?, exit_code = ? WHERE run_id = ?",
+        (
+            source_status,
+            "2026-08-10T12:00:00Z",
+            0 if source_status == "completed" else -1,
+            "original-source-run",
+        ),
+    )
+    canceled = store.cancel_intervention_by_stop(
+        created.intervention_id,
+        expected_resume_generation=created.resume_generation,
+    )
+    assert canceled.status is store_module.InterventionStatus.CANCELED_BY_STOP
+    assert store.agent_run("original-source-run").status == source_status
+    assert store.cancel_intervention_by_stop(
+        canceled.intervention_id,
+        expected_resume_generation=canceled.resume_generation,
+    ) == canceled
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    assert reopened.cancel_intervention_by_stop(
+        canceled.intervention_id,
+        expected_resume_generation=canceled.resume_generation,
+    ) == canceled
+    assert reopened.agent_run("original-source-run").status == source_status
+    assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+    assert reopened.authenticated_intervention(canceled.intervention_id) == canceled
+    reopened.close()
+
+
+@pytest.mark.parametrize("mutation", ("source_run", "source_owner"))
+def test_repeated_terminal_directed_source_stop_rejects_wrong_owner_without_mutation(
+    tmp_path,
+    valid_brief,
+    mutation: str,
+) -> None:
+    """Canonical replay cannot substitute a compatible terminal source identity."""
+    store = SQLiteStore(
+        tmp_path / f"terminal-source-stop-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    canceled = store.cancel_intervention_by_stop(
+        created.intervention_id,
+        expected_resume_generation=created.resume_generation,
+    )
+    if mutation == "source_run":
+        store._connection.execute(  # noqa: SLF001 - exact owner tamper
+            "UPDATE interventions SET directed_binding_json = json_set("
+            "directed_binding_json, '$.source_run_id', 'substituted-source') "
+            "WHERE intervention_id = ?",
+            (canceled.intervention_id,),
+        )
+    else:
+        store._connection.execute(  # noqa: SLF001 - exact owner tamper
+            "UPDATE agent_runs SET cli_session_id = 'substituted-provider' "
+            "WHERE run_id = 'original-source-run'"
+        )
+    before = _scope_owner_fixture_snapshot(store)
+
+    with pytest.raises(RuntimeError, match="binding|run|owner|authenticated"):
+        store.cancel_intervention_by_stop(
+            canceled.intervention_id,
+            expected_resume_generation=canceled.resume_generation,
+        )
+
+    assert _scope_owner_fixture_snapshot(store) == before
+
+
+def test_staged_scope_stop_uniqueness_queries_are_bounded(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """Stop ambiguity checks bound compatible persisted history at two rows."""
+    store = SQLiteStore(
+        tmp_path / "bounded-staged-scope-stop.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    _, stage, _, _, _ = _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    row = store._connection.execute(  # noqa: SLF001 - compatible history fixture
+        "SELECT * FROM interventions WHERE intervention_id = ?",
+        (stage.intervention_id,),
+    ).fetchone()
+    assert row is not None
+    columns = tuple(row.keys())
+    placeholders = ", ".join("?" for _ in columns)
+    for index in range(64):
+        values = list(row)
+        values[columns.index("intervention_id")] = f"unrelated-stage-{index}"
+        binding = json.loads(values[columns.index("directed_binding_json")])
+        binding["parent_question_id"] = f"unrelated-parent-{index}"
+        values[columns.index("directed_binding_json")] = json.dumps(
+            binding, sort_keys=True, separators=(",", ":"),
+        )
+        store._connection.execute(  # noqa: SLF001 - compatible history fixture
+            f"INSERT INTO interventions ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values),
+        )
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+    try:
+        store.cancel_intervention_by_stop(
+            stage.intervention_id,
+            expected_resume_generation=stage.resume_generation,
+        )
+    finally:
+        store._connection.set_trace_callback(None)  # noqa: SLF001
+
+    checkpoint_reads = [
+        statement for statement in statements
+        if "FROM directed_fable_answer_checkpoints" in statement
+        and "WHERE session_id =" in statement
+        and "ORDER BY rowid" in statement
+    ]
+    preparation_reads = [
+        statement for statement in statements
+        if "FROM prepared_actions" in statement
+        and "status IN" in statement
+        and "ORDER BY rowid" in statement
+    ]
+    history_reads = [
+        statement for statement in statements
+        if "FROM interventions" in statement and "json_extract" in statement
+    ]
+    assert checkpoint_reads and all("LIMIT 2" in row for row in checkpoint_reads)
+    assert preparation_reads and all("LIMIT 2" in row for row in preparation_reads)
+    assert history_reads and all("LIMIT 2" in row for row in history_reads)
 
 
 @pytest.mark.parametrize("operation", ("retry", "stop"))

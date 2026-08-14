@@ -1616,8 +1616,8 @@ def test_stop_rejects_a_reconstructed_reservation_claim() -> None:
     asyncio.run(exercise())
 
 
-def test_owner_release_during_stop_reservation_is_applied_after_stop_cancellation() -> None:
-    """Dropping an ordinary release during a reservation would strand the lease."""
+def test_owner_release_during_failed_stop_stays_pinned_for_exact_retry() -> None:
+    """A failed Stop cannot release authority while its exact child may remain live."""
     async def exercise() -> None:
         runtime = _runtime("project-a")
         lease = ActiveAgentLease()
@@ -1648,6 +1648,8 @@ def test_owner_release_during_stop_reservation_is_applied_after_stop_cancellatio
         with pytest.raises(RuntimeError, match="injected Stop failure"):
             await stopping
         assert runtime.coordinator.stops == []
+        assert lease.snapshot() == prepared.token
+        lease.release(prepared.token)
         assert lease.snapshot() is None
 
     asyncio.run(exercise())
