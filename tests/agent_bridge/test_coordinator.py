@@ -56,6 +56,7 @@ from agent_bridge.hub import (
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
+    ApprovalPayload,
     NewRequestPayload,
     PreparedActionOutcome,
     ResumeDriftProjection,
@@ -4632,6 +4633,334 @@ def test_later_stop_cancels_cross_route_resuming_nested_sol_child_and_survives_r
         reopened.close()
 
     asyncio.run(scenario())
+
+
+def _seed_hub_stop_preallocated_boundary(
+    harness: CoordinatorHarness,
+    *,
+    boundary: str,
+) -> dict[str, object]:
+    """Persist one exact owner without registering it in the local ProcessRunner."""
+    brief = harness.fable.brief
+    store = harness.store
+    store.save_task("session-1", brief, TaskState.AWAITING_USER_APPROVAL)
+    store.set_sol_thread(brief.task_id, brief.revision, THREAD_ID)
+    store.set_fable_session(brief.task_id, brief.revision, "fable-session-1")
+    prepared = store.prepare_approval_action(
+        project_id=harness.coordinator.project_id,
+        session_id="session-1",
+        task_id=brief.task_id,
+        revision=brief.revision,
+        generation=1,
+        payload=ApprovalPayload(
+            baseline_id="baseline-1", baseline_setting=None, scope=None,
+        ),
+    )
+    prepared = store.claim_prepared_action(
+        prepared.preparation_id, generation=prepared.generation,
+    )
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.set_setting("agent_bridge.baseline.task-1.1", {
+        "task_id": brief.task_id,
+        "revision": brief.revision,
+        "baseline_id": "baseline-1",
+        "manifest": {
+            "baseline_id": "baseline-1",
+            "repo_root": str(harness.repo),
+        },
+    })
+    parent_pending = {"sol_run_id": "scope-stop-sol-run", "prompt": "continue exactly"}
+    _, parent = store.reserve_internal_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, question_id="scope-stop-parent",
+        request_key="scope-stop-parent-request", asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        text="May the bounded scope include one exact path?",
+        continuation_state=TaskState.SOL_RUNNING, pending_action=parent_pending,
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="May the bounded scope include one exact path?", task_id=brief.task_id,
+            revision=brief.revision, continuation_generation=1,
+            question_id="scope-stop-parent",
+        ),
+    )
+    store.start_agent_run("scope-stop-source", brief.task_id, brief.revision, "fable")
+    store.set_agent_run_session("scope-stop-source", "fable-session-1")
+    intervention = store.create_intervention_and_request_stop(
+        intervention_id=f"hub-stop-{boundary}", session_id="session-1",
+        task_id=brief.task_id, revision=brief.revision, expected_source_generation=1,
+        message="Keep this exact boundary stopped.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id="scope-stop-source",
+    )
+    store.finish_agent_run("scope-stop-source", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(intervention.intervention_id, run_id=intervention.run_id)
+    store.begin_intervention_resume(
+        intervention.intervention_id,
+        expected_resume_generation=intervention.resume_generation,
+        resume_attempt_id="scope-stop-attempt", resume_run_id="scope-stop-fable-resume",
+    )
+    store.start_agent_run(
+        "scope-stop-fable-resume", brief.task_id, brief.revision, "fable",
+    )
+    store.set_agent_run_session("scope-stop-fable-resume", "fable-session-1")
+    store.finish_agent_run("scope-stop-fable-resume", status="completed", exit_code=0)
+    _, child = store.reserve_fable_answer_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=intervention.resume_generation,
+        outer_question_id=parent.question_id, question_id="scope-stop-child",
+        request_key="scope-stop-child-request",
+        text="Which exact fact permits that bounded path?",
+        event=ConversationEnvelope(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact fact permits that bounded path?", task_id=brief.task_id,
+            revision=brief.revision,
+            continuation_generation=intervention.resume_generation,
+            question_id="scope-stop-child",
+        ),
+        intervention_id=intervention.intervention_id,
+        child_run_id="scope-stop-sol-child-run",
+    )
+    checkpoint = None
+    if boundary == "accepted_scope":
+        store.finish_agent_run("scope-stop-sol-child-run", status="completed", exit_code=0)
+        store.answer_fable_answer_evidence_question(
+            session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+            outer_question_id=parent.question_id, question_id=child.question_id,
+            expected_generation=intervention.resume_generation,
+            answer_text="The exact fact permits only the bounded path.",
+            next_fable_run_id="scope-stop-next-fable-run",
+            event=ConversationEnvelope(
+                sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                message_type=ConversationMessageType.ANSWER,
+                text="The exact fact permits only the bounded path.", task_id=brief.task_id,
+                revision=brief.revision,
+                continuation_generation=intervention.resume_generation,
+                reply_to_question_id=child.question_id,
+            ),
+        )
+        staged = store.authenticated_intervention(intervention.intervention_id)
+        assert staged is not None and staged.directed_binding is not None
+        revised = replace(
+            brief, revision=2,
+            allowed_paths=(*brief.allowed_paths, "scope-extra.txt"),
+        )
+        clarification = _answer(
+            "Add only the explicitly bounded path.", True, revised_brief=revised,
+        )
+        checkpoint = store.checkpoint_directed_fable_scope_answer(
+            prepared, question_id=parent.question_id,
+            continuation_generation=intervention.resume_generation,
+            clarification=clarification,
+            completed_next_fable_intervention_id=staged.intervention_id,
+            completed_next_fable_run_id=staged.directed_binding.next_run_id,
+        )
+        stop_run_id = "scope-stop-next-fable-run"
+    elif boundary == "reserved_sol_child":
+        stop_run_id = "scope-stop-sol-child-run"
+    else:
+        raise AssertionError(f"unknown Stop boundary {boundary}")
+    task = store.get_task(brief.task_id, brief.revision)
+    pause = store._connection.execute(  # noqa: SLF001
+        "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+        (brief.task_id, brief.revision),
+    ).fetchone()["continuation_pause_id"]
+    return {
+        "prepared": prepared, "intervention_id": intervention.intervention_id,
+        "stop_run_id": stop_run_id, "task": task, "pause": pause,
+        "parent": store.question(parent.question_id), "child": store.question(child.question_id),
+        "checkpoint": checkpoint, "events": store.events_after("session-1", 0),
+    }
+
+
+def _provider_invocation_projection(harness: CoordinatorHarness) -> tuple[object, ...]:
+    return (
+        tuple(harness.fable.answer_sol_question_prompts),
+        tuple(harness.fable.clarification_prompts),
+        tuple(harness.fable.review_prompts),
+        tuple(harness.sol.answer_fable_question_calls),
+        tuple(harness.sol.resume_threads),
+    )
+
+
+@pytest.mark.parametrize("boundary", ("accepted_scope", "reserved_sol_child"))
+@pytest.mark.parametrize("local_process", (False, True))
+def test_hub_stop_retires_preallocated_owner_and_reopens_idempotently(
+    harness: CoordinatorHarness,
+    boundary: str,
+    local_process: bool,
+) -> None:
+    """Stop terminalizes a logical owner even when no process-local child exists."""
+    async def scenario() -> None:
+        crash = _seed_hub_stop_preallocated_boundary(harness, boundary=boundary)
+        stop_run_id = crash["stop_run_id"]
+        prepared = crash["prepared"]
+        assert isinstance(stop_run_id, str)
+        assert isinstance(prepared, store_module.PreparedActionRecord)
+        runner: ProcessRunner = (
+            RecordingRunner() if local_process else ProcessRunner(stop_grace_seconds=0)
+        )
+        harness.coordinator._runner = runner  # type: ignore[assignment] # noqa: SLF001
+        provider_before = _provider_invocation_projection(harness)
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id,
+            store=harness.store,
+            coordinator=harness.coordinator,
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        reservation = workflows.reserve_stop(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        await workflows.stop(reservation=reservation)
+
+        terminal = harness.store.intervention(crash["intervention_id"])
+        assert terminal is not None
+        assert terminal.status is store_module.InterventionStatus.CANCELED_BY_STOP
+        assert harness.store.agent_run(stop_run_id).status == "interrupted"
+        stopped_preparation = harness.store.prepared_action(prepared.preparation_id)
+        assert stopped_preparation is not None
+        assert (stopped_preparation.status, stopped_preparation.reason) == (
+            "INTERRUPTED", "stop",
+        )
+        stopped_task = harness.store.get_task("task-1", 1)
+        original_task = crash["task"]
+        assert isinstance(original_task, TaskRecord)
+        assert stopped_task.state is TaskState.INTERRUPTED
+        assert stopped_task.continuation_state is original_task.continuation_state
+        assert stopped_task.pending == original_task.pending
+        stopped_pause = harness.store._connection.execute(  # noqa: SLF001
+            "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+            ("task-1", 1),
+        ).fetchone()["continuation_pause_id"]
+        assert stopped_pause == crash["pause"]
+        assert harness.store.question("scope-stop-parent") == crash["parent"]
+        assert harness.store.question("scope-stop-child") == crash["child"]
+        assert harness.store.events_after("session-1", 0) == crash["events"]
+        assert _provider_invocation_projection(harness) == provider_before
+        if boundary == "accepted_scope":
+            row = harness.store._connection.execute(  # noqa: SLF001
+                "SELECT status FROM directed_fable_answer_checkpoints "
+                "WHERE preparation_id = ? AND question_id = ?",
+                (prepared.preparation_id, "scope-stop-parent"),
+            ).fetchone()
+            assert row is not None and row["status"] == "CONSUMED"
+        if local_process:
+            assert isinstance(runner, RecordingRunner)
+            assert runner.stops == [stop_run_id]
+
+        lease.acquire(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        repeated = workflows.reserve_stop(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+        )
+        await workflows.stop(reservation=repeated)
+        assert harness.store.intervention(crash["intervention_id"]) == terminal
+        assert harness.store.agent_run(stop_run_id).status == "interrupted"
+        if local_process:
+            assert isinstance(runner, RecordingRunner)
+            assert runner.stops == [stop_run_id]
+        assert _provider_invocation_projection(harness) == provider_before
+
+        harness.coordinator.close()
+        harness.tracker.close()
+        harness.store.close()
+        reopened = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:01Z")
+        before_recovery = tuple(
+            tuple(row) for row in reopened._connection.execute(  # noqa: SLF001
+                "SELECT * FROM agent_runs ORDER BY rowid"
+            )
+        )
+        assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+        assert reopened.recover_unfinished_prepared_actions() == (
+            store_module.RecoverySummary(0, 0, 0)
+        )
+        assert tuple(
+            tuple(row) for row in reopened._connection.execute(  # noqa: SLF001
+                "SELECT * FROM agent_runs ORDER BY rowid"
+            )
+        ) == before_recovery
+        assert reopened.authenticated_intervention(crash["intervention_id"]) == terminal
+        reopened.audit_legacy_project_ownership(str(harness.repo))
+        reopened.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "boundary, mutation",
+    (
+        ("accepted_scope", "checkpoint_run"),
+        ("accepted_scope", "checkpoint_owner"),
+        ("reserved_sol_child", "run_owner"),
+    ),
+)
+def test_intervention_stop_wrong_run_or_owner_rolls_back_everything(
+    harness: CoordinatorHarness,
+    boundary: str,
+    mutation: str,
+) -> None:
+    """Stop authenticates its exact logical owner before any terminal mutation."""
+    crash = _seed_hub_stop_preallocated_boundary(harness, boundary=boundary)
+    if mutation == "checkpoint_run":
+        harness.store._connection.execute(  # noqa: SLF001 - owner tamper boundary
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET stage_owner_json = json_set(stage_owner_json, '$.run_id', 'wrong-run')"
+        )
+    elif mutation == "checkpoint_owner":
+        harness.store._connection.execute(  # noqa: SLF001 - owner tamper boundary
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET stage_owner_json = json_set(stage_owner_json, '$.provider_id', 'wrong-owner')"
+        )
+    else:
+        harness.store._connection.execute(  # noqa: SLF001 - run owner tamper boundary
+            "UPDATE agent_runs SET cli_session_id = 'wrong-owner' WHERE run_id = ?",
+            (crash["stop_run_id"],),
+        )
+    tables = (
+        "tasks",
+        "settings",
+        "events",
+        "agent_runs",
+        "interventions",
+        "prepared_actions",
+        "questions",
+        "exchange_reservations",
+        "directed_fable_answer_checkpoints",
+    )
+    before = {
+        table: tuple(tuple(row) for row in harness.store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+
+    with pytest.raises(RuntimeError, match="checkpoint|intervention|owner|run"):
+        record = harness.store.intervention(crash["intervention_id"])
+        assert record is not None
+        harness.store.cancel_intervention_by_stop(
+            record.intervention_id,
+            expected_resume_generation=record.resume_generation,
+        )
+
+    assert {
+        table: tuple(tuple(row) for row in harness.store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    } == before
 
 
 @pytest.mark.parametrize(

@@ -441,6 +441,78 @@ class AnswerPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class _NextFableScopeStageOwner:
+    """Exact durable owner of one accepted, still-staged Fable scope result."""
+
+    intervention_id: str
+    run_id: str
+    resume_attempt_id: str
+    provider_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    generation: int
+    question_id: str
+    parent_question_id: str
+    preparation_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "intervention_id",
+            "run_id",
+            "resume_attempt_id",
+            "provider_id",
+            "session_id",
+            "task_id",
+            "question_id",
+            "parent_question_id",
+            "preparation_id",
+        ):
+            object.__setattr__(
+                self, name, _prepared_identifier(getattr(self, name), name),
+            )
+        revision = _require_integer(self.revision, "revision")
+        generation = _require_integer(self.generation, "generation")
+        if revision < 1 or generation < 1:
+            raise ValueError("scope stage owner revision and generation must be positive")
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "generation", generation)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "intervention_id": self.intervention_id,
+            "run_id": self.run_id,
+            "resume_attempt_id": self.resume_attempt_id,
+            "provider_id": self.provider_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "revision": self.revision,
+            "generation": self.generation,
+            "question_id": self.question_id,
+            "parent_question_id": self.parent_question_id,
+            "preparation_id": self.preparation_id,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "_NextFableScopeStageOwner":
+        if set(value) != {
+            "intervention_id",
+            "run_id",
+            "resume_attempt_id",
+            "provider_id",
+            "session_id",
+            "task_id",
+            "revision",
+            "generation",
+            "question_id",
+            "parent_question_id",
+            "preparation_id",
+        }:
+            raise ValueError("scope stage owner fields are invalid")
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
 class DirectedFableAnswerCheckpoint:
     """One authenticated Fable answer committed before its Sol continuation."""
 
@@ -448,6 +520,8 @@ class DirectedFableAnswerCheckpoint:
     question_id: str
     continuation_generation: int
     clarification: FableClarification
+    stage_kind: Literal["prepared_answer", "next_fable"]
+    stage_owner: _NextFableScopeStageOwner | None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -464,6 +538,12 @@ class DirectedFableAnswerCheckpoint:
         object.__setattr__(self, "continuation_generation", generation)
         if not isinstance(self.clarification, FableClarification):
             raise ValueError("checkpoint clarification is invalid")
+        if self.stage_kind not in {"prepared_answer", "next_fable"}:
+            raise ValueError("checkpoint stage kind is invalid")
+        if (self.stage_kind == "next_fable") != isinstance(
+            self.stage_owner, _NextFableScopeStageOwner,
+        ):
+            raise ValueError("checkpoint stage owner is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1683,6 +1763,9 @@ _MIGRATION_STATEMENTS = (
         question_id TEXT NOT NULL,
         continuation_generation INTEGER NOT NULL CHECK (continuation_generation >= 1),
         clarification_json TEXT NOT NULL,
+        stage_kind TEXT NOT NULL DEFAULT 'prepared_answer'
+            CHECK (stage_kind IN ('prepared_answer', 'next_fable')),
+        stage_owner_json TEXT,
         status TEXT NOT NULL CHECK (status IN ('PENDING', 'CONSUMED')),
         PRIMARY KEY (preparation_id, question_id),
         FOREIGN KEY (question_id) REFERENCES questions(question_id),
@@ -2051,6 +2134,20 @@ class SQLiteStore:
                 "SELECT 1 FROM directed_fable_answer_checkpoints WHERE project_id IS NULL"
             ).fetchone() is not None:
                 raise RuntimeError("Fable answer checkpoint migration is unauthenticated")
+        stage_columns = {
+            column for column in ("stage_kind", "stage_owner_json")
+            if column in checkpoint_columns
+        }
+        if not stage_columns:
+            self._connection.execute(
+                "ALTER TABLE directed_fable_answer_checkpoints ADD COLUMN stage_kind TEXT"
+            )
+            self._connection.execute(
+                "ALTER TABLE directed_fable_answer_checkpoints ADD COLUMN stage_owner_json TEXT"
+            )
+            self._migrate_fable_checkpoint_stage_owners_in_transaction()
+        elif stage_columns != {"stage_kind", "stage_owner_json"}:
+            raise RuntimeError("Fable answer checkpoint stage migration is unauthenticated")
         self._connection.execute(
             """
             CREATE INDEX IF NOT EXISTS directed_fable_answer_checkpoints_identity
@@ -2073,6 +2170,42 @@ class SQLiteStore:
             WHERE permission_id IS NOT NULL
             """
         )
+
+    def _migrate_fable_checkpoint_stage_owners_in_transaction(self) -> None:
+        """Backfill only an exact live next-Fable owner from the preceding schema."""
+        if not self._connection.in_transaction:
+            raise RuntimeError("Fable answer checkpoint migration requires a transaction")
+        rows = self._connection.execute(
+            "SELECT rowid, * FROM directed_fable_answer_checkpoints ORDER BY rowid"
+        ).fetchall()
+        for row in rows:
+            candidates = self._matching_next_fable_scope_stages(
+                session_id=str(row["session_id"]),
+                task_id=str(row["task_id"]),
+                revision=int(row["revision"]),
+                parent_question_id=str(row["question_id"]),
+            )
+            if len(candidates) > 1:
+                raise RuntimeError("Fable answer checkpoint stage migration is ambiguous")
+            if candidates:
+                owner = self._next_fable_scope_stage_owner(
+                    candidates[0], preparation_id=str(row["preparation_id"]),
+                )
+                stage_kind = "next_fable"
+                stage_owner_json = _encode_json(owner.to_dict())
+            else:
+                stage_kind = "prepared_answer"
+                stage_owner_json = None
+            cursor = self._connection.execute(
+                """
+                UPDATE directed_fable_answer_checkpoints
+                SET stage_kind = ?, stage_owner_json = ?
+                WHERE rowid = ? AND stage_kind IS NULL AND stage_owner_json IS NULL
+                """,
+                (stage_kind, stage_owner_json, int(row["rowid"])),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Fable answer checkpoint stage migration changed")
 
     def _migrate_intervention_schema(self) -> None:
         """Keep intervention migration inside the same rollback boundary as all DDL."""
@@ -3168,8 +3301,9 @@ class SQLiteStore:
                         """
                         INSERT INTO directed_fable_answer_checkpoints (
                             preparation_id, project_id, session_id, task_id, revision, question_id,
-                            continuation_generation, clarification_json, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                            continuation_generation, clarification_json,
+                            stage_kind, stage_owner_json, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared_answer', NULL, 'PENDING')
                         """,
                         (
                             checkpoint_preparation_id, claimed.project_id, session_id, task_id,
@@ -6302,6 +6436,133 @@ class SQLiteStore:
             agent_runs_interrupted=0,
         )
 
+    @staticmethod
+    def _directed_fable_answer_checkpoint_from_row(
+        row: sqlite3.Row,
+    ) -> DirectedFableAnswerCheckpoint:
+        try:
+            clarification = FableClarification.from_dict(
+                _decode_mapping(str(row["clarification_json"]), "Fable answer checkpoint")
+            )
+            raw_owner = row["stage_owner_json"]
+            owner = (
+                None
+                if raw_owner is None
+                else _NextFableScopeStageOwner.from_mapping(
+                    _decode_mapping(str(raw_owner), "Fable answer checkpoint stage owner")
+                )
+            )
+            return DirectedFableAnswerCheckpoint(
+                preparation_id=str(row["preparation_id"]),
+                question_id=str(row["question_id"]),
+                continuation_generation=int(row["continuation_generation"]),
+                clarification=clarification,
+                stage_kind=str(row["stage_kind"]),  # type: ignore[arg-type]
+                stage_owner=owner,
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise RuntimeError("Fable answer checkpoint is invalid") from error
+
+    @staticmethod
+    def _next_fable_scope_stage_owner(
+        record: InterventionRecord, *, preparation_id: str,
+    ) -> _NextFableScopeStageOwner:
+        binding = record.directed_binding
+        if (
+            binding is None
+            or binding.stage != "next_fable"
+            or binding.next_run_id is None
+            or binding.next_attempt_id is None
+            or binding.next_provider_id is None
+            or binding.parent_question_id is None
+            or record.resume_attempt_id is None
+        ):
+            raise RuntimeError("next Fable scope stage owner is incomplete")
+        return _NextFableScopeStageOwner(
+            intervention_id=record.intervention_id,
+            run_id=binding.next_run_id,
+            resume_attempt_id=record.resume_attempt_id,
+            provider_id=binding.next_provider_id,
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            generation=record.resume_generation,
+            question_id=binding.question_id,
+            parent_question_id=binding.parent_question_id,
+            preparation_id=preparation_id,
+        )
+
+    def _matching_next_fable_scope_stages(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        parent_question_id: str,
+    ) -> tuple[InterventionRecord, ...]:
+        """Return only exact live next-Fable stages for one persisted parent."""
+        candidates: list[InterventionRecord] = []
+        for row in self._connection.execute(
+            """
+            SELECT * FROM interventions
+            WHERE session_id = ? AND task_id = ? AND revision = ? AND status = ?
+            ORDER BY rowid
+            """,
+            (
+                session_id, task_id, revision, InterventionStatus.RESUMING.value,
+            ),
+        ):
+            record = self._intervention_from_row(row)
+            binding = record.directed_binding
+            if (
+                binding is None
+                or binding.stage != "next_fable"
+                or binding.parent_question_id != parent_question_id
+                or binding.next_run_id is None
+            ):
+                continue
+            self._validated_next_fable_intervention_stage(
+                record.intervention_id, run_id=binding.next_run_id,
+            )
+            candidates.append(record)
+        return tuple(candidates)
+
+    def _validated_checkpoint_stage_owner(
+        self,
+        record: PreparedActionRecord,
+        checkpoint: DirectedFableAnswerCheckpoint,
+    ) -> InterventionRecord:
+        owner = checkpoint.stage_owner
+        if checkpoint.stage_kind != "next_fable" or owner is None:
+            raise RuntimeError("Fable answer checkpoint stage owner is missing")
+        if (
+            owner.preparation_id != record.preparation_id
+            or owner.session_id != record.session_id
+            or owner.task_id != record.task_id
+            or owner.revision != record.revision
+            or owner.generation != checkpoint.continuation_generation
+            or owner.parent_question_id != checkpoint.question_id
+        ):
+            raise RuntimeError("Fable answer checkpoint stage owner changed")
+        stage = self._validated_next_fable_intervention_stage(
+            owner.intervention_id, run_id=owner.run_id,
+        )
+        binding = stage.directed_binding
+        if (
+            binding is None
+            or stage.session_id != owner.session_id
+            or stage.task_id != owner.task_id
+            or stage.revision != owner.revision
+            or stage.resume_generation != owner.generation
+            or stage.resume_attempt_id != owner.resume_attempt_id
+            or binding.next_attempt_id != owner.resume_attempt_id
+            or binding.next_provider_id != owner.provider_id
+            or binding.question_id != owner.question_id
+            or binding.parent_question_id != owner.parent_question_id
+        ):
+            raise RuntimeError("Fable answer checkpoint stage owner changed")
+        return stage
+
     def directed_fable_answer_checkpoint(
         self, record: PreparedActionRecord,
     ) -> DirectedFableAnswerCheckpoint | None:
@@ -6309,8 +6570,7 @@ class SQLiteStore:
         record = self._checkpoint_record(record)
         row = self._connection.execute(
             """
-            SELECT preparation_id, question_id, continuation_generation, clarification_json
-            FROM directed_fable_answer_checkpoints
+            SELECT * FROM directed_fable_answer_checkpoints
             WHERE preparation_id = ? AND project_id = ? AND session_id = ?
               AND task_id = ? AND revision = ? AND status = 'PENDING'
             ORDER BY rowid DESC LIMIT 1
@@ -6322,17 +6582,17 @@ class SQLiteStore:
         ).fetchone()
         if row is None:
             return None
-        try:
-            clarification = FableClarification.from_dict(
-                _decode_mapping(str(row["clarification_json"]), "Fable answer checkpoint")
-            )
-            return DirectedFableAnswerCheckpoint(
-                preparation_id=str(row["preparation_id"]), question_id=str(row["question_id"]),
-                continuation_generation=int(row["continuation_generation"]),
-                clarification=clarification,
-            )
-        except (TypeError, ValueError, RuntimeError) as error:
-            raise RuntimeError("Fable answer checkpoint is invalid") from error
+        checkpoint = self._directed_fable_answer_checkpoint_from_row(row)
+        if checkpoint.stage_kind == "next_fable":
+            self._validated_checkpoint_stage_owner(record, checkpoint)
+        elif self._matching_next_fable_scope_stages(
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            parent_question_id=checkpoint.question_id,
+        ):
+            raise RuntimeError("Fable answer checkpoint stage owner is missing")
+        return checkpoint
 
     def checkpoint_directed_fable_scope_answer(
         self,
@@ -6341,6 +6601,8 @@ class SQLiteStore:
         question_id: str,
         continuation_generation: int,
         clarification: FableClarification,
+        completed_next_fable_intervention_id: str | None = None,
+        completed_next_fable_run_id: str | None = None,
     ) -> DirectedFableAnswerCheckpoint:
         """Persist an accepted scope answer without mutating its exact parent."""
         record = self._checkpoint_record(record)
@@ -6352,6 +6614,18 @@ class SQLiteStore:
             raise ValueError("Fable scope checkpoint clarification is invalid")
         if clarification.answer is None:
             raise ValueError("Fable scope checkpoint answer is missing")
+        if (completed_next_fable_intervention_id is None) != (
+            completed_next_fable_run_id is None
+        ):
+            raise ValueError("next Fable scope checkpoint owner is incomplete")
+        if completed_next_fable_intervention_id is not None:
+            completed_next_fable_intervention_id = _prepared_identifier(
+                completed_next_fable_intervention_id,
+                "completed_next_fable_intervention_id",
+            )
+            completed_next_fable_run_id = _prepared_identifier(
+                completed_next_fable_run_id, "completed_next_fable_run_id",
+            )
         with self._immediate_transaction():
             record = self._checkpoint_record(record)
             if record.status not in {"CLAIMED", "INTERRUPTED", "RECOVERED"}:
@@ -6387,10 +6661,37 @@ class SQLiteStore:
                 ) != pause_id
             ):
                 raise RuntimeError("Fable scope checkpoint parent changed")
+            matching_stages = self._matching_next_fable_scope_stages(
+                session_id=record.session_id,
+                task_id=record.task_id,
+                revision=record.revision,
+                parent_question_id=question_id,
+            )
+            if len(matching_stages) > 1:
+                raise RuntimeError("Fable scope checkpoint stage is ambiguous")
+            stage_owner: _NextFableScopeStageOwner | None = None
+            if matching_stages:
+                stage = matching_stages[0]
+                binding = stage.directed_binding
+                if (
+                    completed_next_fable_intervention_id != stage.intervention_id
+                    or binding is None
+                    or completed_next_fable_run_id != binding.next_run_id
+                ):
+                    raise RuntimeError("Fable scope checkpoint stage owner changed")
+                stage_owner = self._next_fable_scope_stage_owner(
+                    stage, preparation_id=record.preparation_id,
+                )
+            elif completed_next_fable_intervention_id is not None:
+                raise RuntimeError("Fable scope checkpoint stage owner changed")
+            stage_kind = "next_fable" if stage_owner is not None else "prepared_answer"
+            encoded_owner = (
+                None if stage_owner is None else _encode_json(stage_owner.to_dict())
+            )
             existing = self._connection.execute(
                 """
                 SELECT project_id, session_id, task_id, revision, continuation_generation,
-                       clarification_json, status
+                       clarification_json, stage_kind, stage_owner_json, status
                 FROM directed_fable_answer_checkpoints
                 WHERE preparation_id = ? AND question_id = ?
                 """,
@@ -6405,6 +6706,8 @@ class SQLiteStore:
                     or int(existing["revision"]) != record.revision
                     or int(existing["continuation_generation"]) != continuation_generation
                     or existing["clarification_json"] != encoded
+                    or existing["stage_kind"] != stage_kind
+                    or existing["stage_owner_json"] != encoded_owner
                     or existing["status"] != "PENDING"
                 ):
                     raise RuntimeError("Fable scope checkpoint changed")
@@ -6413,13 +6716,14 @@ class SQLiteStore:
                     """
                     INSERT INTO directed_fable_answer_checkpoints (
                         preparation_id, project_id, session_id, task_id, revision, question_id,
-                        continuation_generation, clarification_json, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                        continuation_generation, clarification_json,
+                        stage_kind, stage_owner_json, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                     """,
                     (
                         record.preparation_id, record.project_id, record.session_id,
                         record.task_id, record.revision, question_id,
-                        continuation_generation, encoded,
+                        continuation_generation, encoded, stage_kind, encoded_owner,
                     ),
                 )
         checkpoint = self.directed_fable_answer_checkpoint(record)
@@ -6430,7 +6734,10 @@ class SQLiteStore:
     def _checkpoint_record(self, record: PreparedActionRecord) -> PreparedActionRecord:
         if not isinstance(record, PreparedActionRecord):
             raise ValueError("Fable answer checkpoint record is invalid")
-        persisted = self._prepared_required(record.preparation_id)
+        try:
+            persisted = self._prepared_required(record.preparation_id)
+        except RuntimeError as error:
+            raise RuntimeError("Fable answer checkpoint preparation is missing") from error
         if (
             persisted.project_id != record.project_id
             or persisted.session_id != record.session_id
@@ -8229,6 +8536,17 @@ class SQLiteStore:
             approved = self.get_task(task_id, revision)
         return approved
 
+    @contextmanager
+    def _scope_revision_event_transaction(
+        self, emitted: list[StreamEvent],
+    ) -> Iterator[None]:
+        """Serialize one scope transaction and its committed listener batch."""
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                yield
+            if emitted:
+                self._publish_committed_events(emitted)
+
     def save_scope_revision(
         self,
         session_id: str,
@@ -8326,7 +8644,7 @@ class SQLiteStore:
         if not isinstance(clarification, FableClarification) or not clarification.scope_changed:
             raise ValueError("scope revision clarification is invalid")
         emitted: list[StreamEvent] = []
-        with self._immediate_transaction():
+        with self._scope_revision_event_transaction(emitted):
             completed_stage: InterventionRecord | None = None
             if completed_next_fable_intervention_id is not None:
                 completed_stage = self._validated_next_fable_intervention_stage(
@@ -8442,6 +8760,21 @@ class SQLiteStore:
                     or source.continuation_generation != checkpoint.continuation_generation
                 ):
                     raise RuntimeError("Fable answer checkpoint changed")
+                if checkpoint.stage_kind == "next_fable":
+                    owner = checkpoint.stage_owner
+                    if (
+                        completed_stage is None
+                        or owner is None
+                        or completed_stage.intervention_id != owner.intervention_id
+                        or completed_next_fable_intervention_id != owner.intervention_id
+                        or completed_next_fable_run_id != owner.run_id
+                    ):
+                        raise RuntimeError("Fable answer checkpoint stage owner changed")
+                    self._validated_checkpoint_stage_owner(
+                        directed_checkpoint, checkpoint,
+                    )
+                elif has_staged_completion:
+                    raise RuntimeError("Fable answer checkpoint has no staged owner")
             row = self._connection.execute(
                 "SELECT MAX(revision) AS latest_revision FROM tasks WHERE task_id = ?",
                 (brief.task_id,),
@@ -8502,9 +8835,6 @@ class SQLiteStore:
                     run_id=completed_next_fable_run_id,
                     exit_code=completed_next_fable_exit_code,
                 )
-        if emitted:
-            with self._event_listener_lock:
-                self._publish_committed_events(emitted)
         return self.get_task(brief.task_id, brief.revision)
 
     def save_edited_revision(
@@ -8943,6 +9273,9 @@ class SQLiteStore:
         checkpoint = self.directed_fable_answer_checkpoint(checkpoint_record)
         if checkpoint is None or not checkpoint.clarification.scope_changed:
             return None
+        if checkpoint.stage_kind == "prepared_answer":
+            return None
+        stage = self._validated_checkpoint_stage_owner(checkpoint_record, checkpoint)
         task = self._prepared_task_exact(
             checkpoint_record.session_id,
             checkpoint_record.task_id,
@@ -8951,37 +9284,11 @@ class SQLiteStore:
         if self._unanswered_fable_scope_checkpoint_parent(
             checkpoint_record, task,
         ) is None:
-            return None
-        candidates: list[tuple[str, str]] = []
-        for row in self._connection.execute(
-            """
-            SELECT * FROM interventions
-            WHERE session_id = ? AND task_id = ? AND revision = ? AND status = ?
-            ORDER BY rowid
-            """,
-            (
-                checkpoint_record.session_id,
-                checkpoint_record.task_id,
-                checkpoint_record.revision,
-                InterventionStatus.RESUMING.value,
-            ),
-        ):
-            record = self._intervention_from_row(row)
-            binding = record.directed_binding
-            if (
-                binding is None
-                or binding.stage != "next_fable"
-                or binding.parent_question_id != checkpoint.question_id
-                or binding.next_run_id is None
-            ):
-                continue
-            self._validated_next_fable_intervention_stage(
-                record.intervention_id, run_id=binding.next_run_id,
-            )
-            candidates.append((record.intervention_id, binding.next_run_id))
-        if len(candidates) > 1:
-            raise RuntimeError("Fable scope checkpoint stage is ambiguous")
-        return None if not candidates else candidates[0]
+            raise RuntimeError("Fable scope checkpoint parent changed")
+        owner = checkpoint.stage_owner
+        if owner is None or owner.intervention_id != stage.intervention_id:
+            raise RuntimeError("Fable scope checkpoint stage owner changed")
+        return owner.intervention_id, owner.run_id
 
     def _preserves_accepted_next_fable_scope_stage(
         self, record: InterventionRecord,
@@ -9856,6 +10163,155 @@ class SQLiteStore:
                 raise RuntimeError("intervention completion changed concurrently")
         return self._intervention_required(intervention_id)
 
+    @staticmethod
+    def _intervention_stop_run_id(record: InterventionRecord) -> str | None:
+        binding = record.directed_binding
+        if binding is not None:
+            if binding.stage == "next_fable":
+                return binding.next_run_id
+            return binding.source_run_id
+        if record.status in {
+            InterventionStatus.RESUMING,
+            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+            InterventionStatus.CANCELED_BY_STOP,
+        }:
+            return record.resume_run_id or record.run_id
+        if record.status is InterventionStatus.PENDING_STOP:
+            return record.run_id
+        return None
+
+    def _scope_checkpoint_for_intervention_stop(
+        self, record: InterventionRecord,
+    ) -> tuple[sqlite3.Row, DirectedFableAnswerCheckpoint, PreparedActionRecord] | None:
+        binding = record.directed_binding
+        if binding is None or binding.stage != "next_fable" or binding.parent_question_id is None:
+            return None
+        matches: list[
+            tuple[sqlite3.Row, DirectedFableAnswerCheckpoint, PreparedActionRecord]
+        ] = []
+        for row in self._connection.execute(
+            """
+            SELECT * FROM directed_fable_answer_checkpoints
+            WHERE session_id = ? AND task_id = ? AND revision = ? AND question_id = ?
+            ORDER BY rowid
+            """,
+            (
+                record.session_id, record.task_id, record.revision,
+                binding.parent_question_id,
+            ),
+        ):
+            checkpoint = self._directed_fable_answer_checkpoint_from_row(row)
+            if not checkpoint.clarification.scope_changed:
+                continue
+            try:
+                prepared = self._prepared_required(checkpoint.preparation_id)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "Fable answer checkpoint preparation is missing"
+                ) from error
+            if checkpoint.stage_kind != "next_fable" or checkpoint.stage_owner is None:
+                raise RuntimeError("Fable answer checkpoint stage owner is missing")
+            if checkpoint.stage_owner.intervention_id != record.intervention_id:
+                raise RuntimeError("Fable answer checkpoint stage owner changed")
+            matches.append((row, checkpoint, prepared))
+        if len(matches) > 1:
+            raise RuntimeError("Fable answer checkpoint stage is ambiguous")
+        return None if not matches else matches[0]
+
+    def _validated_intervention_stop_run(
+        self, record: InterventionRecord,
+    ) -> AgentRunRecord | None:
+        run_id = self._intervention_stop_run_id(record)
+        if run_id is None:
+            return None
+        row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        if row is None:
+            if (
+                record.directed_binding is None
+                and record.status is InterventionStatus.RESUMING
+                and run_id == record.resume_run_id
+            ):
+                return None
+            raise RuntimeError("intervention Stop run is missing")
+        run = self._agent_run_from_row(row)
+        binding = record.directed_binding
+        if run.task_id != record.task_id or run.revision != record.revision:
+            raise RuntimeError("intervention Stop run changed")
+        if binding is not None:
+            expected_agent = (
+                ConversationTarget.FABLE
+                if binding.stage == "next_fable"
+                else binding.source_agent
+            )
+            expected_provider = (
+                binding.next_provider_id
+                if binding.stage == "next_fable"
+                else binding.source_provider_id
+            )
+        else:
+            stopping_resume = (
+                record.resume_run_id is not None
+                and run_id == record.resume_run_id
+                and record.status not in {
+                    InterventionStatus.PENDING_STOP,
+                    InterventionStatus.READY,
+                }
+            )
+            if stopping_resume:
+                expected_agent = record.routed_to
+            else:
+                source_agent = _INTERVENTION_SOURCE_AGENTS.get(
+                    record.continuation_state,
+                )
+                if source_agent is None:
+                    raise RuntimeError("intervention Stop source agent changed")
+                expected_agent = ConversationTarget(source_agent)
+            expected_provider = (
+                record.fable_session_id
+                if expected_agent is ConversationTarget.FABLE
+                else record.sol_thread_id
+            )
+        if run.agent != expected_agent.value or run.cli_session_id != expected_provider:
+            raise RuntimeError("intervention Stop run owner changed")
+        if record.status is InterventionStatus.CANCELED_BY_STOP:
+            if run.status != "interrupted":
+                raise RuntimeError("intervention Stop run is not terminal")
+        elif run.status != "running":
+            terminal_directed_source = (
+                binding is not None
+                and binding.stage == "active_question"
+                and run.status in _TERMINAL_RUN_STATUSES
+            )
+            if record.status is not InterventionStatus.READY and not terminal_directed_source:
+                raise RuntimeError("intervention Stop run changed")
+            return None
+        return run
+
+    def canceled_intervention_for_task(
+        self, task_id: str, revision: int,
+    ) -> InterventionRecord | None:
+        """Return the exact latest Stop terminal for idempotent repeated Stop."""
+        row = self._connection.execute(
+            """
+            SELECT * FROM interventions
+            WHERE task_id = ? AND revision = ? AND status = ?
+            ORDER BY created_at DESC, intervention_id DESC LIMIT 1
+            """,
+            (
+                _prepared_identifier(task_id, "task_id"),
+                _require_integer(revision, "revision"),
+                InterventionStatus.CANCELED_BY_STOP.value,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        record = self._intervention_from_row(row)
+        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+            raise RuntimeError("intervention binding is not authenticated")
+        return record
+
     def cancel_intervention_by_stop(
         self, intervention_id: str, *, expected_resume_generation: int,
     ) -> InterventionRecord:
@@ -9864,20 +10320,35 @@ class SQLiteStore:
             expected_resume_generation, "expected_resume_generation",
         )
         with self._immediate_transaction():
-            record = self._intervention_required(intervention_id)
+            record = self.authenticated_intervention(intervention_id)
+            if record is None:
+                raise RuntimeError("intervention not found")
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
-            row = self._connection.execute(
-                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
-                (intervention_id,),
-            ).fetchone()
-            acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            if (
-                record.directed_binding is not None
-                and not self._intervention_is_authenticated(record, acknowledgment_id)
-            ):
-                raise RuntimeError("intervention binding is not authenticated")
+            stop_run = self._validated_intervention_stop_run(record)
+            scope_checkpoint = self._scope_checkpoint_for_intervention_stop(record)
             if record.status is InterventionStatus.CANCELED_BY_STOP:
+                if scope_checkpoint is not None:
+                    checkpoint_row, checkpoint, prepared = scope_checkpoint
+                    if (
+                        checkpoint_row["status"] != "CONSUMED"
+                        or not self._checkpoint_stage_history_is_authenticated(
+                            row=checkpoint_row,
+                            checkpoint=checkpoint,
+                            prepared=prepared,
+                        )
+                    ):
+                        raise RuntimeError("Fable answer checkpoint Stop state changed")
+                if self._connection.execute(
+                    """
+                    SELECT 1 FROM prepared_actions
+                    WHERE session_id = ? AND task_id = ? AND revision = ?
+                      AND status IN ('PREPARED', 'CLAIMED', 'RECOVERED')
+                    LIMIT 1
+                    """,
+                    (record.session_id, record.task_id, record.revision),
+                ).fetchone() is not None:
+                    raise RuntimeError("intervention Stop preparation is not terminal")
                 return record
             if record.status not in {
                 InterventionStatus.PENDING_STOP,
@@ -9887,6 +10358,13 @@ class SQLiteStore:
                 raise RuntimeError("intervention cannot be canceled")
             task = self.get_task(record.task_id, record.revision)
             record = self._bind_nested_intervention_resume_in_transaction(record, task)
+            stop_run = self._validated_intervention_stop_run(record)
+            scope_checkpoint = self._scope_checkpoint_for_intervention_stop(record)
+            if scope_checkpoint is not None:
+                checkpoint_row, checkpoint, prepared = scope_checkpoint
+                self._validated_checkpoint_stage_owner(prepared, checkpoint)
+                if checkpoint_row["status"] != "PENDING":
+                    raise RuntimeError("Fable answer checkpoint Stop state changed")
             if task.state in _ACTIVE_TASK_STATES:
                 cursor = self._connection.execute(
                     """
@@ -9915,6 +10393,58 @@ class SQLiteStore:
                     raise RuntimeError("intervention task changed concurrently")
             elif task.state is not TaskState.INTERRUPTED:
                 raise RuntimeError("intervention task changed concurrently")
+            if stop_run is not None:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE agent_runs
+                    SET status = 'interrupted', exit_code = -1, ended_at = ?
+                    WHERE run_id = ? AND status = 'running'
+                    """,
+                    (self._timestamp(), stop_run.run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention Stop run changed concurrently")
+            active_preparations = self._connection.execute(
+                """
+                SELECT * FROM prepared_actions
+                WHERE session_id = ? AND task_id = ? AND revision = ?
+                  AND status IN ('PREPARED', 'CLAIMED', 'RECOVERED')
+                ORDER BY rowid
+                """,
+                (record.session_id, record.task_id, record.revision),
+            ).fetchall()
+            if len(active_preparations) > 1:
+                raise RuntimeError("intervention Stop preparation is ambiguous")
+            if scope_checkpoint is not None:
+                _, _, checkpoint_prepared = scope_checkpoint
+                if (
+                    len(active_preparations) != 1
+                    or active_preparations[0]["preparation_id"]
+                    != checkpoint_prepared.preparation_id
+                ):
+                    raise RuntimeError("intervention Stop preparation changed")
+            if active_preparations:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE prepared_actions SET status = 'INTERRUPTED', reason = 'stop'
+                    WHERE preparation_id = ?
+                      AND status IN ('PREPARED', 'CLAIMED', 'RECOVERED')
+                    """,
+                    (active_preparations[0]["preparation_id"],),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention Stop preparation changed concurrently")
+            if scope_checkpoint is not None:
+                checkpoint_row, checkpoint, _ = scope_checkpoint
+                cursor = self._connection.execute(
+                    """
+                    UPDATE directed_fable_answer_checkpoints SET status = 'CONSUMED'
+                    WHERE preparation_id = ? AND question_id = ? AND status = 'PENDING'
+                    """,
+                    (checkpoint.preparation_id, checkpoint.question_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Fable answer checkpoint Stop state changed")
             cursor = self._connection.execute(
                 """
                 UPDATE interventions SET status = ?
@@ -9928,6 +10458,31 @@ class SQLiteStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention cancellation changed concurrently")
+            canceled = self.authenticated_intervention(intervention_id)
+            if canceled is None:
+                raise RuntimeError("intervention Stop terminal state is missing")
+            if scope_checkpoint is not None:
+                checkpoint_row = self._connection.execute(
+                    """
+                    SELECT * FROM directed_fable_answer_checkpoints
+                    WHERE preparation_id = ? AND question_id = ?
+                    """,
+                    (checkpoint.preparation_id, checkpoint.question_id),
+                ).fetchone()
+                if checkpoint_row is None:
+                    raise RuntimeError("Fable answer checkpoint Stop state is missing")
+                terminal_checkpoint = self._directed_fable_answer_checkpoint_from_row(
+                    checkpoint_row,
+                )
+                terminal_prepared = self._prepared_required(
+                    terminal_checkpoint.preparation_id,
+                )
+                if not self._checkpoint_stage_history_is_authenticated(
+                    row=checkpoint_row,
+                    checkpoint=terminal_checkpoint,
+                    prepared=terminal_prepared,
+                ):
+                    raise RuntimeError("Fable answer checkpoint Stop state changed")
         return self._intervention_required(intervention_id)
 
     def mark_resume_outcome_unknown(
@@ -10731,9 +11286,7 @@ class SQLiteStore:
                  row["revision"], row["continuation_generation"]),
             ).fetchone()
             try:
-                clarification = FableClarification.from_dict(
-                    _decode_mapping(str(row["clarification_json"]), "Fable answer checkpoint")
-                )
+                checkpoint = self._directed_fable_answer_checkpoint_from_row(row)
             except (RuntimeError, TypeError, ValueError):
                 reasons.add("fable_answer_checkpoint_integrity")
                 continue
@@ -10743,14 +11296,37 @@ class SQLiteStore:
             ):
                 reasons.add("fable_answer_checkpoint_integrity")
                 continue
+            try:
+                prepared = self._prepared_action_from_row(prepared_row)
+            except (RuntimeError, TypeError, ValueError):
+                reasons.add("fable_answer_checkpoint_integrity")
+                continue
+            if not self._checkpoint_stage_history_is_authenticated(
+                row=row, checkpoint=checkpoint, prepared=prepared,
+            ):
+                reasons.add("fable_answer_checkpoint_integrity")
+                continue
             answered = (
                 question_row["answered_by"] == ConversationActor.FABLE.value
-                and question_row["answer_text"] == clarification.answer
+                and question_row["answer_text"] == checkpoint.clarification.answer
             )
             if answered:
                 continue
+            stopped_stage = (
+                row["status"] == "CONSUMED"
+                and checkpoint.stage_kind == "next_fable"
+                and checkpoint.stage_owner is not None
+                and (
+                    stopped_intervention := self.intervention(
+                        checkpoint.stage_owner.intervention_id,
+                    )
+                ) is not None
+                and stopped_intervention.status
+                is InterventionStatus.CANCELED_BY_STOP
+            )
+            if stopped_stage:
+                continue
             try:
-                prepared = self._prepared_action_from_row(prepared_row)
                 task = self._prepared_task_exact(
                     prepared.session_id, prepared.task_id, prepared.revision,
                 )
@@ -10766,6 +11342,98 @@ class SQLiteStore:
             ):
                 reasons.add("fable_answer_checkpoint_integrity")
         return reasons
+
+    def _checkpoint_stage_history_is_authenticated(
+        self,
+        *,
+        row: sqlite3.Row,
+        checkpoint: DirectedFableAnswerCheckpoint,
+        prepared: PreparedActionRecord,
+    ) -> bool:
+        """Authenticate either a live owner or its one permitted terminal image."""
+        historical: list[InterventionRecord] = []
+        try:
+            for intervention_row in self._connection.execute(
+                """
+                SELECT * FROM interventions
+                WHERE session_id = ? AND task_id = ? AND revision = ?
+                ORDER BY rowid
+                """,
+                (prepared.session_id, prepared.task_id, prepared.revision),
+            ):
+                candidate = self._intervention_from_row(intervention_row)
+                binding = candidate.directed_binding
+                if (
+                    binding is not None
+                    and binding.stage == "next_fable"
+                    and binding.parent_question_id == checkpoint.question_id
+                ):
+                    historical.append(candidate)
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        if checkpoint.stage_kind == "prepared_answer":
+            return checkpoint.stage_owner is None and (
+                not checkpoint.clarification.scope_changed or not historical
+            )
+        owner = checkpoint.stage_owner
+        if owner is None or len(historical) != 1:
+            return False
+        record = historical[0]
+        binding = record.directed_binding
+        if binding is None:
+            return False
+        if (
+            owner.preparation_id != prepared.preparation_id
+            or owner.session_id != prepared.session_id
+            or owner.task_id != prepared.task_id
+            or owner.revision != prepared.revision
+            or owner.generation != checkpoint.continuation_generation
+            or owner.parent_question_id != checkpoint.question_id
+            or owner.intervention_id != record.intervention_id
+            or owner.resume_attempt_id != record.resume_attempt_id
+            or owner.generation != record.resume_generation
+            or owner.run_id != binding.next_run_id
+            or owner.resume_attempt_id != binding.next_attempt_id
+            or owner.provider_id != binding.next_provider_id
+            or owner.question_id != binding.question_id
+            or owner.parent_question_id != binding.parent_question_id
+        ):
+            return False
+        intervention_row = self._connection.execute(
+            "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+            (record.intervention_id,),
+        ).fetchone()
+        run_row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (owner.run_id,),
+        ).fetchone()
+        if intervention_row is None or run_row is None:
+            return False
+        try:
+            run = self._agent_run_from_row(run_row)
+        except RuntimeError:
+            return False
+        if (
+            not self._intervention_is_authenticated(
+                record, intervention_row["acknowledgment_id"],
+            )
+            or run.task_id != owner.task_id
+            or run.revision != owner.revision
+            or run.agent != ConversationTarget.FABLE.value
+            or run.cli_session_id != owner.provider_id
+        ):
+            return False
+        if row["status"] == "PENDING":
+            return (
+                record.status is InterventionStatus.RESUMING
+                and run.status == "running"
+            )
+        return (
+            record.status is InterventionStatus.RESUMED
+            and run.status == "completed"
+        ) or (
+            record.status is InterventionStatus.CANCELED_BY_STOP
+            and run.status == "interrupted"
+        )
 
     def _legacy_project_ownership_reasons(
         self, canonical_repo_root: str,

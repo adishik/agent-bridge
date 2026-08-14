@@ -1698,28 +1698,60 @@ class Coordinator:
                 )
             raise
 
+    @staticmethod
+    def _intervention_stop_run_id(record: InterventionRecord) -> str | None:
+        binding = record.directed_binding
+        if binding is not None:
+            return (
+                binding.next_run_id
+                if binding.stage == "next_fable"
+                else binding.source_run_id
+            )
+        if record.status in {
+            InterventionStatus.RESUMING,
+            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+            InterventionStatus.CANCELED_BY_STOP,
+        }:
+            return record.resume_run_id or record.run_id
+        if record.status is InterventionStatus.PENDING_STOP:
+            return record.run_id
+        return None
+
+    async def _signal_intervention_stop_run(self, run_id: str) -> None:
+        receipt = await self._runner.stop(
+            run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+        )
+        if not receipt.process_exited:
+            raise TimeoutError("stop process did not exit")
+        completion = self._run_completions.get(run_id)
+        if completion is not None:
+            await completion.wait()
+
     async def stop_task(self, task_id: str) -> None:
         task = self._latest_required(task_id)
         intervention = self._store.active_intervention_for_task(
             task.task_id, task.revision,
         )
+        if intervention is None and task.state is TaskState.INTERRUPTED:
+            intervention = self._store.canceled_intervention_for_task(
+                task.task_id, task.revision,
+            )
         if intervention is not None:
-            canceled = self._store.cancel_intervention_by_stop(
+            stop_run_id = self._intervention_stop_run_id(intervention)
+            stop_run_was_running = False
+            if stop_run_id is not None:
+                try:
+                    stop_run_was_running = (
+                        self._store.agent_run(stop_run_id).status == "running"
+                    )
+                except RuntimeError:
+                    pass
+            self._store.cancel_intervention_by_stop(
                 intervention.intervention_id,
                 expected_resume_generation=intervention.resume_generation,
             )
-            active = self._store.active_run_for_task(
-                canceled.task_id, canceled.revision,
-            )
-            if active is not None and active.status == "running":
-                receipt = await self._runner.stop(
-                    active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
-                )
-                if not receipt.process_exited:
-                    raise TimeoutError("stop process did not exit")
-                completion = self._run_completions.get(active.run_id)
-                if completion is not None:
-                    await completion.wait()
+            if stop_run_id is not None and stop_run_was_running:
+                await self._signal_intervention_stop_run(stop_run_id)
             return
         if task.state is TaskState.INTERRUPTED:
             pending = task.pending or {}
@@ -1744,14 +1776,7 @@ class Coordinator:
             except RuntimeError:
                 active = None
             if active is not None and active.status == "running":
-                receipt = await self._runner.stop(
-                    run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
-                )
-                if not receipt.process_exited:
-                    raise TimeoutError("stop process did not exit")
-                completion = self._run_completions.get(run_id)
-                if completion is not None:
-                    await completion.wait()
+                await self._signal_intervention_stop_run(run_id)
             return
         if task.state is TaskState.AWAITING_USER_INPUT:
             question = self._store.unanswered_question_for_task(
@@ -2643,6 +2668,14 @@ class Coordinator:
                     question_id=question.question_id,
                     continuation_generation=question.continuation_generation,
                     clarification=clarification,
+                    completed_next_fable_intervention_id=(
+                        completed_next_fable_intervention_id
+                    ),
+                    completed_next_fable_run_id=(
+                        run_id
+                        if completed_next_fable_intervention_id is not None
+                        else None
+                    ),
                 )
             await self._route_directed_fable_answer(
                 task,

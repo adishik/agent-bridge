@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 import os
@@ -187,6 +188,238 @@ def test_event_listener_registration_is_thread_safe(tmp_path) -> None:
         "session-1", None, "coordinator", "status", {"state": "ready"}
     )
     assert store.events_after("session-1", 0) == (event,)
+
+
+def test_scope_revision_event_batch_publishes_before_a_later_committed_event(
+    tmp_path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later writer cannot publish past a committed scope-answer batch."""
+    store = SQLiteStore(
+        tmp_path / "scope-event-order.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store._connection.execute(  # noqa: SLF001 - exact durable scope fixture
+        "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+        (
+            "2026-08-10T12:00:00Z",
+            "baseline-1",
+            valid_brief.task_id,
+            valid_brief.revision,
+        ),
+    )
+    pending = {"sol_run_id": "sol-run-1", "prompt": "continue exactly"}
+    _, question = store.reserve_internal_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=1,
+        question_id="scope-order-question",
+        request_key="scope-order-request",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="May the exact scope include one more file?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action=pending,
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="May the exact scope include one more file?",
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            continuation_generation=1,
+            question_id="scope-order-question",
+        ),
+    )
+    revised = replace(
+        valid_brief,
+        revision=2,
+        allowed_paths=(*valid_brief.allowed_paths, "scope-extra.txt"),
+    )
+    clarification = FableClarification.from_dict({
+        "status": "answered",
+        "answer": "Add the exact bounded path.",
+        "reasoning": "The additional path is explicitly bounded.",
+        "confidence": 0.9,
+        "scope_changed": True,
+        "revised_brief": revised.to_dict(),
+        "question_for_user": None,
+        "directed_question": None,
+    })
+    answer_event = ConversationEnvelope(
+        sender=ConversationActor.FABLE,
+        addressed_to=ConversationTarget.SOL,
+        routed_to=ConversationTarget.SOL,
+        message_type=ConversationMessageType.ANSWER,
+        text=clarification.answer or "",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        continuation_generation=1,
+        reply_to_question_id=question.question_id,
+    )
+    observed = []
+    failing_observer = []
+
+    def fail_after_commit(event) -> None:
+        failing_observer.append(event.sequence)
+        raise RuntimeError("listener failures remain isolated")
+
+    store.add_event_listener(observed.append)
+    store.add_event_listener(fail_after_commit)
+    commit_entered = threading.Event()
+    release_scope_publish = threading.Event()
+    later_finished = threading.Event()
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction  # noqa: SLF001
+
+    @contextmanager
+    def block_scope_after_commit():
+        with original_transaction():
+            yield
+        if threading.current_thread().name == "scope-revision-writer":
+            commit_entered.set()
+            if not release_scope_publish.wait(timeout=2):
+                raise TimeoutError("scope publication was not released")
+
+    monkeypatch.setattr(store, "_immediate_transaction", block_scope_after_commit)
+
+    def save_scope() -> None:
+        try:
+            store.save_scope_revision(
+                "session-1",
+                revised,
+                fable_session_id="fable-session-1",
+                sol_thread_id="sol-thread-1",
+                correction_count=0,
+                continuation_state=TaskState.SOL_RUNNING,
+                pending={"answer": clarification.answer, **pending},
+                baseline_id="baseline-1",
+                setting=("agent_bridge.baseline.task-1.2", {"baseline_id": "baseline-1"}),
+                clarification=clarification,
+                answered_question_id=question.question_id,
+                answered_question_generation=1,
+                answered_pending=pending,
+                answer_event=answer_event,
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    def append_later() -> None:
+        try:
+            store.append_event(
+                "session-1",
+                valid_brief.task_id,
+                "coordinator",
+                "later",
+                {"state": "later"},
+            )
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            later_finished.set()
+
+    scope_thread = threading.Thread(target=save_scope, name="scope-revision-writer")
+    scope_thread.start()
+    assert commit_entered.wait(timeout=2)
+    later_thread = threading.Thread(target=append_later)
+    later_thread.start()
+    # The unfixed writer completes here and publishes out of order.  The fixed
+    # writer remains behind the listener lock until the scope batch is released.
+    later_finished.wait(timeout=0.5)
+    release_scope_publish.set()
+    scope_thread.join(timeout=2)
+    later_thread.join(timeout=2)
+
+    assert failures == []
+    assert scope_thread.is_alive() is False
+    assert later_thread.is_alive() is False
+    durable = store.events_after("session-1", 0)
+    relevant = tuple(
+        event for event in durable
+        if event.kind in {"task_brief", "clarification", "later"}
+        or (
+            event.kind == "conversation"
+            and event.payload.get("reply_to_question_id") == question.question_id
+        )
+    )
+    assert [event.kind for event in relevant] == [
+        "conversation", "task_brief", "clarification", "later",
+    ]
+    assert [event.sequence for event in observed[-4:]] == [
+        event.sequence for event in relevant
+    ]
+    assert failing_observer[-4:] == [event.sequence for event in relevant]
+
+
+def test_scope_revision_failure_publishes_nothing_and_releases_listener_lock(
+    tmp_path,
+    valid_brief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed scope transaction neither dispatches events nor strands writers."""
+    store = SQLiteStore(
+        tmp_path / "scope-event-rollback.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "fable-session-1")
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    revised = replace(valid_brief, revision=2)
+    clarification = FableClarification.from_dict({
+        "status": "answered",
+        "answer": "Keep the same bounded scope.",
+        "reasoning": "The bounded fixture forces rollback.",
+        "confidence": 0.9,
+        "scope_changed": True,
+        "revised_brief": revised.to_dict(),
+        "question_for_user": None,
+        "directed_question": None,
+    })
+    observed = []
+    store.add_event_listener(observed.append)
+    original_insert = store._insert_event_in_transaction  # noqa: SLF001
+
+    def fail_task_brief(*args, **kwargs):
+        kind = args[3] if len(args) >= 4 else kwargs.get("kind")
+        if kind == "task_brief":
+            raise RuntimeError("injected scope event failure")
+        return original_insert(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_insert_event_in_transaction", fail_task_brief)
+    with pytest.raises(RuntimeError, match="injected scope event failure"):
+        store.save_scope_revision(
+            "session-1",
+            revised,
+            fable_session_id="fable-session-1",
+            sol_thread_id="sol-thread-1",
+            correction_count=0,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending={"answer": clarification.answer, "sol_run_id": "sol-run-1"},
+            baseline_id="baseline-1",
+            clarification=clarification,
+        )
+    assert observed == []
+    assert store.latest_task(valid_brief.task_id).revision == 1  # type: ignore[union-attr]
+
+    appended: list[object] = []
+    worker = threading.Thread(target=lambda: appended.append(store.append_event(
+        "session-1", valid_brief.task_id, "coordinator", "after_failure", {"ok": True},
+    )))
+    worker.start()
+    worker.join(timeout=2)
+    assert worker.is_alive() is False
+    assert len(appended) == 1
 
 
 def test_sqlite_thread_mode_defaults_safe_validates_type_and_can_be_opted_out(
@@ -5113,6 +5346,473 @@ def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
     assert stage is not None and stage.directed_binding is not None
     assert stage.directed_binding.stage == "next_fable"
     return stage
+
+
+def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief):
+    """Build one accepted scope checkpoint with a still-running exact Fable owner."""
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "provider-1")
+    store.set_fable_session(valid_brief.task_id, valid_brief.revision, "provider-1")
+    prepared = store.prepare_approval_action(
+        project_id="a" * 32,
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=41,
+        payload=ApprovalPayload(
+            baseline_id="baseline-1",
+            baseline_setting=None,
+            scope=None,
+        ),
+    )
+    prepared = store.claim_prepared_action(
+        prepared.preparation_id, generation=prepared.generation,
+    )
+    parent_pending = {"sol_run_id": "sol-run-1", "prompt": "continue exactly"}
+    _, parent = store.reserve_internal_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=1,
+        question_id="scope-owner-parent",
+        request_key="scope-owner-parent-request",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        text="May the bounded scope include one exact path?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action=parent_pending,
+        event=_conversation_question(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=1,
+            question_id="scope-owner-parent",
+            text="May the bounded scope include one exact path?",
+        ),
+    )
+    store.start_agent_run(
+        "scope-owner-source", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("scope-owner-source", "provider-1")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="scope-owner-intervention",
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_source_generation=1,
+        message="Keep the scope answer exact.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id="scope-owner-source",
+    )
+    store.finish_agent_run("scope-owner-source", status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.begin_intervention_resume(
+        created.intervention_id,
+        expected_resume_generation=created.resume_generation,
+        resume_attempt_id="scope-owner-attempt",
+        resume_run_id="scope-owner-resume",
+    )
+    store.start_agent_run(
+        "scope-owner-resume", valid_brief.task_id, valid_brief.revision, "fable",
+    )
+    store.set_agent_run_session("scope-owner-resume", "provider-1")
+    store.finish_agent_run("scope-owner-resume", status="completed", exit_code=0)
+    _, child = store.reserve_fable_answer_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        expected_generation=created.resume_generation,
+        outer_question_id=parent.question_id,
+        question_id="scope-owner-child",
+        request_key="scope-owner-child-request",
+        text="Which exact fact permits that bounded path?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=created.resume_generation,
+            question_id="scope-owner-child",
+            text="Which exact fact permits that bounded path?",
+        ),
+        intervention_id=created.intervention_id,
+        child_run_id="scope-owner-child-run",
+    )
+    store.finish_agent_run("scope-owner-child-run", status="completed", exit_code=0)
+    store.answer_fable_answer_evidence_question(
+        session_id="session-1",
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        outer_question_id=parent.question_id,
+        question_id=child.question_id,
+        expected_generation=created.resume_generation,
+        answer_text="The exact fact permits only the bounded path.",
+        next_fable_run_id="scope-owner-next-fable",
+        event=_conversation_answer(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=created.resume_generation,
+            question_id=child.question_id,
+            text="The exact fact permits only the bounded path.",
+        ),
+    )
+    stage = store.authenticated_intervention(created.intervention_id)
+    assert stage is not None and stage.directed_binding is not None
+    assert stage.directed_binding.stage == "next_fable"
+    clarification = FableClarification.from_dict({
+        "status": "answered",
+        "answer": "Add only the explicitly bounded path.",
+        "reasoning": "The exact evidence supports one bounded scope revision.",
+        "confidence": 0.9,
+        "scope_changed": True,
+        "revised_brief": replace(
+            valid_brief,
+            revision=2,
+            allowed_paths=(*valid_brief.allowed_paths, "scope-extra.txt"),
+        ).to_dict(),
+        "question_for_user": None,
+        "directed_question": None,
+    })
+    checkpoint = store.checkpoint_directed_fable_scope_answer(
+        prepared,
+        question_id=parent.question_id,
+        continuation_generation=created.resume_generation,
+        clarification=clarification,
+        completed_next_fable_intervention_id=stage.intervention_id,
+        completed_next_fable_run_id=stage.directed_binding.next_run_id,
+    )
+    return prepared, stage, checkpoint, clarification, parent_pending
+
+
+def _scope_owner_fixture_snapshot(store) -> dict[str, tuple[tuple[object, ...], ...]]:
+    tables = (
+        "tasks",
+        "settings",
+        "events",
+        "agent_runs",
+        "interventions",
+        "prepared_actions",
+        "questions",
+        "exchange_reservations",
+        "directed_fable_answer_checkpoints",
+    )
+    return {
+        table: tuple(tuple(row) for row in store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+
+
+def _consume_staged_scope_checkpoint(
+    store,
+    valid_brief,
+    *,
+    prepared,
+    stage,
+    clarification,
+    parent_pending,
+):
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    revised = replace(
+        valid_brief,
+        revision=2,
+        allowed_paths=(*valid_brief.allowed_paths, "scope-extra.txt"),
+    )
+    return store.save_scope_revision(
+        "session-1",
+        revised,
+        fable_session_id="provider-1",
+        sol_thread_id="provider-1",
+        correction_count=0,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"answer": clarification.answer, **parent_pending},
+        baseline_id="baseline-1",
+        setting=("agent_bridge.baseline.task-1.2", {"baseline_id": "baseline-1"}),
+        directed_checkpoint=prepared,
+        clarification=clarification,
+        completed_next_fable_intervention_id=stage.intervention_id,
+        completed_next_fable_run_id=binding.next_run_id,
+        completed_next_fable_exit_code=0,
+        answered_question_id="scope-owner-parent",
+        answered_question_generation=stage.resume_generation,
+        answered_pending=parent_pending,
+        answer_event=_conversation_answer(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=stage.resume_generation,
+            question_id="scope-owner-parent",
+            text=clarification.answer,
+        ),
+    )
+
+
+_SCOPE_CHECKPOINT_OWNER_KEYS = {
+    "intervention_id",
+    "run_id",
+    "resume_attempt_id",
+    "provider_id",
+    "session_id",
+    "task_id",
+    "revision",
+    "generation",
+    "question_id",
+    "parent_question_id",
+    "preparation_id",
+}
+
+
+def test_staged_scope_checkpoint_persists_its_complete_exact_owner(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """The accepted checkpoint itself names the only stage it may consume."""
+    store = SQLiteStore(
+        tmp_path / "scope-checkpoint-owner.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    prepared, stage, checkpoint, _, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store, valid_brief,
+    )
+    binding = stage.directed_binding
+    assert binding is not None
+    row = store._connection.execute(  # noqa: SLF001 - persisted owner contract
+        "SELECT stage_kind, stage_owner_json FROM directed_fable_answer_checkpoints "
+        "WHERE preparation_id = ? AND question_id = ?",
+        (prepared.preparation_id, checkpoint.question_id),
+    ).fetchone()
+    assert row is not None
+    assert row["stage_kind"] == "next_fable"
+    owner = json.loads(row["stage_owner_json"])
+    assert set(owner) == _SCOPE_CHECKPOINT_OWNER_KEYS
+    assert owner == {
+        "intervention_id": stage.intervention_id,
+        "run_id": binding.next_run_id,
+        "resume_attempt_id": stage.resume_attempt_id,
+        "provider_id": binding.next_provider_id,
+        "session_id": stage.session_id,
+        "task_id": stage.task_id,
+        "revision": stage.revision,
+        "generation": stage.resume_generation,
+        "question_id": binding.question_id,
+        "parent_question_id": binding.parent_question_id,
+        "preparation_id": prepared.preparation_id,
+    }
+
+
+@pytest.mark.parametrize("operation", ("recover", "save"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_owner",
+        "missing_owner_field",
+        "stage_kind",
+        "intervention",
+        "missing_intervention",
+        "run",
+        "missing_run",
+        "attempt",
+        "provider",
+        "session",
+        "task",
+        "revision",
+        "generation",
+        "question",
+        "parent",
+        "preparation",
+        "missing_preparation",
+    ),
+)
+def test_staged_scope_checkpoint_owner_tampering_fails_closed_and_rolls_back(
+    tmp_path,
+    valid_brief,
+    operation: str,
+    mutation: str,
+) -> None:
+    """Recovery and consumption accept only the checkpoint's exact stage owner."""
+    store = SQLiteStore(
+        tmp_path / f"scope-owner-{operation}-{mutation}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    prepared, stage, _, clarification, parent_pending = (
+        _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    )
+    owner_mutations = {
+        "intervention": ("intervention_id", "substituted-intervention"),
+        "run": ("run_id", "substituted-run"),
+        "attempt": ("resume_attempt_id", "substituted-attempt"),
+        "provider": ("provider_id", "substituted-provider"),
+        "session": ("session_id", "substituted-session"),
+        "task": ("task_id", "substituted-task"),
+        "revision": ("revision", 999),
+        "generation": ("generation", 999),
+        "question": ("question_id", "substituted-question"),
+        "parent": ("parent_question_id", "substituted-parent"),
+        "preparation": ("preparation_id", "substituted-preparation"),
+    }
+    if mutation == "missing_owner":
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE directed_fable_answer_checkpoints SET stage_owner_json = NULL"
+        )
+    elif mutation == "missing_owner_field":
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET stage_owner_json = json_remove(stage_owner_json, '$.provider_id')"
+        )
+    elif mutation == "stage_kind":
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE directed_fable_answer_checkpoints SET stage_kind = 'prepared_answer'"
+        )
+    elif mutation == "missing_intervention":
+        store._connection.execute(  # noqa: SLF001
+            "DELETE FROM interventions WHERE intervention_id = ?",
+            (stage.intervention_id,),
+        )
+    elif mutation == "missing_run":
+        assert stage.directed_binding is not None
+        store._connection.execute(  # noqa: SLF001
+            "DELETE FROM agent_runs WHERE run_id = ?",
+            (stage.directed_binding.next_run_id,),
+        )
+    elif mutation == "missing_preparation":
+        store._connection.execute(  # noqa: SLF001
+            "DELETE FROM prepared_actions WHERE preparation_id = ?",
+            (prepared.preparation_id,),
+        )
+    else:
+        key, value = owner_mutations[mutation]
+        store._connection.execute(  # noqa: SLF001
+            "UPDATE directed_fable_answer_checkpoints "
+            "SET stage_owner_json = json_set(stage_owner_json, ?, json(?))",
+            (f"$.{key}", json.dumps(value)),
+        )
+    before = _scope_owner_fixture_snapshot(store)
+
+    with pytest.raises(RuntimeError, match="checkpoint|stage|owner|intervention|preparation"):
+        if operation == "recover":
+            store.recoverable_next_fable_scope_stage(prepared)
+        else:
+            _consume_staged_scope_checkpoint(
+                store,
+                valid_brief,
+                prepared=prepared,
+                stage=stage,
+                clarification=clarification,
+                parent_pending=parent_pending,
+            )
+
+    assert _scope_owner_fixture_snapshot(store) == before
+
+
+def test_exact_staged_scope_checkpoint_reopens_and_consumes_once(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """An untampered checkpoint survives reopen and consumes its one owner once."""
+    path = tmp_path / "scope-checkpoint-replay.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, _, clarification, parent_pending = (
+        _staged_scope_checkpoint_for_owner_matrix(store, valid_brief)
+    )
+    expected_stage = (stage.intervention_id, stage.directed_binding.next_run_id)  # type: ignore[union-attr]
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    assert reopened.recoverable_next_fable_scope_stage(prepared) == expected_stage
+    saved = _consume_staged_scope_checkpoint(
+        reopened,
+        valid_brief,
+        prepared=prepared,
+        stage=stage,
+        clarification=clarification,
+        parent_pending=parent_pending,
+    )
+    assert saved.revision == 2
+    assert reopened.directed_fable_answer_checkpoint(prepared) is None
+    assert reopened.intervention(stage.intervention_id).status is (  # type: ignore[union-attr]
+        store_module.InterventionStatus.RESUMED
+    )
+    assert reopened.agent_run(expected_stage[1]).status == "completed"
+    after_first = _scope_owner_fixture_snapshot(reopened)
+
+    with pytest.raises(RuntimeError, match="checkpoint|stage|completion"):
+        _consume_staged_scope_checkpoint(
+            reopened,
+            valid_brief,
+            prepared=prepared,
+            stage=stage,
+            clarification=clarification,
+            parent_pending=parent_pending,
+        )
+    assert _scope_owner_fixture_snapshot(reopened) == after_first
+    reopened.close()
+
+    audited = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:02Z")
+    assert audited.recover_active_tasks() == store_module.RecoverySummary(0, 0, 0)
+    assert _scope_owner_fixture_snapshot(audited) == after_first
+    audited.close()
+
+
+def test_staged_scope_checkpoint_owner_migration_is_exact_and_byte_idempotent(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """The preceding checkpoint schema backfills only its one authenticated stage."""
+    path = tmp_path / "scope-checkpoint-owner-migration.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, checkpoint, _, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store, valid_brief,
+    )
+    expected_stage = (stage.intervention_id, stage.directed_binding.next_run_id)  # type: ignore[union-attr]
+    store.close()
+
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        """
+        CREATE TABLE preceding_directed_fable_answer_checkpoints AS
+        SELECT preparation_id, project_id, session_id, task_id, revision,
+               question_id, continuation_generation, clarification_json, status
+        FROM directed_fable_answer_checkpoints
+        """
+    )
+    legacy.execute("DROP TABLE directed_fable_answer_checkpoints")
+    legacy.execute(
+        "ALTER TABLE preceding_directed_fable_answer_checkpoints "
+        "RENAME TO directed_fable_answer_checkpoints"
+    )
+    legacy.commit()
+    legacy.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    row = migrated._connection.execute(  # noqa: SLF001 - migration contract
+        "SELECT stage_kind, stage_owner_json "
+        "FROM directed_fable_answer_checkpoints WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert row is not None and row["stage_kind"] == "next_fable"
+    assert set(json.loads(row["stage_owner_json"])) == _SCOPE_CHECKPOINT_OWNER_KEYS
+    assert migrated.recoverable_next_fable_scope_stage(prepared) == expected_stage
+    assert migrated.directed_fable_answer_checkpoint(prepared) == checkpoint
+    migrated.close()
+
+    migrated_bytes = path.read_bytes()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:02Z")
+    assert reopened.recoverable_next_fable_scope_stage(prepared) == expected_stage
+    reopened.close()
+    assert path.read_bytes() == migrated_bytes
 
 
 def test_child_answer_cas_preallocates_the_exact_next_fable_run(
