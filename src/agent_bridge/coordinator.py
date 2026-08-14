@@ -1548,8 +1548,13 @@ class Coordinator:
                     resume_session_id=task.fable_session_id, run_id=resume_run_id,
                 )
             else:
+                guidance = None if (
+                    record.continuation_state in _SOL_STATES
+                    and isinstance(context, ClarificationContext)
+                    and context.clarification_prompt == record.message
+                ) else record.message
                 await self._run_context(
-                    task, context, record.message, run_id=resume_run_id,
+                    task, context, guidance, run_id=resume_run_id,
                 )
         else:
             raise RuntimeError("intervention route changed")

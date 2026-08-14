@@ -248,7 +248,9 @@ def _verdict(
 class FakeFable:
     brief: TaskBrief
     clarification_prompts: list[str] = field(default_factory=list)
+    clarification_sessions: list[str] = field(default_factory=list)
     review_prompts: list[str] = field(default_factory=list)
+    review_sessions: list[str] = field(default_factory=list)
     answer_sol_question_prompts: list[tuple[str, str, str]] = field(default_factory=list)
     plan_calls: list[tuple[str, str, str]] = field(default_factory=list)
     resume_plan_sessions: list[str] = field(default_factory=list)
@@ -296,6 +298,7 @@ class FakeFable:
         self, *, run_id: str, session_id: str, prompt: str,
     ) -> AgentRunResult:
         self.clarification_prompts.append(prompt)
+        self.clarification_sessions.append(session_id)
         if self.hold_clarification is not None:
             await self.hold_clarification.wait()
             return _result(
@@ -336,6 +339,7 @@ class FakeFable:
         self, *, run_id: str, session_id: str, prompt: str,
     ) -> AgentRunResult:
         self.review_prompts.append(prompt)
+        self.review_sessions.append(session_id)
         if self.hold_review is not None:
             await self.hold_review.wait()
             return _result(
@@ -359,6 +363,7 @@ class FakeSol:
         default_factory=deque
     )
     hold_start: asyncio.Event | None = None
+    hold_resume: asyncio.Event | None = None
     on_start: Callable[[], None] | None = None
     on_resume: Callable[[], None] | None = None
     returned_run_id: str | None = None
@@ -410,6 +415,11 @@ class FakeSol:
         self.resume_prompts.append(prompt)
         if self.on_resume is not None:
             self.on_resume()
+        if self.hold_resume is not None:
+            await self.hold_resume.wait()
+            return _result(
+                run_id, None, session_id=thread_id, interrupted=True, exit_code=-15,
+            )
         outcome, events = self._next()
         return _result(run_id, outcome.to_dict(), session_id=thread_id, events=events)
 
@@ -2010,6 +2020,259 @@ def test_interrupted_intervention_adapter_result_remains_unknown_with_exact_owne
         assert task.state is TaskState.INTERRUPTED
         assert harness.store.agent_run(record.resume_run_id).status == "interrupted"
         assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_fable_clarification_intervention_resumes_exact_session_with_durable_guidance(
+    harness: CoordinatorHarness,
+) -> None:
+    """A persisted Fable clarification resumes its validated session, not a new route."""
+    async def scenario() -> None:
+        source_released = asyncio.Event()
+        harness.sol.queue(_question("Which approved constraint applies?"))
+        harness.fable.hold_clarification = source_released
+        harness.runner.release_on_stop = source_released
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        while len(harness.fable.clarification_sessions) != 1:
+            await asyncio.sleep(0)
+        active = harness.store.active_run_for_task("task-1", 1)
+        task = harness.store.get_task("task-1", 1)
+        assert active is not None
+        assert task.state is TaskState.FABLE_CLARIFYING
+        assert task.fable_session_id is not None
+        harness.store.set_agent_run_session(active.run_id, task.fable_session_id)
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(project_id=runtime.project_id, session_id="session-1", task_id="task-1")
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="fable-clarification", message="Keep this clarification narrow.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=task.continuation_generation,
+            ),
+        )
+        harness.fable.hold_clarification = None
+
+        await workflows.continue_intervention(prepared)
+        await approval
+
+        record = harness.store.intervention("fable-clarification")
+        assert record is not None
+        assert record.routed_to is ConversationTarget.FABLE
+        assert record.status.value == "resumed"
+        assert harness.fable.clarification_sessions == [task.fable_session_id] * 2
+        assert harness.fable.clarification_prompts[-1] == (
+            f"{harness.fable.clarification_prompts[0]}\n"
+            "User answer: Keep this clarification narrow."
+        )
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_fable_review_intervention_resumes_exact_session_with_durable_guidance(
+    harness: CoordinatorHarness,
+) -> None:
+    """A persisted Fable review uses ReviewVerdict continuation and releases the Hub lease."""
+    async def scenario() -> None:
+        source_released = asyncio.Event()
+        harness.sol.queue(_completed())
+        harness.fable.hold_review = source_released
+        harness.runner.release_on_stop = source_released
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        while len(harness.fable.review_sessions) != 1:
+            await asyncio.sleep(0)
+        active = harness.store.active_run_for_task("task-1", 1)
+        task = harness.store.get_task("task-1", 1)
+        assert active is not None
+        assert task.state is TaskState.FABLE_REVIEWING
+        assert task.fable_session_id is not None
+        harness.store.set_agent_run_session(active.run_id, task.fable_session_id)
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(project_id=runtime.project_id, session_id="session-1", task_id="task-1")
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="fable-review", message="Review the evidence boundary.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=task.continuation_generation,
+            ),
+        )
+        harness.fable.hold_review = None
+
+        await workflows.continue_intervention(prepared)
+        await approval
+
+        record = harness.store.intervention("fable-review")
+        assert record is not None
+        assert record.routed_to is ConversationTarget.FABLE
+        assert record.status.value == "resumed"
+        assert harness.fable.review_sessions == [task.fable_session_id] * 2
+        assert harness.fable.review_prompts[-1] == (
+            f"{harness.fable.review_prompts[0]}\n"
+            "User answer: Review the evidence boundary."
+        )
+        assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_fable_addressed_correction_intervention_uses_exact_fable_clarification(
+    harness: CoordinatorHarness,
+) -> None:
+    """Fable guidance in correction uses FableClarification before the exact Sol resume."""
+    async def scenario() -> None:
+        source_released = asyncio.Event()
+        correction_started = asyncio.Event()
+        harness.sol.queue(_completed())
+        harness.fable.next_verdicts.append(
+            _verdict(harness.fable.brief, status="corrections_required")
+        )
+        harness.sol.hold_resume = source_released
+        harness.sol.on_resume = correction_started.set
+        harness.runner.release_on_stop = source_released
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await correction_started.wait()
+        active = harness.store.active_run_for_task("task-1", 1)
+        task = harness.store.get_task("task-1", 1)
+        assert active is not None
+        assert task.state is TaskState.SOL_CORRECTING
+        assert task.sol_thread_id == THREAD_ID
+        harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(project_id=runtime.project_id, session_id="session-1", task_id="task-1")
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="fable-correction", message="Correct only the recorded gap.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=task.continuation_generation,
+            ),
+        )
+        harness.sol.hold_resume = None
+
+        await workflows.continue_intervention(prepared)
+        await approval
+
+        record = harness.store.intervention("fable-correction")
+        assert record is not None
+        assert record.routed_to is ConversationTarget.FABLE
+        assert record.status.value == "resumed"
+        assert harness.fable.clarification_sessions[-1] == task.fable_session_id
+        assert harness.fable.clarification_prompts[-1] == "Correct only the recorded gap."
+        assert harness.sol.resume_threads[-1] == THREAD_ID
+        assert harness.sol.resume_prompts[-1] == "Use the existing approved scope."
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ("preapproval", "no_thread", "terminal", "scope_widened"))
+def test_intervention_sol_recipient_rejects_ineligible_phase_before_dispatch(
+    harness, phase: str,
+) -> None:
+    """Sol is eligible only for an approved, live exact-thread continuation."""
+    async def scenario() -> None:
+        if phase == "preapproval":
+            release = asyncio.Event()
+            harness.fable.hold_plan = release
+            initial = asyncio.create_task(
+                harness.coordinator.handle_user_request("session-1", "Build the bridge")
+            )
+            while harness.store.active_run_for_task("task-1", 0) is None:
+                await asyncio.sleep(0)
+            task = harness.store.get_task("task-1", 0)
+            with pytest.raises(RuntimeError, match="Sol recipient is not eligible"):
+                harness.coordinator.prepare_intervention(
+                    "task-1", InterventionIntent("ineligible-preapproval", "Do not route.",
+                    ConversationTarget.SOL, 0, task.continuation_generation),
+                )
+            release.set()
+            await initial
+            assert harness.sol.starts == []
+            assert harness.sol.resume_threads == []
+            return
+
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        task = harness.store.get_task("task-1", 1)
+        if phase == "terminal":
+            harness.store._connection.execute(
+                "UPDATE tasks SET state = ? WHERE task_id = ? AND revision = ?",
+                (TaskState.COMPLETED.value, "task-1", 1),
+            )
+        elif phase == "scope_widened":
+            harness.store._connection.execute(
+                "UPDATE tasks SET state = ? WHERE task_id = ? AND revision = ?",
+                (TaskState.AWAITING_SCOPE_APPROVAL.value, "task-1", 1),
+            )
+        with pytest.raises(RuntimeError):
+            harness.coordinator.prepare_intervention(
+                "task-1", InterventionIntent(f"ineligible-{phase}", "Do not route.",
+                ConversationTarget.SOL, 1, task.continuation_generation),
+            )
+        assert harness.sol.resume_threads == []
 
     asyncio.run(scenario())
 
