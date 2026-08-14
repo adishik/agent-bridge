@@ -5348,7 +5348,207 @@ def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
     return stage
 
 
-def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief, *, prefix: str = ""):
+def _prepare_staged_scope_checkpoint_owner(
+    store,
+    valid_brief,
+    *,
+    action: str,
+    session_id: str,
+    provider_id: str,
+    owned,
+):
+    """Create one real prepared action that can reach a Sol-to-Fable scope answer."""
+    parent_pending = {
+        "sol_run_id": owned("sol-run-1"),
+        "prompt": "continue exactly",
+    }
+    context = SolResumeContext(
+        sol_thread_id=provider_id,
+        sol_run_id=parent_pending["sol_run_id"],
+        prompt=parent_pending["prompt"],
+    )
+    approval = store.prepare_approval_action(
+        project_id="a" * 32,
+        session_id=session_id,
+        task_id=valid_brief.task_id,
+        revision=valid_brief.revision,
+        generation=41 if action == "approval" else 40,
+        payload=ApprovalPayload(
+            baseline_id="baseline-1",
+            baseline_setting=None,
+            scope=None,
+        ),
+    )
+    approval = store.claim_prepared_action(
+        approval.preparation_id,
+        generation=approval.generation,
+    )
+    if action == "approval":
+        return approval, parent_pending
+    if action == "resume":
+        store.pause_for_continuation(
+            valid_brief.task_id,
+            valid_brief.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=TaskState.INTERRUPTED,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending=parent_pending,
+        )
+        approval = store.interrupt_claimed_prepared_action(
+            approval.preparation_id,
+            generation=approval.generation,
+            reason="adapter_interrupted",
+        )
+        prepared = store.prepare_resume_action(
+            project_id="a" * 32,
+            session_id=session_id,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=41,
+            payload=ResumePayload(
+                continuation=context,
+                drift_event=ResumeDriftProjection(
+                    status="unchanged",
+                    summary="Repository drift was checked.",
+                    evidence_hashes=(),
+                ),
+            ),
+            previous_preparation_id=approval.preparation_id,
+        )
+    else:
+        store.complete_prepared_action(
+            approval.preparation_id,
+            generation=approval.generation,
+        )
+    if action == "resume":
+        pass
+    elif action in {"answer", "continuation_message"}:
+        store.pause_for_continuation(
+            valid_brief.task_id,
+            valid_brief.revision,
+            expected=TaskState.SOL_RUNNING,
+            target=TaskState.AWAITING_USER_INPUT,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending=parent_pending,
+        )
+        if action == "answer":
+            prepared = store.prepare_answer_action(
+                project_id="a" * 32,
+                session_id=session_id,
+                task_id=valid_brief.task_id,
+                revision=valid_brief.revision,
+                generation=41,
+                payload=AnswerPayload(
+                    answer="Continue with the exact approved path.",
+                    continuation=context,
+                ),
+            )
+        else:
+            prepared = store.prepare_continuation_message_action(
+                project_id="a" * 32,
+                session_id=session_id,
+                task_id=valid_brief.task_id,
+                revision=valid_brief.revision,
+                generation=41,
+                payload=ContinuationMessagePayload(
+                    text="Continue with the exact approved path.",
+                    addressed_to=ConversationTarget.SOL,
+                    routed_to=ConversationTarget.SOL,
+                    continuation_generation=1,
+                    continuation=context,
+                ),
+            )
+    elif action == "question_answer":
+        store.pause_for_question(
+            session_id=session_id,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            expected_generation=1,
+            question_id=owned("scope-owner-user-question"),
+            asked_by=ConversationActor.SOL,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            text="Which exact approved option should Sol use?",
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action=parent_pending,
+            event=_conversation_question(
+                sender=ConversationActor.SOL,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                task_id=valid_brief.task_id,
+                revision=valid_brief.revision,
+                generation=1,
+                question_id=owned("scope-owner-user-question"),
+                text="Which exact approved option should Sol use?",
+            ),
+        )
+        prepared = store.prepare_question_answer_action(
+            project_id="a" * 32,
+            session_id=session_id,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=41,
+            payload=QuestionAnswerPayload(
+                question_id=owned("scope-owner-user-question"),
+                answer="Use the exact approved option.",
+                continuation_generation=1,
+                continuation=context,
+            ),
+        )
+    elif action == "exchange_grant":
+        attempted = DirectedAgentQuestion(
+            addressed_to="fable",
+            text="Resolve the exact approved ambiguity.",
+            reason="The finite internal exchange allowance is exhausted.",
+        )
+        store._connection.execute(  # noqa: SLF001 - exact permission fixture
+            "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+            (valid_brief.task_id, valid_brief.revision),
+        )
+        store.pause_for_exchange_permission(
+            session_id=session_id,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            expected_generation=1,
+            attempted_question=attempted,
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action=parent_pending,
+            event=_conversation_permission(
+                task_id=valid_brief.task_id,
+                revision=valid_brief.revision,
+                generation=1,
+            ),
+        )
+        prepared = store.prepare_exchange_grant_action(
+            project_id="a" * 32,
+            session_id=session_id,
+            task_id=valid_brief.task_id,
+            revision=valid_brief.revision,
+            generation=41,
+            payload=ExchangeGrantPayload(
+                request_id=owned("scope-owner-grant-request"),
+                continuation_generation=1,
+                attempted_question=attempted,
+                continuation=context,
+                parent_mode="top_level",
+            ),
+        )
+    else:
+        raise AssertionError(f"unsupported staged checkpoint owner action {action}")
+    prepared = store.claim_prepared_action(
+        prepared.preparation_id,
+        generation=prepared.generation,
+    )
+    return prepared, parent_pending
+
+
+def _staged_scope_checkpoint_for_owner_matrix(
+    store,
+    valid_brief,
+    *,
+    prefix: str = "",
+    preparation_action: str = "approval",
+):
     """Build one accepted scope checkpoint with a still-running exact Fable owner."""
     def owned(value: str) -> str:
         return value if not prefix else f"{prefix}-{value}"
@@ -5359,27 +5559,22 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief, *, prefix: str
     store.save_task(session_id, valid_brief, TaskState.AWAITING_USER_APPROVAL)
     store.set_sol_thread(valid_brief.task_id, valid_brief.revision, provider_id)
     store.set_fable_session(valid_brief.task_id, valid_brief.revision, provider_id)
-    prepared = store.prepare_approval_action(
-        project_id="a" * 32,
+    prepared, parent_pending = _prepare_staged_scope_checkpoint_owner(
+        store,
+        valid_brief,
+        action=preparation_action,
         session_id=session_id,
-        task_id=valid_brief.task_id,
-        revision=valid_brief.revision,
-        generation=41,
-        payload=ApprovalPayload(
-            baseline_id="baseline-1",
-            baseline_setting=None,
-            scope=None,
-        ),
+        provider_id=provider_id,
+        owned=owned,
     )
-    prepared = store.claim_prepared_action(
-        prepared.preparation_id, generation=prepared.generation,
-    )
-    parent_pending = {"sol_run_id": owned("sol-run-1"), "prompt": "continue exactly"}
+    question_generation = store.get_task(
+        valid_brief.task_id, valid_brief.revision,
+    ).continuation_generation
     _, parent = store.reserve_internal_question(
         session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
-        expected_generation=1,
+        expected_generation=question_generation,
         question_id=owned("scope-owner-parent"),
         request_key=owned("scope-owner-parent-request"),
         asked_by=ConversationActor.SOL,
@@ -5394,7 +5589,7 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief, *, prefix: str
             routed_to=ConversationTarget.FABLE,
             task_id=valid_brief.task_id,
             revision=valid_brief.revision,
-            generation=1,
+            generation=question_generation,
             question_id=owned("scope-owner-parent"),
             text="May the bounded scope include one exact path?",
         ),
@@ -5408,7 +5603,7 @@ def _staged_scope_checkpoint_for_owner_matrix(store, valid_brief, *, prefix: str
         session_id=session_id,
         task_id=valid_brief.task_id,
         revision=valid_brief.revision,
-        expected_source_generation=1,
+        expected_source_generation=question_generation,
         message="Keep the scope answer exact.",
         addressed_to=ConversationTarget.FABLE,
         routed_to=ConversationTarget.FABLE,
@@ -5904,6 +6099,115 @@ def test_terminal_staged_scope_checkpoint_migration_preserves_exact_owner(
     assert path.read_bytes() == migrated_bytes
 
 
+@pytest.mark.parametrize("terminal", ("pending", "resumed", "canceled_by_stop"))
+def test_resume_owned_staged_scope_checkpoint_migration_preserves_exact_owner(
+    tmp_path,
+    valid_brief,
+    terminal: str,
+) -> None:
+    """A real resumed workflow may own every valid staged checkpoint form."""
+    path = tmp_path / f"resume-scope-owner-{terminal}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, _, clarification, parent_pending = (
+        _staged_scope_checkpoint_for_owner_matrix(
+            store,
+            valid_brief,
+            preparation_action="resume",
+        )
+    )
+    binding = stage.directed_binding
+    assert prepared.action == "resume"
+    assert binding is not None and binding.next_run_id is not None
+    if terminal == "pending":
+        expected_checkpoint_status = "PENDING"
+        expected_intervention_status = store_module.InterventionStatus.RESUMING
+        expected_run_status = "running"
+    elif terminal == "resumed":
+        _consume_staged_scope_checkpoint(
+            store,
+            valid_brief,
+            prepared=prepared,
+            stage=stage,
+            clarification=clarification,
+            parent_pending=parent_pending,
+        )
+        expected_checkpoint_status = "CONSUMED"
+        expected_intervention_status = store_module.InterventionStatus.RESUMED
+        expected_run_status = "completed"
+    else:
+        store.cancel_intervention_by_stop(
+            stage.intervention_id,
+            expected_resume_generation=stage.resume_generation,
+        )
+        expected_checkpoint_status = "CONSUMED"
+        expected_intervention_status = store_module.InterventionStatus.CANCELED_BY_STOP
+        expected_run_status = "interrupted"
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    row = migrated._connection.execute(  # noqa: SLF001 - migration contract
+        "SELECT stage_kind, stage_owner_json, status "
+        "FROM directed_fable_answer_checkpoints WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert row is not None
+    assert (row["stage_kind"], row["status"]) == (
+        "next_fable",
+        expected_checkpoint_status,
+    )
+    assert json.loads(row["stage_owner_json"])["preparation_id"] == (
+        prepared.preparation_id
+    )
+    assert migrated.prepared_action(prepared.preparation_id).action == "resume"
+    assert migrated.authenticated_intervention(stage.intervention_id).status is (  # type: ignore[union-attr]
+        expected_intervention_status
+    )
+    assert migrated.agent_run(binding.next_run_id).status == expected_run_status
+    assert migrated._directed_fable_answer_checkpoint_reasons("a" * 32) == set()  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "action",
+    ("answer", "continuation_message", "question_answer", "exchange_grant"),
+)
+def test_pending_staged_scope_checkpoint_migration_accepts_other_reachable_owners(
+    tmp_path,
+    valid_brief,
+    action: str,
+) -> None:
+    """Every other real prepared workflow that can ask Fable remains migratable."""
+    path = tmp_path / f"{action}-scope-owner.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    prepared, stage, _, _, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store,
+        valid_brief,
+        preparation_action=action,
+    )
+    binding = stage.directed_binding
+    assert prepared.action == action
+    assert binding is not None and binding.next_run_id is not None
+    store.close()
+    _restore_pre_stage_owner_checkpoint_schema(path)
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:01Z")
+    row = migrated._connection.execute(  # noqa: SLF001 - migration contract
+        "SELECT stage_kind, stage_owner_json, status "
+        "FROM directed_fable_answer_checkpoints WHERE preparation_id = ?",
+        (prepared.preparation_id,),
+    ).fetchone()
+    assert row is not None
+    assert (row["stage_kind"], row["status"]) == ("next_fable", "PENDING")
+    assert json.loads(row["stage_owner_json"])["preparation_id"] == (
+        prepared.preparation_id
+    )
+    assert migrated.recoverable_next_fable_scope_stage(prepared) == (
+        stage.intervention_id,
+        binding.next_run_id,
+    )
+    assert migrated._directed_fable_answer_checkpoint_reasons("a" * 32) == set()  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "fault", ("missing_history", "missing_run", "ambiguous_history"),
 )
@@ -6165,7 +6469,8 @@ def test_staged_scope_checkpoint_migration_pages_rows_and_limits_owner_candidate
     preparation_reads = [
         statement for statement in statements
         if statement.lstrip().startswith("SELECT rowid, * FROM prepared_actions")
-        and "action = 'approval'" in statement
+        and "payload_json =" in statement
+        and "previous_preparation_id IS" in statement
     ]
     assert len(page_reads) == 4
     assert all("LIMIT 2" in statement for statement in page_reads)

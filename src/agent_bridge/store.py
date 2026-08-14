@@ -6669,16 +6669,37 @@ class SQLiteStore:
         ).fetchall()
         if len(inverse_rows) != 1 or int(inverse_rows[0]["rowid"]) != int(row["rowid"]):
             return False
+        named_prepared_row = self._connection.execute(
+            """
+            SELECT rowid, * FROM prepared_actions
+            WHERE preparation_id = ? AND project_id = ? AND session_id = ?
+              AND task_id = ? AND revision = ?
+            """,
+            (
+                row["preparation_id"], row["project_id"], row["session_id"],
+                row["task_id"], row["revision"],
+            ),
+        ).fetchone()
+        if named_prepared_row is None:
+            return False
         prepared_rows = self._connection.execute(
             """
             SELECT rowid, * FROM prepared_actions
             WHERE project_id = ? AND session_id = ? AND task_id = ?
-              AND revision = ? AND action = 'approval'
+              AND revision = ? AND action = ? AND payload_json = ?
+              AND source_state = ? AND active_state = ?
+              AND continuation_state IS ? AND pending_context_json IS ?
+              AND previous_preparation_id IS ?
             ORDER BY rowid LIMIT 2
             """,
             (
-                row["project_id"], row["session_id"], row["task_id"],
-                row["revision"],
+                named_prepared_row["project_id"], named_prepared_row["session_id"],
+                named_prepared_row["task_id"], named_prepared_row["revision"],
+                named_prepared_row["action"], named_prepared_row["payload_json"],
+                named_prepared_row["source_state"], named_prepared_row["active_state"],
+                named_prepared_row["continuation_state"],
+                named_prepared_row["pending_context_json"],
+                named_prepared_row["previous_preparation_id"],
             ),
         ).fetchall()
         question_row = self._connection.execute(
