@@ -1532,7 +1532,11 @@ class Coordinator:
             question = self._store.unanswered_question_for_task(task.task_id, task.revision)
             if question is None or question.routed_to is not record.routed_to:
                 raise RuntimeError("intervention directed route changed")
-            await self.answer_directed_question(question)
+            await self.answer_directed_question(
+                question,
+                run_id=resume_run_id,
+                intervention_message=record.message,
+            )
         elif record.routed_to is ConversationTarget.SOL:
             if task.state not in _SOL_STATES:
                 raise RuntimeError("intervention Sol route changed")
@@ -2228,7 +2232,13 @@ class Coordinator:
             }
         raise RuntimeError("directed question has no persisted continuation")
 
-    async def answer_directed_question(self, question: QuestionRecord) -> None:
+    async def answer_directed_question(
+        self,
+        question: QuestionRecord,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
+    ) -> None:
         """Answer one persisted agent-routed question; user questions stay human-only."""
         if not isinstance(question, QuestionRecord):
             raise ValueError("question must be a QuestionRecord")
@@ -2257,12 +2267,24 @@ class Coordinator:
         if persisted.routed_to is ConversationTarget.FABLE:
             if persisted.asked_by is not ConversationActor.SOL:
                 raise RuntimeError("Fable may answer only Sol's exact question")
-            await self._answer_sol_question_with_fable(task, persisted, continuation)
+            await self._answer_sol_question_with_fable(
+                task,
+                persisted,
+                continuation,
+                run_id=run_id,
+                intervention_message=intervention_message,
+            )
             return
         if persisted.routed_to is ConversationTarget.SOL:
             if persisted.asked_by is not ConversationActor.FABLE:
                 raise RuntimeError("Sol may answer only Fable's exact question")
-            await self._answer_fable_question_with_sol(task, persisted, continuation)
+            await self._answer_fable_question_with_sol(
+                task,
+                persisted,
+                continuation,
+                run_id=run_id,
+                intervention_message=intervention_message,
+            )
             return
         raise RuntimeError("directed question has no exact answering agent")
 
@@ -2271,12 +2293,17 @@ class Coordinator:
         task: TaskRecord,
         question: QuestionRecord,
         continuation: object,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("Fable answer requires the exact Fable session")
         evidence = self._store.nested_evidence_for_parent(question.question_id)
         prompt = question.text if evidence is None else f"{question.text}\nSol evidence: {evidence}"
-        run_id = self._ids.new_run_id()
+        if intervention_message is not None:
+            prompt = f"{prompt}\n\nIntervention guidance:\n{intervention_message}"
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
@@ -2480,10 +2507,13 @@ class Coordinator:
         task: TaskRecord,
         question: QuestionRecord,
         continuation: object,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
     ) -> None:
         if task.sol_thread_id is None or task.brief is None:
             raise RuntimeError("Sol answer requires the exact approved thread and brief")
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         self._store.start_agent_run(run_id, task.task_id, task.revision, "sol")
         completion = self._track_run(run_id)
         try:
@@ -2491,7 +2521,10 @@ class Coordinator:
                 run_id=run_id,
                 thread_id=task.sol_thread_id,
                 brief=task.brief,
-                prompt=question.text,
+                prompt=(
+                    question.text if intervention_message is None else
+                    f"{question.text}\n\nIntervention guidance:\n{intervention_message}"
+                ),
             )
             self._persist_agent_result(
                 task,

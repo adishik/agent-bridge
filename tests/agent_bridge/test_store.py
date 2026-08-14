@@ -4372,6 +4372,9 @@ def test_intervention_retry_audit_preserves_the_source_bound_user_event(
 
     assert retried.status is store_module.InterventionStatus.READY
     assert retried.resume_generation == created.resume_generation + 1
+    assert store.get_task(
+        valid_brief.task_id, valid_brief.revision,
+    ).continuation_generation == retried.resume_generation
     events = store.events_after("session-1", 0)
     assert len(events) == 1
     assert ConversationEnvelope.from_dict(events[0].payload).continuation_generation == 1

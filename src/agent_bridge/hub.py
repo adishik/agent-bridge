@@ -39,6 +39,12 @@ _SCHEDULER_UNAVAILABLE = "scheduler_unavailable"
 _TERMINAL_PREPARED_STATUSES = frozenset({
     "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
 })
+_TERMINAL_INTERVENTION_STATUSES = frozenset({
+    InterventionStatus.RESUMED,
+    InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    InterventionStatus.CANCELED_BY_STOP,
+    InterventionStatus.FAILED,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,10 +527,33 @@ class HubWorkflowOrchestrator:
         """Commit an intervention while retaining its exact live source lease."""
         if not isinstance(intent, InterventionIntent):
             raise ValueError("intent must be an InterventionIntent")
+        runtime = self._runtime_for_session(project_id, session_id)
+        existing = runtime.store.authenticated_intervention(intent.intervention_id)
+        if existing is not None:
+            if (
+                existing.session_id != session_id
+                or existing.task_id != task_id
+                or existing.revision != intent.revision
+                or existing.source_generation != intent.continuation_generation
+                or existing.message != intent.message
+                or existing.addressed_to is not intent.addressed_to
+                or existing.routed_to is not intent.addressed_to
+            ):
+                raise RuntimeError("intervention identifier is already bound differently")
+            if existing.status in _TERMINAL_INTERVENTION_STATUSES:
+                return PreparedIntervention(
+                    record=existing,
+                    lease_token=LeaseToken(
+                        existing.source_generation,
+                        project_id,
+                        session_id,
+                        task_id,
+                    ),
+                    lease_origin=InterventionLeaseOrigin.BORROWED_SOURCE,
+                )
         token = self.require_exact_stop_owner(
             project_id=project_id, session_id=session_id, task_id=task_id,
         )
-        runtime = self._runtime_for_session(project_id, session_id)
         record = runtime.coordinator.prepare_intervention(task_id, intent)
         if (
             record.session_id != session_id
@@ -544,11 +573,14 @@ class HubWorkflowOrchestrator:
         """Stop, freshly gate, and dispatch one durable intervention while leased."""
         if not isinstance(prepared, PreparedIntervention):
             raise ValueError("prepared must be a PreparedIntervention")
-        if self._lease.snapshot() != prepared.lease_token:
-            raise RuntimeError("intervention no longer owns the active lease")
         runtime = self._runtime_for_session(
             prepared.lease_token.project_id, prepared.lease_token.session_id,
         )
+        current = runtime.store.authenticated_intervention(prepared.record.intervention_id)
+        if current is not None and current.status in _TERMINAL_INTERVENTION_STATUSES:
+            return
+        if self._lease.snapshot() != prepared.lease_token:
+            raise RuntimeError("intervention no longer owns the active lease")
         existing = self._intervention_continuations.get(prepared.record.intervention_id)
         if existing is not None:
             await existing.wait()

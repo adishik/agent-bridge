@@ -1355,6 +1355,49 @@ def test_duplicate_hub_intervention_continuations_do_not_release_the_running_own
     asyncio.run(exercise())
 
 
+def test_hub_completed_intervention_retry_returns_canonical_record_without_a_lease() -> None:
+    """An exact endpoint retry after completion must not require the released source lease."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        readiness_calls: list[None] = []
+        runtime.readiness = _readiness(fable_calls=readiness_calls, sol_calls=readiness_calls)
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        intent = InterventionIntent(
+            intervention_id="completed-retry", message="Keep it bounded.",
+            addressed_to=ConversationTarget.FABLE, revision=0,
+            continuation_generation=source.token.generation,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1", intent=intent,
+        )
+        readiness_calls.clear()
+        await workflows.continue_intervention(prepared)
+        assert lease.snapshot() is None
+        continued = list(runtime.coordinator.intervention_continues)
+        dispatched = list(runtime.coordinator.intervention_dispatches)
+        readiness = list(readiness_calls)
+
+        retried = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1", intent=intent,
+        )
+        await workflows.continue_intervention(retried)
+
+        assert retried.record == runtime.store.intervention("completed-retry")
+        assert runtime.coordinator.intervention_continues == continued
+        assert runtime.coordinator.intervention_dispatches == dispatched
+        assert readiness_calls == readiness
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("status", (InterventionStatus.PENDING_STOP, InterventionStatus.READY))
 def test_recovery_preparation_acquires_and_abort_releases_only_its_new_lease(
     status: InterventionStatus,
