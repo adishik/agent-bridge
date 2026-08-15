@@ -47,8 +47,8 @@
     </header>
 
     <div id="workspace" role="application" aria-label="Team workspace">
-      <main id="conversation" aria-labelledby="conversation-heading">
-        <div class="conversation-intro" id="conversation-empty">
+      <main id="conversation-shell" aria-labelledby="conversation-heading">
+        <header class="conversation-intro">
           <p class="eyebrow">Chronological team chat</p>
           <h1 id="conversation-heading">Conversation</h1>
           <p>
@@ -59,7 +59,12 @@
             Fable reads and plans. You approve each exact task revision. Sol is
             the only participant allowed to change the repository.
           </p>
-        </div>
+        </header>
+        <section id="conversation" aria-label="Conversation history">
+          <p class="empty-state" id="conversation-empty">
+            Conversation messages will appear here.
+          </p>
+        </section>
         <p id="conversation-status" role="status" aria-live="polite">
           Conversation status will appear here.
         </p>
@@ -146,13 +151,17 @@
           <span id="connection-status" class="status-pill status-checking">
             Connection · checking
           </span>
-          <span id="fable-status" class="status-pill status-checking">
+          <span class="team-presence">
             <span id="fable-avatar" role="img" aria-label="Fable">F</span>
-            Fable · Subscription · checking
+            <span id="fable-status" class="status-pill status-checking">
+              Fable · Subscription · checking
+            </span>
           </span>
-          <span id="sol-status" class="status-pill status-checking">
+          <span class="team-presence">
             <span id="sol-avatar" role="img" aria-label="Sol">S</span>
-            Sol · checking
+            <span id="sol-status" class="status-pill status-checking">
+              Sol · checking
+            </span>
           </span>
         </div>
         <section id="task-list" aria-labelledby="task-list-heading">
@@ -167,16 +176,20 @@
       </nav>
 
       <aside
-        id="task-inspector"
+        id="task-inspector-panel"
         aria-label="Task inspector"
         aria-labelledby="task-inspector-heading"
-        data-drawer="mobile"
-        tabindex="-1"
       >
         <div class="panel-heading">
           <p class="eyebrow">Selected work</p>
           <h2 id="task-inspector-heading">Task inspector</h2>
         </div>
+        <div
+          id="task-inspector"
+          aria-labelledby="task-inspector-heading"
+          data-drawer="mobile"
+          tabindex="-1"
+        ></div>
         <dl id="task-inspector-summary">
           <dt>Task revision</dt>
           <dd>Awaiting task selection</dd>

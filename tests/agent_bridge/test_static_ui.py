@@ -24,6 +24,8 @@ class _RenderedLayout(HTMLParser):
         self.elements: list[tuple[str, dict[str, str | None]]] = []
         self.ids: set[str] = set()
         self.text: list[str] = []
+        self.ancestors: dict[str, tuple[str, ...]] = {}
+        self._open_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
@@ -31,7 +33,35 @@ class _RenderedLayout(HTMLParser):
         values = dict(attrs)
         self.elements.append((tag, values))
         if values.get("id") is not None:
-            self.ids.add(str(values["id"]))
+            element_id = str(values["id"])
+            self.ids.add(element_id)
+            self.ancestors[element_id] = tuple(
+                str(open_attrs["id"])
+                for _open_tag, open_attrs in self._open_elements
+                if open_attrs.get("id") is not None
+            )
+        if tag not in {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "source",
+            "track",
+            "wbr",
+        }:
+            self._open_elements.append((tag, values))
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._open_elements) - 1, -1, -1):
+            if self._open_elements[index][0] == tag:
+                del self._open_elements[index:]
+                return
 
     def handle_data(self, data: str) -> None:
         self.text.append(data)
@@ -102,10 +132,10 @@ def test_index_uses_one_semantic_three_pane_application_workspace() -> None:
     assert rendered.element("ul", "project-list")["aria-label"] == "Projects"
     assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
     assert rendered.element("button", "new-chat")["type"] == "button"
-    assert rendered.element("main", "conversation")["aria-labelledby"] == "conversation-heading"
+    assert rendered.element("main", "conversation-shell")["aria-labelledby"] == "conversation-heading"
     assert rendered.element("p", "conversation-status")["aria-live"] == "polite"
     assert (
-        rendered.element("aside", "task-inspector")["aria-labelledby"]
+        rendered.element("aside", "task-inspector-panel")["aria-labelledby"]
         == "task-inspector-heading"
     )
     assert "open" not in rendered.element("details", "activity-audit")
@@ -202,6 +232,48 @@ def test_index_keeps_conversation_first_with_single_mobile_drawer_controls() -> 
     assert "panel.inert" in script
     assert "focusTarget?.focus()" in script
     assert "@media (prefers-reduced-motion: reduce)" in styles
+
+
+def test_static_shells_survive_controller_replacement_roots() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert rendered.element("main", "conversation-shell")["aria-labelledby"] == (
+        "conversation-heading"
+    )
+    assert rendered.element("section", "conversation")["aria-label"] == (
+        "Conversation history"
+    )
+    assert "conversation-shell" in rendered.ancestors["conversation"]
+    for persistent_id in (
+        "conversation-heading",
+        "selected-project-name",
+        "selected-chat-name",
+        "conversation-status",
+        "conversation-context",
+        "composer",
+    ):
+        assert "conversation" not in rendered.ancestors[persistent_id]
+
+    assert rendered.element("aside", "task-inspector-panel")["aria-labelledby"] == (
+        "task-inspector-heading"
+    )
+    assert rendered.element("div", "task-inspector")["aria-labelledby"] == (
+        "task-inspector-heading"
+    )
+    assert "task-inspector-panel" in rendered.ancestors["task-inspector"]
+    for persistent_id in (
+        "task-inspector-heading",
+        "task-inspector-summary",
+        "task-controls",
+        "activity-audit",
+    ):
+        assert "task-inspector" not in rendered.ancestors[persistent_id]
+
+    assert "fable-status" not in rendered.ancestors["fable-avatar"]
+    assert "sol-status" not in rendered.ancestors["sol-avatar"]
+    assert "slack" not in html.lower()
 
 
 def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
@@ -1496,8 +1568,8 @@ def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() ->
     assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
     assert rendered.element("button", "new-chat")["type"] == "button"
     assert rendered.element("button", "new-chat")["disabled"] is None
-    assert rendered.element("main", "conversation")["id"] == "conversation"
-    assert rendered.element("aside", "task-inspector")["id"] == "task-inspector"
+    assert rendered.element("main", "conversation-shell")["id"] == "conversation-shell"
+    assert rendered.element("aside", "task-inspector-panel")["id"] == "task-inspector-panel"
     assert "Fable" in " ".join(rendered.text)
     assert "Sol" in " ".join(rendered.text)
     assert not any(
