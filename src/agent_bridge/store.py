@@ -11013,8 +11013,6 @@ class SQLiteStore:
                 (intervention_id,),
             ).fetchone()
             acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            if not self._intervention_is_authenticated(record, acknowledgment_id):
-                raise RuntimeError("intervention binding is not authenticated")
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
             if (
@@ -11022,6 +11020,10 @@ class SQLiteStore:
                 or record.resume_run_id != resume_run_id
             ):
                 raise RuntimeError("intervention resume owner changed")
+            if not self._intervention_is_authenticated(
+                record, acknowledgment_id, terminal_outcome="complete",
+            ):
+                raise RuntimeError("intervention binding is not authenticated")
             if record.status is InterventionStatus.RESUMED:
                 return record
             if record.status is not InterventionStatus.RESUMING:
@@ -11386,13 +11388,15 @@ class SQLiteStore:
                 (intervention_id,),
             ).fetchone()
             acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            if not self._intervention_is_authenticated(record, acknowledgment_id):
-                raise RuntimeError("intervention binding is not authenticated")
             if (
                 record.resume_attempt_id != resume_attempt_id
                 or record.resume_run_id != resume_run_id
             ):
                 raise RuntimeError("intervention resume owner changed")
+            if not self._intervention_is_authenticated(
+                record, acknowledgment_id, terminal_outcome="unknown",
+            ):
+                raise RuntimeError("intervention binding is not authenticated")
             if record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN:
                 return record
             if record.status is not InterventionStatus.RESUMING:
@@ -11452,11 +11456,14 @@ class SQLiteStore:
                 )
             ):
                 raise RuntimeError("intervention binding is not authenticated")
+            migration_complete = self._intervention_acknowledgment_migration_is_complete()
             if (
                 record.status is InterventionStatus.READY
                 and record.resume_generation == expected_resume_generation + 1
                 and stored_acknowledgment == acknowledgment_id
             ):
+                if not migration_complete:
+                    self._mark_intervention_acknowledgment_migration_complete()
                 return record
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
@@ -11585,6 +11592,8 @@ class SQLiteStore:
                     acknowledged, acknowledgment_id,
                 )
             )
+            if not migration_complete:
+                self._mark_intervention_acknowledgment_migration_complete()
         return self._intervention_required(intervention_id)
 
     def _advance_intervention_reservation_generation(
@@ -13353,12 +13362,82 @@ class SQLiteStore:
             )
         return True
 
+    def _intervention_terminal_owner_is_authenticated(
+        self,
+        record: InterventionRecord,
+        task: TaskRecord,
+        *,
+        outcome: Literal["complete", "unknown"],
+    ) -> bool:
+        """Require the exact durable owner image for one terminal transition.
+
+        Ordinary intervention reads intentionally accept the small union of
+        owner images that can be observed while a caller is deciding what to
+        do next.  A terminal write has less latitude: success needs the
+        completed owner, while UNKNOWN is restricted to the finite absent,
+        running, or interrupted images.  The sole directed exception is the
+        stored Fable predecessor of a nested Sol child: after that child
+        interrupts, the predecessor is necessarily completed while the bound
+        child remains the exact uncertainty owner.
+        """
+        binding = record.directed_binding
+        expected_run_id = record.resume_run_id
+        active = self.active_run_for_task(record.task_id, record.revision)
+        if binding is not None:
+            if binding.stage == "next_fable":
+                expected_run_id = binding.next_run_id
+            elif (
+                binding.kind == "nested_resume"
+                and binding.stage == "active_question"
+                and active is not None
+            ):
+                expected_run_id = binding.source_run_id
+        if expected_run_id is None or (
+            active is not None and active.run_id != expected_run_id
+        ):
+            return False
+        row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (expected_run_id,),
+        ).fetchone()
+        if row is None:
+            return outcome == "unknown" and active is None
+        try:
+            run = self._agent_run_from_row(row)
+        except RuntimeError:
+            return False
+        if outcome == "complete":
+            return run.status == "completed" and task.state is not TaskState.INTERRUPTED
+        if run.status in {"running", "interrupted"}:
+            return True
+        if not (
+            binding is not None
+            and binding.kind == "nested_resume"
+            and binding.stage == "active_question"
+            and binding.next_predecessor_run_id == record.resume_run_id
+            and expected_run_id == record.resume_run_id
+            and run.status == "completed"
+            and task.state is TaskState.INTERRUPTED
+            and task.continuation_state is binding.continuation_state
+        ):
+            return False
+        child_row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (binding.source_run_id,),
+        ).fetchone()
+        if child_row is None:
+            return False
+        try:
+            child = self._agent_run_from_row(child_row)
+        except RuntimeError:
+            return False
+        return child.status == "interrupted"
+
     def _intervention_is_authenticated(
         self,
         record: InterventionRecord,
         acknowledgment_id: object,
         *,
         allow_legacy_acknowledgment_lineage: bool = False,
+        terminal_outcome: Literal["complete", "unknown"] | None = None,
     ) -> bool:
         """Validate durable intervention authority without repairing persisted state."""
         task_row = self._connection.execute(
@@ -13517,6 +13596,14 @@ class SQLiteStore:
         } and has_resume_owner and not acknowledged_next_fable_ready:
             return False
         if not self._intervention_resume_run_is_authenticated(record, task):
+            return False
+        if (
+            terminal_outcome is not None
+            and record.status is InterventionStatus.RESUMING
+            and not self._intervention_terminal_owner_is_authenticated(
+                record, task, outcome=terminal_outcome,
+            )
+        ):
             return False
         if acknowledgment_id is not None:
             try:

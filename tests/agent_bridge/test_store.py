@@ -4396,6 +4396,9 @@ def test_authenticated_intervention_retains_only_the_one_acknowledged_retry_line
         result = store.intervention(acknowledged.intervention_id)
         assert result is not None
         if status is store_module.InterventionStatus.RESUMED:
+            store.start_agent_run("retry-run", result.task_id, result.revision, "sol")
+            store.set_agent_run_session("retry-run", "sol-thread-1")
+            store.finish_agent_run("retry-run", status="completed", exit_code=0)
             result = store.complete_intervention(
                 acknowledged.intervention_id,
                 expected_resume_generation=acknowledged.resume_generation,
@@ -4467,6 +4470,9 @@ def _acknowledged_ordinary_retry(
         assert result is not None
         return result
     if status is store_module.InterventionStatus.RESUMED:
+        store.start_agent_run(second_run_id, brief.task_id, brief.revision, "sol")
+        store.set_agent_run_session(second_run_id, f"sol-thread-retry{suffix_text}")
+        store.finish_agent_run(second_run_id, status="completed", exit_code=0)
         return store.complete_intervention(
             acknowledged.intervention_id,
             expected_resume_generation=acknowledged.resume_generation,
@@ -4915,6 +4921,271 @@ def test_acknowledgment_backfill_rolls_back_every_row_on_one_invalid_legacy_row(
     inspected.close()
 
 
+def test_authorizing_a_markerless_unknown_seals_its_private_migration_boundary(
+    tmp_path, valid_brief,
+) -> None:
+    """The first post-upgrade acknowledgement cannot leave a new legacy window."""
+    path = tmp_path / "markerless-unknown-authorization.sqlite3"
+    marker_key = "agent_bridge.internal.intervention_acknowledgment_migration.v1"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _seed_visible_intervention(
+        store, valid_brief, status=store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        suffix="markerless-unknown",
+    )
+    store.set_setting("unrelated-markerless-setting", {"keep": "exact"})
+    store._connection.execute(  # noqa: SLF001 - simulate no-ack legacy predecessor
+        "DELETE FROM settings WHERE key = ?", (marker_key,),
+    )
+
+    authorized = store.authorize_retry_after_unknown(
+        record.intervention_id,
+        expected_resume_generation=record.resume_generation,
+        acknowledgment_id="markerless-authorized-ack",
+    )
+
+    marker = store._connection.execute(  # noqa: SLF001 - exact private boundary
+        "SELECT value_json FROM settings WHERE key = ?", (marker_key,),
+    ).fetchone()
+    assert marker is not None and marker["value_json"] == '{"version":1}'
+    assert store.get_setting("unrelated-markerless-setting") == {"keep": "exact"}
+    before_retry = path.read_bytes()
+    assert store.authorize_retry_after_unknown(
+        authorized.intervention_id,
+        expected_resume_generation=record.resume_generation,
+        acknowledgment_id="markerless-authorized-ack",
+    ) == authorized
+    assert path.read_bytes() == before_retry
+    store.close()
+
+
+@pytest.mark.parametrize("mutation", ("acknowledgment", "generations"))
+def test_authorized_markerless_unknown_never_reopens_a_legacy_backfill_window(
+    tmp_path, valid_brief, mutation: str,
+) -> None:
+    """Deleting a new lineage after authorization must fail closed on reopen."""
+    path = tmp_path / f"markerless-unknown-reopen-{mutation}.sqlite3"
+    marker_key = "agent_bridge.internal.intervention_acknowledgment_migration.v1"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    unknown = _seed_visible_intervention(
+        store, valid_brief, status=store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        suffix=f"markerless-reopen-{mutation}",
+    )
+    store._connection.execute(  # noqa: SLF001 - simulate no-ack legacy predecessor
+        "DELETE FROM settings WHERE key = ?", (marker_key,),
+    )
+    ready = store.authorize_retry_after_unknown(
+        unknown.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id=f"markerless-reopen-ack-{mutation}",
+    )
+    lineage_key = (
+        "agent_bridge.internal.intervention_acknowledgment."
+        f"{ready.intervention_id}"
+    )
+    store._connection.execute(  # noqa: SLF001 - durable post-authorization tamper
+        "DELETE FROM settings WHERE key = ?", (lineage_key,),
+    )
+    if mutation == "acknowledgment":
+        store._connection.execute(  # noqa: SLF001 - durable post-authorization tamper
+            "UPDATE interventions SET acknowledgment_id = 'safe-substituted-ack' "
+            "WHERE intervention_id = ?",
+            (ready.intervention_id,),
+        )
+    elif mutation == "generations":
+        event = store._connection.execute(  # noqa: SLF001 - exact source event fixture
+            "SELECT sequence, payload_json FROM events "
+            "WHERE session_id = ? AND task_id = ? AND actor = 'user' AND kind = 'conversation' "
+            "ORDER BY sequence",
+            (ready.session_id, ready.task_id),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload_json"])
+        payload["continuation_generation"] = ready.source_generation + 7
+        store._connection.execute(
+            "UPDATE events SET payload_json = ? WHERE session_id = ? AND sequence = ?",
+            (
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                ready.session_id,
+                event["sequence"],
+            ),
+        )
+        store._connection.execute(
+            "UPDATE interventions SET source_generation = source_generation + 7, "
+            "resume_generation = resume_generation + 7 WHERE intervention_id = ?",
+            (ready.intervention_id,),
+        )
+        store._connection.execute(
+            "UPDATE tasks SET continuation_generation = continuation_generation + 7 "
+            "WHERE task_id = ? AND revision = ?",
+            (ready.task_id, ready.revision),
+        )
+    else:
+        raise AssertionError(f"unknown markerless reopen mutation: {mutation}")
+    store.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(ready.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+@pytest.mark.parametrize("marker", ("[", '{"version":2}'))
+def test_authorization_rolls_back_when_the_private_migration_marker_is_invalid(
+    tmp_path, valid_brief, marker: str,
+) -> None:
+    """Authorization cannot write an acknowledgement beside a malformed marker."""
+    path = tmp_path / "invalid-marker-authorization.sqlite3"
+    marker_key = "agent_bridge.internal.intervention_acknowledgment_migration.v1"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _seed_visible_intervention(
+        store, valid_brief, status=store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        suffix=f"invalid-marker-{len(marker)}",
+    )
+    store._connection.execute(  # noqa: SLF001 - durable marker fixture
+        "INSERT INTO settings (key, value_json) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        (marker_key, marker),
+    )
+    before = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="migration marker"):
+        store.authorize_retry_after_unknown(
+            record.intervention_id,
+            expected_resume_generation=record.resume_generation,
+            acknowledgment_id=f"invalid-marker-ack-{len(marker)}",
+        )
+
+    assert path.read_bytes() == before
+    store.close()
+
+
+def _ordinary_resuming_terminal_owner(
+    store: SQLiteStore,
+    valid_brief,
+    *,
+    owner_status: str,
+) -> store_module.InterventionRecord:
+    """Build one ordinary resuming retry with one hand-set exact owner image."""
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.RESUMING,
+        suffix=f"terminal-{owner_status}",
+    )
+    assert record.resume_run_id is not None
+    if owner_status == "missing":
+        return record
+    store.start_agent_run(record.resume_run_id, record.task_id, record.revision, "sol")
+    store.set_agent_run_session(record.resume_run_id, "sol-thread-retry-terminal-" f"{owner_status}")
+    if owner_status != "running":
+        store.finish_agent_run(
+            record.resume_run_id, status=owner_status, exit_code=(0 if owner_status == "completed" else -1),
+        )
+    return record
+
+
+@pytest.mark.parametrize(
+    ("owner_status", "task_state", "accepted"),
+    (
+        ("missing", TaskState.SOL_RUNNING, False),
+        ("running", TaskState.SOL_RUNNING, False),
+        ("completed", TaskState.COMPLETED, True),
+        ("failed", TaskState.FAILED, False),
+        ("interrupted", TaskState.INTERRUPTED, False),
+    ),
+)
+def test_complete_intervention_accepts_only_the_exact_known_success_owner(
+    tmp_path, valid_brief, owner_status: str, task_state: TaskState, accepted: bool,
+) -> None:
+    """Completion must not convert an uncertain, failed, or missing owner into success."""
+    path = tmp_path / f"complete-owner-{owner_status}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _ordinary_resuming_terminal_owner(
+        store, valid_brief, owner_status=owner_status,
+    )
+    store._connection.execute(  # noqa: SLF001 - exact post-adapter state fixture
+        "UPDATE tasks SET state = ?, continuation_state = NULL, pending_json = NULL "
+        "WHERE task_id = ? AND revision = ?",
+        (task_state.value, record.task_id, record.revision),
+    )
+    before = path.read_bytes()
+
+    if accepted:
+        completed = store.complete_intervention(
+            record.intervention_id,
+            expected_resume_generation=record.resume_generation,
+            resume_attempt_id=record.resume_attempt_id,  # type: ignore[arg-type]
+            resume_run_id=record.resume_run_id,  # type: ignore[arg-type]
+        )
+        assert completed.status is store_module.InterventionStatus.RESUMED
+    else:
+        with pytest.raises(RuntimeError, match="authenticated"):
+            store.complete_intervention(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+                resume_attempt_id=record.resume_attempt_id,  # type: ignore[arg-type]
+                resume_run_id=record.resume_run_id,  # type: ignore[arg-type]
+            )
+        assert path.read_bytes() == before
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("owner_status", "task_state", "accepted"),
+    (
+        ("missing", TaskState.SOL_RUNNING, True),
+        ("running", TaskState.SOL_RUNNING, True),
+        ("completed", TaskState.COMPLETED, False),
+        ("failed", TaskState.FAILED, False),
+        ("interrupted", TaskState.INTERRUPTED, True),
+    ),
+)
+def test_unknown_terminalization_accepts_only_exact_uncertainty_owner_images(
+    tmp_path, valid_brief, owner_status: str, task_state: TaskState, accepted: bool,
+) -> None:
+    """UNKNOWN keeps only finite uncertain, interrupted, or missing owner images."""
+    path = tmp_path / f"unknown-owner-{owner_status}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _ordinary_resuming_terminal_owner(
+        store, valid_brief, owner_status=owner_status,
+    )
+    store._connection.execute(  # noqa: SLF001 - exact result/uncertainty state fixture
+        "UPDATE tasks SET state = ?, continuation_state = ?, pending_json = NULL "
+        "WHERE task_id = ? AND revision = ?",
+        (
+            task_state.value,
+            None if task_state is not TaskState.INTERRUPTED else TaskState.SOL_RUNNING.value,
+            record.task_id,
+            record.revision,
+        ),
+    )
+    before = path.read_bytes()
+
+    if accepted:
+        unknown = store.mark_resume_outcome_unknown(
+            record.intervention_id,
+            resume_attempt_id=record.resume_attempt_id,  # type: ignore[arg-type]
+            resume_run_id=record.resume_run_id,  # type: ignore[arg-type]
+        )
+        assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    else:
+        with pytest.raises(RuntimeError, match="authenticated"):
+            store.mark_resume_outcome_unknown(
+                record.intervention_id,
+                resume_attempt_id=record.resume_attempt_id,  # type: ignore[arg-type]
+                resume_run_id=record.resume_run_id,  # type: ignore[arg-type]
+            )
+        assert path.read_bytes() == before
+    store.close()
+
+
 @pytest.mark.parametrize("terminal", ("complete", "unknown"))
 @pytest.mark.parametrize(
     "mutation", ("task_generation", "source_run", "source_event", "resume_run"),
@@ -5257,6 +5528,13 @@ def _seed_previous_directed_intervention_families(
                 ),
             )
             if status is store_module.InterventionStatus.RESUMED:
+                store.start_agent_run(
+                    f"resume-{suffix}", brief.task_id, brief.revision, "fable",
+                )
+                store.set_agent_run_session(f"resume-{suffix}", f"fable-{suffix}")
+                store.finish_agent_run(
+                    f"resume-{suffix}", status="completed", exit_code=0,
+                )
                 store.complete_intervention(
                     created.intervention_id,
                     expected_resume_generation=created.resume_generation,
@@ -8743,6 +9021,9 @@ def test_directed_intervention_terminal_forms_authenticate_the_original_binding(
     if status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN:
         store.recover_active_tasks()
     elif status is store_module.InterventionStatus.RESUMED:
+        store.start_agent_run("resume-run-1", valid_brief.task_id, valid_brief.revision, "fable")
+        store.set_agent_run_session("resume-run-1", "provider-1")
+        store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
         store.complete_intervention(
             created.intervention_id, expected_resume_generation=created.resume_generation,
             resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
@@ -8866,6 +9147,9 @@ def test_corrupt_ordinary_terminal_intervention_cannot_mimic_a_directed_binding(
         created.intervention_id, expected_resume_generation=created.resume_generation,
         resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
     )
+    store.start_agent_run("resume-run-1", valid_brief.task_id, valid_brief.revision, "fable")
+    store.set_agent_run_session("resume-run-1", "provider-fable")
+    store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
     store.complete_intervention(
         created.intervention_id, expected_resume_generation=created.resume_generation,
         resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
@@ -9244,12 +9528,16 @@ def test_intervention_status_transitions_are_exact_owner_bound_and_idempotent(
     store.create_session("session-1", "/repo")
     store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
     store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store._connection.execute(  # noqa: SLF001 - exact eligible Sol fixture
+        "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", "baseline-1", valid_brief.task_id, valid_brief.revision),
+    )
     store.start_agent_run("source-run-1", valid_brief.task_id, valid_brief.revision, "sol")
     store.set_agent_run_session("source-run-1", "sol-thread-1")
     created = store.create_intervention_and_request_stop(
         intervention_id="intervention-1", session_id="session-1", task_id=valid_brief.task_id,
         revision=valid_brief.revision, expected_source_generation=1, message="Pause here.",
-        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        addressed_to=ConversationTarget.SOL, routed_to=ConversationTarget.SOL,
         run_id="source-run-1",
     )
     store.finish_agent_run("source-run-1", status="interrupted", exit_code=0)
@@ -9279,6 +9567,14 @@ def test_intervention_status_transitions_are_exact_owner_bound_and_idempotent(
             "intervention-1", expected_resume_generation=created.resume_generation,
             resume_attempt_id="attempt-other", resume_run_id="resume-run-1",
         )
+    store._connection.execute(  # noqa: SLF001 - exact post-resume success fixture
+        "UPDATE tasks SET state = ?, continuation_state = NULL "
+        "WHERE task_id = ? AND revision = ?",
+        (TaskState.SOL_RUNNING.value, valid_brief.task_id, valid_brief.revision),
+    )
+    store.start_agent_run("resume-run-1", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("resume-run-1", "sol-thread-1")
+    store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
     completed = store.complete_intervention(
         "intervention-1", expected_resume_generation=created.resume_generation,
         resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
@@ -9287,6 +9583,20 @@ def test_intervention_status_transitions_are_exact_owner_bound_and_idempotent(
 
     store._connection.execute(
         "UPDATE interventions SET status = 'resuming' WHERE intervention_id = 'intervention-1'"
+    )
+    store._connection.execute(
+        "UPDATE agent_runs SET status = 'interrupted', exit_code = -1 "
+        "WHERE run_id = 'resume-run-1'"
+    )
+    store._connection.execute(
+        "UPDATE tasks SET state = ?, continuation_state = ? "
+        "WHERE task_id = ? AND revision = ?",
+        (
+            TaskState.INTERRUPTED.value,
+            TaskState.SOL_RUNNING.value,
+            valid_brief.task_id,
+            valid_brief.revision,
+        ),
     )
     unknown = store.mark_resume_outcome_unknown(
         "intervention-1", resume_attempt_id="attempt-1", resume_run_id="resume-run-1",
