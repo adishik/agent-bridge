@@ -71,6 +71,9 @@ input[type="checkbox"] {
 button:focus-visible,
 textarea:focus-visible,
 input:focus-visible,
+select:focus-visible,
+a:focus-visible,
+summary:focus-visible,
 [tabindex]:focus-visible {
   outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
@@ -190,7 +193,7 @@ input:focus-visible,
 
 .project-navigation-button {
   max-width: 11rem;
-  min-height: 2.75rem;
+  min-height: 44px;
   padding: 0.26rem 0.5rem;
   overflow: hidden;
   color: var(--muted);
@@ -217,7 +220,7 @@ input:focus-visible,
 }
 
 #new-chat {
-  min-height: 2.75rem;
+  min-height: 44px;
   padding: 0.26rem 0.5rem;
   font-size: 0.7rem;
 }
@@ -616,7 +619,7 @@ dialog h2 {
 }
 
 .button {
-  min-height: 2.75rem;
+  min-height: 44px;
   padding: 0.58rem 0.85rem;
   color: var(--ink);
   font-weight: 740;

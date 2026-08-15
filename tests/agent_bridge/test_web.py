@@ -867,10 +867,10 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (nodes["message-input"].disabled) process.exit(28);
 
       await nodes["task-drawer-toggle"].emit("click");
-      if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert) process.exit(14);
+      if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert || nodes["project-navigation"].attributes.role !== "dialog" || nodes["project-navigation"].attributes["aria-modal"] !== "true") process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
       await documentRoot.emit("keydown", {{key: "Escape", preventDefault() {{}}}});
-      if (nodes["project-navigation"].classList.contains("drawer-open")) process.exit(16);
+      if (nodes["project-navigation"].classList.contains("drawer-open") || nodes["project-navigation"].attributes.role !== undefined || nodes["project-navigation"].attributes["aria-modal"] !== undefined) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
       if (globalThis.pwned === true) process.exit(18);
       media.matches = false;

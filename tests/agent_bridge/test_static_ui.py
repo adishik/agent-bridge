@@ -415,7 +415,6 @@ def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
         "scope issue", "Fable risk", "fix it", "criterion proof",
         "Architecture impact", "Ambiguous scope", "Could widen changes", "Option B",
             "Clarification reasoning", "Clarification question", "Review question",
-            "activity-hash",
             "Approved at 2026-08-10T01:00:00Z", "Correction count", "2",
             "Sol Correcting", "2026-08-10T01:02:03Z", "Sol · started 2026-08-10T01:01:00Z",
       ]) {{
@@ -1610,7 +1609,9 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     assert "slack" not in styles.lower()
     assert "#6a4d91" not in styles.lower()
     assert re.search(r"outline:\s*(?:2|3)px solid var\(--focus-ring\)", styles)
-    assert "min-height: 2.75rem" in styles
+    assert "min-height: 44px" in styles
+    assert "select:focus-visible" in styles
+    assert "summary:focus-visible" in styles
     assert "@media (max-width: 899px)" in styles
     assert "@media (prefers-reduced-motion: reduce)" in styles
     assert "@media (forced-colors: active)" in styles
@@ -1642,7 +1643,7 @@ def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowl
       };
       const task = {
         task_id: "task-a", revision: 4, continuation_generation: 7,
-        state: "fable_planning",
+        state: "sol_running",
       };
       const first = bridge.interventionRequest(state, task, "Hold this boundary.", "intervention-a", "sol");
       if (first.path !== "/api/projects/project-a/chats/chat-a/tasks/task-a/intervene") process.exit(2);
@@ -1674,6 +1675,20 @@ def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowl
       })) process.exit(8);
       if (bridge.composerPresentation({...state, activeLease: null}, null, "fable").submit !== "Send") process.exit(9);
       if (!bridge.composerPresentation(state, null, "fable").disabled) process.exit(10);
+    """
+    _run_module_harness(harness)
+
+
+def test_intervention_draft_policy_is_server_safe_and_preserves_one_exact_payload() -> None:
+    harness = r"""
+      const task = {task_id: "task-a", revision: 2, continuation_generation: 5, state: "fable_planning"};
+      if (JSON.stringify(bridge.interventionRecipients(task)) !== JSON.stringify(["fable"])) process.exit(2);
+      if (JSON.stringify(bridge.interventionRecipients({...task, state: "sol_running"})) !== JSON.stringify(["fable", "sol"])) process.exit(3);
+      const draft = bridge.interventionDraft(task, "intervention-a", "fable", "Keep the scope exact.");
+      if (JSON.stringify(draft) !== JSON.stringify({taskId: "task-a", revision: 2, sourceGeneration: 5, interventionId: "intervention-a", addressedTo: "fable", message: "Keep the scope exact.", submitted: false})) process.exit(4);
+      const unknownOne = bridge.interventionWarningKey({intervention_id: "i", resume_generation: 4});
+      const unknownTwo = bridge.interventionWarningKey({intervention_id: "i", resume_generation: 5});
+      if (unknownOne === unknownTwo || unknownOne !== "i:4") process.exit(5);
     """
     _run_module_harness(harness)
 
