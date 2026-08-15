@@ -1623,6 +1623,28 @@ def test_activity_sanitizer_uses_the_exact_per_kind_producer_schema() -> None:
     _run_module_harness(harness)
 
 
+def test_activity_sanitizer_projects_valid_agent_fields_independently() -> None:
+    harness = r"""
+      const validDigest = "a".repeat(64);
+      const invalidDigest = "A".repeat(64);
+      const cases = [
+        [{status: "completed"}, {status: "completed"}],
+        [{command_sha256: validDigest}, {command_sha256: validDigest}],
+        [{status: "completed", command_sha256: invalidDigest}, {status: "completed"}],
+        [{status: "running", command_sha256: validDigest}, {command_sha256: validDigest}],
+        [{status: "completed", command_sha256: validDigest}, {status: "completed", command_sha256: validDigest}],
+        [{status: "running", command_sha256: invalidDigest}, {}],
+      ];
+      for (const [source, expected] of cases) {
+        if (JSON.stringify(bridge.sanitizeActivity("agent_event", source)) !== JSON.stringify(expected)) process.exit(2);
+      }
+      for (const kind of ["action_error", "stop_error", "resume_drift"]) {
+        if (JSON.stringify(bridge.sanitizeActivity(kind, {status: "completed", command_sha256: validDigest})) !== "{}") process.exit(3);
+      }
+    """
+    _run_module_harness(harness)
+
+
 def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     styles = (STATIC / "styles.css").read_text(encoding="utf-8")
 
@@ -1815,8 +1837,8 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         ".project-navigation-button[aria-current=\"true\"]": {"color", "background", "border-color"},
         ".project-navigation-button:disabled": {"color"},
         ".status-pill": {"color", "background", "border"}, ".state-badge": {"color", "background", "border"},
-        ".status-pill::before": {"background", "box-shadow", "border"},
-        ".state-badge::before": {"background", "box-shadow", "border"},
+        ".status-pill::before": {"background", "border"},
+        ".state-badge::before": {"background", "border"},
         ".status-ready::before": {"background"}, ".state-completed::before": {"background"},
         ".status-running::before": {"background", "box-shadow"},
         ".state-sol_running::before": {"background", "box-shadow"},
@@ -1859,7 +1881,7 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         ".toast": {"color", "background", "border", "box-shadow"}, ".toast-error": {"background"},
     }
     relevant_properties = re.compile(
-        r"(?:^|;)\s*(color|background|border(?:-(?:top|right|bottom|left|color))?|outline|box-shadow)\s*:",
+        r"(?:^|;)\s*(color|background|border(?:-(?:top|right|bottom|left)(?:-color)?|-color)?|outline|box-shadow)\s*:",
     )
     shipped_rendered_properties: set[tuple[str, str]] = set()
     for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
@@ -1872,7 +1894,7 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         for selector, properties in rendered_model.items()
         for property_name in properties
     }
-    assert shipped_rendered_properties <= model_properties
+    assert shipped_rendered_properties == model_properties
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

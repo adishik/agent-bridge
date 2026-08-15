@@ -679,15 +679,14 @@ export function sanitizeActivity(kind, candidate) {
     return {};
   }
   const activity = asObject(candidate);
-  if (
-    typeof activity.status !== "string"
-    || !AGENT_ACTIVITY_STATUSES.has(activity.status)
-    || typeof activity.command_sha256 !== "string"
-    || !SHA256_DIGEST.test(activity.command_sha256)
-  ) {
-    return {};
+  const safe = {};
+  if (typeof activity.status === "string" && AGENT_ACTIVITY_STATUSES.has(activity.status)) {
+    safe.status = activity.status;
   }
-  return {status: activity.status, command_sha256: activity.command_sha256};
+  if (typeof activity.command_sha256 === "string" && SHA256_DIGEST.test(activity.command_sha256)) {
+    safe.command_sha256 = activity.command_sha256;
+  }
+  return safe;
 }
 
 function activitySummary(task) {

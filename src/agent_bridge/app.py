@@ -80,14 +80,12 @@ def _activity_projection(
         return kind, {}
     status_value = activity.get("status")
     digest = activity.get("command_sha256")
-    if not (
-        isinstance(status_value, str)
-        and status_value in _AGENT_ACTIVITY_STATUSES
-        and isinstance(digest, str)
-        and _LOWER_HEX_256.fullmatch(digest)
-    ):
-        return kind, {}
-    return kind, {"status": status_value, "command_sha256": digest}
+    safe: dict[str, object] = {}
+    if isinstance(status_value, str) and status_value in _AGENT_ACTIVITY_STATUSES:
+        safe["status"] = status_value
+    if isinstance(digest, str) and _LOWER_HEX_256.fullmatch(digest):
+        safe["command_sha256"] = digest
+    return kind, safe
 
 
 class EventSubscription(Protocol):

@@ -606,7 +606,9 @@ def test_bootstrap_activity_projection_drops_invalid_agent_fields(
         *[(status, {"status": status, "command_sha256": "c" * 64}) for status in (
             "completed", "declined", "failed", "in_progress", "interrupted",
         )],
-        *[(status, {}) for status in ("running", "pending", "success", "error", "COMPLETED")],
+        *[(status, {"command_sha256": "c" * 64}) for status in (
+            "running", "pending", "success", "error", "COMPLETED",
+        )],
     ),
 )
 def test_bootstrap_activity_projection_matches_coordinator_agent_event_statuses(
@@ -645,6 +647,25 @@ def test_coordinator_producer_characterizes_the_agent_event_status_contract(
     assert event is not None
     assert event["status"] == status
     assert event["command_sha256"] == digest
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_status"),
+    (("item.started", None), ("item.updated", None), ("item.completed", "completed")),
+)
+def test_coordinator_producer_only_attaches_status_to_completed_agent_events(
+    event_type: str,
+    expected_status: str | None,
+) -> None:
+    event = Coordinator._sol_structural_event({
+        "type": event_type,
+        "item_type": "command_execution",
+        "status": "completed",
+        "command_sha256": "e" * 64,
+    })
+    assert event is not None
+    assert event.get("status") == expected_status
+    assert event["command_sha256"] == "e" * 64
 
 
 def test_default_bootstrap_shape_is_complete_and_fail_closed(
