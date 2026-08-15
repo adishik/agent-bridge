@@ -635,8 +635,8 @@ dialog h2 {
 }
 
 .button:disabled {
-  color: #7a847f;
-  background: #ecefec;
+  color: var(--ink-800);
+  background: var(--cream-100);
   cursor: not-allowed;
 }
 
@@ -736,7 +736,7 @@ dialog h2 {
 }
 
 #composer-recipient {
-  min-height: 2.45rem;
+  min-height: 44px;
   padding: 0.45rem;
 }
 
@@ -750,13 +750,13 @@ dialog h2 {
 }
 
 .composer-binding .button {
-  min-height: 2rem;
+  min-height: 44px;
   padding: 0.35rem 0.55rem;
   font-size: 0.72rem;
 }
 
 #message-input {
-  min-height: 3rem;
+  min-height: 44px;
   max-height: 10rem;
 }
 
@@ -773,6 +773,11 @@ dialog {
 dialog::backdrop {
   background: rgb(20 32 27 / 58%);
   backdrop-filter: blur(3px);
+}
+
+summary {
+  min-height: 44px;
+  padding: 0.55rem 0;
 }
 
 #usage-credits-form {

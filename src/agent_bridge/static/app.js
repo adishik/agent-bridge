@@ -3078,7 +3078,12 @@ export function startBrowserApp(documentRoot, windowRoot) {
         activeTask = null;
       }
     }
-    if (activeInterventionDraft !== null && (activeTask === null || activeInterventionDraft.taskId !== taskIdentity(activeTask))) {
+    if (activeInterventionDraft !== null && (
+      activeTask === null
+      || activeInterventionDraft.taskId !== taskIdentity(activeTask)
+      || activeInterventionDraft.revision !== activeTask.revision
+      || activeInterventionDraft.sourceGeneration !== activeTask.continuation_generation
+    )) {
       activeInterventionDraft = null;
     }
     if (activeInterventionDraft !== null && activePresentation?.kind !== "new") {
@@ -3376,7 +3381,11 @@ export function startBrowserApp(documentRoot, windowRoot) {
   }
 
   async function submitUnknownAcknowledgement(presentation) {
-    if (acknowledgementDraft?.interventionId !== presentation.interventionId) {
+    if (
+      acknowledgementDraft?.interventionId !== presentation.interventionId
+      || acknowledgementDraft?.resumeGeneration !== presentation.resumeGeneration
+    ) {
+      acknowledgementDraft = null;
       return;
     }
     try {
@@ -3393,6 +3402,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
       unknownWarningId = null;
       await controller?.refreshSelectedBootstrap();
     } catch (error) {
+      if (String(error.message ?? error).includes("409")) {
+        activeInterventionDraft = null;
+        messageInput.value = "";
+      }
       showToast(documentRoot, String(error.message ?? error), true);
     }
   }
@@ -3456,7 +3469,12 @@ export function startBrowserApp(documentRoot, windowRoot) {
     try {
       if (activeInterventionDraft !== null) {
         const activeTask = activeTaskForControls(state);
-        if (activeTask === null || activeInterventionDraft.taskId !== taskIdentity(activeTask)) {
+        if (
+          activeTask === null
+          || activeInterventionDraft.taskId !== taskIdentity(activeTask)
+          || activeInterventionDraft.revision !== activeTask.revision
+          || activeInterventionDraft.sourceGeneration !== activeTask.continuation_generation
+        ) {
           throw new Error("intervention source is no longer active");
         }
         const recipient = composerRecipient?.value ?? activeInterventionDraft.addressedTo;
@@ -3499,6 +3517,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
       if (activeInterventionDraft?.submitted) {
         activeInterventionDraft = Object.freeze({...activeInterventionDraft, submitted: false});
       }
+      if (String(error.message ?? error).includes("409")) {
+        activeInterventionDraft = null;
+        messageInput.value = "";
+      }
       showToast(documentRoot, String(error.message ?? error), true);
     } finally {
       renderStatus();
@@ -3513,6 +3535,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
     usageSubmit.disabled = !usageCheckbox.checked;
   });
   usageModal.addEventListener("cancel", (event) => event.preventDefault());
+  documentRoot.querySelector("#activity-audit")?.addEventListener("toggle", renderWorkspace);
   usageForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!usageCheckbox.checked || !state.csrfToken) {
@@ -3614,6 +3637,11 @@ export function startBrowserApp(documentRoot, windowRoot) {
       if (focusable.length > 0) {
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
+        if (documentRoot.activeElement !== first && documentRoot.activeElement !== last) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus?.();
+          return;
+        }
         if ((!event.shiftKey && documentRoot.activeElement === last)
           || (event.shiftKey && documentRoot.activeElement === first)) {
           event.preventDefault();
