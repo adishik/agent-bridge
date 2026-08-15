@@ -60,6 +60,32 @@ _SAFE_ID_BODY = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
 _SAFE_ID_PATTERN = f"^{_SAFE_ID_BODY}$"
 _SAFE_ID = re.compile(f"{_SAFE_ID_BODY}\\Z")
 _MAX_BROWSER_TEXT_BYTES = 16 * 1024
+_ACTIVITY_KINDS = frozenset({
+    "action_error", "stop_error", "agent_event", "resume_drift",
+})
+_AGENT_ACTIVITY_STATUSES = frozenset({
+    "completed", "failed", "running", "pending", "success", "error",
+})
+_LOWER_HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _activity_projection(
+    kind: object,
+    activity: object,
+) -> tuple[str | None, Mapping[str, object] | None]:
+    """Project one browser-safe structural activity record without provider data."""
+    if not isinstance(kind, str) or kind not in _ACTIVITY_KINDS:
+        return None, None
+    if kind != "agent_event" or not isinstance(activity, Mapping):
+        return kind, {}
+    safe: dict[str, object] = {}
+    status_value = activity.get("status")
+    if isinstance(status_value, str) and status_value in _AGENT_ACTIVITY_STATUSES:
+        safe["status"] = status_value
+    digest = activity.get("command_sha256")
+    if isinstance(digest, str) and _LOWER_HEX_256.fullmatch(digest):
+        safe["command_sha256"] = digest
+    return kind, safe
 
 
 class EventSubscription(Protocol):
@@ -512,6 +538,9 @@ def create_hub_app(
 
     def task_snapshot(runtime: object, overview: TaskOverview) -> Mapping[str, object]:
         task = overview.task
+        activity_kind, activity = _activity_projection(
+            overview.activity_kind, overview.activity,
+        )
         store = getattr(runtime, "store")
         question = store.unanswered_question_for_task(task.task_id, task.revision)
         pending_question: Mapping[str, object] | None = None
@@ -555,14 +584,8 @@ def create_hub_app(
             "outcome": thaw_projection(overview.outcome),
             "review": thaw_projection(overview.review),
             "clarification": thaw_projection(overview.clarification),
-            "activity_kind": (
-                overview.activity_kind
-                if overview.activity_kind in {
-                    "action_error", "stop_error", "agent_event", "resume_drift",
-                }
-                else None
-            ),
-            "activity": thaw_projection(overview.activity),
+            "activity_kind": activity_kind,
+            "activity": activity,
             "intervention": (
                 None if intervention is None else intervention_projection(intervention)
             ),
@@ -1522,6 +1545,9 @@ def create_app(
 
     def task_snapshot(overview: TaskOverview) -> Mapping[str, object]:
         task = overview.task
+        activity_kind, activity = _activity_projection(
+            overview.activity_kind, overview.activity,
+        )
         return {
             "task_id": task.task_id,
             "revision": task.revision,
@@ -1539,14 +1565,8 @@ def create_app(
             "outcome": thaw_projection(overview.outcome),
             "review": thaw_projection(overview.review),
             "clarification": thaw_projection(overview.clarification),
-            "activity_kind": (
-                overview.activity_kind
-                if overview.activity_kind in {
-                    "action_error", "stop_error", "agent_event", "resume_drift",
-                }
-                else None
-            ),
-            "activity": thaw_projection(overview.activity),
+            "activity_kind": activity_kind,
+            "activity": activity,
         }
 
     def forward_committed_event(event: StreamEvent) -> None:

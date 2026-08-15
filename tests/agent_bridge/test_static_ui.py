@@ -1664,12 +1664,13 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         return value.lower()
 
     # These are selector/property sources, resolved from the shipped CSS rather
-    # than a duplicated palette. They cover every text, disabled-text, focus,
-    # and visible non-text control adjacency in this stylesheet.
+    # than a duplicated palette. The inventory below also ensures a future
+    # color declaration cannot silently bypass this concrete surface matrix.
     adjacencies = (
         ("body", "color", ":root", "--surface", 4.5),
         (".brand-block span", "color", ":root", "--surface", 4.5),
         (".project-navigation-button", "color", ":root", "--panel", 4.5),
+        (".project-navigation-button:hover:not(:disabled)", "color", ":root", "--brand-soft", 4.5),
         (".project-navigation-button:disabled", "color", ":root", "--panel", 4.5),
         (".status-pill", "color", ":root", "--coordinator-soft", 4.5),
         (".eyebrow", "color", ":root", "--surface", 4.5),
@@ -1680,15 +1681,35 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         (".button:disabled", "color", ":root", "--cream-100", 4.5),
         (".button-primary", "color", ":root", "--brand", 4.5),
         (".button-danger", "color", ":root", "--panel", 4.5),
+        (".field-group textarea", "color", ":root", "--panel", 4.5),
+        ("#conversation-context", "color", ":root", "--cream-100", 4.5),
+        (".composer-recipient", "color", ":root", "--panel", 4.5),
+        (".composer-binding", "color", ":root", "--panel", 4.5),
+        ("dialog", "color", ":root", "--panel", 4.5),
         (".form-error", "color", ":root", "--panel", 4.5),
         (".toast", "color", ":root", "--brand-strong", 4.5),
         (".toast-error", "color", ":root", "--danger", 4.5),
         (".skip-link", "color", ":root", "--brand-strong", 4.5),
         ("button:focus-visible", "outline-color", ":root", "--surface", 3),
+        (".status-pill::before", "background", ":root", "--coordinator-soft", 3),
+        (".status-ready::before", "background", ":root", "--coordinator-soft", 3),
+        (".status-running::before", "background", ":root", "--cream-100", 3),
+        (".status-error::before", "background", ":root", "--coordinator-soft", 3),
+        (".task-list-button:hover", "border-color", ":root", "--panel", 3),
+        (".button", "border", ":root", "--panel", 3),
+        (".button-primary", "border-color", ":root", "--panel", 3),
+        (".button-danger", "border-color", ":root", "--panel", 3),
+        (".toast", "border", ":root", "--brand-strong", 3),
+        (".message-user", "border-left-color", ":root", "--user-soft", 3),
+        (".message-fable", "border-left-color", ":root", "--fable-soft", 3),
+        (".message-sol", "border-left-color", ":root", "--sol-soft", 3),
+        (".message-coordinator", "border-left-color", ":root", "--coordinator-soft", 3),
     )
     for selector, foreground_property, background_selector, background_property, minimum in adjacencies:
         if foreground_property == "outline-color":
             foreground = declaration(selector, "outline").split()[-1]
+        elif foreground_property == "border":
+            foreground = declaration(selector, "border").split()[-1]
         else:
             try:
                 foreground = declaration(selector, foreground_property)
@@ -1698,6 +1719,25 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
                 foreground = declaration(".message-avatar", foreground_property)
         background = tokens[background_property] if background_selector == ":root" else declaration(background_selector, background_property)
         assert contrast(resolve(foreground), resolve(background)) >= minimum
+
+    audited_color_selectors = {
+        "body", ".skip-link", ".brand-block span", ".project-navigation-label",
+        ".project-navigation-label strong", ".project-navigation-button",
+        ".project-navigation-button:hover:not(:disabled)",
+        ".project-navigation-button[aria-current=\"true\"]",
+        ".project-navigation-button:disabled", ".status-pill", ".state-badge",
+        ".eyebrow", ".empty-state", ".form-guidance", ".metadata", ".task-meta",
+        ".task-list-button", ".conversation-intro > p:last-child", ".message-avatar",
+        ".message time", ".conversation-status", ".task-section-empty", ".button",
+        ".button:disabled", ".button-primary", ".button-danger", ".field-group textarea",
+        ".field-group input", "#message-input", "#composer-recipient", "#conversation-context",
+        ".composer-recipient", ".composer-binding", "dialog", ".form-error", ".toast",
+    }
+    shipped_color_selectors: set[str] = set()
+    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
+        if re.search(r"(?:^|;)\s*color\s*:", body):
+            shipped_color_selectors.update(item.strip() for item in header.split(","))
+    assert shipped_color_selectors <= audited_color_selectors
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

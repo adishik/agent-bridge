@@ -671,10 +671,13 @@ function activitySummary(task) {
   if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
     return "No structured activity recorded";
   }
+  const agentStatuses = new Set(["completed", "failed", "running", "pending", "success", "error"]);
   return [
     stateLabel(task.activity_kind),
-    typeof activity.status === "string" ? stateLabel(activity.status) : null,
-    typeof activity.command_sha256 === "string" ? activity.command_sha256 : null,
+    typeof activity.status === "string" && agentStatuses.has(activity.status)
+      ? stateLabel(activity.status) : null,
+    typeof activity.command_sha256 === "string" && /^[a-f0-9]{64}$/.test(activity.command_sha256)
+      ? activity.command_sha256 : null,
   ].filter(Boolean).join(" · ");
 }
 
@@ -682,15 +685,16 @@ function activitySummary(task) {
 function activityRows(task) {
   const activity = asObject(task?.activity);
   const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
+  const agentStatuses = new Set(["completed", "failed", "running", "pending", "success", "error"]);
   if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
     return [["Type", "No structured activity recorded"]];
   }
   const type = stateLabel(task.activity_kind);
   const rows = [["Type", type]];
-  if (typeof activity.status === "string") {
+  if (typeof activity.status === "string" && agentStatuses.has(activity.status)) {
     rows.push(["Status", stateLabel(activity.status)]);
   }
-  if (typeof activity.command_sha256 === "string" && /^[a-f0-9]{32,128}$/i.test(activity.command_sha256)) {
+  if (typeof activity.command_sha256 === "string" && /^[a-f0-9]{64}$/.test(activity.command_sha256)) {
     rows.push(["Command digest", activity.command_sha256]);
   }
   return rows;

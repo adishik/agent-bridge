@@ -485,7 +485,7 @@ def test_bootstrap_keeps_current_revision_evidence_outside_recent_chat_window(
         "outcome": {"summary": "durable outcome"},
         "review": {"summary": "durable review"},
         "clarification": {"reasoning": "durable clarification"},
-        "agent_event": {"status": "durable activity", "command_sha256": "safe-hash"},
+        "agent_event": {"status": "completed", "command_sha256": "a" * 64},
     }
     for kind, payload in evidence.items():
         web_harness.store.append_event(
@@ -507,6 +507,97 @@ def test_bootstrap_keeps_current_revision_evidence_outside_recent_chat_window(
     assert task["clarification"] == evidence["clarification"]
     assert task["activity_kind"] == "agent_event"
     assert task["activity"] == evidence["agent_event"]
+
+
+@pytest.mark.parametrize("kind", ("action_error", "stop_error", "agent_event", "resume_drift"))
+def test_bootstrap_activity_projection_is_allowlisted_and_never_reloads_raw_details(
+    web_harness: WebHarness,
+    kind: str,
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "coordinator", kind,
+        {
+            "status": "completed",
+            "command_sha256": "a" * 64,
+            "run_id": "provider-run-secret",
+            "thread_id": "provider-thread-secret",
+            "session_id": "provider-session-secret",
+            "command": "rm -rf never-render-this",
+            "raw_output": "provider output must not reload",
+            "extra": "hostile-extra",
+            "hostile": '<img src=x onerror="globalThis.pwned=true">' * 200,
+        },
+    )
+
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+
+    assert task["activity_kind"] == kind
+    assert task["activity"] == (
+        {"status": "completed", "command_sha256": "a" * 64}
+        if kind == "agent_event" else {}
+    )
+    serialized = json.dumps(task)
+    for forbidden in (
+        "provider-run-secret", "provider-thread-secret", "provider-session-secret",
+        "rm -rf never-render-this", "provider output must not reload", "hostile-extra",
+        "globalThis.pwned",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize("kind", ("action_error", "stop_error", "agent_event", "resume_drift"))
+def test_hub_bootstrap_activity_projection_is_allowlisted_and_project_scoped(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    kind: str,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    runtime.store.append_event(
+        "chat-a", valid_brief.task_id, "fable", "task_brief", {"brief": valid_brief.to_dict()},
+    )
+    runtime.store.append_event(
+        "chat-a", valid_brief.task_id, "coordinator", kind,
+        {"status": "completed", "command_sha256": "b" * 64, "run_id": "foreign-provider-run"},
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        payload = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    task = next(item for item in payload["tasks"] if item["task_id"] == valid_brief.task_id)
+    assert task["activity_kind"] == kind
+    assert task["activity"] == (
+        {"status": "completed", "command_sha256": "b" * 64}
+        if kind == "agent_event" else {}
+    )
+    assert "foreign-provider-run" not in json.dumps(payload)
+
+
+def test_bootstrap_activity_projection_drops_invalid_agent_fields(
+    web_harness: WebHarness,
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "coordinator", "agent_event",
+        {
+            "status": "COMPLETED",
+            "command_sha256": "A" * 64,
+            "run_id": "invalid-digest-provider-run",
+        },
+    )
+
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+
+    assert task["activity_kind"] == "agent_event"
+    assert task["activity"] == {}
+    assert "invalid-digest-provider-run" not in json.dumps(task)
 
 
 def test_default_bootstrap_shape_is_complete_and_fail_closed(
@@ -662,7 +753,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
       const hostileActivity = "<img src=x onerror=globalThis.pwned=true>".repeat(200);
-      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], exchange_allowance: 2, exchange_consumed: 1, activity: {{status: hostileActivity, command_sha256: hostileActivity}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
+      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], exchange_allowance: 2, exchange_consumed: 1, activity_kind: "agent_event", activity: {{status: hostileActivity, command_sha256: hostileActivity, run_id: hostileActivity, raw_output: hostileActivity}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
       let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, usage_credits_acknowledged: true, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
@@ -762,16 +853,18 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       );
       const disabledDrawerControl = new Node("button", "disabled-drawer-control");
       disabledDrawerControl.disabled = true;
-      const drawerSummary = new Node("summary", "drawer-summary");
-      drawerSummary.textContent = "Drawer navigation";
-      nodes["project-navigation"].append(disabledDrawerControl, drawerSummary, nodes["task-list"]);
+      nodes["project-navigation"].append(disabledDrawerControl, nodes["task-list"]);
       nodes["task-inspector-panel"].append(
         nodes["task-inspector"], nodes["task-inspector-summary"], nodes["task-controls"],
-        nodes["activity-audit"],
+        nodes["task-inspector-empty"], nodes["activity-audit"],
       );
       nodes["composer"].append(
         nodes["composer-label"], nodes["message-input"], nodes["composer-recipient"],
         nodes["composer-submit"], nodes["composer-guidance"],
+      );
+      nodes["conversation-context"].append(
+        nodes["intervention-context"], nodes["conversation-status"],
+        nodes["intervene-control"], nodes["stop-control"],
       );
       nodes["conversation-shell"].append(nodes["conversation-context"], nodes["composer"]);
       const isDescendantOf = (node, ancestor) => {{
@@ -930,13 +1023,18 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
 
       media.matches = true;
       media.emit();
+      const firstDrawerFocusable = nodes["task-list"].children[1].children[0].querySelector("button");
       await nodes["task-drawer-toggle"].emit("click");
       if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert || nodes["project-navigation"].attributes.role !== "dialog" || nodes["project-navigation"].attributes["aria-modal"] !== "true") process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
-      if (documentRoot.activeElement !== drawerSummary) process.exit(35);
+      if (documentRoot.activeElement !== firstDrawerFocusable) process.exit(35);
       launcher.focus();
       await documentRoot.emit("keydown", {{key: "Tab", preventDefault() {{ this.prevented = true; }}}});
-      if (documentRoot.activeElement !== drawerSummary) process.exit(36);
+      if (documentRoot.activeElement !== firstDrawerFocusable) process.exit(36);
+      const blockedCalls = fetchCalls.length;
+      nodes["message-input"].value = "This cannot send while navigation is inert.";
+      await nodes["composer"].emit("submit");
+      if (fetchCalls.length !== blockedCalls) process.exit(54);
       await documentRoot.emit("keydown", {{key: "Escape", preventDefault() {{}}}});
       if (nodes["project-navigation"].classList.contains("drawer-open") || nodes["project-navigation"].attributes.role !== undefined || nodes["project-navigation"].attributes["aria-modal"] !== undefined) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
@@ -944,8 +1042,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await nodes["inspector-drawer-toggle"].emit("click");
       nodes["activity-audit"].open = true;
       await nodes["activity-audit"].emit("toggle");
-      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(37);
-      if (!nodes["activity-audit"].textContent.includes("TypeNo structured activity recorded")) process.exit(50);
+      if (!nodes["activity-audit"].textContent.includes("Agent Event") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(37);
+      if (!nodes["activity-audit"].textContent.includes("TypeAgent Event")) process.exit(50);
       media.matches = false;
       media.emit();
       if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);
@@ -955,7 +1053,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const taskButton = nodes["task-list"].children[1].children[1].querySelector("button");
       await taskButton.emit("click");
       if (!nodes["project-navigation"].inert || nodes["project-navigation"].classList.contains("drawer-open") || nodes["conversation-shell"].inert) process.exit(20);
-      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded")) process.exit(38);
+      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(38);
       projectBootstrap.fable_ready = false;
       projectBootstrap.fable_status = "unavailable";
       projectBootstrap.sol_status = "unavailable";
@@ -996,28 +1094,31 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await firstAcknowledge.emit("click");
       const acknowledgements = () => fetchCalls.filter((call) => call.url.endsWith("/authorize-retry"));
       const firstAcknowledgement = JSON.parse(acknowledgements()[0].options.body);
-      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
-      const secondAcknowledgement = JSON.parse(acknowledgements()[1].options.body);
-      if (firstAcknowledgement.acknowledgment_id !== secondAcknowledgement.acknowledgment_id || firstAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(42);
-      const focusBeforeNewGeneration = nodes["intervention-context"].focusCount;
       projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 5}};
       await refreshFromEvent(persistedEvent.sequence + 52);
+      if (nodes["intervention-context"].focusCount <= warningFocuses) process.exit(43);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const secondAcknowledgement = JSON.parse(acknowledgements()[1].options.body);
+      if (firstAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || secondAcknowledgement.expected_resume_generation !== 5 || secondAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(42);
+      const focusBeforeNewGeneration = nodes["intervention-context"].focusCount;
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 6}};
+      await refreshFromEvent(persistedEvent.sequence + 53);
       if (nodes["intervention-context"].focusCount <= focusBeforeNewGeneration || focusBeforeNewGeneration < warningFocuses) process.exit(43);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const thirdAcknowledgement = JSON.parse(acknowledgements()[2].options.body);
-      if (thirdAcknowledgement.acknowledgment_id === firstAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 5) process.exit(44);
-      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 6}};
-      await refreshFromEvent(persistedEvent.sequence + 53);
+      if (thirdAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 6) process.exit(44);
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 7}};
+      await refreshFromEvent(persistedEvent.sequence + 54);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const conflictAcknowledgement = JSON.parse(acknowledgements()[3].options.body);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const freshAcknowledgement = JSON.parse(acknowledgements()[4].options.body);
-      if (conflictAcknowledgement.acknowledgment_id === freshAcknowledgement.acknowledgment_id || freshAcknowledgement.expected_resume_generation !== 6 || freshAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(48);
+      if (conflictAcknowledgement.acknowledgment_id === freshAcknowledgement.acknowledgment_id || freshAcknowledgement.expected_resume_generation !== 7 || freshAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(48);
       for (const status of ["pending_stop", "ready", "resuming", "resume_outcome_unknown"]) {{
         projectBootstrap.tasks[1].intervention = {{
           intervention_id: `stop-${{status}}`, status, resume_generation: 6, eligible: false,
         }};
-        await refreshFromEvent(persistedEvent.sequence + 54 + acknowledgements().length);
+        await refreshFromEvent(persistedEvent.sequence + 55 + acknowledgements().length);
         if (nodes["stop-control"].hidden || nodes["stop-control"].disabled) process.exit(45);
         await nodes["stop-control"].emit("click");
       }}
