@@ -555,6 +555,13 @@ def create_hub_app(
             "outcome": thaw_projection(overview.outcome),
             "review": thaw_projection(overview.review),
             "clarification": thaw_projection(overview.clarification),
+            "activity_kind": (
+                overview.activity_kind
+                if overview.activity_kind in {
+                    "action_error", "stop_error", "agent_event", "resume_drift",
+                }
+                else None
+            ),
             "activity": thaw_projection(overview.activity),
             "intervention": (
                 None if intervention is None else intervention_projection(intervention)
@@ -1532,6 +1539,13 @@ def create_app(
             "outcome": thaw_projection(overview.outcome),
             "review": thaw_projection(overview.review),
             "clarification": thaw_projection(overview.clarification),
+            "activity_kind": (
+                overview.activity_kind
+                if overview.activity_kind in {
+                    "action_error", "stop_error", "agent_event", "resume_drift",
+                }
+                else None
+            ),
             "activity": thaw_projection(overview.activity),
         }
 

@@ -665,22 +665,27 @@ function appendListSection(documentRoot, parent, headingText, values) {
 }
 
 
-function activitySummary(value) {
-  const activity = asObject(value);
+function activitySummary(task) {
+  const activity = asObject(task?.activity);
+  const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
+  if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
+    return "No structured activity recorded";
+  }
   return [
-    typeof activity.type === "string" ? stateLabel(activity.type) : "No structured activity recorded",
+    stateLabel(task.activity_kind),
     typeof activity.status === "string" ? stateLabel(activity.status) : null,
     typeof activity.command_sha256 === "string" ? activity.command_sha256 : null,
   ].filter(Boolean).join(" · ");
 }
 
 
-function activityRows(value) {
-  const activity = asObject(value);
+function activityRows(task) {
+  const activity = asObject(task?.activity);
   const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
-  const type = typeof activity.type === "string" && allowed.has(activity.type)
-    ? stateLabel(activity.type)
-    : "No structured activity recorded";
+  if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
+    return [["Type", "No structured activity recorded"]];
+  }
+  const type = stateLabel(task.activity_kind);
   const rows = [["Type", type]];
   if (typeof activity.status === "string") {
     rows.push(["Status", stateLabel(activity.status)]);
@@ -698,12 +703,12 @@ function renderActivityAudit(documentRoot, task) {
     return;
   }
   const rows = element(documentRoot, "dl", undefined, "activity-audit-rows");
-  rows.append(...activityRows(task?.activity).flatMap(([label, value]) => [
+  rows.append(...activityRows(task).flatMap(([label, value]) => [
     element(documentRoot, "dt", label), element(documentRoot, "dd", value),
   ]));
   audit.replaceChildren(
     element(documentRoot, "summary", "Activity and audit"),
-    element(documentRoot, "p", activitySummary(task?.activity)),
+    element(documentRoot, "p", activitySummary(task)),
     rows,
   );
 }
@@ -726,7 +731,11 @@ function boundedInspectorList(value) {
 function renderPersistentInspector(documentRoot, task, options) {
   const summary = documentRoot.querySelector("#task-inspector-summary");
   const controls = documentRoot.querySelector("#task-controls");
+  const empty = documentRoot.querySelector("#task-inspector-empty");
   if (!task) {
+    if (empty) {
+      empty.hidden = false;
+    }
     if (summary) {
       const rows = [
         ["Task revision", "Awaiting task selection"],
@@ -751,6 +760,9 @@ function renderPersistentInspector(documentRoot, task, options) {
       );
     }
     return;
+  }
+  if (empty) {
+    empty.hidden = true;
   }
   const brief = taskBrief(task);
   const identity = taskIdentity(task);
@@ -2944,7 +2956,7 @@ export function reduceTaskEvent(tasks, event) {
   } else if (event.kind === "review") {
     updated = {...updated, review: payload};
   } else if (["agent_event", "resume_drift", "stop_error", "action_error"].includes(event.kind)) {
-    updated = {...updated, activity: {...payload, type: event.kind}};
+    updated = {...updated, activity_kind: event.kind, activity: payload};
   }
   return upsertTask(tasks, updated);
 }

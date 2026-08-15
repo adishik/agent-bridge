@@ -1495,6 +1495,7 @@ class TaskOverview:
     outcome: Mapping[str, JsonValue] | None
     review: Mapping[str, JsonValue] | None
     clarification: Mapping[str, JsonValue] | None
+    activity_kind: str | None
     activity: Mapping[str, JsonValue] | None
 
 
@@ -8098,16 +8099,36 @@ class SQLiteStore:
                     LIMIT 1
                 ) AS revision_start_sequence
               FROM bounded_tasks
+            ),
+            activity_evidence AS (
+              SELECT
+                bounded_with_revision.*,
+                (
+                  SELECT event.sequence
+                  FROM events AS event
+                  WHERE event.session_id = bounded_with_revision.session_id
+                    AND event.task_id = bounded_with_revision.task_id
+                    AND bounded_with_revision.revision_start_sequence IS NOT NULL
+                    AND event.sequence > bounded_with_revision.revision_start_sequence
+                    AND event.kind IN (
+                      'agent_event', 'resume_drift', 'stop_error', 'action_error'
+                    )
+                  ORDER BY event.sequence DESC
+                  LIMIT 1
+                ) AS activity_sequence
+              FROM bounded_with_revision
             )
             SELECT
-              bounded_with_revision.*,
+              activity_evidence.*,
+              activity_event.kind AS activity_kind,
+              activity_event.payload_json AS activity_payload_json,
               (
                 SELECT event.payload_json
                 FROM events AS event
-                WHERE event.session_id = bounded_with_revision.session_id
-                  AND event.task_id = bounded_with_revision.task_id
-                  AND bounded_with_revision.revision_start_sequence IS NOT NULL
-                  AND event.sequence > bounded_with_revision.revision_start_sequence
+                WHERE event.session_id = activity_evidence.session_id
+                  AND event.task_id = activity_evidence.task_id
+                  AND activity_evidence.revision_start_sequence IS NOT NULL
+                  AND event.sequence > activity_evidence.revision_start_sequence
                   AND event.kind = 'outcome'
                 ORDER BY event.sequence DESC
                 LIMIT 1
@@ -8115,10 +8136,10 @@ class SQLiteStore:
               (
                 SELECT event.payload_json
                 FROM events AS event
-                WHERE event.session_id = bounded_with_revision.session_id
-                  AND event.task_id = bounded_with_revision.task_id
-                  AND bounded_with_revision.revision_start_sequence IS NOT NULL
-                  AND event.sequence > bounded_with_revision.revision_start_sequence
+                WHERE event.session_id = activity_evidence.session_id
+                  AND event.task_id = activity_evidence.task_id
+                  AND activity_evidence.revision_start_sequence IS NOT NULL
+                  AND event.sequence > activity_evidence.revision_start_sequence
                   AND event.kind = 'review'
                 ORDER BY event.sequence DESC
                 LIMIT 1
@@ -8126,28 +8147,17 @@ class SQLiteStore:
               (
                 SELECT event.payload_json
                 FROM events AS event
-                WHERE event.session_id = bounded_with_revision.session_id
-                  AND event.task_id = bounded_with_revision.task_id
-                  AND bounded_with_revision.revision_start_sequence IS NOT NULL
-                  AND event.sequence > bounded_with_revision.revision_start_sequence
+                WHERE event.session_id = activity_evidence.session_id
+                  AND event.task_id = activity_evidence.task_id
+                  AND activity_evidence.revision_start_sequence IS NOT NULL
+                  AND event.sequence > activity_evidence.revision_start_sequence
                   AND event.kind = 'clarification'
                 ORDER BY event.sequence DESC
                 LIMIT 1
-              ) AS clarification_payload_json,
-              (
-                SELECT event.payload_json
-                FROM events AS event
-                WHERE event.session_id = bounded_with_revision.session_id
-                  AND event.task_id = bounded_with_revision.task_id
-                  AND bounded_with_revision.revision_start_sequence IS NOT NULL
-                  AND event.sequence > bounded_with_revision.revision_start_sequence
-                  AND event.kind IN (
-                    'agent_event', 'resume_drift', 'stop_error', 'action_error'
-                  )
-                ORDER BY event.sequence DESC
-                LIMIT 1
-              ) AS activity_payload_json
-            FROM bounded_with_revision
+              ) AS clarification_payload_json
+            FROM activity_evidence
+            LEFT JOIN events AS activity_event
+              ON activity_event.sequence = activity_evidence.activity_sequence
             ORDER BY COALESCE(overview_sequence, 0) DESC, task_id
             """,
             (session_id, session_id, MAX_TASK_OVERVIEWS),
@@ -8179,6 +8189,9 @@ class SQLiteStore:
                     else _decode_mapping(
                         row["clarification_payload_json"], "clarification payload"
                     )
+                ),
+                activity_kind=(
+                    None if row["activity_kind"] is None else str(row["activity_kind"])
                 ),
                 activity=(
                     None

@@ -452,6 +452,7 @@ def test_bootstrap_is_complete_authoritative_and_omits_runtime_secrets(
                 "outcome": None,
                 "review": None,
                 "clarification": None,
+                "activity_kind": None,
                 "activity": None,
             }
         ],
@@ -504,6 +505,7 @@ def test_bootstrap_keeps_current_revision_evidence_outside_recent_chat_window(
     assert task["outcome"] == evidence["outcome"]
     assert task["review"] == evidence["review"]
     assert task["clarification"] == evidence["clarification"]
+    assert task["activity_kind"] == "agent_event"
     assert task["activity"] == evidence["agent_event"]
 
 
@@ -659,7 +661,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
     harness = f"""
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
-      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], activity: {{type: "agent_event", status: "ready", command_sha256: "audit-a"}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
+      const hostileActivity = "<img src=x onerror=globalThis.pwned=true>".repeat(200);
+      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], exchange_allowance: 2, exchange_consumed: 1, activity: {{status: hostileActivity, command_sha256: hostileActivity}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
       let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, usage_credits_acknowledged: true, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
@@ -733,7 +736,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         "connection-status", "task-drawer-toggle", "inspector-drawer-toggle",
         "bootstrap-retry", "project-list", "chat-list", "new-chat",
             "selected-project-name", "selected-chat-name", "task-inspector-summary", "composer-recipient",
-            "composer-label",
+            "composer-label", "task-inspector-empty",
             "task-controls", "activity-audit", "intervention-context", "intervene-control",
             "stop-control", "conversation-status", "conversation-context",
       ];
@@ -861,14 +864,16 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (documentRoot.activeElement !== nodes["usage-credits-confirm"]) process.exit(3);
       if (await controller.ready) process.exit(4);
       if (nodes["bootstrap-retry"].hidden || !nodes["message-input"].disabled) process.exit(5);
+      if (nodes["task-inspector-empty"].hidden) process.exit(53);
       if (!interactionAllowed(nodes["bootstrap-retry"])) process.exit(25);
       if (!nodes["usage-error"].textContent.includes("No project chats")) process.exit(26);
 
       await nodes["bootstrap-retry"].emit("click");
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
-      if (!nodes["task-inspector-summary"].textContent.includes("Question budget")) process.exit(34);
+      if (!nodes["task-inspector-summary"].textContent.includes("Question budget2 remaining · 1 consumed")) process.exit(34);
       if (!nodes["task-controls"].hidden) process.exit(49);
+      if (!nodes["task-inspector-empty"].hidden) process.exit(52);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
       media.matches = false;
       media.emit();
@@ -939,8 +944,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await nodes["inspector-drawer-toggle"].emit("click");
       nodes["activity-audit"].open = true;
       await nodes["activity-audit"].emit("toggle");
-      if (!nodes["activity-audit"].textContent.includes("Agent Event · Ready · audit-a")) process.exit(37);
-      if (!nodes["activity-audit"].textContent.includes("TypeAgent EventStatusReady")) process.exit(50);
+      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(37);
+      if (!nodes["activity-audit"].textContent.includes("TypeNo structured activity recorded")) process.exit(50);
       media.matches = false;
       media.emit();
       if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);

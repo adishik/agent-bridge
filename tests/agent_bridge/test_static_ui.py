@@ -836,7 +836,7 @@ def test_every_persisted_event_kind_reduces_without_raw_conversation_details() -
       if (task.state !== "failed") process.exit(2);
       if (task.history.length !== events.length - 1 || task.history[0].sequence !== 2) process.exit(3);
       if (task.activity.command_sha256 !== "hash-only") process.exit(23);
-      if (task.activity.type !== "agent_event") process.exit(29);
+      if (task.activity_kind !== "agent_event" || task.activity.type !== "command_execution") process.exit(29);
       if (task.outcome.architecture_docs !== "unchanged") process.exit(4);
       if (task.clarification.question_for_user !== "Choose one") process.exit(5);
       if (task.review.question_for_user !== "Review question") process.exit(6);
@@ -1639,49 +1639,65 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
         return (lighter + 0.05) / (darker + 0.05)
 
-    colors = {
-        "ink": "#211a17", "muted": "#3b302b", "surface": "#fffaf3",
-        "panel": "#fffaf3", "cream": "#f6ecdf", "copper": "#9a4524",
-        "copper_soft": "#f4d8c7", "green": "#49634e", "green_soft": "#dce8da",
-        "danger": "#8b2f2f", "danger_soft": "#f5dddd", "focus": "#176b87",
-        "status": "#eef1ef", "white": "#ffffff",
-    }
-    # Every shipped text, disabled-text, and focus adjacency is listed by the
-    # selector that owns it.  This is deliberately component-level rather than
-    # merely checking that the palette tokens happen to contrast.
+    root = re.search(r":root\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert root is not None
+    tokens = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", root.group("body")))
+
+    def declaration(selector: str, property_name: str) -> str:
+        for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
+            selectors = {item.strip() for item in header.split(",")}
+            if selector not in selectors:
+                continue
+            match = re.search(rf"(?:^|;)\s*{re.escape(property_name)}\s*:\s*([^;]+);", body)
+            if match:
+                return match.group(1).strip()
+        raise AssertionError(f"missing {property_name} declaration for {selector}")
+
+    def resolve(value: str) -> str:
+        value = value.strip()
+        match = re.fullmatch(r"var\((--[\w-]+)\)", value)
+        if match:
+            return resolve(tokens[match.group(1)])
+        if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
+            return "#" + "".join(channel * 2 for channel in value[1:])
+        assert re.fullmatch(r"#[0-9a-fA-F]{6}", value), value
+        return value.lower()
+
+    # These are selector/property sources, resolved from the shipped CSS rather
+    # than a duplicated palette. They cover every text, disabled-text, focus,
+    # and visible non-text control adjacency in this stylesheet.
     adjacencies = (
-        ("body", "ink", "surface", 4.5),
-        (".brand-block span", "muted", "surface", 4.5),
-        (".project-navigation-button", "muted", "panel", 4.5),
-        (".project-navigation-button:disabled", "muted", "panel", 4.5),
-        (".status-pill", "muted", "cream", 4.5),
-        (".eyebrow", "copper", "surface", 4.5),
-        (".empty-state", "muted", "surface", 4.5),
-        (".message", "ink", "panel", 4.5),
-        (".message-user", "ink", "cream", 4.5),
-        (".message-fable", "ink", "copper_soft", 4.5),
-        (".message-sol", "ink", "green_soft", 4.5),
-        (".message-coordinator", "ink", "cream", 4.5),
-        (".message-avatar", "white", "muted", 4.5),
-        (".message-fable .message-avatar", "white", "copper", 4.5),
-        (".message-sol .message-avatar", "white", "green", 4.5),
-        (".conversation-status", "muted", "status", 4.5),
-        (".button", "ink", "panel", 4.5),
-        (".button:disabled", "muted", "cream", 4.5),
-        (".button-primary", "white", "copper", 4.5),
-        (".button-danger", "danger", "panel", 4.5),
-        (".field-group textarea", "ink", "panel", 4.5),
-        ("#conversation-context", "muted", "cream", 4.5),
-        ("dialog", "ink", "panel", 4.5),
-        (".form-error", "danger", "panel", 4.5),
-        (".toast", "white", "copper", 4.5),
-        (".toast-error", "white", "danger", 4.5),
-        (".skip-link", "white", "copper", 4.5),
-        ("button:focus-visible", "focus", "surface", 3),
+        ("body", "color", ":root", "--surface", 4.5),
+        (".brand-block span", "color", ":root", "--surface", 4.5),
+        (".project-navigation-button", "color", ":root", "--panel", 4.5),
+        (".project-navigation-button:disabled", "color", ":root", "--panel", 4.5),
+        (".status-pill", "color", ":root", "--coordinator-soft", 4.5),
+        (".eyebrow", "color", ":root", "--surface", 4.5),
+        (".message-avatar", "color", ":root", "--coordinator", 4.5),
+        (".message-fable .message-avatar", "color", ":root", "--fable", 4.5),
+        (".message-sol .message-avatar", "color", ":root", "--sol", 4.5),
+        (".button", "color", ":root", "--panel", 4.5),
+        (".button:disabled", "color", ":root", "--cream-100", 4.5),
+        (".button-primary", "color", ":root", "--brand", 4.5),
+        (".button-danger", "color", ":root", "--panel", 4.5),
+        (".form-error", "color", ":root", "--panel", 4.5),
+        (".toast", "color", ":root", "--brand-strong", 4.5),
+        (".toast-error", "color", ":root", "--danger", 4.5),
+        (".skip-link", "color", ":root", "--brand-strong", 4.5),
+        ("button:focus-visible", "outline-color", ":root", "--surface", 3),
     )
-    for selector, foreground, background, minimum in adjacencies:
-        assert selector in styles
-        assert contrast(colors[foreground], colors[background]) >= minimum
+    for selector, foreground_property, background_selector, background_property, minimum in adjacencies:
+        if foreground_property == "outline-color":
+            foreground = declaration(selector, "outline").split()[-1]
+        else:
+            try:
+                foreground = declaration(selector, foreground_property)
+            except AssertionError:
+                # Avatar variants only replace their surface; their readable
+                # foreground is inherited from the base avatar declaration.
+                foreground = declaration(".message-avatar", foreground_property)
+        background = tokens[background_property] if background_selector == ":root" else declaration(background_selector, background_property)
+        assert contrast(resolve(foreground), resolve(background)) >= minimum
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

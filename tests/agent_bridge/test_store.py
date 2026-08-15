@@ -585,6 +585,22 @@ def test_task_overview_projects_only_latest_evidence_after_exact_revision_bounda
     assert overview.review == expected["review"]
     assert overview.clarification == expected["clarification"]
     assert overview.activity == expected["agent_event"]
+    assert overview.activity_kind == "agent_event"
+    for kind in ("action_error", "stop_error", "resume_drift", "agent_event"):
+        store.append_event(
+            "session-1", valid_brief.task_id, "coordinator", kind,
+            {"status": "safe", "command_sha256": "not-a-provider-command"},
+        )
+        latest = store.latest_task_overviews("session-1")[0]
+        assert latest.activity_kind == kind
+        assert latest.activity == {"status": "safe", "command_sha256": "not-a-provider-command"}
+    store.append_event(
+        "session-1", valid_brief.task_id, "coordinator", "unknown_activity",
+        {"status": "untrusted", "command": "provider command"},
+    )
+    fail_closed = store.latest_task_overviews("session-1")[0]
+    assert fail_closed.activity_kind == "agent_event"
+    assert fail_closed.activity == {"status": "safe", "command_sha256": "not-a-provider-command"}
     plan = store._connection.execute(
         """
         EXPLAIN QUERY PLAN
