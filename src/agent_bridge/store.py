@@ -65,6 +65,10 @@ MAX_CHAT_PAGE_SIZE = 50
 _NEW_CHAT_TITLE = "New chat"
 _ACTIVE_SESSION_SETTING = "agent_bridge.active_session_id"
 _BASELINE_SETTING_PREFIX = "agent_bridge.baseline."
+_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX = (
+    "agent_bridge.internal.intervention_acknowledgment."
+)
+_INTERVENTION_ACKNOWLEDGMENT_LINEAGE_VERSION = 1
 _MAX_LEGACY_AUDIT_REASONS = 8
 _MAX_PREPARED_TEXT_LENGTH = 16 * 1024
 _MAX_RESUME_DRIFT_SUMMARY_LENGTH = 1024
@@ -1332,6 +1336,148 @@ class InterventionRecord:
             raise ValueError("intervention directed binding is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class _InterventionAcknowledgmentLineage:
+    """One private durable authorization boundary for a possible prior retry."""
+
+    intervention_id: str
+    acknowledgment_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    run_id: str
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    continuation_state: TaskState
+    source_generation: int
+    resume_generation: int
+    fable_session_id: str | None
+    sol_thread_id: str | None
+    authorized_resume_attempt_id: str | None
+    authorized_resume_run_id: str | None
+    retry_resume_attempt_id: str | None
+    retry_resume_run_id: str | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "intervention_id", "acknowledgment_id", "session_id", "task_id", "run_id",
+        ):
+            object.__setattr__(self, name, _prepared_identifier(getattr(self, name), name))
+        for name in (
+            "revision", "source_generation", "resume_generation",
+        ):
+            value = _require_integer(getattr(self, name), name)
+            if value < (0 if name == "revision" else 1):
+                raise ValueError("intervention acknowledgment lineage generation is invalid")
+            object.__setattr__(self, name, value)
+        if (
+            self.addressed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}
+            or self.routed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}
+            or not isinstance(self.continuation_state, TaskState)
+        ):
+            raise ValueError("intervention acknowledgment lineage route is invalid")
+        for name in (
+            "fable_session_id", "sol_thread_id", "authorized_resume_attempt_id",
+            "authorized_resume_run_id", "retry_resume_attempt_id", "retry_resume_run_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _prepared_identifier(value, name))
+        if (self.authorized_resume_attempt_id is None) != (
+            self.authorized_resume_run_id is None
+        ):
+            raise ValueError("intervention acknowledgment lineage authorization owner is invalid")
+        if (self.retry_resume_attempt_id is None) != (self.retry_resume_run_id is None):
+            raise ValueError("intervention acknowledgment lineage retry owner is invalid")
+
+    @classmethod
+    def from_record(
+        cls, record: InterventionRecord, acknowledgment_id: str,
+        *, retry_resume_attempt_id: str | None = None,
+        retry_resume_run_id: str | None = None,
+    ) -> "_InterventionAcknowledgmentLineage":
+        return cls(
+            intervention_id=record.intervention_id,
+            acknowledgment_id=acknowledgment_id,
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            run_id=record.run_id,
+            addressed_to=record.addressed_to,
+            routed_to=record.routed_to,
+            continuation_state=record.continuation_state,
+            source_generation=record.source_generation,
+            resume_generation=record.resume_generation,
+            fable_session_id=record.fable_session_id,
+            sol_thread_id=record.sol_thread_id,
+            authorized_resume_attempt_id=record.resume_attempt_id,
+            authorized_resume_run_id=record.resume_run_id,
+            retry_resume_attempt_id=retry_resume_attempt_id,
+            retry_resume_run_id=retry_resume_run_id,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "acknowledgment_id": self.acknowledgment_id,
+            "addressed_to": self.addressed_to.value,
+            "authorized_resume_attempt_id": self.authorized_resume_attempt_id,
+            "authorized_resume_run_id": self.authorized_resume_run_id,
+            "continuation_state": self.continuation_state.value,
+            "fable_session_id": self.fable_session_id,
+            "intervention_id": self.intervention_id,
+            "resume_generation": self.resume_generation,
+            "retry_resume_attempt_id": self.retry_resume_attempt_id,
+            "retry_resume_run_id": self.retry_resume_run_id,
+            "revision": self.revision,
+            "routed_to": self.routed_to.value,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "sol_thread_id": self.sol_thread_id,
+            "source_generation": self.source_generation,
+            "task_id": self.task_id,
+            "version": _INTERVENTION_ACKNOWLEDGMENT_LINEAGE_VERSION,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "_InterventionAcknowledgmentLineage":
+        expected_keys = {
+            "acknowledgment_id", "addressed_to", "authorized_resume_attempt_id",
+            "authorized_resume_run_id", "continuation_state", "fable_session_id",
+            "intervention_id", "resume_generation", "retry_resume_attempt_id",
+            "retry_resume_run_id", "revision", "routed_to", "run_id", "session_id",
+            "sol_thread_id", "source_generation", "task_id", "version",
+        }
+        if set(value) != expected_keys or value.get("version") != (
+            _INTERVENTION_ACKNOWLEDGMENT_LINEAGE_VERSION
+        ):
+            raise ValueError("intervention acknowledgment lineage is invalid")
+        try:
+            addressed_to = ConversationTarget(value["addressed_to"])
+            routed_to = ConversationTarget(value["routed_to"])
+            continuation_state = TaskState(value["continuation_state"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("intervention acknowledgment lineage is invalid") from error
+        return cls(
+            intervention_id=value["intervention_id"],
+            acknowledgment_id=value["acknowledgment_id"],
+            session_id=value["session_id"],
+            task_id=value["task_id"],
+            revision=value["revision"],
+            run_id=value["run_id"],
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            continuation_state=continuation_state,
+            source_generation=value["source_generation"],
+            resume_generation=value["resume_generation"],
+            fable_session_id=value["fable_session_id"],
+            sol_thread_id=value["sol_thread_id"],
+            authorized_resume_attempt_id=value["authorized_resume_attempt_id"],
+            authorized_resume_run_id=value["authorized_resume_run_id"],
+            retry_resume_attempt_id=value["retry_resume_attempt_id"],
+            retry_resume_run_id=value["retry_resume_run_id"],
+        )
+
+
 @dataclass(frozen=True)
 class TaskOverview:
     """Safe task-list metadata without agent continuation identities or PIDs."""
@@ -1956,6 +2102,7 @@ class SQLiteStore:
             self._migrate_session_chat_metadata()
             self._migrate_intervention_schema()
             self._migrate_directed_conversation_schema()
+            self._migrate_intervention_acknowledgment_lineages_in_transaction()
         except BaseException:
             self._connection.rollback()
             raise
@@ -2170,6 +2317,65 @@ class SQLiteStore:
             WHERE permission_id IS NOT NULL
             """
         )
+
+    def _migrate_intervention_acknowledgment_lineages_in_transaction(self) -> None:
+        """Backfill the one pre-lineage acknowledgment format once and fail closed."""
+        if not self._connection.in_transaction:
+            raise RuntimeError("intervention acknowledgment lineage migration requires a transaction")
+        last_rowid = 0
+        while True:
+            rows = self._connection.execute(
+                """
+                SELECT rowid, * FROM interventions
+                WHERE acknowledgment_id IS NOT NULL AND rowid > ?
+                ORDER BY rowid LIMIT ?
+                """,
+                (last_rowid, _STARTUP_RECOVERY_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                last_rowid = int(row["rowid"])
+                try:
+                    record = self._intervention_from_row(row)
+                    acknowledgment_id = _prepared_identifier(
+                        row["acknowledgment_id"], "acknowledgment_id",
+                    )
+                    key = self._intervention_acknowledgment_lineage_key(record.intervention_id)
+                    if self._connection.execute(
+                        "SELECT 1 FROM settings WHERE key = ? LIMIT 2", (key,),
+                    ).fetchone() is not None:
+                        continue
+                    if not self._intervention_is_authenticated(
+                        record,
+                        acknowledgment_id,
+                        allow_legacy_acknowledgment_lineage=True,
+                    ):
+                        raise RuntimeError("legacy intervention acknowledgment is unauthenticated")
+                    retry_owner = (
+                        (record.resume_attempt_id, record.resume_run_id)
+                        if record.status in {
+                            InterventionStatus.RESUMING,
+                            InterventionStatus.RESUMED,
+                        }
+                        or (
+                            record.status is InterventionStatus.CANCELED_BY_STOP
+                            and record.resume_attempt_id is not None
+                        )
+                        else (None, None)
+                    )
+                    self._insert_intervention_acknowledgment_lineage(
+                        _InterventionAcknowledgmentLineage.from_record(
+                            record,
+                            acknowledgment_id,
+                            retry_resume_attempt_id=retry_owner[0],
+                            retry_resume_run_id=retry_owner[1],
+                        )
+                    )
+                except (RuntimeError, ValueError, TypeError):
+                    # A malformed or structurally invalid legacy row stays unbound.
+                    # Subsequent authentication rejects it without rewriting its bytes.
+                    continue
 
     def _migrate_fable_checkpoint_stage_owners_in_transaction(self) -> None:
         """Backfill one positively authenticated live or terminal stage owner."""
@@ -10470,6 +10676,13 @@ class SQLiteStore:
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
         with self._immediate_transaction():
             record = self._intervention_required(intervention_id)
+            row = self._connection.execute(
+                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+                (intervention_id,),
+            ).fetchone()
+            acknowledgment_id = None if row is None else row["acknowledgment_id"]
+            if not self._intervention_is_authenticated(record, acknowledgment_id):
+                raise RuntimeError("intervention binding is not authenticated")
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
             if record.status is InterventionStatus.RESUMING:
@@ -10495,6 +10708,15 @@ class SQLiteStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention resume claim changed concurrently")
+            if acknowledgment_id is not None:
+                self._replace_intervention_acknowledgment_retry_owner(
+                    record=record,
+                    acknowledgment_id=_prepared_identifier(
+                        acknowledgment_id, "acknowledgment_id",
+                    ),
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
         return self._intervention_required(intervention_id)
 
     def begin_intervention_resume(
@@ -10746,6 +10968,13 @@ class SQLiteStore:
                 )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention resume claim changed concurrently")
+            if acknowledgment_id is not None:
+                self._replace_intervention_acknowledgment_retry_owner(
+                    record=record,
+                    acknowledgment_id=acknowledgment_id,
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
         return self.get_task(record.task_id, record.revision)
 
     def complete_intervention(
@@ -10764,6 +10993,17 @@ class SQLiteStore:
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
         with self._immediate_transaction():
             record = self._intervention_required(intervention_id)
+            row = self._connection.execute(
+                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+                (intervention_id,),
+            ).fetchone()
+            acknowledgment_id = None if row is None else row["acknowledgment_id"]
+            if not self._intervention_acknowledgment_lineage_is_authenticated(
+                record,
+                acknowledgment_id,
+                allow_legacy_acknowledgment_lineage=False,
+            ):
+                raise RuntimeError("intervention acknowledgment lineage is not authenticated")
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
             if (
@@ -11130,6 +11370,17 @@ class SQLiteStore:
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
         with self._immediate_transaction():
             record = self._intervention_required(intervention_id)
+            row = self._connection.execute(
+                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+                (intervention_id,),
+            ).fetchone()
+            acknowledgment_id = None if row is None else row["acknowledgment_id"]
+            if not self._intervention_acknowledgment_lineage_is_authenticated(
+                record,
+                acknowledgment_id,
+                allow_legacy_acknowledgment_lineage=False,
+            ):
+                raise RuntimeError("intervention acknowledgment lineage is not authenticated")
             if (
                 record.resume_attempt_id != resume_attempt_id
                 or record.resume_run_id != resume_run_id
@@ -11141,18 +11392,24 @@ class SQLiteStore:
                 raise RuntimeError("intervention outcome is not pending")
             cursor = self._connection.execute(
                 """
-                UPDATE interventions SET status = ?
+                UPDATE interventions SET status = ?, acknowledgment_id = NULL
                 WHERE intervention_id = ? AND resume_attempt_id = ? AND resume_run_id = ?
-                  AND status = ?
+                  AND status = ? AND acknowledgment_id IS ?
                 """,
                 (
                     InterventionStatus.RESUME_OUTCOME_UNKNOWN.value,
                     intervention_id, resume_attempt_id, resume_run_id,
                     InterventionStatus.RESUMING.value,
+                    acknowledgment_id,
                 ),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention outcome changed concurrently")
+            if acknowledgment_id is not None:
+                self._delete_intervention_acknowledgment_lineage(
+                    record,
+                    _prepared_identifier(acknowledgment_id, "acknowledgment_id"),
+                )
         return self._intervention_required(intervention_id)
 
     def authorize_retry_after_unknown(
@@ -11175,8 +11432,17 @@ class SQLiteStore:
             ).fetchone()
             stored_acknowledgment = None if row is None else row["acknowledgment_id"]
             if (
-                record.directed_binding is not None
-                and not self._intervention_is_authenticated(record, stored_acknowledgment)
+                not self._intervention_acknowledgment_lineage_is_authenticated(
+                    record,
+                    stored_acknowledgment,
+                    allow_legacy_acknowledgment_lineage=False,
+                )
+                or (
+                    record.directed_binding is not None
+                    and not self._intervention_is_authenticated(
+                        record, stored_acknowledgment,
+                    )
+                )
             ):
                 raise RuntimeError("intervention binding is not authenticated")
             if (
@@ -11300,6 +11566,18 @@ class SQLiteStore:
                 )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention retry authorization changed concurrently")
+            acknowledged = self._intervention_required(intervention_id)
+            if not self._intervention_is_authenticated(
+                acknowledged,
+                acknowledgment_id,
+                allow_legacy_acknowledgment_lineage=True,
+            ):
+                raise RuntimeError("intervention retry authorization is not authenticated")
+            self._insert_intervention_acknowledgment_lineage(
+                _InterventionAcknowledgmentLineage.from_record(
+                    acknowledged, acknowledgment_id,
+                )
+            )
         return self._intervention_required(intervention_id)
 
     def _advance_intervention_reservation_generation(
@@ -11812,9 +12090,30 @@ class SQLiteStore:
                     f"({preserved_intervention_placeholders})"
                 )
             )
-            self._connection.execute(
+            resuming_rows = self._connection.execute(
                 f"""
-                UPDATE interventions SET status = ?
+                SELECT * FROM interventions
+                WHERE status = ?{preserved_intervention_clause}
+                ORDER BY intervention_id
+                """,
+                (
+                    InterventionStatus.RESUMING.value,
+                    *preserved_scope_intervention_ids,
+                ),
+            ).fetchall()
+            retired_acknowledgments: list[tuple[InterventionRecord, str]] = []
+            for row in resuming_rows:
+                acknowledgment_id = row["acknowledgment_id"]
+                if acknowledgment_id is not None:
+                    retired_acknowledgments.append((
+                        self._intervention_from_row(row),
+                        _prepared_identifier(acknowledgment_id, "acknowledgment_id"),
+                    ))
+            for record, acknowledgment_id in retired_acknowledgments:
+                self._delete_intervention_acknowledgment_lineage(record, acknowledgment_id)
+            cursor = self._connection.execute(
+                f"""
+                UPDATE interventions SET status = ?, acknowledgment_id = NULL
                 WHERE status = ?{preserved_intervention_clause}
                 """,
                 (
@@ -11823,6 +12122,9 @@ class SQLiteStore:
                     *preserved_scope_intervention_ids,
                 ),
             )
+            if cursor.rowcount != len(resuming_rows):
+                raise RuntimeError("resuming intervention changed during recovery")
+            self._validate_interventions_for_recovery_in_transaction()
         return RecoverySummary(
             prepared_actions_recovered=0,
             tasks_interrupted=tasks_interrupted,
@@ -11838,17 +12140,23 @@ class SQLiteStore:
                 raise RuntimeError("intervention recovery state is invalid")
 
     def set_setting(self, key: str, value: object) -> None:
+        key = _require_string(key, "key")
+        if key.startswith(_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX):
+            raise ValueError("setting key is reserved")
         self._connection.execute(
             """
             INSERT INTO settings (key, value_json) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
             """,
-            (_require_string(key, "key"), _encode_json(value)),
+            (key, _encode_json(value)),
         )
 
     def get_setting(self, key: str) -> object | None:
+        key = _require_string(key, "key")
+        if key.startswith(_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX):
+            raise ValueError("setting key is reserved")
         row = self._connection.execute(
-            "SELECT value_json FROM settings WHERE key = ?", (_require_string(key, "key"),)
+            "SELECT value_json FROM settings WHERE key = ?", (key,)
         ).fetchone()
         if row is None:
             return None
@@ -12701,8 +13009,210 @@ class SQLiteStore:
             return claimed_run.status in {"running", *_TERMINAL_RUN_STATUSES}
         return claimed_run.status in _TERMINAL_RUN_STATUSES
 
+    @staticmethod
+    def _intervention_acknowledgment_lineage_key(intervention_id: str) -> str:
+        return f"{_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX}{_prepared_identifier(intervention_id, 'intervention_id')}"
+
+    def _intervention_acknowledgment_lineage_is_unique(
+        self, *, intervention_id: str, key: str,
+    ) -> bool:
+        rows = self._connection.execute(
+            """
+            SELECT key FROM settings
+            WHERE key LIKE ?
+              AND CASE WHEN json_valid(value_json)
+                       THEN json_extract(value_json, '$.intervention_id') END = ?
+            ORDER BY key LIMIT 2
+            """,
+            (f"{_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX}%", intervention_id),
+        ).fetchall()
+        return len(rows) == 1 and rows[0]["key"] == key
+
+    def _intervention_acknowledgment_lineage(
+        self, record: InterventionRecord,
+    ) -> _InterventionAcknowledgmentLineage | None:
+        key = self._intervention_acknowledgment_lineage_key(record.intervention_id)
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("intervention acknowledgment lineage is invalid")
+        row = rows[0]
+        try:
+            raw = _require_string(row["value_json"], "intervention acknowledgment lineage")
+            lineage = _InterventionAcknowledgmentLineage.from_dict(
+                _decode_mapping(raw, "intervention acknowledgment lineage")
+            )
+        except (RuntimeError, ValueError, TypeError) as error:
+            raise RuntimeError("intervention acknowledgment lineage is invalid") from error
+        if (
+            raw != _encode_json(lineage.to_dict())
+            or lineage.intervention_id != record.intervention_id
+            or not self._intervention_acknowledgment_lineage_is_unique(
+                intervention_id=record.intervention_id, key=key,
+            )
+        ):
+            raise RuntimeError("intervention acknowledgment lineage is invalid")
+        return lineage
+
+    @staticmethod
+    def _intervention_acknowledgment_lineage_matches(
+        lineage: _InterventionAcknowledgmentLineage,
+        record: InterventionRecord,
+        acknowledgment_id: str,
+    ) -> bool:
+        if (
+            lineage.acknowledgment_id != acknowledgment_id
+            or lineage.intervention_id != record.intervention_id
+            or lineage.session_id != record.session_id
+            or lineage.task_id != record.task_id
+            or lineage.revision != record.revision
+            or lineage.run_id != record.run_id
+            or lineage.addressed_to is not record.addressed_to
+            or lineage.routed_to is not record.routed_to
+            or lineage.continuation_state is not record.continuation_state
+            or lineage.source_generation != record.source_generation
+            or lineage.resume_generation != record.resume_generation
+            or lineage.fable_session_id != record.fable_session_id
+            or lineage.sol_thread_id != record.sol_thread_id
+        ):
+            return False
+        if record.status is InterventionStatus.READY:
+            expected_owner = (
+                lineage.authorized_resume_attempt_id,
+                lineage.authorized_resume_run_id,
+            )
+        elif record.status is InterventionStatus.CANCELED_BY_STOP and (
+            lineage.retry_resume_attempt_id is None
+        ):
+            expected_owner = (
+                lineage.authorized_resume_attempt_id,
+                lineage.authorized_resume_run_id,
+            )
+        else:
+            expected_owner = (
+                lineage.retry_resume_attempt_id,
+                lineage.retry_resume_run_id,
+            )
+        return expected_owner == (record.resume_attempt_id, record.resume_run_id)
+
+    def _insert_intervention_acknowledgment_lineage(
+        self, lineage: _InterventionAcknowledgmentLineage,
+    ) -> None:
+        key = self._intervention_acknowledgment_lineage_key(lineage.intervention_id)
+        if self._connection.execute(
+            "SELECT 1 FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchone() is not None:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+        if self._connection.execute(
+            """
+            SELECT 1 FROM settings
+            WHERE key LIKE ?
+              AND CASE WHEN json_valid(value_json)
+                       THEN json_extract(value_json, '$.intervention_id') END = ?
+            LIMIT 1
+            """,
+            (f"{_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX}%", lineage.intervention_id),
+        ).fetchone() is not None:
+            raise RuntimeError("intervention acknowledgment lineage is ambiguous")
+        try:
+            encoded = _encode_json(lineage.to_dict())
+            self._connection.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                (key, encoded),
+            )
+        except sqlite3.IntegrityError as error:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently") from error
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["value_json"] != encoded:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+
+    def _replace_intervention_acknowledgment_retry_owner(
+        self,
+        *,
+        record: InterventionRecord,
+        acknowledgment_id: str,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        lineage = self._intervention_acknowledgment_lineage(record)
+        if (
+            lineage is None
+            or not self._intervention_acknowledgment_lineage_matches(
+                lineage, record, acknowledgment_id,
+            )
+        ):
+            raise RuntimeError("intervention acknowledgment lineage is not authenticated")
+        next_lineage = replace(
+            lineage,
+            retry_resume_attempt_id=resume_attempt_id,
+            retry_resume_run_id=resume_run_id,
+        )
+        key = self._intervention_acknowledgment_lineage_key(record.intervention_id)
+        cursor = self._connection.execute(
+            """
+            UPDATE settings SET value_json = ?
+            WHERE key = ? AND value_json = ?
+            """,
+            (
+                _encode_json(next_lineage.to_dict()), key,
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+
+    def _delete_intervention_acknowledgment_lineage(
+        self, record: InterventionRecord, acknowledgment_id: str,
+    ) -> None:
+        lineage = self._intervention_acknowledgment_lineage(record)
+        if (
+            lineage is None
+            or not self._intervention_acknowledgment_lineage_matches(
+                lineage, record, acknowledgment_id,
+            )
+        ):
+            raise RuntimeError("intervention acknowledgment lineage is not authenticated")
+        cursor = self._connection.execute(
+            "DELETE FROM settings WHERE key = ? AND value_json = ?",
+            (
+                self._intervention_acknowledgment_lineage_key(record.intervention_id),
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+
+    def _intervention_acknowledgment_lineage_is_authenticated(
+        self,
+        record: InterventionRecord,
+        acknowledgment_id: object,
+        *,
+        allow_legacy_acknowledgment_lineage: bool,
+    ) -> bool:
+        try:
+            if acknowledgment_id is None:
+                return self._intervention_acknowledgment_lineage(record) is None
+            acknowledged = _prepared_identifier(acknowledgment_id, "acknowledgment_id")
+            lineage = self._intervention_acknowledgment_lineage(record)
+            if lineage is None:
+                return allow_legacy_acknowledgment_lineage
+            return self._intervention_acknowledgment_lineage_matches(
+                lineage, record, acknowledged,
+            )
+        except (RuntimeError, ValueError, TypeError):
+            return False
+
     def _intervention_is_authenticated(
-        self, record: InterventionRecord, acknowledgment_id: object,
+        self,
+        record: InterventionRecord,
+        acknowledgment_id: object,
+        *,
+        allow_legacy_acknowledgment_lineage: bool = False,
     ) -> bool:
         """Validate durable intervention authority without repairing persisted state."""
         task_row = self._connection.execute(
@@ -12875,7 +13385,7 @@ class SQLiteStore:
                 record.resume_generation != task.continuation_generation
                 or (
                     binding is None
-                    and record.resume_generation != record.source_generation + 2
+                    and record.resume_generation < record.source_generation + 2
                 )
                 or (
                     binding is not None
@@ -12886,6 +13396,12 @@ class SQLiteStore:
             ):
                 return False
         elif record.resume_generation != task.continuation_generation:
+            return False
+        if not self._intervention_acknowledgment_lineage_is_authenticated(
+            record,
+            acknowledgment_id,
+            allow_legacy_acknowledgment_lineage=allow_legacy_acknowledgment_lineage,
+        ):
             return False
         return True
 

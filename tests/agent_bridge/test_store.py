@@ -4407,6 +4407,400 @@ def test_authenticated_intervention_retains_only_the_one_acknowledged_retry_line
     assert store.authenticated_intervention(initial.intervention_id) == result
 
 
+def _acknowledged_ordinary_retry(
+    store: SQLiteStore,
+    valid_brief,
+    *,
+    status: store_module.InterventionStatus,
+) -> store_module.InterventionRecord:
+    """Build one ordinary retry through authorization and its exact terminal path."""
+    brief = replace(valid_brief, task_id=f"retry-lineage-{status.value}")
+    store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(brief.task_id, brief.revision, "sol-thread-retry")
+    store._connection.execute(  # noqa: SLF001 - exact eligible Sol fixture
+        "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", "baseline-retry", brief.task_id, brief.revision),
+    )
+    store.set_pending_context(
+        brief.task_id, brief.revision, expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "retry-source", "prompt": "continue exactly"},
+    )
+    store.start_agent_run("retry-source", brief.task_id, brief.revision, "sol")
+    store.set_agent_run_session("retry-source", "sol-thread-retry")
+    initial = store.create_intervention_and_request_stop(
+        intervention_id=f"retry-intervention-{status.value}", session_id="session-1",
+        task_id=brief.task_id, revision=brief.revision,
+        expected_source_generation=1, message="Continue the exact Sol path.",
+        addressed_to=ConversationTarget.SOL, routed_to=ConversationTarget.SOL,
+        run_id="retry-source",
+    )
+    store.finish_agent_run("retry-source", status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(initial.intervention_id, run_id=initial.run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id, expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="retry-first-attempt", resume_run_id="retry-first-run",
+    )
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 0)
+    unknown = store.authenticated_intervention(initial.intervention_id)
+    assert unknown is not None
+    acknowledged = store.authorize_retry_after_unknown(
+        initial.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id=f"retry-ack-{status.value}",
+    )
+    if status is store_module.InterventionStatus.READY:
+        return acknowledged
+    store.begin_intervention_resume(
+        acknowledged.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="retry-second-attempt", resume_run_id="retry-second-run",
+    )
+    if status is store_module.InterventionStatus.RESUMING:
+        result = store.intervention(acknowledged.intervention_id)
+        assert result is not None
+        return result
+    if status is store_module.InterventionStatus.RESUMED:
+        return store.complete_intervention(
+            acknowledged.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+            resume_attempt_id="retry-second-attempt", resume_run_id="retry-second-run",
+        )
+    if status is store_module.InterventionStatus.CANCELED_BY_STOP:
+        return store.cancel_intervention_by_stop(
+            acknowledged.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+        )
+    raise AssertionError(f"unsupported retry lineage status: {status}")
+
+
+def test_recovery_retires_an_acknowledged_retry_to_a_reauthorizable_unknown(
+    tmp_path, valid_brief,
+) -> None:
+    """Startup recovery must not persist an acknowledged row in UNKNOWN state."""
+    path = tmp_path / "acknowledged-retry-recovery.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.RESUMING,
+    )
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.recover_active_tasks() == store_module.RecoverySummary(0, 1, 0)
+    unknown = reopened.authenticated_intervention(record.intervention_id)
+    assert unknown is not None
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    assert reopened._connection.execute(  # noqa: SLF001 - durable terminal assertion
+        "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+        (record.intervention_id,),
+    ).fetchone()["acknowledgment_id"] is None
+    retried = reopened.authorize_retry_after_unknown(
+        record.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="retry-after-recovery-ack",
+    )
+    assert retried.status is store_module.InterventionStatus.READY
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
+    ),
+)
+@pytest.mark.parametrize("mutation", ("acknowledgment", "retry_owner"))
+def test_acknowledged_retry_rejects_safe_substitution_without_repair(
+    tmp_path, valid_brief, status: store_module.InterventionStatus, mutation: str,
+) -> None:
+    """A retry's exact acknowledgment and owner IDs are immutable durable authority."""
+    path = tmp_path / f"ack-substitution-{status.value}-{mutation}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(store, valid_brief, status=status)
+    if mutation == "acknowledgment":
+        store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "UPDATE interventions SET acknowledgment_id = 'safe-substituted-ack' "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "retry_owner":
+        store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "UPDATE interventions SET resume_attempt_id = 'safe-substituted-attempt', "
+            "resume_run_id = 'safe-substituted-run' WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    else:
+        raise AssertionError(f"unknown substitution: {mutation}")
+    store.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    if status in {
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+    }:
+        with pytest.raises(RuntimeError, match="authenticated"):
+            reopened.current_visible_intervention_for_task(record.task_id, record.revision)
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    if status is store_module.InterventionStatus.READY:
+        with pytest.raises(RuntimeError, match="not ready to resume"):
+            reopened.begin_intervention_resume(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+                resume_attempt_id="substitution-attempt",
+                resume_run_id="substitution-run",
+            )
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+def test_acknowledged_retry_rejects_coordinated_source_resume_generation_substitution(
+    tmp_path, valid_brief,
+) -> None:
+    """A mutually consistent task/event rewrite cannot replace retry provenance."""
+    path = tmp_path / "acknowledged-generation-substitution.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.READY,
+    )
+    event_row = next(
+        row for row in store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "SELECT sequence, payload_json FROM events "
+            "WHERE session_id = ? AND task_id = ? AND actor = 'user' AND kind = 'conversation' "
+            "ORDER BY sequence",
+            (record.session_id, record.task_id),
+        )
+        if json.loads(row["payload_json"]).get("continuation_generation")
+        == record.source_generation
+    )
+    generation_offset = 11
+    event_payload = json.loads(event_row["payload_json"])
+    event_payload["continuation_generation"] = record.source_generation + generation_offset
+    store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+        "UPDATE events SET payload_json = ? WHERE session_id = ? AND sequence = ?",
+        (
+            json.dumps(event_payload, separators=(",", ":"), sort_keys=True),
+            record.session_id,
+            event_row["sequence"],
+        ),
+    )
+    store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+        "UPDATE interventions SET source_generation = source_generation + ?, "
+        "resume_generation = resume_generation + ? WHERE intervention_id = ?",
+        (generation_offset, generation_offset, record.intervention_id),
+    )
+    store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+        "UPDATE tasks SET continuation_generation = continuation_generation + ? "
+        "WHERE task_id = ? AND revision = ?",
+        (generation_offset, record.task_id, record.revision),
+    )
+    store.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.current_visible_intervention_for_task(record.task_id, record.revision)
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    with pytest.raises(RuntimeError, match="not ready to resume"):
+        reopened.begin_intervention_resume(
+            record.intervention_id,
+            expected_resume_generation=record.resume_generation + generation_offset,
+            resume_attempt_id="generation-substitution-attempt",
+            resume_run_id="generation-substitution-run",
+        )
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+def test_startup_backfills_one_structurally_valid_legacy_acknowledgment_once(
+    tmp_path, valid_brief,
+) -> None:
+    """A legitimate pre-lineage retry becomes exact without rewriting other settings."""
+    path = tmp_path / "legacy-acknowledgment-backfill.sqlite3"
+    lineage_key = "agent_bridge.internal.intervention_acknowledgment.retry-intervention-ready"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.READY,
+    )
+    store.set_setting("unrelated-setting", {"preserve": "exactly"})
+    store._connection.execute(  # noqa: SLF001 - simulate a pre-lineage database
+        "DELETE FROM settings WHERE key = ?", (lineage_key,),
+    )
+    store.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert migrated.authenticated_intervention(record.intervention_id) == record
+    lineage = migrated._connection.execute(  # noqa: SLF001 - durable migration assertion
+        "SELECT value_json FROM settings WHERE key = ?", (lineage_key,),
+    ).fetchone()
+    assert lineage is not None
+    assert migrated.get_setting("unrelated-setting") == {"preserve": "exactly"}
+    migrated.close()
+    first_migration_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.authenticated_intervention(record.intervention_id) == record
+    assert reopened.get_setting("unrelated-setting") == {"preserve": "exactly"}
+    reopened.close()
+    assert path.read_bytes() == first_migration_bytes
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
+    ),
+)
+def test_startup_backfill_preserves_a_legitimate_legacy_retry_owner(
+    tmp_path, valid_brief, status: store_module.InterventionStatus,
+) -> None:
+    """Compatibility migration retains the owner of a retry already in flight."""
+    path = tmp_path / f"legacy-acknowledgment-retry-owner-{status.value}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(store, valid_brief, status=status)
+    lineage_key = (
+        "agent_bridge.internal.intervention_acknowledgment."
+        f"{record.intervention_id}"
+    )
+    store._connection.execute(  # noqa: SLF001 - simulate a pre-lineage database
+        "DELETE FROM settings WHERE key = ?", (lineage_key,),
+    )
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.authenticated_intervention(record.intervention_id) == record
+    reopened.close()
+
+
+def test_startup_backfill_rejects_duplicate_physical_private_settings_rows(
+    tmp_path, valid_brief,
+) -> None:
+    """A legacy settings table without its primary key cannot hide a duplicate row."""
+    path = tmp_path / "legacy-duplicate-private-settings.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.READY,
+    )
+    lineage_key = (
+        "agent_bridge.internal.intervention_acknowledgment."
+        f"{record.intervention_id}"
+    )
+    store.close()
+
+    legacy = sqlite3.connect(path)
+    settings_rows = legacy.execute(
+        "SELECT key, value_json FROM settings",
+    ).fetchall()
+    legacy.execute("ALTER TABLE settings RENAME TO settings_with_primary_key")
+    legacy.execute(
+        "CREATE TABLE settings (key TEXT NOT NULL, value_json TEXT NOT NULL)",
+    )
+    legacy.executemany(
+        "INSERT INTO settings (key, value_json) VALUES (?, ?)", settings_rows,
+    )
+    legacy.execute("DROP TABLE settings_with_primary_key")
+    legacy.execute(
+        "INSERT INTO settings (key, value_json) VALUES (?, '[')", (lineage_key,),
+    )
+    legacy.commit()
+    legacy.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+@pytest.mark.parametrize("mutation", ("acknowledgment", "duplicate", "malformed"))
+def test_startup_lineage_backfill_never_retrusts_a_subsequent_tamper(
+    tmp_path, valid_brief, mutation: str,
+) -> None:
+    """A completed compatibility backfill is an exact one-time boundary, not TOFU."""
+    path = tmp_path / f"legacy-acknowledgment-tamper-{mutation}.sqlite3"
+    lineage_key = "agent_bridge.internal.intervention_acknowledgment.retry-intervention-ready"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _acknowledged_ordinary_retry(
+        store, valid_brief, status=store_module.InterventionStatus.READY,
+    )
+    store._connection.execute(  # noqa: SLF001 - simulate a pre-lineage database
+        "DELETE FROM settings WHERE key = ?", (lineage_key,),
+    )
+    store.close()
+
+    migrated = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert migrated.authenticated_intervention(record.intervention_id) == record
+    lineage = migrated._connection.execute(  # noqa: SLF001 - durable tamper seed
+        "SELECT value_json FROM settings WHERE key = ?", (lineage_key,),
+    ).fetchone()
+    assert lineage is not None
+    migrated.close()
+
+    tamper = sqlite3.connect(path)
+    if mutation == "acknowledgment":
+        tamper.execute(
+            "UPDATE interventions SET acknowledgment_id = 'safe-post-backfill-ack' "
+            "WHERE intervention_id = ?", (record.intervention_id,),
+        )
+    elif mutation == "duplicate":
+        tamper.execute(
+            "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+            (f"{lineage_key}.duplicate", lineage["value_json"]),
+        )
+    elif mutation == "malformed":
+        tamper.execute(
+            "UPDATE settings SET value_json = '[' WHERE key = ?", (lineage_key,),
+        )
+    else:
+        raise AssertionError(f"unknown post-backfill tamper: {mutation}")
+    tamper.commit()
+    tamper.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.current_visible_intervention_for_task(record.task_id, record.revision)
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+def test_intervention_acknowledgment_lineage_namespace_has_no_public_setting_seam(
+    tmp_path,
+) -> None:
+    """Only exact Store transitions may write or read private retry authority."""
+    store = _store(tmp_path)
+    key = "agent_bridge.internal.intervention_acknowledgment.intervention-1"
+
+    with pytest.raises(ValueError, match="reserved"):
+        store.set_setting(key, {"acknowledgment_id": "public-write"})
+    with pytest.raises(ValueError, match="reserved"):
+        store.get_setting(key)
+
+
 def test_directed_intervention_binding_migration_is_additive_idempotent_and_preserves_rows(
     tmp_path, valid_brief,
 ) -> None:
