@@ -31,7 +31,7 @@ from agent_bridge.contracts import (
     StreamEvent,
     TaskBrief,
 )
-from agent_bridge.coordinator import Coordinator
+from agent_bridge.coordinator import Coordinator, InterventionIntent
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -41,8 +41,9 @@ from agent_bridge.hub import (
     RuntimeStatus,
 )
 from agent_bridge.projects import project_id_for_root
+from agent_bridge.process import ProcessRunner, StopReceipt
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import SQLiteStore
+from agent_bridge.store import InterventionStatus, SQLiteStore
 
 
 SESSION_ID = "session-1"
@@ -1941,6 +1942,29 @@ class _RealHubHarness:
             runtime.store.close()
 
 
+class _InterventionRunner(ProcessRunner):
+    """Controlled process edge; the Hub, Coordinator, and Store stay real."""
+
+    def __init__(self) -> None:
+        super().__init__(stop_grace_seconds=0)
+        self.stores: dict[str, SQLiteStore] = {}
+        self.stops: list[str] = []
+        self.stop_started = asyncio.Event()
+        self.release_stop = asyncio.Event()
+        self.block_stop = False
+
+    async def stop(self, run_id: str, *, timeout_seconds: float) -> StopReceipt:
+        assert timeout_seconds > 0
+        self.stops.append(run_id)
+        self.stop_started.set()
+        if self.block_stop:
+            await self.release_stop.wait()
+        self.stores[run_id].finish_agent_run(
+            run_id, status="interrupted", exit_code=-15,
+        )
+        return StopReceipt(run_id=run_id, was_running=True, process_exited=True)
+
+
 def _real_hub_harness(
     tmp_path: Path,
     *,
@@ -1948,6 +1972,7 @@ def _real_hub_harness(
     sol_results: tuple[object, ...] = ("ready",),
     fable: object | None = None,
     repository: object | None = None,
+    runner: object | None = None,
 ) -> _RealHubHarness:
     static_dir = tmp_path / "real-static"
     static_dir.mkdir()
@@ -1968,7 +1993,7 @@ def _real_hub_harness(
         coordinator = Coordinator(
             store=store,
             repository=object() if repository is None else repository,
-            runner=object(),
+            runner=object() if runner is None else runner,
             fable=object() if fable is None else fable,
             sol=object(),
             ids=_RealIds(),
@@ -4112,3 +4137,700 @@ def test_compatibility_model_starts_use_the_injected_fresh_readiness_check(
         )
     assert response.status_code == 409
     assert web_harness.coordinator.calls == []
+
+
+def test_intervention_request_body_is_strict_before_any_workflow_lookup(
+    hub_harness: _HubHarness,
+) -> None:
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/intervene",
+            json={
+                "intervention_id": "intervention-1", "message": "Keep scope exact.",
+                "addressed_to": "fable", "revision": 1,
+                "continuation_generation": 1, "routed_to": "sol",
+            },
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert hub_harness.workflows.prepared == []
+
+
+def _seed_live_fable_intervention_source(
+    harness: _RealHubHarness,
+    *,
+    runtime_key: str,
+    brief: TaskBrief,
+    runner: _InterventionRunner,
+    run_id: str,
+    lease: ActiveAgentLease | None = None,
+) -> tuple[_HubRuntime, LeaseToken]:
+    """Seed only the real persisted source run that an Intervene route owns."""
+    runtime = harness.runtimes[runtime_key]
+    runtime.store.save_task("shared-chat", brief, TaskState.FABLE_PLANNING)
+    runtime.store.start_agent_run(run_id, brief.task_id, brief.revision, "fable")
+    runner.stores[run_id] = runtime.store
+    owner = harness.lease if lease is None else lease
+    return runtime, owner.acquire(
+        project_id=runtime.project_id,
+        session_id="shared-chat",
+        task_id=brief.task_id,
+    )
+
+
+def _seed_unknown_intervention(
+    runtime: _HubRuntime,
+    *,
+    brief: TaskBrief,
+) -> object:
+    """Build a genuine UNKNOWN record without invoking a provider."""
+    store = runtime.store
+    source_run_id = "unknown-source-run"
+    sol_thread_id = "123e4567-e89b-12d3-a456-426614174000"
+    store.save_task("shared-chat", brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(brief.task_id, brief.revision, sol_thread_id)
+    store.set_pending_context(
+        brief.task_id,
+        brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": source_run_id, "prompt": "Continue exactly."},
+    )
+    store.start_agent_run(source_run_id, brief.task_id, brief.revision, "sol")
+    store.set_agent_run_session(source_run_id, sol_thread_id)
+    created = store.create_intervention_and_request_stop(
+        intervention_id="unknown-intervention",
+        session_id="shared-chat",
+        task_id=brief.task_id,
+        revision=brief.revision,
+        expected_source_generation=1,
+        message="Keep the approved boundary exact.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id=source_run_id,
+    )
+    store.finish_agent_run(source_run_id, status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(created.intervention_id, run_id=source_run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id,
+        expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="unknown-attempt",
+        resume_run_id="unknown-resume-run",
+    )
+    unknown = store.mark_resume_outcome_unknown(
+        ready.intervention_id,
+        resume_attempt_id="unknown-attempt",
+        resume_run_id="unknown-resume-run",
+    )
+    store.recover_active_tasks()
+    return unknown
+
+
+def test_intervention_routes_require_keyed_csrf_usage_and_strict_exact_inputs(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    """A route that accepts any browser input could route hidden process authority."""
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.FABLE_PLANNING)
+    payload = {
+        "intervention_id": "intervention-1",
+        "message": "Keep the approved scope exact.",
+        "addressed_to": "fable",
+        "revision": valid_brief.revision,
+        "continuation_generation": 1,
+    }
+    path = "/api/projects/project-a/chats/chat-a/tasks/task-1/intervene"
+    with TestClient(hub_harness.app) as unauthenticated:
+        assert unauthenticated.post(path, json=payload).status_code == 403
+    with _authenticated_hub_client(hub_harness) as client:
+        assert client.post(path, json=payload).status_code == 403
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        assert client.post(path, json=payload, headers=headers).status_code == 409
+        hub_harness.hub_store.acknowledge_usage_credits()
+        assert client.post(
+            path,
+            json={**payload, "revision": valid_brief.revision + 1},
+            headers=headers,
+        ).status_code == 409
+        invalid_payloads = (
+            {**payload, "intervention_id": "x" * 129},
+            {**payload, "message": " \t"},
+            {**payload, "message": "unsafe\x00text"},
+            {**payload, "message": "x" * (16 * 1024 + 1)},
+            {**payload, "addressed_to": "team"},
+            {**payload, "continuation_generation": 0},
+            {**payload, "routed_to": "sol"},
+            {**payload, "run_id": "run-1"},
+            {**payload, "provider_session_id": "provider-1"},
+            {**payload, "continuation": "fable_planning"},
+            {**payload, "path": "/repo"},
+            {**payload, "command": "unsafe"},
+            {**payload, "env": {"HOME": "/tmp"}},
+        )
+        for invalid in invalid_payloads:
+            response = client.post(path, json=invalid, headers=headers)
+            assert response.status_code == 422
+            assert response.json() == {"detail": "invalid request"}
+    assert hub_harness.workflows.prepared == []
+
+
+def test_intervene_commits_before_blocked_stop_and_rechecks_model_gate(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """If scheduling owned the write, a blocked source could make HTTP lie about intent."""
+    runner = _InterventionRunner()
+    runner.block_stop = True
+    harness = _real_hub_harness(
+        tmp_path,
+        runner=runner,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime, owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="blocked-source-run",
+    )
+    path = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        f"tasks/{valid_brief.task_id}/intervene"
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            stale = client.post(
+                path,
+                json={
+                    "intervention_id": "stale-generation-intervention",
+                    "message": "This stale generation must not claim the source.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation + 1,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert stale.status_code == 409
+            assert runtime.store.intervention("stale-generation-intervention") is None
+            assert runner.stops == []
+            response = client.post(
+                path,
+                json={
+                    "intervention_id": "blocked-intervention",
+                    "message": "Pause at this exact boundary.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 202
+            accepted = response.json()
+            assert accepted["scheduled"] is True
+            assert accepted["intervention"] == {
+                "intervention_id": "blocked-intervention",
+                "message": "Pause at this exact boundary.",
+                "addressed_to": "fable",
+                "routed_to": "fable",
+                "status": "pending_stop",
+                "task_id": valid_brief.task_id,
+                "revision": valid_brief.revision,
+                "source_generation": owner.generation,
+                "resume_generation": owner.generation + 1,
+                "eligible": True,
+                "visible_discontinuity": True,
+                "warning": None,
+            }
+            committed = runtime.store.intervention("blocked-intervention")
+            assert committed is not None
+            assert committed.status is InterventionStatus.PENDING_STOP
+            assert runtime.store.get_task(
+                valid_brief.task_id, valid_brief.revision,
+            ).state is TaskState.INTERRUPTED
+            client.portal.call(runner.stop_started.wait)
+            assert runner.stops == ["blocked-source-run"]
+            assert harness.lease.snapshot() == owner
+            client.portal.call(runner.release_stop.set)
+            _wait_until(lambda: not harness.app.state.active_coroutines)
+        ready = runtime.store.intervention("blocked-intervention")
+        assert ready is not None
+        assert ready.status is InterventionStatus.READY
+        assert ready.resume_attempt_id is None
+        assert ready.resume_run_id is None
+        assert harness.lease.snapshot() is None
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("final_status", ("pending", "ready"))
+def test_intervention_scheduler_rejection_preserves_source_and_releases_recovery_lease(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+    final_status: str,
+) -> None:
+    """Failed installation must not release a source token or retain a recovery token."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(
+        tmp_path,
+        runner=runner,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime, source_owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="recovery-source-run",
+    )
+    path = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        f"tasks/{valid_brief.task_id}/intervene"
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            accepted = client.post(
+                path,
+                json={
+                    "intervention_id": "recovery-intervention",
+                    "message": "Preserve this durable stop intent.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": source_owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert accepted.status_code == 202
+        assert accepted.json()["scheduled"] is False
+        record = runtime.store.intervention("recovery-intervention")
+        assert record is not None
+        assert record.status is InterventionStatus.PENDING_STOP
+        assert harness.lease.snapshot() == source_owner
+        assert runner.stops == []
+        assert harness.app.state.active_coroutines == set()
+
+        if final_status == "ready":
+            runtime.store.finish_agent_run(
+                "recovery-source-run", status="interrupted", exit_code=-15,
+            )
+            record = runtime.store.mark_intervention_ready(
+                record.intervention_id, run_id=record.run_id,
+            )
+
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        resume_path = (
+            f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+            f"interventions/{record.intervention_id}/resume"
+        )
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            rejected = client.post(
+                resume_path,
+                json={"expected_resume_generation": record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert rejected.status_code == 202
+        assert rejected.json()["scheduled"] is False
+        assert runtime.store.intervention(record.intervention_id) == record
+        assert restarted_lease.snapshot() is None
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+
+        monkeypatch.undo()
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            recovered = client.post(
+                resume_path,
+                json={"expected_resume_generation": record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert recovered.status_code == 202
+            assert recovered.json()["scheduled"] is True
+            _wait_until(lambda: not restarted_app.state.active_coroutines)
+        recovered_record = runtime.store.intervention(record.intervention_id)
+        assert recovered_record is not None
+        assert recovered_record.status is InterventionStatus.READY
+        assert recovered_record.resume_attempt_id is None
+        assert restarted_lease.snapshot() is None
+    finally:
+        harness.close()
+
+
+def test_intervention_persistence_failure_is_bounded_and_never_scheduled(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error before durable commit must not start an unowned stop coroutine."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime, owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="failed-persistence-source",
+    )
+
+    def fail_persistence(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected persistence failure")
+
+    monkeypatch.setattr(
+        runtime.store, "create_intervention_and_request_stop", fail_persistence,
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                f"tasks/{valid_brief.task_id}/intervene",
+                json={
+                    "intervention_id": "failed-persistence-intervention",
+                    "message": "Never schedule an uncommitted stop.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 409
+        assert response.json() == {"detail": "workflow is not currently available"}
+        assert runtime.store.intervention("failed-persistence-intervention") is None
+        assert runtime.store.get_task(
+            valid_brief.task_id, valid_brief.revision,
+        ).state is TaskState.FABLE_PLANNING
+        assert runner.stops == []
+        assert harness.lease.snapshot() == owner
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_resume_rejects_an_unauthenticated_intervention_before_scheduling(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """Using the raw row here would let a tampered record obtain a recovery lease."""
+    runner = _InterventionRunner()
+    runner.block_stop = True
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime, source_owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="tampered-source-run",
+    )
+    try:
+        prepared = harness.workflows.prepare_intervention(
+            project_id=runtime.project_id,
+            session_id="shared-chat",
+            task_id=valid_brief.task_id,
+            intent=InterventionIntent(
+                intervention_id="tampered-intervention",
+                message="Keep this authenticated.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=valid_brief.revision,
+                continuation_generation=source_owner.generation,
+            ),
+        )
+        runtime.store._connection.execute(
+            "UPDATE interventions SET message = 'tampered' WHERE intervention_id = ?",
+            (prepared.record.intervention_id,),
+        )
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                "interventions/tampered-intervention/resume",
+                json={"expected_resume_generation": prepared.record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            missing = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                "interventions/missing-intervention/resume",
+                json={"expected_resume_generation": prepared.record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 404
+        assert missing.status_code == 404
+        assert restarted_lease.snapshot() is None
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_unknown_retry_requires_literal_acknowledgement_and_is_not_resume(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """An ordinary resume must never silently authorize a possibly executed retry."""
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime = harness.runtimes["a"]
+    unknown = _seed_unknown_intervention(runtime, brief=valid_brief)
+    assert runtime.store.authenticated_intervention("unknown-intervention") == unknown
+    base = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        "interventions/unknown-intervention"
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            ordinary = client.post(
+                f"{base}/resume",
+                json={"expected_resume_generation": unknown.resume_generation},
+                headers=headers,
+            )
+            assert ordinary.status_code == 409
+            for invalid_acknowledgement in (False, "true"):
+                rejected = client.post(
+                    f"{base}/authorize-retry",
+                    json={
+                        "expected_resume_generation": unknown.resume_generation,
+                        "acknowledgment_id": "acknowledgment-1",
+                        "acknowledge_possible_prior_execution": invalid_acknowledgement,
+                    },
+                    headers=headers,
+                )
+                assert rejected.status_code == 422
+            authorized = client.post(
+                f"{base}/authorize-retry",
+                json={
+                    "expected_resume_generation": unknown.resume_generation,
+                    "acknowledgment_id": "acknowledgment-1",
+                    "acknowledge_possible_prior_execution": True,
+                },
+                headers=headers,
+            )
+            assert authorized.status_code == 202
+            assert authorized.json()["scheduled"] is True
+            _wait_until(lambda: not harness.app.state.active_coroutines)
+        retried = runtime.store.authenticated_intervention("unknown-intervention")
+        assert retried is not None
+        assert retried.status is InterventionStatus.READY
+        assert retried.resume_generation == unknown.resume_generation + 1
+        assert retried.resume_attempt_id is None
+        assert retried.resume_run_id is None
+    finally:
+        harness.close()
+
+
+def test_intervention_routes_select_only_the_named_project_and_conflicts_do_not_schedule(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hub-wide ID lookup would let one project observe or alter another's intent."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime_a, owner_a = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="project-a-source",
+    )
+    try:
+        record_a = harness.workflows.prepare_intervention(
+            project_id=runtime_a.project_id,
+            session_id="shared-chat",
+            task_id=valid_brief.task_id,
+            intent=InterventionIntent(
+                intervention_id="shared-intervention",
+                message="Project A guidance.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=valid_brief.revision,
+                continuation_generation=owner_a.generation,
+            ),
+        ).record
+        harness.lease.release(owner_a)
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        runtime_b, owner_b = _seed_live_fable_intervention_source(
+            harness,
+            runtime_key="b",
+            brief=valid_brief,
+            runner=runner,
+            run_id="project-b-source",
+            lease=restarted_lease,
+        )
+
+        def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+            raise RuntimeError("scheduler unavailable")
+
+        with monkeypatch.context() as scoped:
+            def foreign_query(*args: object, **kwargs: object) -> object:
+                raise AssertionError("the project A Store must not be queried")
+
+            scoped.setattr(runtime_a.store, "authenticated_intervention", foreign_query)
+            scoped.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+            with TestClient(restarted_app) as client:
+                client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+                created_b = client.post(
+                    f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                    f"tasks/{valid_brief.task_id}/intervene",
+                    json={
+                        "intervention_id": "shared-intervention",
+                        "message": "Project B guidance.",
+                        "addressed_to": "fable",
+                        "revision": valid_brief.revision,
+                        "continuation_generation": owner_b.generation,
+                    },
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+                repeated_b = client.post(
+                    f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                    f"tasks/{valid_brief.task_id}/intervene",
+                    json={
+                        "intervention_id": "shared-intervention",
+                        "message": "Project B guidance.",
+                        "addressed_to": "fable",
+                        "revision": valid_brief.revision,
+                        "continuation_generation": owner_b.generation,
+                    },
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+            assert created_b.status_code == 202
+            assert created_b.json()["scheduled"] is False
+            assert repeated_b.status_code == 202
+            assert repeated_b.json() == created_b.json()
+        record_b = runtime_b.store.intervention("shared-intervention")
+        assert record_b is not None
+        assert record_b.message == "Project B guidance."
+        assert runtime_a.store.intervention("shared-intervention") == record_a
+        assert runner.stops == []
+
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            conflict = client.post(
+                f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                f"tasks/{valid_brief.task_id}/intervene",
+                json={
+                    "intervention_id": "shared-intervention",
+                    "message": "Conflicting B guidance.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner_b.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert conflict.status_code == 409
+        assert runtime_b.store.intervention("shared-intervention") == record_b
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+
+        with monkeypatch.context() as scoped:
+            def foreign_resume_query(*args: object, **kwargs: object) -> object:
+                raise AssertionError("the project B Store must not be queried")
+
+            scoped.setattr(runtime_b.store, "intervention", foreign_resume_query)
+            with TestClient(restarted_app) as client:
+                client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+                foreign_resume = client.post(
+                    f"/api/projects/{runtime_a.project_id}/chats/shared-chat/"
+                    "interventions/shared-intervention/resume",
+                    json={"expected_resume_generation": record_a.resume_generation},
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+        assert foreign_resume.status_code == 409
+        assert runtime_a.store.intervention("shared-intervention") == record_a
+        assert runtime_b.store.intervention("shared-intervention") == record_b
+        assert restarted_app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_hub_bootstrap_intervention_projection_is_allowlisted_and_warns_unknown(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """The bootstrap must not turn a durable control record into process disclosure."""
+    harness = _real_hub_harness(tmp_path)
+    runtime = harness.runtimes["a"]
+    unknown = _seed_unknown_intervention(runtime, brief=valid_brief)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            task = client.get(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/bootstrap"
+            ).json()["tasks"][0]
+        intervention = task["intervention"]
+        assert set(intervention) == {
+            "intervention_id", "message", "addressed_to", "routed_to", "status",
+            "task_id", "revision", "source_generation", "resume_generation",
+            "eligible", "visible_discontinuity", "warning",
+        }
+        assert intervention == {
+            "intervention_id": "unknown-intervention",
+            "message": "Keep the approved boundary exact.",
+            "addressed_to": "fable",
+            "routed_to": "fable",
+            "status": "resume_outcome_unknown",
+            "task_id": valid_brief.task_id,
+            "revision": valid_brief.revision,
+            "source_generation": 1,
+            "resume_generation": unknown.resume_generation,
+            "eligible": False,
+            "visible_discontinuity": False,
+            "warning": "prior resume outcome is unknown and may have executed",
+        }
+        serialized = str(intervention)
+        for forbidden in (
+            "run_id", "resume_attempt_id", "fable_session_id", "sol_thread_id",
+            "pending", "baseline", "raw_result", "command", "process_group",
+        ):
+            assert forbidden not in serialized
+    finally:
+        harness.close()

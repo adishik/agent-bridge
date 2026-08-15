@@ -36,7 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 from agent_bridge.contracts import ConversationTarget, StreamEvent, TaskBrief
-from agent_bridge.coordinator import Coordinator
+from agent_bridge.coordinator import Coordinator, InterventionIntent
 from agent_bridge.store import (
     EVENT_REPLAY_PAGE_SIZE,
     MAX_CHAT_PAGE_SIZE,
@@ -45,6 +45,8 @@ from agent_bridge.store import (
     SQLiteStore,
     TaskOverview,
     TaskRecord,
+    InterventionRecord,
+    InterventionStatus,
 )
 
 if TYPE_CHECKING:
@@ -250,6 +252,38 @@ class ExchangeGrantRequest(_StrictRequest):
         return _safe_browser_identifier(value, "request_id")
 
 
+class InterventionRequest(_StrictRequest):
+    intervention_id: StrictStr
+    message: StrictStr
+    addressed_to: Literal["fable", "sol"]
+    revision: StrictInt = Field(ge=0)
+    continuation_generation: StrictInt = Field(ge=1)
+
+    @field_validator("intervention_id")
+    @classmethod
+    def _intervention_id_is_safe(cls, value: str) -> str:
+        return _safe_browser_identifier(value, "intervention_id")
+
+    @field_validator("message")
+    @classmethod
+    def _message_is_safe(cls, value: str) -> str:
+        return _non_empty_browser_text(value, "message")
+
+
+class InterventionResumeRequest(_StrictRequest):
+    expected_resume_generation: StrictInt = Field(ge=1)
+
+
+class UnknownOutcomeRetryRequest(InterventionResumeRequest):
+    acknowledgment_id: StrictStr
+    acknowledge_possible_prior_execution: Literal[True]
+
+    @field_validator("acknowledgment_id")
+    @classmethod
+    def _acknowledgment_id_is_safe(cls, value: str) -> str:
+        return _safe_browser_identifier(value, "acknowledgment_id")
+
+
 def _non_empty_browser_text(value: str, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} must be non-empty")
@@ -450,6 +484,32 @@ def create_hub_app(
             return [thaw_projection(item) for item in value]
         return value
 
+    def intervention_projection(record: InterventionRecord) -> Mapping[str, object]:
+        unknown = record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        return {
+            "intervention_id": record.intervention_id,
+            "message": record.message,
+            "addressed_to": record.addressed_to.value,
+            "routed_to": record.routed_to.value,
+            "status": record.status.value,
+            "task_id": record.task_id,
+            "revision": record.revision,
+            "source_generation": record.source_generation,
+            "resume_generation": record.resume_generation,
+            "eligible": record.status in {
+                InterventionStatus.PENDING_STOP,
+                InterventionStatus.READY,
+            },
+            "visible_discontinuity": (
+                record.continuation_state.value == "fable_planning"
+                and record.fable_session_id is None
+            ),
+            "warning": (
+                "prior resume outcome is unknown and may have executed"
+                if unknown else None
+            ),
+        }
+
     def task_snapshot(runtime: object, overview: TaskOverview) -> Mapping[str, object]:
         task = overview.task
         store = getattr(runtime, "store")
@@ -469,6 +529,9 @@ def create_hub_app(
             session_id=task.session_id,
             task_id=task.task_id,
             revision=task.revision,
+        )
+        intervention = store.current_visible_intervention_for_task(
+            task.task_id, task.revision,
         )
         return {
             "task_id": task.task_id,
@@ -493,6 +556,9 @@ def create_hub_app(
             "review": thaw_projection(overview.review),
             "clarification": thaw_projection(overview.clarification),
             "activity": thaw_projection(overview.activity),
+            "intervention": (
+                None if intervention is None else intervention_projection(intervention)
+            ),
         }
 
     def chat_snapshot(chat: ChatRecord) -> Mapping[str, object]:
@@ -570,6 +636,19 @@ def create_hub_app(
                 status_code=status.HTTP_404_NOT_FOUND, detail="task not found"
             )
         return task
+
+    def selected_intervention(
+        runtime: object, session_id: str, intervention_id: str,
+    ) -> InterventionRecord:
+        try:
+            record = runtime.store.authenticated_intervention(intervention_id)
+        except (RuntimeError, ValueError):
+            record = None
+        if record is None or record.session_id != session_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="intervention not found"
+            )
+        return record
 
     def workflow_http_error(error: BaseException) -> None:
         if isinstance(error, LookupError):
@@ -1149,6 +1228,102 @@ def create_hub_app(
         ):
             raise recoverable_preparation(prepared)
         return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/intervene",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def intervene_task(
+        project_id: ProjectId, session_id: SessionId, task_id: TaskId,
+        body: InterventionRequest,
+    ) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        task = selected_task(runtime, session_id, task_id)
+        if hub_store.usage_credits_acknowledged() is not True:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="usage credits must be acknowledged")
+        if body.revision != task.revision:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="intervention must name the latest exact revision")
+        try:
+            prepared = workflows.prepare_intervention(
+                project_id=project_id, session_id=session_id, task_id=task_id,
+                intent=InterventionIntent(
+                    intervention_id=body.intervention_id, message=body.message,
+                    addressed_to=ConversationTarget(body.addressed_to), revision=body.revision,
+                    continuation_generation=body.continuation_generation,
+                ),
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        installed = install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.continue_intervention(prepared),
+            abort=lambda value, reason: workflows.abort_prepared_intervention(value, reason=reason),
+        )
+        return {"intervention": intervention_projection(prepared.record), "scheduled": installed}
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/interventions/{intervention_id}/resume",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def resume_intervention(
+        project_id: ProjectId, session_id: SessionId, intervention_id: TaskId,
+        body: InterventionResumeRequest,
+    ) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        current = selected_intervention(runtime, session_id, intervention_id)
+        if hub_store.usage_credits_acknowledged() is not True:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="usage credits must be acknowledged")
+        try:
+            if current.resume_generation != body.expected_resume_generation:
+                raise RuntimeError("intervention resume generation changed")
+            prepared = workflows.prepare_recovery_resume(
+                project_id=project_id, session_id=session_id, intervention_id=intervention_id,
+                expected_resume_generation=body.expected_resume_generation,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        installed = install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.continue_intervention(prepared),
+            abort=lambda value, reason: workflows.abort_prepared_intervention(value, reason=reason),
+        )
+        return {"intervention": intervention_projection(prepared.record), "scheduled": installed}
+
+    @app.post(
+        "/api/projects/{project_id}/chats/{session_id}/interventions/{intervention_id}/authorize-retry",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(require_mutation)],
+    )
+    async def authorize_intervention_retry(
+        project_id: ProjectId, session_id: SessionId, intervention_id: TaskId,
+        body: UnknownOutcomeRetryRequest,
+    ) -> Mapping[str, object]:
+        runtime = selected_runtime(project_id)
+        selected_chat(runtime, session_id)
+        if hub_store.usage_credits_acknowledged() is not True:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="usage credits must be acknowledged")
+        try:
+            selected_intervention(runtime, session_id, intervention_id)
+            authorized = runtime.store.authorize_retry_after_unknown(
+                intervention_id, expected_resume_generation=body.expected_resume_generation,
+                acknowledgment_id=body.acknowledgment_id,
+            )
+            prepared = workflows.prepare_recovery_resume(
+                project_id=project_id, session_id=session_id, intervention_id=intervention_id,
+                expected_resume_generation=authorized.resume_generation,
+            )
+        except BaseException as error:
+            workflow_http_error(error)
+        installed = install_prepared_action(
+            prepared=prepared,
+            coroutine_factory=lambda: workflows.continue_intervention(prepared),
+            abort=lambda value, reason: workflows.abort_prepared_intervention(value, reason=reason),
+        )
+        return {"intervention": intervention_projection(prepared.record), "scheduled": installed}
 
     @app.post(
         "/api/projects/{project_id}/chats/{session_id}/tasks/{task_id}/stop",

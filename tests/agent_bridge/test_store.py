@@ -4108,6 +4108,109 @@ def test_intervention_migration_is_additive_idempotent_and_preserves_current_row
     assert path.read_bytes() == first_migration_bytes
 
 
+def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read_only(
+    tmp_path, valid_brief,
+) -> None:
+    """The browser projection may read one exact current intervention, never repair it."""
+    path = tmp_path / "visible-interventions.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+
+    def seed(status: store_module.InterventionStatus) -> store_module.InterventionRecord:
+        suffix = status.value
+        brief = replace(valid_brief, task_id=f"visible-{suffix}")
+        store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+        store.set_sol_thread(brief.task_id, brief.revision, f"thread-{suffix}")
+        store.set_pending_context(
+            brief.task_id, brief.revision, expected=TaskState.SOL_RUNNING,
+            pending={"sol_run_id": f"source-{suffix}", "prompt": "continue exactly"},
+        )
+        store.start_agent_run(f"source-{suffix}", brief.task_id, brief.revision, "sol")
+        store.set_agent_run_session(f"source-{suffix}", f"thread-{suffix}")
+        record = store.create_intervention_and_request_stop(
+            intervention_id=f"intervention-{suffix}", session_id="session-1",
+            task_id=brief.task_id, revision=brief.revision,
+            expected_source_generation=1, message=f"Keep {suffix} exact.",
+            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+            run_id=f"source-{suffix}",
+        )
+        if status is store_module.InterventionStatus.PENDING_STOP:
+            return record
+        store.finish_agent_run(f"source-{suffix}", status="interrupted", exit_code=-15)
+        record = store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+        if status is store_module.InterventionStatus.READY:
+            return record
+        store.begin_intervention_resume(
+            record.intervention_id, expected_resume_generation=record.resume_generation,
+            resume_attempt_id=f"attempt-{suffix}", resume_run_id=f"resume-{suffix}",
+        )
+        record = store.intervention(record.intervention_id)
+        assert record is not None
+        if status is store_module.InterventionStatus.RESUMING:
+            return record
+        store.mark_resume_outcome_unknown(
+            record.intervention_id, resume_attempt_id=record.resume_attempt_id,
+            resume_run_id=record.resume_run_id,
+        )
+        store.recover_active_tasks()
+        record = store.intervention(record.intervention_id)
+        assert record is not None
+        return record
+
+    records = {
+        status: seed(status) for status in (
+            store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+            store_module.InterventionStatus.PENDING_STOP,
+            store_module.InterventionStatus.READY,
+            store_module.InterventionStatus.RESUMING,
+        )
+    }
+    before_changes = store._connection.total_changes
+    for status, record in records.items():
+        assert store.current_visible_intervention_for_task(record.task_id, record.revision) == record
+        assert store.intervention(record.intervention_id).status is status  # type: ignore[union-attr]
+    assert store._connection.total_changes == before_changes
+    assert store.current_visible_intervention_for_task("missing-task", 1) is None
+
+    terminal = records[store_module.InterventionStatus.READY]
+    store._connection.execute(
+        "UPDATE interventions SET status = ? WHERE intervention_id = ?",
+        (store_module.InterventionStatus.RESUMED.value, terminal.intervention_id),
+    )
+    assert store.current_visible_intervention_for_task(terminal.task_id, terminal.revision) is None
+
+    ambiguous = records[store_module.InterventionStatus.PENDING_STOP]
+    store._connection.execute(
+        """INSERT INTO interventions SELECT REPLACE(intervention_id, 'pending_stop', 'duplicate'),
+        session_id, task_id, revision, addressed_to, routed_to, message, run_id,
+        continuation_state, source_generation, resume_generation, fable_session_id,
+        sol_thread_id, resume_attempt_id, resume_run_id, acknowledgment_id,
+        directed_binding_json, status, created_at FROM interventions WHERE intervention_id = ?""",
+        (ambiguous.intervention_id,),
+    )
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        store.current_visible_intervention_for_task(ambiguous.task_id, ambiguous.revision)
+    store._connection.execute(
+        "DELETE FROM interventions WHERE intervention_id LIKE 'intervention-duplicate%'"
+    )
+    store._connection.execute(
+        "UPDATE interventions SET message = 'tampered' WHERE intervention_id = ?",
+        (ambiguous.intervention_id,),
+    )
+    with pytest.raises(RuntimeError, match="authenticated"):
+        store.current_visible_intervention_for_task(ambiguous.task_id, ambiguous.revision)
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    unknown = records[store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN]
+    assert reopened.current_visible_intervention_for_task(unknown.task_id, unknown.revision) == unknown
+    other = SQLiteStore(tmp_path / "other-visible.sqlite3", clock=lambda: "2026-08-10T12:00:00Z")
+    other.create_session("session-1", "/other")
+    assert other.current_visible_intervention_for_task(unknown.task_id, unknown.revision) is None
+    other.close()
+    reopened.close()
+
+
 def test_directed_intervention_binding_migration_is_additive_idempotent_and_preserves_rows(
     tmp_path, valid_brief,
 ) -> None:

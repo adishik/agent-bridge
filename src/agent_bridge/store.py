@@ -9519,6 +9519,29 @@ class SQLiteStore:
             raise RuntimeError("intervention binding is not authenticated")
         return record
 
+    def current_visible_intervention_for_task(
+        self, task_id: str, revision: int,
+    ) -> InterventionRecord | None:
+        """Read one fully authenticated intervention safe for the current task UI."""
+        rows = self._connection.execute(
+            """
+            SELECT * FROM interventions
+            WHERE task_id = ? AND revision = ?
+              AND status IN ('pending_stop', 'ready', 'resuming', 'resume_outcome_unknown')
+            ORDER BY created_at DESC, intervention_id DESC LIMIT 2
+            """,
+            (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("current intervention is ambiguous")
+        row = rows[0]
+        record = self._intervention_from_row(row)
+        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+            raise RuntimeError("intervention binding is not authenticated")
+        return record
+
     def prepared_nested_intervention_run(
         self, *, question_id: str, run_id: str | None = None,
     ) -> AgentRunRecord | None:
