@@ -600,6 +600,53 @@ def test_bootstrap_activity_projection_drops_invalid_agent_fields(
     assert "invalid-digest-provider-run" not in json.dumps(task)
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        *[(status, {"status": status, "command_sha256": "c" * 64}) for status in (
+            "completed", "declined", "failed", "in_progress", "interrupted",
+        )],
+        *[(status, {}) for status in ("running", "pending", "success", "error", "COMPLETED")],
+    ),
+)
+def test_bootstrap_activity_projection_matches_coordinator_agent_event_statuses(
+    web_harness: WebHarness,
+    status: str,
+    expected: dict[str, str],
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "sol", "agent_event",
+        {"status": status, "command_sha256": "c" * 64, "run_id": "never-project"},
+    )
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+    assert task["activity_kind"] == "agent_event"
+    assert task["activity"] == expected
+    assert "never-project" not in json.dumps(task)
+
+
+@pytest.mark.parametrize(
+    "status", ("completed", "declined", "failed", "in_progress", "interrupted"),
+)
+def test_coordinator_producer_characterizes_the_agent_event_status_contract(
+    status: str,
+) -> None:
+    digest = "d" * 64
+    event = Coordinator._sol_structural_event({
+        "type": "item.completed",
+        "item_type": "command_execution",
+        "status": status,
+        "command_sha256": digest,
+    })
+    assert event is not None
+    assert event["status"] == status
+    assert event["command_sha256"] == digest
+
+
 def test_default_bootstrap_shape_is_complete_and_fail_closed(
     web_harness: WebHarness,
 ) -> None:
@@ -1065,6 +1112,26 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         await flush();
       }};
       await refreshFromEvent(persistedEvent.sequence + 50);
+      const safeDigest = "a".repeat(64);
+      media.matches = false;
+      media.emit();
+      const taskOneButton = nodes["task-list"].children[1].children[0].querySelector("button");
+      await taskOneButton.emit("click");
+      for (const [index, [kind, expected]] of [
+        ["action_error", "Action Error"], ["stop_error", "Stop Error"],
+        ["agent_event", "Agent Event"], ["resume_drift", "Resume Drift"],
+      ].entries()) {{
+        projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], activity_kind: kind, activity: {{
+          status: "completed", command_sha256: safeDigest, run_id: hostileActivity,
+          raw_output: hostileActivity, extra: hostileActivity,
+        }}}};
+        await refreshFromEvent(persistedEvent.sequence + 60 + index);
+        const auditText = nodes["activity-audit"].textContent;
+        if (!auditText.includes(expected) || auditText.includes(hostileActivity)) process.exit(55 + index);
+        if (kind !== "agent_event" && (auditText.includes("Completed") || auditText.includes(safeDigest))) process.exit(56);
+        if (kind === "agent_event" && (!auditText.includes("Completed") || !auditText.includes(safeDigest))) process.exit(57);
+      }}
+      await nodes["task-list"].children[1].children[1].querySelector("button").emit("click");
       if (controller.state.gate.canCompose || !nodes["message-input"].disabled) process.exit(41);
       await nodes["intervene-control"].emit("click");
       if (nodes["composer-recipient"].value !== "fable" || !nodes["composer-recipient"].options[1].disabled) process.exit(47);
@@ -1088,27 +1155,27 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         intervention_id: "unknown-a", status: "resume_outcome_unknown", resume_generation: 4,
         warning: "may have executed", eligible: false,
       }}}};
-      await refreshFromEvent(persistedEvent.sequence + 51);
+      await refreshFromEvent(persistedEvent.sequence + 101);
       const warningFocuses = nodes["intervention-context"].focusCount;
       const firstAcknowledge = nodes["conversation-context"].querySelector("#intervention-acknowledge-control");
       await firstAcknowledge.emit("click");
       const acknowledgements = () => fetchCalls.filter((call) => call.url.endsWith("/authorize-retry"));
       const firstAcknowledgement = JSON.parse(acknowledgements()[0].options.body);
       projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 5}};
-      await refreshFromEvent(persistedEvent.sequence + 52);
+      await refreshFromEvent(persistedEvent.sequence + 102);
       if (nodes["intervention-context"].focusCount <= warningFocuses) process.exit(43);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const secondAcknowledgement = JSON.parse(acknowledgements()[1].options.body);
       if (firstAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || secondAcknowledgement.expected_resume_generation !== 5 || secondAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(42);
       const focusBeforeNewGeneration = nodes["intervention-context"].focusCount;
       projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 6}};
-      await refreshFromEvent(persistedEvent.sequence + 53);
+      await refreshFromEvent(persistedEvent.sequence + 103);
       if (nodes["intervention-context"].focusCount <= focusBeforeNewGeneration || focusBeforeNewGeneration < warningFocuses) process.exit(43);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const thirdAcknowledgement = JSON.parse(acknowledgements()[2].options.body);
       if (thirdAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 6) process.exit(44);
       projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 7}};
-      await refreshFromEvent(persistedEvent.sequence + 54);
+      await refreshFromEvent(persistedEvent.sequence + 104);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const conflictAcknowledgement = JSON.parse(acknowledgements()[3].options.body);
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
@@ -1118,7 +1185,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         projectBootstrap.tasks[1].intervention = {{
           intervention_id: `stop-${{status}}`, status, resume_generation: 6, eligible: false,
         }};
-        await refreshFromEvent(persistedEvent.sequence + 55 + acknowledgements().length);
+        await refreshFromEvent(persistedEvent.sequence + 105 + acknowledgements().length);
         if (nodes["stop-control"].hidden || nodes["stop-control"].disabled) process.exit(45);
         await nodes["stop-control"].emit("click");
       }}

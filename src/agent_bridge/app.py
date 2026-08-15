@@ -64,7 +64,7 @@ _ACTIVITY_KINDS = frozenset({
     "action_error", "stop_error", "agent_event", "resume_drift",
 })
 _AGENT_ACTIVITY_STATUSES = frozenset({
-    "completed", "failed", "running", "pending", "success", "error",
+    "completed", "declined", "failed", "in_progress", "interrupted",
 })
 _LOWER_HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -78,14 +78,16 @@ def _activity_projection(
         return None, None
     if kind != "agent_event" or not isinstance(activity, Mapping):
         return kind, {}
-    safe: dict[str, object] = {}
     status_value = activity.get("status")
-    if isinstance(status_value, str) and status_value in _AGENT_ACTIVITY_STATUSES:
-        safe["status"] = status_value
     digest = activity.get("command_sha256")
-    if isinstance(digest, str) and _LOWER_HEX_256.fullmatch(digest):
-        safe["command_sha256"] = digest
-    return kind, safe
+    if not (
+        isinstance(status_value, str)
+        and status_value in _AGENT_ACTIVITY_STATUSES
+        and isinstance(digest, str)
+        and _LOWER_HEX_256.fullmatch(digest)
+    ):
+        return kind, {}
+    return kind, {"status": status_value, "command_sha256": digest}
 
 
 class EventSubscription(Protocol):

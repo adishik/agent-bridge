@@ -1597,6 +1597,32 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
     assert ".message-coordinator" in styles
 
 
+def test_activity_sanitizer_uses_the_exact_per_kind_producer_schema() -> None:
+    harness = r"""
+      const digest = "a".repeat(64);
+      for (const status of ["completed", "declined", "failed", "in_progress", "interrupted"]) {
+        const safe = bridge.sanitizeActivity("agent_event", {
+          status, command_sha256: digest, run_id: "never", output: "never",
+        });
+        if (JSON.stringify(safe) !== JSON.stringify({status, command_sha256: digest})) process.exit(2);
+      }
+      for (const status of ["running", "pending", "success", "error", "COMPLETED"]) {
+        const safe = bridge.sanitizeActivity("agent_event", {
+          status, command_sha256: "A".repeat(64), run_id: "never",
+        });
+        if (JSON.stringify(safe) !== "{}") process.exit(3);
+      }
+      for (const kind of ["action_error", "stop_error", "resume_drift"]) {
+        const safe = bridge.sanitizeActivity(kind, {
+          status: "completed", command_sha256: digest, raw_output: "never",
+        });
+        if (JSON.stringify(safe) !== "{}") process.exit(4);
+      }
+      if (bridge.sanitizeActivity("unrecognized", {status: "completed"}) !== null) process.exit(5);
+    """
+    _run_module_harness(harness)
+
+
 def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     styles = (STATIC / "styles.css").read_text(encoding="utf-8")
 
@@ -1660,6 +1686,22 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
             return resolve(tokens[match.group(1)])
         if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
             return "#" + "".join(channel * 2 for channel in value[1:])
+        rgb = re.fullmatch(
+            r"rgb\(\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})(?:\s*/\s*(\d{1,3})%)?\s*\)",
+            value,
+        )
+        if rgb:
+            red, green, blue = (int(channel) for channel in rgb.group(1, 2, 3))
+            assert all(0 <= channel <= 255 for channel in (red, green, blue))
+            opacity = int(rgb.group(4) or "100") / 100
+            if opacity < 1:
+                backdrop = resolve(tokens["--surface"])
+                base = tuple(int(backdrop[index:index + 2], 16) for index in (1, 3, 5))
+                red, green, blue = (
+                    round(channel * opacity + under * (1 - opacity))
+                    for channel, under in zip((red, green, blue), base)
+                )
+            return f"#{red:02x}{green:02x}{blue:02x}"
         assert re.fullmatch(r"#[0-9a-fA-F]{6}", value), value
         return value.lower()
 
@@ -1668,12 +1710,20 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     # color declaration cannot silently bypass this concrete surface matrix.
     adjacencies = (
         ("body", "color", ":root", "--surface", 4.5),
-        (".brand-block span", "color", ":root", "--surface", 4.5),
+        (".brand-block span", "color", "#app-header", "background", 4.5),
+        (".project-navigation-label", "color", "#app-header", "background", 4.5),
+        (".project-navigation-label strong", "color", "#app-header", "background", 4.5),
         (".project-navigation-button", "color", ":root", "--panel", 4.5),
         (".project-navigation-button:hover:not(:disabled)", "color", ":root", "--brand-soft", 4.5),
         (".project-navigation-button:disabled", "color", ":root", "--panel", 4.5),
         (".status-pill", "color", ":root", "--coordinator-soft", 4.5),
-        (".eyebrow", "color", ":root", "--surface", 4.5),
+        (".eyebrow", "color", "#task-list", "background", 4.5),
+        (".conversation-intro > p:last-child", "color", ".conversation-intro", "background", 4.5),
+        (".message time", "color", ".message-user", "background", 4.5),
+        (".message time", "color", ".message-fable", "background", 4.5),
+        (".message time", "color", ".message-sol", "background", 4.5),
+        (".message time", "color", ".message-coordinator", "background", 4.5),
+        (".conversation-status", "color", ".conversation-status", "background", 4.5),
         (".message-avatar", "color", ":root", "--coordinator", 4.5),
         (".message-fable .message-avatar", "color", ":root", "--fable", 4.5),
         (".message-sol .message-avatar", "color", ":root", "--sol", 4.5),
@@ -1691,6 +1741,12 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         (".toast-error", "color", ":root", "--danger", 4.5),
         (".skip-link", "color", ":root", "--brand-strong", 4.5),
         ("button:focus-visible", "outline-color", ":root", "--surface", 3),
+        ("textarea:focus-visible", "outline-color", "#composer", "background", 3),
+        ("input:focus-visible", "outline-color", "dialog", "background", 3),
+        ("select:focus-visible", "outline-color", "#composer", "background", 3),
+        ("a:focus-visible", "outline-color", ":root", "--surface", 3),
+        ("summary:focus-visible", "outline-color", ":root", "--panel", 3),
+        ("[tabindex]:focus-visible", "outline-color", ":root", "--panel", 3),
         (".status-pill::before", "background", ":root", "--coordinator-soft", 3),
         (".status-ready::before", "background", ":root", "--coordinator-soft", 3),
         (".status-running::before", "background", ":root", "--cream-100", 3),
@@ -1738,6 +1794,85 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         if re.search(r"(?:^|;)\s*color\s*:", body):
             shipped_color_selectors.update(item.strip() for item in header.split(","))
     assert shipped_color_selectors <= audited_color_selectors
+
+    # The rendered-adjacency table above is intentionally coupled to this
+    # complete declaration inventory.  Keep structural styling such as radius
+    # out of the proof, but require every shipped foreground, surface, border,
+    # focus ring, and status halo declaration to be represented by its actual
+    # selector/property source.
+    rendered_model = {
+        "body": {"color", "background"},
+        "button:focus-visible": {"outline"}, "textarea:focus-visible": {"outline"},
+        "input:focus-visible": {"outline"}, "select:focus-visible": {"outline"},
+        "a:focus-visible": {"outline"}, "summary:focus-visible": {"outline"},
+        "[tabindex]:focus-visible": {"outline"},
+        ".skip-link": {"color", "background"},
+        "#app-header": {"background", "border-bottom", "box-shadow"},
+        ".brand-block span": {"color"},
+        ".project-navigation-label": {"color"}, ".project-navigation-label strong": {"color"},
+        ".project-navigation-button": {"color", "background", "border"},
+        ".project-navigation-button:hover:not(:disabled)": {"color", "background", "border-color"},
+        ".project-navigation-button[aria-current=\"true\"]": {"color", "background", "border-color"},
+        ".project-navigation-button:disabled": {"color"},
+        ".status-pill": {"color", "background", "border"}, ".state-badge": {"color", "background", "border"},
+        ".status-pill::before": {"background", "box-shadow", "border"},
+        ".state-badge::before": {"background", "box-shadow", "border"},
+        ".status-ready::before": {"background"}, ".state-completed::before": {"background"},
+        ".status-running::before": {"background", "box-shadow"},
+        ".state-sol_running::before": {"background", "box-shadow"},
+        ".state-sol_correcting::before": {"background", "box-shadow"},
+        ".state-fable_planning::before": {"background", "box-shadow"},
+        ".state-fable_clarifying::before": {"background", "box-shadow"},
+        ".state-fable_reviewing::before": {"background", "box-shadow"},
+        ".status-error::before": {"background"}, ".state-failed::before": {"background"},
+        ".state-interrupted::before": {"background"},
+        "#project-navigation": {"background", "border-right", "box-shadow"},
+        "#task-inspector-panel": {"background", "border-left", "box-shadow"},
+        "#task-list": {"background", "border-right"}, "#task-inspector": {"background", "border-left"},
+        ".panel-heading": {"border-bottom"}, ".eyebrow": {"color"},
+        ".empty-state": {"color"}, ".form-guidance": {"color"}, ".metadata": {"color"}, ".task-meta": {"color"},
+        ".task-list-button": {"color", "background", "border"},
+        ".task-list-button:hover": {"border-color", "box-shadow"},
+        ".task-list-button[aria-current=\"true\"]": {"border-color", "box-shadow"},
+        ".conversation-intro": {"background", "border", "box-shadow"},
+        ".conversation-intro > p:last-child": {"color"},
+        ".message": {"background", "border", "box-shadow"},
+        ".message-avatar": {"color", "background"},
+        ".message-user .message-avatar": {"background"}, ".message-fable .message-avatar": {"background"},
+        ".message-sol .message-avatar": {"background"},
+        ".conversation-action-card": {"background", "border", "border-left", "box-shadow"},
+        ".message time": {"color"}, ".message-user": {"background", "border-left-color"},
+        ".message-fable": {"background", "border-left-color"}, ".message-sol": {"background", "border-left-color"},
+        ".message-coordinator": {"background", "border-left-color"},
+        ".conversation-status": {"color", "background", "border-left"},
+        ".task-section": {"background", "border"}, ".task-section-empty": {"color"},
+        ".button": {"color", "background", "border"}, ".button:hover:not(:disabled)": {"border-color"},
+        ".button:disabled": {"color", "background"}, ".button-primary": {"color", "background", "border-color"},
+        ".button-primary:hover:not(:disabled)": {"background"}, ".button-danger": {"color", "border-color"},
+        ".button-quiet": {"background"},
+        ".field-group textarea": {"color", "background", "border"}, ".field-group input": {"color", "background", "border"},
+        "#message-input": {"color", "background", "border"}, "#composer-recipient": {"color", "background", "border"},
+        "#composer": {"background", "border-top"}, "#conversation-context": {"color", "background", "border-top", "border-bottom"},
+        ".composer-recipient": {"color"}, ".composer-binding": {"color"},
+        "dialog": {"color", "background", "border", "box-shadow"}, "dialog::backdrop": {"background"},
+        ".acknowledgement-row": {"background", "border"}, ".form-error": {"color"},
+        ".toast": {"color", "background", "border", "box-shadow"}, ".toast-error": {"background"},
+    }
+    relevant_properties = re.compile(
+        r"(?:^|;)\s*(color|background|border(?:-(?:top|right|bottom|left|color))?|outline|box-shadow)\s*:",
+    )
+    shipped_rendered_properties: set[tuple[str, str]] = set()
+    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
+        properties = set(relevant_properties.findall(body))
+        if properties:
+            for selector in (item.strip() for item in header.split(",")):
+                shipped_rendered_properties.update((selector, property_name) for property_name in properties)
+    model_properties = {
+        (selector, property_name)
+        for selector, properties in rendered_model.items()
+        for property_name in properties
+    }
+    assert shipped_rendered_properties <= model_properties
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

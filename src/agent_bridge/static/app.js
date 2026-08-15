@@ -665,36 +665,55 @@ function appendListSection(documentRoot, parent, headingText, values) {
 }
 
 
+const ACTIVITY_KINDS = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
+const AGENT_ACTIVITY_STATUSES = new Set([
+  "completed", "declined", "failed", "in_progress", "interrupted",
+]);
+const SHA256_DIGEST = /^[a-f0-9]{64}$/;
+
+export function sanitizeActivity(kind, candidate) {
+  if (typeof kind !== "string" || !ACTIVITY_KINDS.has(kind)) {
+    return null;
+  }
+  if (kind !== "agent_event") {
+    return {};
+  }
+  const activity = asObject(candidate);
+  if (
+    typeof activity.status !== "string"
+    || !AGENT_ACTIVITY_STATUSES.has(activity.status)
+    || typeof activity.command_sha256 !== "string"
+    || !SHA256_DIGEST.test(activity.command_sha256)
+  ) {
+    return {};
+  }
+  return {status: activity.status, command_sha256: activity.command_sha256};
+}
+
 function activitySummary(task) {
-  const activity = asObject(task?.activity);
-  const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
-  if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
+  const activity = sanitizeActivity(task?.activity_kind, task?.activity);
+  if (activity === null) {
     return "No structured activity recorded";
   }
-  const agentStatuses = new Set(["completed", "failed", "running", "pending", "success", "error"]);
   return [
     stateLabel(task.activity_kind),
-    typeof activity.status === "string" && agentStatuses.has(activity.status)
-      ? stateLabel(activity.status) : null,
-    typeof activity.command_sha256 === "string" && /^[a-f0-9]{64}$/.test(activity.command_sha256)
-      ? activity.command_sha256 : null,
+    typeof activity.status === "string" ? stateLabel(activity.status) : null,
+    typeof activity.command_sha256 === "string" ? activity.command_sha256 : null,
   ].filter(Boolean).join(" · ");
 }
 
 
 function activityRows(task) {
-  const activity = asObject(task?.activity);
-  const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
-  const agentStatuses = new Set(["completed", "failed", "running", "pending", "success", "error"]);
-  if (typeof task?.activity_kind !== "string" || !allowed.has(task.activity_kind)) {
+  const activity = sanitizeActivity(task?.activity_kind, task?.activity);
+  if (activity === null) {
     return [["Type", "No structured activity recorded"]];
   }
   const type = stateLabel(task.activity_kind);
   const rows = [["Type", type]];
-  if (typeof activity.status === "string" && agentStatuses.has(activity.status)) {
+  if (typeof activity.status === "string") {
     rows.push(["Status", stateLabel(activity.status)]);
   }
-  if (typeof activity.command_sha256 === "string" && /^[a-f0-9]{64}$/.test(activity.command_sha256)) {
+  if (typeof activity.command_sha256 === "string") {
     rows.push(["Command digest", activity.command_sha256]);
   }
   return rows;
