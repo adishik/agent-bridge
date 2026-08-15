@@ -8499,18 +8499,7 @@ class SQLiteStore:
                 or pause != question_pause
             ):
                 raise RuntimeError("directed answer identity changed")
-            if question_id is not None and question.nested_parent_kind == "question":
-                if question.parent_question_id is None:
-                    raise RuntimeError("directed answer identity changed")
-                parent, parent_continuation, parent_pending, parent_pause = (
-                    self._question_exact(
-                        session_id=task.session_id,
-                        task_id=task_id,
-                        revision=revision,
-                        expected_generation=task.continuation_generation,
-                        question_id=question.parent_question_id,
-                    )
-                )
+            if question_id is not None:
                 owner_rows = self._connection.execute(
                     """
                     SELECT * FROM interventions
@@ -8523,52 +8512,82 @@ class SQLiteStore:
                         InterventionStatus.RESUMING.value,
                     ),
                 ).fetchall()
-                owners: list[tuple[InterventionRecord, object]] = []
-                for owner_row in owner_rows:
+                if not owner_rows:
+                    if question.nested_parent_kind == "question":
+                        raise RuntimeError("directed answer identity changed")
+                elif len(owner_rows) != 1:
+                    raise RuntimeError("directed answer identity changed")
+                else:
+                    owner_row = owner_rows[0]
                     owner = self._intervention_from_row(owner_row)
                     binding = owner.directed_binding
                     if (
-                        binding is not None
-                        and binding.kind == "nested_resume"
-                        and binding.stage == "active_question"
-                        and binding.question_id == question.question_id
-                        and binding.parent_question_id == question.parent_question_id
-                        and binding.parent_continuation_pause_id
-                        == question.parent_continuation_pause_id
-                        and binding.continuation_pause_id == question_pause
-                        and binding.continuation_state is continuation
-                        and binding.question_generation == task.continuation_generation
-                        and binding.source_run_id == run_id
-                        and binding.source_agent is ConversationTarget.SOL
-                        and binding.source_provider_id == source.cli_session_id
-                        and binding.asked_by is question.asked_by
-                        and binding.addressed_to is question.addressed_to
-                        and binding.routed_to is question.routed_to
-                        and binding.nested_parent_kind == question.nested_parent_kind
-                        and owner.routed_to is ConversationTarget.FABLE
-                        and owner.continuation_state in _SOL_TASK_STATES
-                        and owner.resume_generation == task.continuation_generation
-                        and owner.resume_attempt_id is not None
-                        and owner.resume_run_id is not None
+                        binding is None
+                        or binding.kind != "nested_resume"
+                        or binding.stage != "active_question"
+                        or binding.question_id != question.question_id
+                        or binding.continuation_pause_id != question_pause
+                        or binding.continuation_state is not continuation
+                        or binding.question_generation != task.continuation_generation
+                        or binding.source_run_id != run_id
+                        or binding.source_agent is not ConversationTarget.SOL
+                        or binding.source_provider_id != source.cli_session_id
+                        or binding.asked_by is not question.asked_by
+                        or binding.addressed_to is not question.addressed_to
+                        or binding.routed_to is not question.routed_to
+                        or owner.routed_to is not ConversationTarget.FABLE
+                        or owner.continuation_state not in _SOL_TASK_STATES
+                        or owner.resume_generation != task.continuation_generation
+                        or owner.resume_attempt_id is None
+                        or owner.resume_run_id is None
                     ):
-                        owners.append((owner, owner_row["acknowledgment_id"]))
-                if len(owners) != 1:
-                    raise RuntimeError("directed answer identity changed")
-                owner, acknowledgment_id = owners[0]
-                if (
-                    parent.nested_parent_kind is not None
-                    or parent.asked_by is not ConversationActor.SOL
-                    or parent.addressed_to is not ConversationTarget.FABLE
-                    or parent.routed_to is not ConversationTarget.FABLE
-                    or parent.answer_text is not None
-                    or parent.answered_by is not None
-                    or parent.continuation_generation != task.continuation_generation
-                    or parent_pause != question.parent_continuation_pause_id
-                    or parent_pending != pending
-                    or parent_continuation not in _SOL_TASK_STATES
-                    or not self._intervention_is_authenticated(owner, acknowledgment_id)
-                ):
-                    raise RuntimeError("directed answer identity changed")
+                        raise RuntimeError("directed answer identity changed")
+                    if not self._intervention_is_authenticated(
+                        owner, owner_row["acknowledgment_id"],
+                    ):
+                        raise RuntimeError("directed answer identity changed")
+                    if binding.nested_parent_kind == "question":
+                        if (
+                            question.nested_parent_kind != "question"
+                            or question.parent_question_id != binding.parent_question_id
+                            or question.parent_continuation_pause_id
+                            != binding.parent_continuation_pause_id
+                            or question.parent_question_id is None
+                        ):
+                            raise RuntimeError("directed answer identity changed")
+                        parent, parent_continuation, parent_pending, parent_pause = (
+                            self._question_exact(
+                                session_id=task.session_id,
+                                task_id=task_id,
+                                revision=revision,
+                                expected_generation=task.continuation_generation,
+                                question_id=question.parent_question_id,
+                            )
+                        )
+                        if (
+                            parent.nested_parent_kind is not None
+                            or parent.asked_by is not ConversationActor.SOL
+                            or parent.addressed_to is not ConversationTarget.FABLE
+                            or parent.routed_to is not ConversationTarget.FABLE
+                            or parent.answer_text is not None
+                            or parent.answered_by is not None
+                            or parent.continuation_generation != task.continuation_generation
+                            or parent_pause != binding.parent_continuation_pause_id
+                            or parent_pending != pending
+                            or parent_continuation not in _SOL_TASK_STATES
+                        ):
+                            raise RuntimeError("directed answer identity changed")
+                    elif binding.nested_parent_kind == "clarification":
+                        if (
+                            question.nested_parent_kind != "clarification"
+                            or question.parent_question_id is not None
+                            or question.parent_continuation_pause_id is not None
+                            or binding.parent_question_id is not None
+                            or binding.parent_continuation_pause_id is not None
+                        ):
+                            raise RuntimeError("directed answer identity changed")
+                    else:
+                        raise RuntimeError("directed answer identity changed")
             cursor = self._connection.execute(
                 """
                 UPDATE tasks SET state = ?

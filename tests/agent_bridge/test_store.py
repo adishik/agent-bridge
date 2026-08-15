@@ -9665,6 +9665,7 @@ def test_interrupt_directed_answer_for_stop_preserves_an_exact_nested_child(
         "answered_parent",
         "changed_parent_generation",
         "changed_parent_route",
+        "downgraded_child_to_clarification",
         "substituted_binding_child",
         "substituted_binding_parent",
     ),
@@ -9709,6 +9710,13 @@ def test_interrupt_directed_answer_for_stop_authenticates_question_nested_parent
         store._connection.execute(  # noqa: SLF001 - parent route tamper boundary
             "UPDATE questions SET addressed_to = 'sol', routed_to = 'sol' "
             "WHERE question_id = 'original-question'",
+        )
+    elif mutation == "downgraded_child_to_clarification":
+        store._connection.execute(  # noqa: SLF001 - valid child-shape downgrade boundary
+            "UPDATE questions SET nested_parent_kind = 'clarification', "
+            "parent_question_id = NULL, parent_continuation_pause_id = NULL "
+            "WHERE question_id = ?",
+            (child.question_id,),
         )
     elif mutation == "substituted_binding_child":
         store._connection.execute(  # noqa: SLF001 - owning binding tamper boundary
