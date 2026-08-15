@@ -703,6 +703,100 @@ function renderActivityAudit(documentRoot, task) {
 }
 
 
+function boundedInspectorList(value) {
+  if (!Array.isArray(value)) {
+    return "None recorded";
+  }
+  const values = value
+    .filter((entry) => typeof entry === "string" && entry.trim())
+    .slice(0, 20);
+  if (values.length === 0) {
+    return "None recorded";
+  }
+  return values.join(" · ");
+}
+
+
+function renderPersistentInspector(documentRoot, task, options) {
+  const summary = documentRoot.querySelector("#task-inspector-summary");
+  const controls = documentRoot.querySelector("#task-controls");
+  if (!task) {
+    if (summary) {
+      const rows = [
+        ["Task revision", "Awaiting task selection"],
+        ["State", "Awaiting task selection"],
+        ["Scope", "Awaiting task selection"],
+        ["Allowed paths", "Awaiting task selection"],
+        ["Required tests", "Awaiting task selection"],
+        ["Question budget", "Awaiting task selection"],
+      ];
+      summary.replaceChildren(...rows.flatMap(([label, value]) => [
+        element(documentRoot, "dt", label),
+        element(documentRoot, "dd", value),
+      ]));
+    }
+    if (controls) {
+      const heading = element(documentRoot, "h3", "Task controls");
+      heading.id = "task-controls-heading";
+      controls.replaceChildren(
+        heading,
+        element(documentRoot, "p", "Task-specific controls appear after task selection."),
+      );
+    }
+    return;
+  }
+  const brief = taskBrief(task);
+  const identity = taskIdentity(task);
+  const questionBudget = Number.isInteger(task?.exchange_allowance)
+    && task.exchange_allowance >= 0
+    ? `${task.exchange_allowance} remaining${Number.isInteger(task.exchange_consumed) && task.exchange_consumed >= 0 ? ` · ${task.exchange_consumed} consumed` : ""}`
+    : "Not recorded";
+  if (summary) {
+    const rows = [
+      ["Task revision", `${identity} · r${taskRevision(task)}`],
+      ["State", stateLabel(String(task?.state ?? "unknown"))],
+      ["Scope", brief?.objective ?? "None recorded"],
+      ["Allowed paths", boundedInspectorList(brief?.allowed_paths)],
+      ["Required tests", boundedInspectorList(brief?.required_tests)],
+      ["Question budget", questionBudget],
+    ];
+    summary.replaceChildren(...rows.flatMap(([label, value]) => [
+      element(documentRoot, "dt", label),
+      element(documentRoot, "dd", value),
+    ]));
+  }
+  if (!controls) {
+    return;
+  }
+  const heading = element(documentRoot, "h3", "Task controls");
+  heading.id = "task-controls-heading";
+  const actions = element(documentRoot, "div", undefined, "task-actions");
+  const gate = normalizeInspectorGate(options);
+  const taskControls = controlsForState(String(task?.state ?? ""), gate);
+  const approvalBlocked = APPROVAL_STATES.has(String(task?.state ?? ""))
+    && brief !== null && brief.open_questions.length > 0;
+  const unusableBrief = brief === null && (APPROVAL_STATES.has(String(task?.state ?? ""))
+    || (task?.brief !== null && task?.brief !== undefined));
+  const descriptors = [
+    ["Approve & run", "approve", unusableBrief ? control(false, false) : (approvalBlocked ? control(true, false) : taskControls.approve), "button-primary"],
+    ["Edit", "edit", unusableBrief ? control(false, false) : taskControls.edit, ""],
+    ["Reject", "reject", taskControls.reject, "button-danger"],
+    ["Stop", "stop", taskControls.stop, "button-danger"],
+    ["Resume", "resume", taskControls.resume, "button-primary"],
+  ];
+  for (const [label, action, descriptor, className] of descriptors) {
+    const button = actionButton(
+      documentRoot, label, action, descriptor,
+      () => options.onAction?.(action, task), className,
+    );
+    if (button) {
+      actions.append(button);
+    }
+  }
+  controls.replaceChildren(heading, actions);
+}
+
+
 function control(visible, enabled) {
   return Object.freeze({visible, enabled});
 }
@@ -2927,6 +3021,19 @@ function closeDrawer(documentRoot, id, button, isMobileDrawer, restoreFocus = fa
 }
 
 
+function drawerFocusables(panel) {
+  const selector = "button, textarea, input, select, a, summary, [tabindex]";
+  const candidates = typeof panel?.querySelectorAll === "function"
+    ? Array.from(panel.querySelectorAll(selector))
+    : [panel?.querySelector?.(selector)].filter(Boolean);
+  return candidates.filter((node) => (
+    node.disabled !== true
+    && node.hidden !== true
+    && node.getAttribute?.("tabindex") !== "-1"
+  ));
+}
+
+
 function wireDrawer(
   documentRoot,
   buttonId,
@@ -2957,7 +3064,7 @@ function wireDrawer(
     button.setAttribute("aria-expanded", opening ? "true" : "false");
     syncInert?.();
     if (opening) {
-      const focusTarget = panel.querySelector("button, textarea, input, select, a, summary, [tabindex]");
+      const focusTarget = drawerFocusables(panel)[0];
       focusTarget?.focus();
     } else {
       button.focus?.();
@@ -3138,7 +3245,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
       return;
     }
     const activeRun = activeTask !== null && ACTIVE_STATES.has(activeTask.state);
-    const stoppableIntervention = ["pending", "resume", "unknown"].includes(presentation?.kind);
+    const interventionStatus = asObject(activeTask?.intervention).status;
+    const stoppableIntervention = [
+      "pending_stop", "ready", "resuming", "resume_outcome_unknown",
+    ].includes(interventionStatus);
     interveneControl.hidden = activeTask === null;
     stopControl.hidden = !(activeRun || stoppableIntervention);
     stopControl.disabled = !(activeRun || stoppableIntervention);
@@ -3245,6 +3355,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
       }
     });
     renderTaskInspector(documentRoot, selectedTask(), {
+      gate: state.gate,
+      onAction: handleTaskAction,
+    });
+    renderPersistentInspector(documentRoot, selectedTask(), {
       gate: state.gate,
       onAction: handleTaskAction,
     });
@@ -3629,11 +3743,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
       const openPanel = [projectDrawerId, inspectorDrawerId]
         .map((panelId) => documentRoot.querySelector(panelId))
         .find((panel) => panel?.classList.contains("drawer-open"));
-      const focusable = typeof openPanel?.querySelectorAll === "function"
-        ? Array.from(openPanel.querySelectorAll("button, textarea, input, select, a, summary, [tabindex]"))
-          .filter((node) => !node.disabled && node.getAttribute?.("tabindex") !== "-1")
-        : [openPanel?.querySelector?.("button, textarea, input, select, a, summary, [tabindex]")]
-          .filter((node) => node && !node.disabled);
+      const focusable = drawerFocusables(openPanel);
       if (focusable.length > 0) {
         const first = focusable[0];
         const last = focusable[focusable.length - 1];

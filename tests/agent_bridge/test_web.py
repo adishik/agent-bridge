@@ -659,7 +659,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
     harness = f"""
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
-      const projectBootstrap = {{...bootstrap, project_id: "project-a"}};
+      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], activity: {{type: "agent_event", status: "ready", command_sha256: "audit-a"}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
       let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, usage_credits_acknowledged: true, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
@@ -686,13 +686,14 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
           this.checked = false; this.open = false; this.inert = false; this.listeners = {{}};
         }}
         set textContent(value) {{ this._text = String(value); this.children = []; }}
-        get textContent() {{ return this._text; }}
+        get textContent() {{ return this._text + this.children.map((child) => child.textContent).join(""); }}
         append(...children) {{ for (const child of children) {{ child.parent = this; this.children.push(child); }} }}
         replaceChildren(...children) {{ this.children = []; this.append(...children); this._text = ""; }}
         removeChild(child) {{ this.children.splice(this.children.indexOf(child), 1); }}
         remove() {{ this.parent?.removeChild(this); }}
         setAttribute(name, value) {{ this.attributes[name] = String(value); }}
         removeAttribute(name) {{ delete this.attributes[name]; if (name === "open") this.open = false; }}
+        getAttribute(name) {{ return this.attributes[name] ?? null; }}
         addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }}
             async emit(kind, event = {{}}) {{
               if (!interactionAllowed(this)) return;
@@ -703,15 +704,23 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         focus() {{ documentRoot.activeElement = this; this.focusCount = (this.focusCount ?? 0) + 1; }}
         showModal() {{ this.open = true; this.showModalCount = (this.showModalCount ?? 0) + 1; }}
         close() {{ this.open = false; this.closeCount = (this.closeCount ?? 0) + 1; }}
-        querySelector(selector) {{
-          const wanted = selector.includes("button") ? "button" : null;
+        querySelectorAll(selector) {{
+          const selectors = selector.split(",").map((entry) => entry.trim());
+          const matches = (node) => selectors.some((entry) => (
+            entry === node.tag || entry === "[tabindex]" && node.attributes.tabindex !== undefined
+              || entry.startsWith("#") && node.id === entry.slice(1)
+          ));
+          const result = [];
           const stack = [...this.children];
           while (stack.length) {{
             const child = stack.shift();
-            if (wanted && child.tag === wanted && !child.disabled) return child;
+            if (matches(child)) result.push(child);
             stack.push(...child.children);
           }}
-          return null;
+          return result;
+        }}
+        querySelector(selector) {{
+          return this.querySelectorAll(selector)[0] ?? null;
         }}
       }}
 
@@ -723,13 +732,17 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         "toast-region", "fable-status", "sol-status", "repository-status",
         "connection-status", "task-drawer-toggle", "inspector-drawer-toggle",
         "bootstrap-retry", "project-list", "chat-list", "new-chat",
-        "selected-project-name", "selected-chat-name",
+            "selected-project-name", "selected-chat-name", "task-inspector-summary",
+            "task-controls", "activity-audit", "intervention-context", "intervene-control",
+            "stop-control", "conversation-status", "conversation-context",
       ];
       const nodes = Object.fromEntries(ids.map((id) => [id, new Node(
         id === "usage-modal" ? "dialog" : id.includes("toggle") || id.includes("submit") || id === "bootstrap-retry" || id === "new-chat" ? "button" : id === "composer" || id === "usage-credits-form" ? "form" : "div",
         id,
       )]));
       nodes["message-input"].tag = "textarea";
+      nodes["intervene-control"].tag = "button"; nodes["stop-control"].tag = "button";
+      nodes["activity-audit"].tag = "details";
       nodes["usage-credits-confirm"].tag = "input";
       nodes["task-drawer-toggle"].setAttribute("aria-expanded", "false");
       nodes["inspector-drawer-toggle"].setAttribute("aria-expanded", "false");
@@ -738,7 +751,11 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         nodes["usage-credits-confirm"], nodes["usage-credits-acknowledge"],
         nodes["usage-error"], nodes["bootstrap-retry"],
       );
-      nodes["project-navigation"].append(nodes["task-list"]);
+      const disabledDrawerControl = new Node("button", "disabled-drawer-control");
+      disabledDrawerControl.disabled = true;
+      const drawerSummary = new Node("summary", "drawer-summary");
+      drawerSummary.textContent = "Drawer navigation";
+      nodes["project-navigation"].append(disabledDrawerControl, drawerSummary, nodes["task-list"]);
       nodes["task-inspector-panel"].append(nodes["task-inspector"]);
       const isDescendantOf = (node, ancestor) => {{
         for (let current = node; current; current = current.parent) {{
@@ -761,6 +778,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const fetchCalls = [];
       let projectFetchCount = 0;
       let bootstrapFetchCount = 0;
+      let interventionAttempts = 0;
+      let acknowledgementAttempts = 0;
       let releaseReconnectBootstrap;
       const scheduled = [];
       class FakeSocket {{
@@ -796,6 +815,18 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
             }}
             return {{ok: true, status: 200, json: async () => projectBootstrap}};
           }}
+          if (url.endsWith("/tasks/intervene-task/intervene")) {{
+            interventionAttempts += 1;
+            return interventionAttempts === 1
+              ? {{ok: false, status: 409, json: async () => ({{}})}}
+              : {{ok: true, status: 202, json: async () => ({{}})}};
+          }}
+          if (url.endsWith("/authorize-retry")) {{
+            acknowledgementAttempts += 1;
+            return acknowledgementAttempts === 1
+              ? {{ok: false, status: 503, json: async () => ({{}})}}
+              : {{ok: true, status: 202, json: async () => ({{}})}};
+          }}
           return {{ok: true, status: 202, json: async () => ({{}})}};
         }},
         setTimeout: (callback, delay) => {{ scheduled.push({{callback, delay}}); return scheduled.length; }},
@@ -814,6 +845,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await nodes["bootstrap-retry"].emit("click");
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
+      if (!nodes["task-inspector-summary"].textContent.includes("Question budget")) process.exit(34);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
       if (nodes["repository-status"].textContent !== "Project: PROJECT-A · Branch: feat/agent-bridge") {{
         process.exit(9);
@@ -869,16 +901,85 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await nodes["task-drawer-toggle"].emit("click");
       if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert || nodes["project-navigation"].attributes.role !== "dialog" || nodes["project-navigation"].attributes["aria-modal"] !== "true") process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
+      if (documentRoot.activeElement !== drawerSummary) process.exit(35);
+      launcher.focus();
+      await documentRoot.emit("keydown", {{key: "Tab", preventDefault() {{ this.prevented = true; }}}});
+      if (documentRoot.activeElement !== drawerSummary) process.exit(36);
       await documentRoot.emit("keydown", {{key: "Escape", preventDefault() {{}}}});
       if (nodes["project-navigation"].classList.contains("drawer-open") || nodes["project-navigation"].attributes.role !== undefined || nodes["project-navigation"].attributes["aria-modal"] !== undefined) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
       if (globalThis.pwned === true) process.exit(18);
+      nodes["activity-audit"].open = true;
+      await nodes["activity-audit"].emit("toggle");
+      if (!nodes["activity-audit"].textContent.includes("Agent Event · Ready · audit-a")) process.exit(37);
       media.matches = false;
       media.emit();
       if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);
-      const taskButton = nodes["task-list"].children[1].querySelector("button");
+      media.matches = true;
+      media.emit();
+      await nodes["task-drawer-toggle"].emit("click");
+      const taskButton = nodes["task-list"].children[1].children[1].querySelector("button");
       await taskButton.emit("click");
-      if (nodes["project-navigation"].inert) process.exit(20);
+      if (!nodes["project-navigation"].inert || nodes["project-navigation"].classList.contains("drawer-open") || nodes["conversation-shell"].inert) process.exit(20);
+      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded")) process.exit(38);
+      projectBootstrap.fable_ready = false;
+      projectBootstrap.fable_status = "unavailable";
+      projectBootstrap.sol_status = "unavailable";
+      const activeSocket = FakeSocket.instances.at(-1);
+      const refreshFromEvent = async (sequence) => {{
+        activeSocket.listeners.message({{data: JSON.stringify({{...persistedEvent, sequence, task_id: "intervene-task", kind: "conversation", payload: {{text: "refresh"}}}})}});
+        await flush();
+        scheduled.at(-1).callback();
+        await flush();
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 50);
+      if (controller.state.gate.canCompose || !nodes["message-input"].disabled) process.exit(41);
+      await nodes["intervene-control"].emit("click");
+      nodes["message-input"].value = "Keep scope exact.";
+      await nodes["message-input"].emit("input");
+      if (nodes["composer-submit"].disabled) process.exit(32);
+      await nodes["composer"].emit("submit");
+      const intervention = fetchCalls.find((call) => call.url === "/api/projects/project-a/chats/session-1/tasks/intervene-task/intervene");
+      if (!intervention || JSON.parse(intervention.options.body).message !== "Keep scope exact.") process.exit(33);
+      if (!nodes["message-input"].disabled || !nodes["composer-submit"].disabled) process.exit(39);
+      await nodes["intervene-control"].emit("click");
+      nodes["message-input"].value = "Use the fresh intervention identity.";
+      await nodes["message-input"].emit("input");
+      await nodes["composer"].emit("submit");
+      const interventionRequests = fetchCalls.filter((call) => call.url === intervention.url);
+      const firstPayload = JSON.parse(interventionRequests[0].options.body);
+      const secondPayload = JSON.parse(interventionRequests[1].options.body);
+      if (interventionRequests.length !== 2 || firstPayload.intervention_id === secondPayload.intervention_id || secondPayload.message !== "Use the fresh intervention identity.") process.exit(40);
+      projectBootstrap.tasks[1] = {{...projectBootstrap.tasks[1], state: "completed", intervention: {{
+        intervention_id: "unknown-a", status: "resume_outcome_unknown", resume_generation: 4,
+        warning: "may have executed", eligible: false,
+      }}}};
+      await refreshFromEvent(persistedEvent.sequence + 51);
+      const warningFocuses = nodes["intervention-context"].focusCount;
+      const firstAcknowledge = nodes["conversation-context"].querySelector("#intervention-acknowledge-control");
+      await firstAcknowledge.emit("click");
+      const acknowledgements = () => fetchCalls.filter((call) => call.url.endsWith("/authorize-retry"));
+      const firstAcknowledgement = JSON.parse(acknowledgements()[0].options.body);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const secondAcknowledgement = JSON.parse(acknowledgements()[1].options.body);
+      if (firstAcknowledgement.acknowledgment_id !== secondAcknowledgement.acknowledgment_id || firstAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(42);
+      const focusBeforeNewGeneration = nodes["intervention-context"].focusCount;
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 5}};
+      await refreshFromEvent(persistedEvent.sequence + 52);
+      if (nodes["intervention-context"].focusCount <= focusBeforeNewGeneration || focusBeforeNewGeneration < warningFocuses) process.exit(43);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const thirdAcknowledgement = JSON.parse(acknowledgements()[2].options.body);
+      if (thirdAcknowledgement.acknowledgment_id === firstAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 5) process.exit(44);
+      for (const status of ["pending_stop", "ready", "resuming", "resume_outcome_unknown"]) {{
+        projectBootstrap.tasks[1].intervention = {{
+          intervention_id: `stop-${{status}}`, status, resume_generation: 6, eligible: false,
+        }};
+        await refreshFromEvent(persistedEvent.sequence + 53 + acknowledgements().length);
+        if (nodes["stop-control"].hidden || nodes["stop-control"].disabled) process.exit(45);
+        await nodes["stop-control"].emit("click");
+      }}
+      const stopRequests = fetchCalls.filter((call) => call.url.endsWith("/tasks/intervene-task/stop"));
+      if (stopRequests.length !== 4 || stopRequests.some((call) => call.options.body !== "null")) process.exit(46);
     """
     result = subprocess.run(
         [

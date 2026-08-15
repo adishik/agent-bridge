@@ -1625,11 +1625,49 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
         return (lighter + 0.05) / (darker + 0.05)
 
-    for foreground in (
-        "#211a17", "#3b302b", "#9a4524", "#49634e", "#8b2f2f",
-    ):
-        assert contrast(foreground, "#fffaf3") >= 4.5
-    assert contrast("#176b87", "#fffaf3") >= 3
+    colors = {
+        "ink": "#211a17", "muted": "#3b302b", "surface": "#fffaf3",
+        "panel": "#fffaf3", "cream": "#f6ecdf", "copper": "#9a4524",
+        "copper_soft": "#f4d8c7", "green": "#49634e", "green_soft": "#dce8da",
+        "danger": "#8b2f2f", "danger_soft": "#f5dddd", "focus": "#176b87",
+        "status": "#eef1ef", "white": "#ffffff",
+    }
+    # Every shipped text, disabled-text, and focus adjacency is listed by the
+    # selector that owns it.  This is deliberately component-level rather than
+    # merely checking that the palette tokens happen to contrast.
+    adjacencies = (
+        ("body", "ink", "surface", 4.5),
+        (".brand-block span", "muted", "surface", 4.5),
+        (".project-navigation-button", "muted", "panel", 4.5),
+        (".project-navigation-button:disabled", "muted", "panel", 4.5),
+        (".status-pill", "muted", "cream", 4.5),
+        (".eyebrow", "copper", "surface", 4.5),
+        (".empty-state", "muted", "surface", 4.5),
+        (".message", "ink", "panel", 4.5),
+        (".message-user", "ink", "cream", 4.5),
+        (".message-fable", "ink", "copper_soft", 4.5),
+        (".message-sol", "ink", "green_soft", 4.5),
+        (".message-coordinator", "ink", "cream", 4.5),
+        (".message-avatar", "white", "muted", 4.5),
+        (".message-fable .message-avatar", "white", "copper", 4.5),
+        (".message-sol .message-avatar", "white", "green", 4.5),
+        (".conversation-status", "muted", "status", 4.5),
+        (".button", "ink", "panel", 4.5),
+        (".button:disabled", "muted", "cream", 4.5),
+        (".button-primary", "white", "copper", 4.5),
+        (".button-danger", "danger", "panel", 4.5),
+        (".field-group textarea", "ink", "panel", 4.5),
+        ("#conversation-context", "muted", "cream", 4.5),
+        ("dialog", "ink", "panel", 4.5),
+        (".form-error", "danger", "panel", 4.5),
+        (".toast", "white", "copper", 4.5),
+        (".toast-error", "white", "danger", 4.5),
+        (".skip-link", "white", "copper", 4.5),
+        ("button:focus-visible", "focus", "surface", 3),
+    )
+    for selector, foreground, background, minimum in adjacencies:
+        assert selector in styles
+        assert contrast(colors[foreground], colors[background]) >= minimum
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

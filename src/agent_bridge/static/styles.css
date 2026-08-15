@@ -215,7 +215,7 @@ summary:focus-visible,
 }
 
 .project-navigation-button:disabled {
-  color: #7a847f;
+  color: var(--ink-800);
   cursor: not-allowed;
 }
 
