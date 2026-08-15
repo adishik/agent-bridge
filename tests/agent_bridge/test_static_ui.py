@@ -60,17 +60,34 @@ def _run_module_harness(source: str) -> None:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() -> None:
+def test_index_uses_one_semantic_three_pane_application_workspace() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     rendered = _RenderedLayout()
     rendered.feed(html)
 
+    application_landmarks = [
+        attrs
+        for _tag, attrs in rendered.elements
+        if attrs.get("role") == "application"
+    ]
+    assert application_landmarks == [
+        {"id": "workspace", "role": "application", "aria-label": "Team workspace"}
+    ]
     assert {
         "app-header",
         "workspace",
+        "project-navigation",
+        "project-list",
+        "chat-list",
+        "new-chat",
         "task-list",
         "conversation",
+        "conversation-heading",
+        "conversation-status",
+        "conversation-context",
         "task-inspector",
+        "task-inspector-heading",
+        "activity-audit",
         "composer",
         "message-input",
         "usage-modal",
@@ -81,14 +98,19 @@ def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() 
         "inspector-drawer-toggle",
         "repository-authority-note",
     } <= rendered.ids
-    assert rendered.element("aside", "task-list")["aria-label"] == "Tasks"
-    assert rendered.element("section", "conversation")["aria-live"] == "polite"
+    assert rendered.element("nav", "project-navigation")["aria-label"] == "Projects and chats"
+    assert rendered.element("ul", "project-list")["aria-label"] == "Projects"
+    assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
+    assert rendered.element("button", "new-chat")["type"] == "button"
+    assert rendered.element("main", "conversation")["aria-labelledby"] == "conversation-heading"
+    assert rendered.element("p", "conversation-status")["aria-live"] == "polite"
     assert (
-        rendered.element("aside", "task-inspector")["aria-label"]
-        == "Task inspector"
+        rendered.element("aside", "task-inspector")["aria-labelledby"]
+        == "task-inspector-heading"
     )
+    assert "open" not in rendered.element("details", "activity-audit")
     assert rendered.element("button", "task-drawer-toggle")["aria-controls"] == (
-        "task-list"
+        "project-navigation task-list"
     )
     assert rendered.element("button", "inspector-drawer-toggle")[
         "aria-controls"
@@ -96,7 +118,7 @@ def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() 
     assert "open" not in rendered.element("dialog", "usage-modal")
     modal_markup = html[html.index('<dialog\n      id="usage-modal"'):html.index("</dialog>")]
     assert 'id="bootstrap-retry"' in modal_markup
-    assert "disabled" in rendered.element("button", "composer-submit")
+    assert rendered.element("button", "composer-submit")["type"] == "submit"
     assert rendered.element("script", "bridge-module")["type"] == "module"
     assert rendered.element("script", "bridge-module")["src"] == "/static/app.js"
     assert any(
@@ -113,6 +135,73 @@ def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() 
     )
     assert "Claude account usage credits are disabled" in page_text
     assert "cannot verify or change this account setting" in page_text
+
+
+def test_index_accessibility_contract_has_explicit_labels_and_safe_hooks() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert [tag for tag, _attrs in rendered.elements].count("h1") == 1
+    page_text = " ".join(" ".join(rendered.text).split())
+    assert all(label in page_text for label in ("Projects", "Chats", "Conversation", "Task inspector"))
+    assert all(
+        attrs.get("type") is not None
+        for tag, attrs in rendered.elements
+        if tag == "button"
+    )
+    assert rendered.element("span", "fable-avatar")["aria-label"] == "Fable"
+    assert rendered.element("span", "sol-avatar")["aria-label"] == "Sol"
+    assert "Fable · Subscription · checking" in page_text
+    assert "Sol · checking" in page_text
+    assert any(
+        attrs.get("aria-current") == "true"
+        for _tag, attrs in rendered.elements
+    )
+
+    live_regions = [
+        attrs
+        for _tag, attrs in rendered.elements
+        if attrs.get("aria-live") is not None
+    ]
+    assert all(attrs.get("role") in {"status", "alert"} for attrs in live_regions)
+    assert re.search(r"<[^>]+\s(?:on[a-z]+|style)=", html, flags=re.IGNORECASE) is None
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert all(
+        sink not in script
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
+    )
+
+
+def test_index_keeps_conversation_first_with_single_mobile_drawer_controls() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    element_ids = [attrs.get("id") for _tag, attrs in rendered.elements]
+    assert element_ids.index("conversation") < element_ids.index("project-navigation")
+    assert element_ids.index("conversation") < element_ids.index("task-inspector")
+    for panel_id, heading_id in (
+        ("project-navigation", "project-navigation-heading"),
+        ("task-inspector", "task-inspector-heading"),
+    ):
+        panel = next(
+            attrs
+            for _tag, attrs in rendered.elements
+            if attrs.get("id") == panel_id
+        )
+        assert panel["data-drawer"] == "mobile"
+        assert panel["aria-labelledby"] == heading_id
+        assert panel["tabindex"] == "-1"
+    assert element_ids.count("task-drawer-toggle") == 1
+    assert element_ids.count("inspector-drawer-toggle") == 1
+
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+    styles = (STATIC / "styles.css").read_text(encoding="utf-8")
+    assert 'event.key !== "Escape"' in script
+    assert "panel.inert" in script
+    assert "focusTarget?.focus()" in script
+    assert "@media (prefers-reduced-motion: reduce)" in styles
 
 
 def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
@@ -1407,7 +1496,7 @@ def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() ->
     assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
     assert rendered.element("button", "new-chat")["type"] == "button"
     assert rendered.element("button", "new-chat")["disabled"] is None
-    assert rendered.element("section", "conversation")["id"] == "conversation"
+    assert rendered.element("main", "conversation")["id"] == "conversation"
     assert rendered.element("aside", "task-inspector")["id"] == "task-inspector"
     assert "Fable" in " ".join(rendered.text)
     assert "Sol" in " ".join(rendered.text)
