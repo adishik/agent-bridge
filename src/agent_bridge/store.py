@@ -69,6 +69,11 @@ _INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX = (
     "agent_bridge.internal.intervention_acknowledgment."
 )
 _INTERVENTION_ACKNOWLEDGMENT_LINEAGE_VERSION = 1
+_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY = (
+    "agent_bridge.internal.intervention_acknowledgment_migration.v1"
+)
+_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_VERSION = 1
+_INTERNAL_SETTING_PREFIX = "agent_bridge.internal."
 _MAX_LEGACY_AUDIT_REASONS = 8
 _MAX_PREPARED_TEXT_LENGTH = 16 * 1024
 _MAX_RESUME_DRIFT_SUMMARY_LENGTH = 1024
@@ -2322,7 +2327,10 @@ class SQLiteStore:
         """Backfill the one pre-lineage acknowledgment format once and fail closed."""
         if not self._connection.in_transaction:
             raise RuntimeError("intervention acknowledgment lineage migration requires a transaction")
+        if self._intervention_acknowledgment_migration_is_complete():
+            return
         last_rowid = 0
+        saw_acknowledgment = False
         while True:
             rows = self._connection.execute(
                 """
@@ -2333,7 +2341,10 @@ class SQLiteStore:
                 (last_rowid, _STARTUP_RECOVERY_BATCH_SIZE),
             ).fetchall()
             if not rows:
+                if saw_acknowledgment:
+                    self._mark_intervention_acknowledgment_migration_complete()
                 return
+            saw_acknowledgment = True
             for row in rows:
                 last_rowid = int(row["rowid"])
                 try:
@@ -2341,10 +2352,10 @@ class SQLiteStore:
                     acknowledgment_id = _prepared_identifier(
                         row["acknowledgment_id"], "acknowledgment_id",
                     )
-                    key = self._intervention_acknowledgment_lineage_key(record.intervention_id)
-                    if self._connection.execute(
-                        "SELECT 1 FROM settings WHERE key = ? LIMIT 2", (key,),
-                    ).fetchone() is not None:
+                    lineage = self._intervention_acknowledgment_lineage(record)
+                    if lineage is not None:
+                        if not self._intervention_is_authenticated(record, acknowledgment_id):
+                            raise RuntimeError("existing intervention acknowledgment is unauthenticated")
                         continue
                     if not self._intervention_is_authenticated(
                         record,
@@ -2372,10 +2383,10 @@ class SQLiteStore:
                             retry_resume_run_id=retry_owner[1],
                         )
                     )
-                except (RuntimeError, ValueError, TypeError):
-                    # A malformed or structurally invalid legacy row stays unbound.
-                    # Subsequent authentication rejects it without rewriting its bytes.
-                    continue
+                except (RuntimeError, ValueError, TypeError) as error:
+                    raise RuntimeError(
+                        "intervention acknowledgment migration is invalid"
+                    ) from error
 
     def _migrate_fable_checkpoint_stage_owners_in_transaction(self) -> None:
         """Backfill one positively authenticated live or terminal stage owner."""
@@ -10410,6 +10421,10 @@ class SQLiteStore:
                         ),
                     ),
                 ))
+                if not self._intervention_acknowledgment_migration_is_complete():
+                    # A newly created intervention is post-compatibility data;
+                    # never permit a later missing lineage to look legacy.
+                    self._mark_intervention_acknowledgment_migration_complete()
             self._publish_committed_events(emitted)
         record = self.intervention(intervention_id)
         if record is None:
@@ -10998,12 +11013,8 @@ class SQLiteStore:
                 (intervention_id,),
             ).fetchone()
             acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            if not self._intervention_acknowledgment_lineage_is_authenticated(
-                record,
-                acknowledgment_id,
-                allow_legacy_acknowledgment_lineage=False,
-            ):
-                raise RuntimeError("intervention acknowledgment lineage is not authenticated")
+            if not self._intervention_is_authenticated(record, acknowledgment_id):
+                raise RuntimeError("intervention binding is not authenticated")
             if record.resume_generation != expected_resume_generation:
                 raise RuntimeError("intervention resume generation changed")
             if (
@@ -11375,12 +11386,8 @@ class SQLiteStore:
                 (intervention_id,),
             ).fetchone()
             acknowledgment_id = None if row is None else row["acknowledgment_id"]
-            if not self._intervention_acknowledgment_lineage_is_authenticated(
-                record,
-                acknowledgment_id,
-                allow_legacy_acknowledgment_lineage=False,
-            ):
-                raise RuntimeError("intervention acknowledgment lineage is not authenticated")
+            if not self._intervention_is_authenticated(record, acknowledgment_id):
+                raise RuntimeError("intervention binding is not authenticated")
             if (
                 record.resume_attempt_id != resume_attempt_id
                 or record.resume_run_id != resume_run_id
@@ -12141,7 +12148,7 @@ class SQLiteStore:
 
     def set_setting(self, key: str, value: object) -> None:
         key = _require_string(key, "key")
-        if key.startswith(_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX):
+        if key.startswith(_INTERNAL_SETTING_PREFIX):
             raise ValueError("setting key is reserved")
         self._connection.execute(
             """
@@ -12153,7 +12160,7 @@ class SQLiteStore:
 
     def get_setting(self, key: str) -> object | None:
         key = _require_string(key, "key")
-        if key.startswith(_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX):
+        if key.startswith(_INTERNAL_SETTING_PREFIX):
             raise ValueError("setting key is reserved")
         row = self._connection.execute(
             "SELECT value_json FROM settings WHERE key = ?", (key,)
@@ -13009,6 +13016,52 @@ class SQLiteStore:
             return claimed_run.status in {"running", *_TERMINAL_RUN_STATUSES}
         return claimed_run.status in _TERMINAL_RUN_STATUSES
 
+    def _intervention_acknowledgment_migration_is_complete(self) -> bool:
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2",
+            (_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY,),
+        ).fetchall()
+        if not rows:
+            return False
+        if len(rows) != 1:
+            raise RuntimeError("intervention acknowledgment migration marker is invalid")
+        try:
+            raw = _require_string(
+                rows[0]["value_json"], "intervention acknowledgment migration marker",
+            )
+            marker = _decode_mapping(raw, "intervention acknowledgment migration marker")
+        except (RuntimeError, ValueError, TypeError) as error:
+            raise RuntimeError("intervention acknowledgment migration marker is invalid") from error
+        if raw != _encode_json({"version": _INTERVENTION_ACKNOWLEDGMENT_MIGRATION_VERSION}) or (
+            marker != {"version": _INTERVENTION_ACKNOWLEDGMENT_MIGRATION_VERSION}
+        ):
+            raise RuntimeError("intervention acknowledgment migration marker is invalid")
+        return True
+
+    def _mark_intervention_acknowledgment_migration_complete(self) -> None:
+        marker = _encode_json({"version": _INTERVENTION_ACKNOWLEDGMENT_MIGRATION_VERSION})
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2",
+            (_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY,),
+        ).fetchall()
+        if rows:
+            raise RuntimeError("intervention acknowledgment migration marker changed concurrently")
+        try:
+            self._connection.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                (_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY, marker),
+            )
+        except sqlite3.IntegrityError as error:
+            raise RuntimeError(
+                "intervention acknowledgment migration marker changed concurrently"
+            ) from error
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2",
+            (_INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY,),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["value_json"] != marker:
+            raise RuntimeError("intervention acknowledgment migration marker changed concurrently")
+
     @staticmethod
     def _intervention_acknowledgment_lineage_key(intervention_id: str) -> str:
         return f"{_INTERVENTION_ACKNOWLEDGMENT_SETTING_PREFIX}{_prepared_identifier(intervention_id, 'intervention_id')}"
@@ -13207,6 +13260,99 @@ class SQLiteStore:
         except (RuntimeError, ValueError, TypeError):
             return False
 
+    def _intervention_resume_run_is_authenticated(
+        self, record: InterventionRecord, task: TaskRecord,
+    ) -> bool:
+        """Authenticate the exact claimed run through its narrow terminal images."""
+        if (
+            record.status is not InterventionStatus.RESUMING
+            or record.resume_run_id is None
+        ):
+            return True
+        binding = record.directed_binding
+        expected_run_id = record.resume_run_id
+        expected_agent = record.routed_to
+        expected_provider = (
+            task.fable_session_id
+            if expected_agent is ConversationTarget.FABLE
+            else task.sol_thread_id
+        )
+        active = self.active_run_for_task(record.task_id, record.revision)
+        if binding is not None:
+            if binding.stage == "next_fable":
+                expected_run_id = binding.next_run_id
+                expected_agent = ConversationTarget.FABLE
+                expected_provider = binding.next_provider_id
+            elif (
+                binding.kind == "nested_resume"
+                and binding.stage == "active_question"
+            ):
+                # The stored outer Fable predecessor remains authoritative
+                # until its exact Sol child is live.  After a child retry has
+                # its own owner, that owner must instead carry the binding's
+                # Sol identity, including once it has completed.
+                if active is not None:
+                    expected_run_id = binding.source_run_id
+                    expected_agent = binding.source_agent
+                    expected_provider = binding.source_provider_id
+                elif record.resume_run_id != binding.next_predecessor_run_id:
+                    expected_agent = binding.source_agent
+                    expected_provider = binding.source_provider_id
+        if expected_run_id is None or (
+            active is not None and active.run_id != expected_run_id
+        ):
+            return False
+        row = self._connection.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?", (expected_run_id,),
+        ).fetchone()
+        if row is None:
+            # Claiming precedes runner creation. Existing direct Store callers use
+            # that narrow window, while a durable run must be exact once present.
+            return active is None
+        try:
+            run = self._agent_run_from_row(row)
+        except (RuntimeError, ValueError):
+            return False
+        if not (
+            run.task_id == record.task_id
+            and run.revision == record.revision
+            and run.agent == expected_agent.value
+        ):
+            return False
+        if task.state is TaskState.COMPLETED and run.status != "completed":
+            return False
+        if expected_provider is None:
+            # Before a fresh Fable plan returns its first session ID, the sole
+            # exact publication point is the claimed Fable run itself.  Its
+            # null provider is legitimate only while it is running, or after
+            # the interrupted no-result failure image that becomes UNKNOWN.
+            return (
+                binding is None
+                and record.routed_to is ConversationTarget.FABLE
+                and record.continuation_state is TaskState.FABLE_PLANNING
+                and record.fable_session_id is None
+                and task.fable_session_id is None
+                and run.cli_session_id is None
+                and run.status in {"running", "interrupted"}
+                and task.state in {TaskState.FABLE_PLANNING, TaskState.INTERRUPTED}
+            )
+        try:
+            self._require_exact_intervention_provider_identity(
+                expected_provider, run.cli_session_id,
+            )
+        except RuntimeError:
+            # A rejected adapter-shaped result is deliberately not exposed, so
+            # its exact run can have no provider identity.  It may only become
+            # UNKNOWN from the interrupted source continuation, never succeed.
+            return (
+                binding is None
+                and run.cli_session_id is None
+                and run.status == "interrupted"
+                and task.state is TaskState.INTERRUPTED
+                and task.continuation_state is record.continuation_state
+            )
+        return True
+
     def _intervention_is_authenticated(
         self,
         record: InterventionRecord,
@@ -13353,6 +13499,7 @@ class SQLiteStore:
         if record.status is InterventionStatus.RESUMING and task.state not in {
             TaskState.INTERRUPTED,
             TaskState.AWAITING_USER_INPUT,
+            TaskState.COMPLETED,
             *_ACTIVE_TASK_STATES,
         }:
             return False
@@ -13368,6 +13515,8 @@ class SQLiteStore:
             InterventionStatus.PENDING_STOP,
             InterventionStatus.READY,
         } and has_resume_owner and not acknowledged_next_fable_ready:
+            return False
+        if not self._intervention_resume_run_is_authenticated(record, task):
             return False
         if acknowledgment_id is not None:
             try:
