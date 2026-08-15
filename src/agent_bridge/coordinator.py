@@ -4617,25 +4617,46 @@ class Coordinator:
         task: TaskRecord,
         result: AgentRunResult,
     ) -> TaskRecord | None:
-        """Bind a first Fable session to its pending Stop before any terminal write."""
-        if not result.interrupted or result.cli_session_id is None:
+        """Bind a first Fable session at a pending Stop or its fresh plan claim."""
+        if result.cli_session_id is None:
             return None
         current = self._store.get_task(task.task_id, task.revision)
-        if (
-            current.state is not TaskState.INTERRUPTED
-            or current.continuation_state is not TaskState.FABLE_PLANNING
-            or current.fable_session_id is not None
-        ):
-            return None
         stopped = (current.pending or {}).get("intervention")
-        if not isinstance(stopped, Mapping):
+        source_stop_publication = (
+            current.state is TaskState.INTERRUPTED
+            and current.continuation_state is TaskState.FABLE_PLANNING
+            and current.fable_session_id is None
+            and isinstance(stopped, Mapping)
+        )
+        if source_stop_publication:
+            intervention_id = stopped.get("intervention_id")
+            if not isinstance(intervention_id, str):
+                raise RuntimeError("fresh Fable intervention identity changed")
+            record = self._store.intervention(intervention_id)
+            if record is None:
+                raise RuntimeError("fresh Fable intervention is missing")
+            if not result.interrupted or result.run_id != record.run_id:
+                raise RuntimeError("fresh Fable source result identity changed")
+        elif (
+            current.state is TaskState.FABLE_PLANNING
+            and current.continuation_state is None
+            and current.pending is None
+            and current.fable_session_id is None
+        ):
+            record = self._store.active_intervention_for_task(
+                current.task_id, current.revision,
+            )
+            if record is None:
+                return None
+            if (
+                record.status is not InterventionStatus.RESUMING
+                or record.continuation_state is not TaskState.FABLE_PLANNING
+                or record.resume_run_id != result.run_id
+                or record.resume_attempt_id is None
+            ):
+                raise RuntimeError("fresh Fable claim identity changed")
+        else:
             return None
-        intervention_id = stopped.get("intervention_id")
-        if not isinstance(intervention_id, str):
-            raise RuntimeError("fresh Fable intervention identity changed")
-        record = self._store.intervention(intervention_id)
-        if record is None:
-            raise RuntimeError("fresh Fable intervention is missing")
         self._validate_cli_session_id("fable", result.cli_session_id, expected=None)
         self._store.bind_fresh_fable_session_to_pending_intervention(
             project_id=self.project_id,

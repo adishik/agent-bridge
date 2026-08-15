@@ -2152,12 +2152,27 @@ def test_fable_early_planning_intervention_dispatches_its_persisted_guidance(har
         assert restarted_prompt["partial_evidence"] == []
         assert restarted_prompt["intervention"] == "Keep the deployment bounded."
         assert ready_before_claim == [(store_module.InterventionStatus.READY, TaskState.INTERRUPTED, None)]
-        assert harness.store.intervention("early-fable").status.value == "resumed"  # type: ignore[union-attr]
+        record = harness.store.intervention("early-fable")
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.RESUMED
+        assert record.fable_session_id == "fable-session-1"
+        assert harness.store.agent_run(record.run_id).cli_session_id is None
+        assert record.resume_run_id is not None
+        assert harness.store.agent_run(record.resume_run_id).cli_session_id == (
+            "fable-session-1"
+        )
         assert [event.payload["text"] for event in harness.store.events_after("session-1", 0)
                 if event.kind == "conversation" and event.payload["sender"] == "system"] == [
             "Fable continuity could not be preserved; a new Fable session was started.",
         ]
         assert lease.snapshot() is None
+        harness.store.set_setting("agent_bridge.active_session_id", "session-1")
+        harness.tracker.close()
+        harness.store.close()
+        reopened = SQLiteStore(harness.database, clock=lambda: "2026-08-10T12:00:00Z")
+        assert reopened.authenticated_intervention(record.intervention_id) == record
+        reopened.audit_legacy_project_ownership(str(harness.repo))
+        reopened.close()
 
     asyncio.run(scenario())
 
@@ -4951,32 +4966,31 @@ def test_hub_prepared_directed_answer_stop_preserves_the_exact_pause_through_fin
 def test_early_fable_session_stop_survives_unknown_acknowledgment_and_retry(
     harness: CoordinatorHarness,
 ) -> None:
-    """A newly issued session remains the authenticated identity across an interrupted retry."""
+    """A fresh claimed plan session survives UNKNOWN without inventing an ID."""
     async def scenario() -> None:
         started = asyncio.Event()
         release = asyncio.Event()
+        plan_calls = 0
 
         async def plan(
             *, run_id: str, task_id: str, prompt: str, context: str,
         ) -> AgentRunResult:
-            started.set()
-            await release.wait()
+            nonlocal plan_calls
+            plan_calls += 1
+            if plan_calls == 1:
+                started.set()
+                await release.wait()
+                return _result(
+                    run_id,
+                    None,
+                    session_id=None,
+                    interrupted=True,
+                    exit_code=-15,
+                )
             return _result(
                 run_id,
                 None,
-                session_id="fable-session-early",
-                interrupted=True,
-                exit_code=-15,
-            )
-
-        async def interrupted_resume(
-            *, run_id: str, session_id: str, task_id: str, prompt: str, context: str,
-        ) -> AgentRunResult:
-            assert session_id == "fable-session-early"
-            return _result(
-                run_id,
-                None,
-                session_id=session_id,
+                session_id="fable-session-fresh",
                 interrupted=True,
                 exit_code=-15,
             )
@@ -4988,7 +5002,6 @@ def test_early_fable_session_stop_survives_unknown_acknowledgment_and_retry(
             return "ready"
 
         harness.fable.plan = plan  # type: ignore[method-assign]
-        harness.fable.resume_plan = interrupted_resume  # type: ignore[method-assign]
         harness.runner.release_on_stop = release
         initial = asyncio.create_task(
             harness.coordinator.handle_user_request("session-1", "Build the bridge")
@@ -5030,11 +5043,15 @@ def test_early_fable_session_stop_survives_unknown_acknowledgment_and_retry(
         unknown = harness.store.intervention("early-fable-unknown")
         assert unknown is not None
         assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
-        assert unknown.fable_session_id == "fable-session-early"
+        assert unknown.fable_session_id == "fable-session-fresh"
         assert unknown.resume_run_id is not None
         assert harness.store.agent_run(unknown.resume_run_id).status == "interrupted"
+        assert harness.store.agent_run(unknown.run_id).cli_session_id is None
+        assert harness.store.agent_run(unknown.resume_run_id).cli_session_id == (
+            "fable-session-fresh"
+        )
         stopped = harness.store.get_task("task-1", 0)
-        assert stopped.fable_session_id == "fable-session-early"
+        assert stopped.fable_session_id == "fable-session-fresh"
         assert stopped.state is TaskState.INTERRUPTED
         assert lease.snapshot() is None
         harness.store.set_setting("agent_bridge.active_session_id", "session-1")
@@ -5052,6 +5069,17 @@ def test_early_fable_session_stop_survives_unknown_acknowledgment_and_retry(
             expected_resume_generation=unknown.resume_generation,
             acknowledgment_id="early-fable-ack",
         )
+        assert reopened_store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id="early-fable-ack",
+        ) == acknowledged
+        with pytest.raises(RuntimeError, match="generation changed"):
+            reopened_store.authorize_retry_after_unknown(
+                unknown.intervention_id,
+                expected_resume_generation=unknown.resume_generation,
+                acknowledgment_id="early-fable-second-ack",
+            )
         retry_fable = FakeFable(harness.fable.brief)
         retried = Coordinator(
             store=reopened_store,
@@ -5089,8 +5117,8 @@ def test_early_fable_session_stop_survives_unknown_acknowledgment_and_retry(
         resumed = reopened_store.intervention(unknown.intervention_id)
         assert resumed is not None
         assert resumed.status is store_module.InterventionStatus.RESUMED
-        assert resumed.fable_session_id == "fable-session-early"
-        assert retry_fable.resume_plan_sessions == ["fable-session-early"]
+        assert resumed.fable_session_id == "fable-session-fresh"
+        assert retry_fable.resume_plan_sessions == ["fable-session-fresh"]
         reopened_store.audit_legacy_project_ownership(str(harness.repo))
         reopened_tracker.close()
         reopened_store.close()

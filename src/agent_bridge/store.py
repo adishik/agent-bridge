@@ -8499,6 +8499,76 @@ class SQLiteStore:
                 or pause != question_pause
             ):
                 raise RuntimeError("directed answer identity changed")
+            if question_id is not None and question.nested_parent_kind == "question":
+                if question.parent_question_id is None:
+                    raise RuntimeError("directed answer identity changed")
+                parent, parent_continuation, parent_pending, parent_pause = (
+                    self._question_exact(
+                        session_id=task.session_id,
+                        task_id=task_id,
+                        revision=revision,
+                        expected_generation=task.continuation_generation,
+                        question_id=question.parent_question_id,
+                    )
+                )
+                owner_rows = self._connection.execute(
+                    """
+                    SELECT * FROM interventions
+                    WHERE session_id = ? AND task_id = ? AND revision = ?
+                      AND status = ?
+                    ORDER BY created_at DESC, intervention_id DESC LIMIT 2
+                    """,
+                    (
+                        task.session_id, task_id, revision,
+                        InterventionStatus.RESUMING.value,
+                    ),
+                ).fetchall()
+                owners: list[tuple[InterventionRecord, object]] = []
+                for owner_row in owner_rows:
+                    owner = self._intervention_from_row(owner_row)
+                    binding = owner.directed_binding
+                    if (
+                        binding is not None
+                        and binding.kind == "nested_resume"
+                        and binding.stage == "active_question"
+                        and binding.question_id == question.question_id
+                        and binding.parent_question_id == question.parent_question_id
+                        and binding.parent_continuation_pause_id
+                        == question.parent_continuation_pause_id
+                        and binding.continuation_pause_id == question_pause
+                        and binding.continuation_state is continuation
+                        and binding.question_generation == task.continuation_generation
+                        and binding.source_run_id == run_id
+                        and binding.source_agent is ConversationTarget.SOL
+                        and binding.source_provider_id == source.cli_session_id
+                        and binding.asked_by is question.asked_by
+                        and binding.addressed_to is question.addressed_to
+                        and binding.routed_to is question.routed_to
+                        and binding.nested_parent_kind == question.nested_parent_kind
+                        and owner.routed_to is ConversationTarget.FABLE
+                        and owner.continuation_state in _SOL_TASK_STATES
+                        and owner.resume_generation == task.continuation_generation
+                        and owner.resume_attempt_id is not None
+                        and owner.resume_run_id is not None
+                    ):
+                        owners.append((owner, owner_row["acknowledgment_id"]))
+                if len(owners) != 1:
+                    raise RuntimeError("directed answer identity changed")
+                owner, acknowledgment_id = owners[0]
+                if (
+                    parent.nested_parent_kind is not None
+                    or parent.asked_by is not ConversationActor.SOL
+                    or parent.addressed_to is not ConversationTarget.FABLE
+                    or parent.routed_to is not ConversationTarget.FABLE
+                    or parent.answer_text is not None
+                    or parent.answered_by is not None
+                    or parent.continuation_generation != task.continuation_generation
+                    or parent_pause != question.parent_continuation_pause_id
+                    or parent_pending != pending
+                    or parent_continuation not in _SOL_TASK_STATES
+                    or not self._intervention_is_authenticated(owner, acknowledgment_id)
+                ):
+                    raise RuntimeError("directed answer identity changed")
             cursor = self._connection.execute(
                 """
                 UPDATE tasks SET state = ?
@@ -10144,7 +10214,7 @@ class SQLiteStore:
         fable_session_id: str,
         continuation: TaskState,
     ) -> InterventionRecord:
-        """Atomically retain a newly observed first Fable session for one Stop."""
+        """Atomically retain the first Fable session at its exact publication point."""
         project_id, session_id, task_id, revision, expected_source_generation = (
             self._prepared_identity(
                 project_id, session_id, task_id, revision, expected_source_generation,
@@ -10183,81 +10253,163 @@ class SQLiteStore:
                 or record.resume_generation != expected_resume_generation
                 or record.resume_attempt_id != expected_resume_attempt_id
                 or record.resume_run_id != expected_resume_run_id
-                or record.status is not InterventionStatus.PENDING_STOP
                 or record.routed_to is not ConversationTarget.FABLE
                 or record.continuation_state is not continuation
-                or task.state is not TaskState.INTERRUPTED
-                or task.continuation_state is not continuation
                 or task.continuation_generation != expected_resume_generation
                 or source_run.task_id != task_id
                 or source_run.revision != revision
                 or source_run.agent != ConversationTarget.FABLE.value
-                or source_run.status != "running"
             ):
                 raise RuntimeError("fresh Fable intervention identity changed")
-            stopped = (task.pending or {}).get("intervention")
-            if (
-                not isinstance(stopped, Mapping)
-                or stopped.get("intervention_id") != intervention_id
-                or stopped.get("source_generation") != expected_source_generation
-                or stopped.get("source_run_id") != source_run_id
-            ):
+            source_stop_publication = (
+                record.status is InterventionStatus.PENDING_STOP
+                and expected_resume_attempt_id is None
+                and expected_resume_run_id is None
+                and task.state is TaskState.INTERRUPTED
+                and task.continuation_state is continuation
+                and source_run.status == "running"
+            )
+            claimed_fresh_plan_publication = (
+                record.status is InterventionStatus.RESUMING
+                and expected_resume_attempt_id is not None
+                and expected_resume_run_id is not None
+                and task.state is TaskState.FABLE_PLANNING
+                and task.continuation_state is None
+                and task.pending is None
+                and source_run.status in _TERMINAL_RUN_STATUSES
+                and source_run.cli_session_id is None
+            )
+            if source_stop_publication:
+                stopped = (task.pending or {}).get("intervention")
+                if (
+                    not isinstance(stopped, Mapping)
+                    or stopped.get("intervention_id") != intervention_id
+                    or stopped.get("source_generation") != expected_source_generation
+                    or stopped.get("source_run_id") != source_run_id
+                ):
+                    raise RuntimeError("fresh Fable intervention continuation changed")
+                ids = (
+                    source_run.cli_session_id,
+                    task.fable_session_id,
+                    record.fable_session_id,
+                )
+                if ids == (fable_session_id, fable_session_id, fable_session_id):
+                    return record
+                if ids != (None, None, None):
+                    raise RuntimeError("fresh Fable intervention session changed")
+                run_cursor = self._connection.execute(
+                    """
+                    UPDATE agent_runs SET cli_session_id = ?
+                    WHERE run_id = ? AND task_id = ? AND revision = ? AND agent = ?
+                      AND status = 'running' AND cli_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, source_run_id, task_id, revision,
+                        ConversationTarget.FABLE.value,
+                    ),
+                )
+                task_cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET fable_session_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND state = ? AND continuation_state = ?
+                      AND continuation_generation = ? AND fable_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, task_id, revision, session_id,
+                        TaskState.INTERRUPTED.value, continuation.value,
+                        expected_resume_generation,
+                    ),
+                )
+                intervention_cursor = self._connection.execute(
+                    """
+                    UPDATE interventions SET fable_session_id = ?
+                    WHERE intervention_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+                      AND run_id = ? AND source_generation = ? AND resume_generation = ?
+                      AND resume_attempt_id IS NULL AND resume_run_id IS NULL
+                      AND status = ? AND continuation_state = ? AND routed_to = ?
+                      AND fable_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, intervention_id, session_id, task_id, revision,
+                        source_run_id, expected_source_generation, expected_resume_generation,
+                        InterventionStatus.PENDING_STOP.value, continuation.value,
+                        ConversationTarget.FABLE.value,
+                    ),
+                )
+                if (
+                    run_cursor.rowcount != 1
+                    or task_cursor.rowcount != 1
+                    or intervention_cursor.rowcount != 1
+                ):
+                    raise RuntimeError("fresh Fable intervention changed concurrently")
+            elif claimed_fresh_plan_publication:
+                claimed_run = self.agent_run(expected_resume_run_id)
+                if (
+                    claimed_run.task_id != task_id
+                    or claimed_run.revision != revision
+                    or claimed_run.agent != ConversationTarget.FABLE.value
+                    or claimed_run.status != "running"
+                ):
+                    raise RuntimeError("fresh Fable intervention resume owner changed")
+                ids = (
+                    source_run.cli_session_id,
+                    claimed_run.cli_session_id,
+                    task.fable_session_id,
+                    record.fable_session_id,
+                )
+                if ids == (None, fable_session_id, fable_session_id, fable_session_id):
+                    return record
+                if ids != (None, None, None, None):
+                    raise RuntimeError("fresh Fable intervention session changed")
+                run_cursor = self._connection.execute(
+                    """
+                    UPDATE agent_runs SET cli_session_id = ?
+                    WHERE run_id = ? AND task_id = ? AND revision = ? AND agent = ?
+                      AND status = 'running' AND cli_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, expected_resume_run_id, task_id, revision,
+                        ConversationTarget.FABLE.value,
+                    ),
+                )
+                task_cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET fable_session_id = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND state = ? AND continuation_state IS NULL AND pending_json IS NULL
+                      AND continuation_generation = ? AND fable_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, task_id, revision, session_id,
+                        TaskState.FABLE_PLANNING.value, expected_resume_generation,
+                    ),
+                )
+                intervention_cursor = self._connection.execute(
+                    """
+                    UPDATE interventions SET fable_session_id = ?
+                    WHERE intervention_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+                      AND run_id = ? AND source_generation = ? AND resume_generation = ?
+                      AND resume_attempt_id = ? AND resume_run_id = ?
+                      AND status = ? AND continuation_state = ? AND routed_to = ?
+                      AND fable_session_id IS NULL
+                    """,
+                    (
+                        fable_session_id, intervention_id, session_id, task_id, revision,
+                        source_run_id, expected_source_generation, expected_resume_generation,
+                        expected_resume_attempt_id, expected_resume_run_id,
+                        InterventionStatus.RESUMING.value, continuation.value,
+                        ConversationTarget.FABLE.value,
+                    ),
+                )
+                if (
+                    run_cursor.rowcount != 1
+                    or task_cursor.rowcount != 1
+                    or intervention_cursor.rowcount != 1
+                ):
+                    raise RuntimeError("fresh Fable intervention changed concurrently")
+            else:
                 raise RuntimeError("fresh Fable intervention continuation changed")
-            ids = (
-                source_run.cli_session_id,
-                task.fable_session_id,
-                record.fable_session_id,
-            )
-            if ids == (fable_session_id, fable_session_id, fable_session_id):
-                return record
-            if ids != (None, None, None):
-                raise RuntimeError("fresh Fable intervention session changed")
-            run_cursor = self._connection.execute(
-                """
-                UPDATE agent_runs SET cli_session_id = ?
-                WHERE run_id = ? AND task_id = ? AND revision = ? AND agent = ?
-                  AND status = 'running' AND cli_session_id IS NULL
-                """,
-                (
-                    fable_session_id, source_run_id, task_id, revision,
-                    ConversationTarget.FABLE.value,
-                ),
-            )
-            task_cursor = self._connection.execute(
-                """
-                UPDATE tasks SET fable_session_id = ?
-                WHERE task_id = ? AND revision = ? AND session_id = ?
-                  AND state = ? AND continuation_state = ?
-                  AND continuation_generation = ? AND fable_session_id IS NULL
-                """,
-                (
-                    fable_session_id, task_id, revision, session_id,
-                    TaskState.INTERRUPTED.value, continuation.value,
-                    expected_resume_generation,
-                ),
-            )
-            intervention_cursor = self._connection.execute(
-                """
-                UPDATE interventions SET fable_session_id = ?
-                WHERE intervention_id = ? AND session_id = ? AND task_id = ? AND revision = ?
-                  AND run_id = ? AND source_generation = ? AND resume_generation = ?
-                  AND resume_attempt_id IS NULL AND resume_run_id IS NULL
-                  AND status = ? AND continuation_state = ? AND routed_to = ?
-                  AND fable_session_id IS NULL
-                """,
-                (
-                    fable_session_id, intervention_id, session_id, task_id, revision,
-                    source_run_id, expected_source_generation, expected_resume_generation,
-                    InterventionStatus.PENDING_STOP.value, continuation.value,
-                    ConversationTarget.FABLE.value,
-                ),
-            )
-            if (
-                run_cursor.rowcount != 1
-                or task_cursor.rowcount != 1
-                or intervention_cursor.rowcount != 1
-            ):
-                raise RuntimeError("fresh Fable intervention changed concurrently")
         return self._intervention_required(intervention_id)
 
     def claim_intervention_resume(
@@ -12455,6 +12607,58 @@ class SQLiteStore:
         ).fetchone()
         return row is not None
 
+    def _claimed_fresh_fable_plan_is_authenticated(
+        self,
+        *,
+        record: InterventionRecord,
+        task: TaskRecord,
+        source_run: AgentRunRecord,
+        acknowledgment_id: object,
+    ) -> bool:
+        """Authenticate a fresh plan that replaced an interrupted no-ID source."""
+        if (
+            record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state is not TaskState.FABLE_PLANNING
+            or source_run.task_id != record.task_id
+            or source_run.revision != record.revision
+            or source_run.agent != ConversationTarget.FABLE.value
+            or source_run.status not in _TERMINAL_RUN_STATUSES
+            or source_run.cli_session_id is not None
+            or task.fable_session_id is None
+            or task.fable_session_id != record.fable_session_id
+        ):
+            return False
+        try:
+            _prepared_identifier(task.fable_session_id, "intervention provider identity")
+        except ValueError:
+            return False
+        if record.status is InterventionStatus.READY:
+            return acknowledgment_id is not None and (
+                record.resume_attempt_id is None and record.resume_run_id is None
+            )
+        if record.status not in {
+            InterventionStatus.RESUMING,
+            InterventionStatus.RESUMED,
+            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+        }:
+            return False
+        if record.resume_attempt_id is None or record.resume_run_id is None:
+            return False
+        try:
+            claimed_run = self.agent_run(record.resume_run_id)
+        except RuntimeError:
+            return False
+        if (
+            claimed_run.task_id != record.task_id
+            or claimed_run.revision != record.revision
+            or claimed_run.agent != ConversationTarget.FABLE.value
+            or claimed_run.cli_session_id != task.fable_session_id
+        ):
+            return False
+        if record.status is InterventionStatus.RESUMING:
+            return claimed_run.status in {"running", *_TERMINAL_RUN_STATUSES}
+        return claimed_run.status in _TERMINAL_RUN_STATUSES
+
     def _intervention_is_authenticated(
         self, record: InterventionRecord, acknowledgment_id: object,
     ) -> bool:
@@ -12499,14 +12703,20 @@ class SQLiteStore:
         if binding is None:
             if task.continuation_generation != record.resume_generation:
                 return False
-            try:
-                self._require_intervention_source_identity(
-                    task=task,
-                    source_state=record.continuation_state,
-                    source_run=source_run,
-                )
-            except RuntimeError:
-                return False
+            if not self._claimed_fresh_fable_plan_is_authenticated(
+                record=record,
+                task=task,
+                source_run=source_run,
+                acknowledgment_id=acknowledgment_id,
+            ):
+                try:
+                    self._require_intervention_source_identity(
+                        task=task,
+                        source_state=record.continuation_state,
+                        source_run=source_run,
+                    )
+                except RuntimeError:
+                    return False
         else:
             if not self._intervention_directed_binding_is_authenticated(
                 record=record,

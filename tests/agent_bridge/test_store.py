@@ -8054,6 +8054,110 @@ def test_early_fable_session_binding_is_atomic_and_authenticates_after_reopen(
     reopened.close()
 
 
+def test_claimed_fresh_fable_plan_session_binds_without_rewriting_no_id_source(
+    tmp_path,
+) -> None:
+    """A no-ID source Stop authenticates the exact fresh claimed plan session."""
+    path = tmp_path / "claimed-fresh-fable-session.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store.create_session("session-1", str(repo))
+    task = store.create_planning_task("session-1", "claimed-fresh-fable-task")
+    store.start_agent_run("claimed-fresh-fable-source", task.task_id, task.revision, "fable")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="claimed-fresh-fable-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Continue from a fresh Fable session.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="claimed-fresh-fable-source",
+    )
+    store.finish_agent_run(created.run_id, status="interrupted", exit_code=-15)
+    store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    resumed = store.begin_intervention_resume(
+        created.intervention_id,
+        expected_resume_generation=created.resume_generation,
+        resume_attempt_id="claimed-fresh-fable-attempt",
+        resume_run_id="claimed-fresh-fable-run",
+    )
+    assert resumed.state is TaskState.FABLE_PLANNING
+    assert resumed.continuation_state is None
+    store.start_agent_run(
+        "claimed-fresh-fable-run", task.task_id, task.revision, "fable",
+    )
+
+    bound = store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=created.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id="claimed-fresh-fable-attempt",
+        expected_resume_run_id="claimed-fresh-fable-run",
+        fable_session_id="claimed-fresh-fable-session",
+        continuation=TaskState.FABLE_PLANNING,
+    )
+
+    assert bound.fable_session_id == "claimed-fresh-fable-session"
+    assert store.get_task(task.task_id, task.revision).fable_session_id == (
+        "claimed-fresh-fable-session"
+    )
+    assert store.agent_run(created.run_id).cli_session_id is None
+    assert store.agent_run("claimed-fresh-fable-run").cli_session_id == (
+        "claimed-fresh-fable-session"
+    )
+    assert store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=created.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id="claimed-fresh-fable-attempt",
+        expected_resume_run_id="claimed-fresh-fable-run",
+        fable_session_id="claimed-fresh-fable-session",
+        continuation=TaskState.FABLE_PLANNING,
+    ) == bound
+    before_tamper = (
+        store.get_task(task.task_id, task.revision),
+        store.intervention(created.intervention_id),
+        store.agent_run(created.run_id),
+        store.agent_run("claimed-fresh-fable-run"),
+    )
+    with pytest.raises(RuntimeError, match="session changed"):
+        store.bind_fresh_fable_session_to_pending_intervention(
+            project_id=project_id_for_root(repo),
+            intervention_id=created.intervention_id,
+            session_id="session-1",
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_source_generation=created.source_generation,
+            expected_resume_generation=created.resume_generation,
+            source_run_id=created.run_id,
+            expected_resume_attempt_id="claimed-fresh-fable-attempt",
+            expected_resume_run_id="claimed-fresh-fable-run",
+            fable_session_id="forged-fable-session",
+            continuation=TaskState.FABLE_PLANNING,
+        )
+    assert (
+        store.get_task(task.task_id, task.revision),
+        store.intervention(created.intervention_id),
+        store.agent_run(created.run_id),
+        store.agent_run("claimed-fresh-fable-run"),
+    ) == before_tamper
+
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.authenticated_intervention(created.intervention_id) == bound
+    reopened.audit_legacy_project_ownership(str(repo))
+    reopened.close()
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("project", "generation", "source", "resume_owner", "provider", "continuation"),
@@ -9550,6 +9654,109 @@ def test_interrupt_directed_answer_for_stop_preserves_an_exact_nested_child(
     assert store.question(nested.question_id) == nested
     assert store.agent_run("nested-stop-run").status == "running"
     assert store.events_after("session-1", 0) == before[3]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "exact",
+        "missing_parent",
+        "changed_parent",
+        "answered_parent",
+        "changed_parent_generation",
+        "changed_parent_route",
+        "substituted_binding_child",
+        "substituted_binding_parent",
+    ),
+)
+def test_interrupt_directed_answer_for_stop_authenticates_question_nested_parent_and_binding(
+    tmp_path,
+    valid_brief,
+    mutation: str,
+) -> None:
+    """A nested-question child can stop only under its exact parent intervention image."""
+    store = _store(tmp_path)
+    record = _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief)
+    binding = record.directed_binding
+    assert binding is not None
+    child = store.question(binding.question_id)
+    assert child is not None
+    assert child.nested_parent_kind == "question"
+    assert child.parent_question_id == binding.parent_question_id
+    assert binding.parent_question_id == "original-question"
+
+    if mutation == "missing_parent":
+        store._connection.execute(  # noqa: SLF001 - parent identity tamper boundary
+            "UPDATE questions SET parent_question_id = NULL WHERE question_id = ?",
+            (child.question_id,),
+        )
+    elif mutation == "changed_parent":
+        store._connection.execute(  # noqa: SLF001 - parent substitution boundary
+            "UPDATE questions SET parent_question_id = 'substituted-parent' WHERE question_id = ?",
+            (child.question_id,),
+        )
+    elif mutation == "answered_parent":
+        store._connection.execute(  # noqa: SLF001 - parent lifecycle tamper boundary
+            "UPDATE questions SET answer_text = 'answered early', answered_by = 'fable' "
+            "WHERE question_id = 'original-question'",
+        )
+    elif mutation == "changed_parent_generation":
+        store._connection.execute(  # noqa: SLF001 - parent generation tamper boundary
+            "UPDATE questions SET continuation_generation = continuation_generation + 1 "
+            "WHERE question_id = 'original-question'",
+        )
+    elif mutation == "changed_parent_route":
+        store._connection.execute(  # noqa: SLF001 - parent route tamper boundary
+            "UPDATE questions SET addressed_to = 'sol', routed_to = 'sol' "
+            "WHERE question_id = 'original-question'",
+        )
+    elif mutation == "substituted_binding_child":
+        store._connection.execute(  # noqa: SLF001 - owning binding tamper boundary
+            "UPDATE interventions SET directed_binding_json = json_set("
+            "directed_binding_json, '$.question_id', 'substituted-child') "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "substituted_binding_parent":
+        store._connection.execute(  # noqa: SLF001 - owning binding tamper boundary
+            "UPDATE interventions SET directed_binding_json = json_set("
+            "directed_binding_json, '$.parent_question_id', 'substituted-parent') "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation != "exact":
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    tables = ("tasks", "questions", "agent_runs", "interventions", "events")
+    before = {
+        table: tuple(tuple(row) for row in store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+    if mutation == "exact":
+        interrupted = store.interrupt_directed_answer_for_stop(
+            valid_brief.task_id,
+            valid_brief.revision,
+            run_id=binding.source_run_id,
+            question_id=child.question_id,
+        )
+        assert interrupted.state is TaskState.INTERRUPTED
+        assert interrupted.continuation_state is TaskState.FABLE_CLARIFYING
+    else:
+        with pytest.raises(RuntimeError):
+            store.interrupt_directed_answer_for_stop(
+                valid_brief.task_id,
+                valid_brief.revision,
+                run_id=binding.source_run_id,
+                question_id=child.question_id,
+            )
+        assert {
+            table: tuple(tuple(row) for row in store._connection.execute(  # noqa: SLF001
+                f"SELECT * FROM {table} ORDER BY rowid"
+            ))
+            for table in tables
+        } == before
 
 
 def test_nested_fable_answer_evidence_binds_outer_question_and_reopens_idempotently(
