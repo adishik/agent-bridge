@@ -12,7 +12,7 @@ import shlex
 import sys
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from agent_bridge.adapters.base import AgentRunResult, FableAdapter, SolAdapter
@@ -116,7 +116,11 @@ _EXCHANGE_PERMISSION_TEXT = (
 _FABLE_LOGIN_EXPIRED_TEXT = (
     "Fable login expired. Run claude auth login on the host, then Resume."
 )
+_FABLE_CONTINUITY_RESTARTED_TEXT = (
+    "Fable continuity could not be preserved; a new Fable session was started."
+)
 _STOP_TIMEOUT_SECONDS = 10.0
+_MAX_INTERVENTION_PARTIAL_EVENTS = 16
 
 
 class RoutingMode(str, Enum):
@@ -168,6 +172,46 @@ class InterventionIntent:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"{name} is invalid")
+
+
+class InterventionOperation(str, Enum):
+    """One explicit provider operation allowed for a durable intervention."""
+
+    FABLE_PLAN = "fable_plan"
+    FABLE_RESUME_PLAN = "fable_resume_plan"
+    FABLE_CLARIFY = "fable_clarify"
+    FABLE_REVIEW = "fable_review"
+    SOL_RESUME = "sol_resume"
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionInvocation:
+    """A coordinator-owned operation and the contract required before routing."""
+
+    operation: InterventionOperation
+    run_id: str
+    expected_contract: Literal[
+        "TaskBrief", "FableClarification", "ReviewVerdict", "SolOutcome",
+    ]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, InterventionOperation):
+            raise ValueError("operation must be an InterventionOperation")
+        if not isinstance(self.run_id, str) or _SAFE_ID.fullmatch(self.run_id) is None:
+            raise ValueError("run_id must be a safe coordinator run ID")
+        expected_contracts = {
+            InterventionOperation.FABLE_PLAN: "TaskBrief",
+            InterventionOperation.FABLE_RESUME_PLAN: "TaskBrief",
+            InterventionOperation.FABLE_CLARIFY: "FableClarification",
+            InterventionOperation.FABLE_REVIEW: "ReviewVerdict",
+            InterventionOperation.SOL_RESUME: "SolOutcome",
+        }
+        if self.expected_contract != expected_contracts[self.operation]:
+            raise ValueError("operation has the wrong expected contract")
+
+
+class _InterventionValidationError(RuntimeError):
+    """A durable intervention cannot safely continue with this provider result."""
 
 
 def route_user_intent(
@@ -1275,16 +1319,22 @@ class Coordinator:
         *,
         answer_source: Literal["user", "sol"] = "user",
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if isinstance(context, AnswerContext):
             await self._run_context(
                 task, context.underlying_continuation, context.answer,
-                answer_source=answer_source, run_id=run_id,
+                answer_source=answer_source,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if isinstance(context, SolResumeContext):
             await self._resume_sol(
-                task, answer if answer is not None else context.prompt, run_id=run_id,
+                task,
+                answer if answer is not None else context.prompt,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if isinstance(context, ScopeApprovalContext):
@@ -1298,22 +1348,46 @@ class Coordinator:
                 )
             return
         if isinstance(context, ReviewContext):
-            prompt = context.review_prompt
-            if answer is not None:
+            if intervention_invocation is not None:
+                if (
+                    intervention_invocation.operation is not InterventionOperation.FABLE_REVIEW
+                    or answer is None
+                ):
+                    raise RuntimeError("intervention review invocation changed")
+                prompt = answer
+            else:
+                prompt = context.review_prompt
+            if answer is not None and intervention_invocation is None:
                 prompt = f"{prompt}\n{'User answer' if answer_source == 'user' else 'Sol evidence'}: {answer}"
             await self._call_fable_review(
-                task, prompt, completion_allowed=context.completion_allowed, run_id=run_id,
+                task,
+                prompt,
+                completion_allowed=context.completion_allowed,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if isinstance(context, ClarificationContext):
-            prompt = context.clarification_prompt
-            if answer is not None:
+            if intervention_invocation is not None:
+                if (
+                    intervention_invocation.operation is not InterventionOperation.FABLE_CLARIFY
+                    or answer is None
+                ):
+                    raise RuntimeError("intervention clarification invocation changed")
+                prompt = answer
+            else:
+                prompt = context.clarification_prompt
+            if answer is not None and intervention_invocation is None:
                 prompt = f"{prompt}\n{'User answer' if answer_source == 'user' else 'Sol evidence'}: {answer}"
             underlying = context.underlying_continuation
             if not isinstance(underlying, SolResumeContext):
                 raise RuntimeError("clarification has no exact Sol continuation")
             await self._call_fable_clarification(
-                task, prompt, underlying_continuation=underlying, run_id=run_id,
+                task,
+                prompt,
+                underlying_continuation=underlying,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if context is None:
@@ -1618,26 +1692,96 @@ class Coordinator:
         elif record.routed_to is ConversationTarget.SOL:
             if task.state not in _SOL_STATES:
                 raise RuntimeError("intervention Sol route changed")
-            await self._resume_sol(task, record.message, run_id=resume_run_id)
+            if (
+                task.sol_thread_id is None
+                or record.sol_thread_id != task.sol_thread_id
+            ):
+                raise RuntimeError("intervention Sol thread changed")
+            self._validated_intervention_sol_thread(task.sol_thread_id)
+            invocation = InterventionInvocation(
+                operation=InterventionOperation.SOL_RESUME,
+                run_id=resume_run_id,
+                expected_contract="SolOutcome",
+            )
+            await self._resume_sol(
+                task,
+                self._intervention_prompt(task, record, invocation),
+                run_id=resume_run_id,
+                intervention_invocation=invocation,
+            )
         elif record.routed_to is ConversationTarget.FABLE:
             context_task = replace(task, continuation_state=task.state)
             context = self._context_from_task(context_task)
             if context is None:
+                if task.fable_session_id is None:
+                    if record.fable_session_id is not None:
+                        raise RuntimeError("intervention planning session changed")
+                    operation = InterventionOperation.FABLE_PLAN
+                else:
+                    if record.fable_session_id != task.fable_session_id:
+                        raise RuntimeError("intervention planning session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    operation = InterventionOperation.FABLE_RESUME_PLAN
+                invocation = InterventionInvocation(
+                    operation=operation,
+                    run_id=resume_run_id,
+                    expected_contract="TaskBrief",
+                )
                 await self._run_planning(
                     task,
-                    f"{self._original_user_message(task.session_id, task.task_id)}"
-                    f"\n\nIntervention guidance:\n{record.message}",
-                    resume_session_id=task.fable_session_id, run_id=resume_run_id,
+                    self._intervention_prompt(task, record, invocation),
+                    resume_session_id=task.fable_session_id,
+                    run_id=resume_run_id,
+                    intervention_invocation=invocation,
                 )
             else:
-                guidance = None if (
-                    record.continuation_state in _SOL_STATES
-                    and isinstance(context, ClarificationContext)
-                    and context.clarification_prompt == record.message
-                ) else record.message
-                await self._run_context(
-                    task, context, guidance, run_id=resume_run_id,
-                )
+                if isinstance(context, ClarificationContext):
+                    if (
+                        task.fable_session_id is None
+                        or record.fable_session_id != task.fable_session_id
+                    ):
+                        raise RuntimeError("intervention clarification session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    invocation = InterventionInvocation(
+                        operation=InterventionOperation.FABLE_CLARIFY,
+                        run_id=resume_run_id,
+                        expected_contract="FableClarification",
+                    )
+                    await self._run_context(
+                        task,
+                        context,
+                        self._intervention_prompt(task, record, invocation),
+                        run_id=resume_run_id,
+                        intervention_invocation=invocation,
+                    )
+                elif isinstance(context, ReviewContext):
+                    if (
+                        task.fable_session_id is None
+                        or record.fable_session_id != task.fable_session_id
+                    ):
+                        raise RuntimeError("intervention review session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    invocation = InterventionInvocation(
+                        operation=InterventionOperation.FABLE_REVIEW,
+                        run_id=resume_run_id,
+                        expected_contract="ReviewVerdict",
+                    )
+                    await self._run_context(
+                        task,
+                        context,
+                        self._intervention_prompt(task, record, invocation),
+                        run_id=resume_run_id,
+                        intervention_invocation=invocation,
+                    )
+                else:
+                    guidance = None if (
+                        record.continuation_state in _SOL_STATES
+                        and isinstance(context, ClarificationContext)
+                        and context.clarification_prompt == record.message
+                    ) else record.message
+                    await self._run_context(
+                        task, context, guidance, run_id=resume_run_id,
+                    )
         else:
             raise RuntimeError("intervention route changed")
         current = self._store.intervention(intervention_id)
@@ -1665,13 +1809,17 @@ class Coordinator:
 
     async def dispatch_ready_intervention(self, intervention_id: str) -> None:
         """Allocate one durable owner and invoke its resumed adapter exactly once."""
-        record = self._store.authenticated_intervention(intervention_id)
+        record = self._store.intervention(intervention_id)
         if record is None:
             raise RuntimeError("intervention not found")
         if record.status is not InterventionStatus.READY:
             if record.status is InterventionStatus.CANCELED_BY_STOP:
                 return
             raise RuntimeError("intervention is not ready to resume")
+        self._validate_ready_intervention_provider_identity(record)
+        record = self._store.authenticated_intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention binding is not authenticated")
         resume_run_id = self._ids.new_run_id()
         resume_attempt_id = f"intervention-{resume_run_id}"
         await self.resume_intervention(
@@ -1914,8 +2062,20 @@ class Coordinator:
         *,
         resume_session_id: str | None,
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         run_id = self._ids.new_run_id() if run_id is None else run_id
+        if intervention_invocation is not None:
+            expected_operation = (
+                InterventionOperation.FABLE_PLAN
+                if resume_session_id is None
+                else InterventionOperation.FABLE_RESUME_PLAN
+            )
+            if (
+                intervention_invocation.operation is not expected_operation
+                or intervention_invocation.run_id != run_id
+            ):
+                raise RuntimeError("intervention planning invocation changed")
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
@@ -1934,6 +2094,17 @@ class Coordinator:
                     prompt=prompt,
                     context=self._repo_context(),
                 )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=resume_session_id,
+                )
+                if intervention_invocation is not None
+                else None
+            )
             self._persist_agent_result(
                 task,
                 "fable",
@@ -1965,7 +2136,11 @@ class Coordinator:
                 return
             if result.payload is None or result.cli_session_id is None:
                 raise RuntimeError("Fable planning completed without a contract or session ID")
-            brief = TaskBrief.from_dict(result.payload)
+            brief = (
+                contract
+                if isinstance(contract, TaskBrief)
+                else TaskBrief.from_dict(result.payload)
+            )
             if brief.task_id != task.task_id or brief.revision != 1:
                 raise ValueError("Fable returned the wrong task identity")
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
@@ -1982,6 +2157,26 @@ class Coordinator:
                 "task_brief",
                 {"brief": brief.to_dict()},
             )
+            if (
+                intervention_invocation is not None
+                and intervention_invocation.operation is InterventionOperation.FABLE_PLAN
+            ):
+                self._store.append_event(
+                    saved.session_id,
+                    saved.task_id,
+                    "system",
+                    "conversation",
+                    ConversationEnvelope(
+                        sender=ConversationActor.SYSTEM,
+                        addressed_to=ConversationTarget.USER,
+                        routed_to=ConversationTarget.USER,
+                        message_type=ConversationMessageType.STATUS,
+                        text=_FABLE_CONTINUITY_RESTARTED_TEXT,
+                        task_id=saved.task_id,
+                        revision=saved.revision,
+                        continuation_generation=saved.continuation_generation,
+                    ).to_dict(),
+                )
         except asyncio.CancelledError:
             self._interrupt_if_active(
                 run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING
@@ -2002,6 +2197,11 @@ class Coordinator:
                 run_id,
                 error,
                 expected_cli_session_id=resume_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING,
             )
             raise
         except BaseException as error:
@@ -2029,13 +2229,29 @@ class Coordinator:
         )
 
     async def _resume_sol(
-        self, task: TaskRecord, prompt: str, *, run_id: str | None = None,
+        self,
+        task: TaskRecord,
+        prompt: str,
+        *,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if task.state not in _SOL_STATES:
             raise RuntimeError("Sol resume requires a persisted Sol state")
         if task.sol_thread_id is None:
             raise RuntimeError("Sol resume requires the exact persisted thread ID")
-        await self._invoke_sol(task, resume_prompt=prompt, context=None, run_id=run_id)
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.SOL_RESUME
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention Sol invocation changed")
+        await self._invoke_sol(
+            task,
+            resume_prompt=prompt,
+            context=None,
+            run_id=run_id,
+            intervention_invocation=intervention_invocation,
+        )
 
     async def _invoke_sol(
         self,
@@ -2044,10 +2260,15 @@ class Coordinator:
         resume_prompt: str | None,
         context: str | None,
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         async with self._writing_lock:
             routed = await self._invoke_sol_locked(
-                task, resume_prompt=resume_prompt, context=context, run_id=run_id,
+                task,
+                resume_prompt=resume_prompt,
+                context=context,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
         if routed is not None:
             await self._route_sol_outcome(routed[0], routed[1], routed[2])
@@ -2059,6 +2280,7 @@ class Coordinator:
         resume_prompt: str | None,
         context: str | None,
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> tuple[
         TaskRecord, SolOutcome, tuple[Mapping[str, object], ...]
     ] | None:
@@ -2071,6 +2293,13 @@ class Coordinator:
             if current.state is not task.state:
                 return None
             task = current
+            if intervention_invocation is not None and (
+                intervention_invocation.operation is not InterventionOperation.SOL_RESUME
+                or intervention_invocation.run_id != run_id
+                or resume_prompt is None
+                or context is not None
+            ):
+                raise RuntimeError("intervention Sol invocation changed")
             self._store.start_agent_run(
                 run_id, task.task_id, task.revision, "sol"
             )
@@ -2109,6 +2338,19 @@ class Coordinator:
                     thread_id=task.sol_thread_id,
                     prompt=resume_prompt,
                 )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "sol",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=(
+                        task.sol_thread_id if resume_prompt is not None else None
+                    ),
+                )
+                if intervention_invocation is not None
+                else None
+            )
             observed_events = self._persist_agent_result(
                 task,
                 "sol",
@@ -2141,12 +2383,22 @@ class Coordinator:
                 return None
             if result.payload is None or result.cli_session_id is None:
                 raise RuntimeError("Sol completed without an outcome or thread ID")
-            outcome = SolOutcome.from_dict(result.payload)
+            outcome = (
+                contract
+                if isinstance(contract, SolOutcome)
+                else SolOutcome.from_dict(result.payload)
+            )
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
         except asyncio.CancelledError:
             if completion is not None:
                 self._interrupt_if_active(
                     run_id, task.task_id, task.revision, task.state
+                )
+            raise
+        except _InterventionValidationError:
+            if completion is not None:
+                self._interrupt_if_active(
+                    run_id, task.task_id, task.revision, task.state,
                 )
             raise
         except BaseException as error:
@@ -3112,6 +3364,7 @@ class Coordinator:
         *,
         underlying_continuation: SolResumeContext | None = None,
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("clarification requires the exact Fable session")
@@ -3127,12 +3380,28 @@ class Coordinator:
                 },
             )
         run_id = self._start_or_reuse_fable_run(task, run_id)
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.FABLE_CLARIFY
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention clarification invocation changed")
         completion = self._track_run(run_id)
         handoff_intervention_id: str | None = None
         directed_outcome_intervention_id: str | None = None
         try:
             result = await self._fable.clarify(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.fable_session_id,
+                )
+                if intervention_invocation is not None
+                else None
             )
             self._persist_agent_result(
                 task,
@@ -3157,7 +3426,11 @@ class Coordinator:
                 return
             if result.payload is None:
                 raise RuntimeError("Fable clarification completed without a contract")
-            clarification = FableClarification.from_dict(result.payload)
+            clarification = (
+                contract
+                if isinstance(contract, FableClarification)
+                else FableClarification.from_dict(result.payload)
+            )
             intervention = self._store.active_intervention_for_task(
                 task.task_id, task.revision,
             )
@@ -3215,6 +3488,11 @@ class Coordinator:
                 run_id,
                 error,
                 expected_cli_session_id=task.fable_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_CLARIFYING,
             )
             raise
         except BaseException as error:
@@ -3480,6 +3758,7 @@ class Coordinator:
         *,
         completion_allowed: bool,
         run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("review requires the exact Fable session")
@@ -3494,11 +3773,27 @@ class Coordinator:
                 },
             )
         run_id = self._ids.new_run_id() if run_id is None else run_id
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.FABLE_REVIEW
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention review invocation changed")
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
             result = await self._fable.review(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.fable_session_id,
+                )
+                if intervention_invocation is not None
+                else None
             )
             self._persist_agent_result(
                 task,
@@ -3523,7 +3818,11 @@ class Coordinator:
                 return
             if result.payload is None:
                 raise RuntimeError("Fable review completed without a contract")
-            verdict = ReviewVerdict.from_dict(result.payload)
+            verdict = (
+                contract
+                if isinstance(contract, ReviewVerdict)
+                else ReviewVerdict.from_dict(result.payload)
+            )
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
         except asyncio.CancelledError:
             self._interrupt_if_active(
@@ -3548,6 +3847,11 @@ class Coordinator:
                 run_id,
                 error,
                 expected_cli_session_id=task.fable_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_REVIEWING,
             )
             raise
         except BaseException as error:
@@ -3923,6 +4227,68 @@ class Coordinator:
     def _baseline_key(task_id: str, revision: int) -> str:
         return f"agent_bridge.baseline.{task_id}.{revision}"
 
+    def _validated_intervention_result(
+        self,
+        task: TaskRecord,
+        actor: Literal["fable", "sol"],
+        result: AgentRunResult,
+        invocation: InterventionInvocation,
+        *,
+        expected_cli_session_id: str | None,
+    ) -> TaskBrief | FableClarification | ReviewVerdict | SolOutcome | None:
+        """Validate one named intervention result before persisting any evidence."""
+        if result.run_id != invocation.run_id:
+            raise _InterventionValidationError(
+                "intervention result identity is invalid"
+            )
+        if result.cli_session_id is None:
+            if not result.interrupted:
+                raise _InterventionValidationError(
+                    "intervention result identity is invalid"
+                )
+        else:
+            try:
+                self._validate_cli_session_id(
+                    actor,
+                    result.cli_session_id,
+                    expected=expected_cli_session_id,
+                )
+            except (RuntimeError, ValueError):
+                raise _InterventionValidationError(
+                    "intervention result identity is invalid"
+                ) from None
+        if result.interrupted:
+            return None
+        if result.payload is None:
+            raise _InterventionValidationError(
+                "intervention result contract is invalid"
+            )
+        try:
+            if invocation.expected_contract == "TaskBrief":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                brief = TaskBrief.from_dict(result.payload)
+                if brief.task_id != task.task_id or brief.revision != 1:
+                    raise ValueError("wrong task")
+                return brief
+            if invocation.expected_contract == "FableClarification":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                return FableClarification.from_dict(result.payload)
+            if invocation.expected_contract == "ReviewVerdict":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                return ReviewVerdict.from_dict(result.payload)
+            if invocation.expected_contract == "SolOutcome":
+                if actor != "sol":
+                    raise ValueError("wrong agent")
+                return SolOutcome.from_dict(result.payload)
+        except (TypeError, ValueError):
+            raise _InterventionValidationError(
+                "intervention result contract is invalid"
+            ) from None
+        raise _InterventionValidationError("intervention result contract is invalid")
+
     def _persist_agent_result(
         self,
         task: TaskRecord,
@@ -4286,6 +4652,122 @@ class Coordinator:
 
     def _repo_context(self) -> str:
         return f"Repository: {self._repo_root}\n{self._repo_context_text}"
+
+    def _intervention_prompt(
+        self,
+        task: TaskRecord,
+        record: InterventionRecord,
+        invocation: InterventionInvocation,
+    ) -> str:
+        """Rebuild a bounded, structural continuation prompt without provider output."""
+        if (
+            invocation.operation not in {
+                InterventionOperation.FABLE_PLAN,
+                InterventionOperation.FABLE_RESUME_PLAN,
+                InterventionOperation.FABLE_CLARIFY,
+                InterventionOperation.FABLE_REVIEW,
+                InterventionOperation.SOL_RESUME,
+            }
+            or task.task_id != record.task_id
+            or task.revision != record.revision
+            or task.session_id != record.session_id
+        ):
+            raise RuntimeError("intervention prompt identity changed")
+        partial_evidence: list[dict[str, object]] = []
+        for event in self._store.events_after(task.session_id, 0):
+            if event.task_id != task.task_id or event.kind != "agent_event":
+                continue
+            if event.actor not in {"fable", "sol"} or not isinstance(event.payload, Mapping):
+                continue
+            safe_event = self._structural_agent_event(event.actor, event.payload)
+            if safe_event is None:
+                continue
+            partial_evidence.append({"actor": event.actor, "event": dict(safe_event)})
+            if len(partial_evidence) == _MAX_INTERVENTION_PARTIAL_EVENTS:
+                break
+        continuation: dict[str, object] = {
+            "kind": {
+                InterventionOperation.FABLE_PLAN: "fable_planning",
+                InterventionOperation.FABLE_RESUME_PLAN: "fable_planning",
+                InterventionOperation.FABLE_CLARIFY: "fable_clarification",
+                InterventionOperation.FABLE_REVIEW: "fable_review",
+                InterventionOperation.SOL_RESUME: "sol_resume",
+            }[invocation.operation],
+        }
+        if invocation.operation is InterventionOperation.FABLE_REVIEW:
+            completion_allowed = (task.pending or {}).get("completion_allowed")
+            if not isinstance(completion_allowed, bool):
+                raise RuntimeError("intervention review continuation changed")
+            continuation["completion_allowed"] = completion_allowed
+        if invocation.operation is InterventionOperation.SOL_RESUME:
+            if task.baseline_id is None:
+                raise RuntimeError("intervention Sol continuation has no baseline")
+            continuation["baseline_id"] = task.baseline_id
+        return json.dumps(
+            {
+                "operation": invocation.operation.value,
+                "original_request": self._original_user_message(
+                    task.session_id, task.task_id,
+                ),
+                "task": {
+                    "task_id": task.task_id,
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                    "state": task.state.value,
+                },
+                "approved_brief": None if task.brief is None else task.brief.to_dict(),
+                "continuation": continuation,
+                "partial_evidence": partial_evidence,
+                "intervention": record.message,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _validated_intervention_fable_session(session_id: object) -> str:
+        if not isinstance(session_id, str) or _SAFE_ID.fullmatch(session_id) is None:
+            raise RuntimeError("intervention Fable session is invalid")
+        return session_id
+
+    @staticmethod
+    def _validated_intervention_sol_thread(thread_id: object) -> str:
+        if not isinstance(thread_id, str):
+            raise RuntimeError("intervention Sol thread is invalid")
+        try:
+            canonical = str(UUID(thread_id))
+        except (ValueError, AttributeError):
+            raise RuntimeError("intervention Sol thread is invalid") from None
+        if canonical != thread_id:
+            raise RuntimeError("intervention Sol thread is invalid")
+        return thread_id
+
+    def _validate_ready_intervention_provider_identity(
+        self, record: InterventionRecord,
+    ) -> None:
+        """Reject forged durable IDs before claiming any resumed provider run."""
+        try:
+            task = self._store.get_task(record.task_id, record.revision)
+            if task.session_id != record.session_id:
+                raise ValueError("task session changed")
+            if record.fable_session_id is None:
+                if task.fable_session_id is not None:
+                    raise ValueError("Fable session changed")
+            elif task.fable_session_id != record.fable_session_id:
+                raise ValueError("Fable session changed")
+            else:
+                self._validated_intervention_fable_session(record.fable_session_id)
+            if record.sol_thread_id is None:
+                if task.sol_thread_id is not None:
+                    raise ValueError("Sol thread changed")
+            elif task.sol_thread_id != record.sol_thread_id:
+                raise ValueError("Sol thread changed")
+            else:
+                self._validated_intervention_sol_thread(record.sol_thread_id)
+        except (RuntimeError, ValueError):
+            raise _InterventionValidationError(
+                "intervention stored provider identity is invalid"
+            ) from None
 
     def _original_user_message(self, session_id: str, task_id: str) -> str:
         for event in self._store.events_after(session_id, 0):

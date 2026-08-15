@@ -270,7 +270,9 @@ class ClaudeCLI:
         expected_task_id: str | None,
         strict_session_id: bool = False,
     ) -> AgentRunResult:
-        auth_result = await self._run_preflight(run_id)
+        auth_result = await self._run_preflight(
+            f"claude-subscription-preflight-{next(self._preflight_ids)}"
+        )
         if auth_result.interrupted:
             return AgentRunResult(
                 run_id=run_id,

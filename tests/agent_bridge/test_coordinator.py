@@ -38,6 +38,8 @@ from agent_bridge.contracts import (
 from agent_bridge.coordinator import (
     Coordinator,
     InterventionIntent,
+    InterventionInvocation,
+    InterventionOperation,
     PreparedActionFailed,
     ResumeDriftBlocked,
     RoutingDecision,
@@ -75,6 +77,41 @@ GIT_EXECUTABLE = Path("/usr/bin/git")
 TEST_COMMAND = (
     f"{TRUSTED_PYTHON} -m pytest -q tests/agent_bridge/test_contracts.py"
 )
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_contract"),
+    (
+        (InterventionOperation.FABLE_PLAN, "TaskBrief"),
+        (InterventionOperation.FABLE_RESUME_PLAN, "TaskBrief"),
+        (InterventionOperation.FABLE_CLARIFY, "FableClarification"),
+        (InterventionOperation.FABLE_REVIEW, "ReviewVerdict"),
+        (InterventionOperation.SOL_RESUME, "SolOutcome"),
+    ),
+)
+def test_intervention_invocation_binds_each_exact_operation_to_its_named_contract(
+    operation: object,
+    expected_contract: str,
+) -> None:
+    """Changing an operation's contract must fail before provider routing."""
+    invocation = InterventionInvocation(
+        operation=operation,  # type: ignore[arg-type]
+        run_id="run-1",
+        expected_contract=expected_contract,  # type: ignore[arg-type]
+    )
+
+    assert invocation.operation is operation
+    assert invocation.expected_contract == expected_contract
+
+    wrong_contract = (
+        "SolOutcome" if expected_contract != "SolOutcome" else "TaskBrief"
+    )
+    with pytest.raises(ValueError, match="expected contract"):
+        InterventionInvocation(
+            operation=operation,  # type: ignore[arg-type]
+            run_id="run-1",
+            expected_contract=wrong_contract,  # type: ignore[arg-type]
+        )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -579,6 +616,80 @@ def harness(tmp_path: Path, valid_brief: TaskBrief) -> CoordinatorHarness:
         ids=ids,
         coordinator=coordinator,
     )
+
+
+async def _ready_sol_intervention(
+    harness: CoordinatorHarness,
+    *,
+    intervention_id: str,
+) -> store_module.InterventionRecord:
+    """Stop an approved Sol run and leave its exact continuation READY."""
+    release = asyncio.Event()
+    harness.sol.hold_start = release
+    harness.runner.release_on_stop = release
+    await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+    approval = asyncio.create_task(
+        harness.coordinator.approve_task("task-1", revision=1)
+    )
+    while harness.store.active_run_for_task("task-1", 1) is None:
+        await asyncio.sleep(0)
+    active = harness.store.active_run_for_task("task-1", 1)
+    assert active is not None
+    harness.store.set_sol_thread("task-1", 1, THREAD_ID)
+    harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+    record = harness.coordinator.prepare_intervention(
+        "task-1",
+        InterventionIntent(
+            intervention_id=intervention_id,
+            message="Preserve this exact direction.",
+            addressed_to=ConversationTarget.SOL,
+            revision=1,
+            continuation_generation=1,
+        ),
+    )
+    await harness.coordinator.continue_intervention(record.intervention_id)
+    await approval
+    ready = harness.store.intervention(record.intervention_id)
+    assert ready is not None
+    assert ready.status is store_module.InterventionStatus.READY
+    return ready
+
+
+async def _ready_fable_planning_intervention(
+    harness: CoordinatorHarness,
+    *,
+    intervention_id: str,
+) -> store_module.InterventionRecord:
+    """Stop a planning run after its exact Fable session has been persisted."""
+    release = asyncio.Event()
+    harness.fable.hold_plan = release
+    harness.runner.release_on_stop = release
+    planning = asyncio.create_task(
+        harness.coordinator.handle_user_request("session-1", "Build the bridge")
+    )
+    while harness.store.active_run_for_task("task-1", 0) is None:
+        await asyncio.sleep(0)
+    active = harness.store.active_run_for_task("task-1", 0)
+    assert active is not None
+    harness.store.set_fable_session("task-1", 0, "fable-session-1")
+    harness.store.set_agent_run_session(active.run_id, "fable-session-1")
+    task = harness.store.get_task("task-1", 0)
+    record = harness.coordinator.prepare_intervention(
+        "task-1",
+        InterventionIntent(
+            intervention_id=intervention_id,
+            message="Keep the original scope.",
+            addressed_to=ConversationTarget.FABLE,
+            revision=0,
+            continuation_generation=task.continuation_generation,
+        ),
+    )
+    await harness.coordinator.continue_intervention(record.intervention_id)
+    await planning
+    ready = harness.store.intervention(record.intervention_id)
+    assert ready is not None
+    assert ready.status is store_module.InterventionStatus.READY
+    return ready
 
 
 def test_coordinator_forwards_recovery_summary(harness: CoordinatorHarness) -> None:
@@ -1927,7 +2038,23 @@ def test_continue_intervention_freshly_gates_claims_dispatches_and_releases_leas
         assert resumed.resume_run_id is not None
         assert readiness_calls == ["fable", "sol"]
         assert harness.sol.resume_threads == [THREAD_ID]
-        assert harness.sol.resume_prompts == ["Continue with this constraint."]
+        assert len(harness.sol.resume_prompts) == 1
+        resumed_prompt = json.loads(harness.sol.resume_prompts[0])
+        assert resumed_prompt["operation"] == "sol_resume"
+        assert resumed_prompt["original_request"] == "Build the bridge"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 1,
+            "continuation_generation": 2,
+            "state": "sol_running",
+        }
+        assert resumed_prompt["approved_brief"] == harness.fable.brief.to_dict()
+        assert resumed_prompt["continuation"] == {
+            "kind": "sol_resume",
+            "baseline_id": harness.store.get_task("task-1", 1).baseline_id,
+        }
+        assert resumed_prompt["partial_evidence"] == []
+        assert resumed_prompt["intervention"] == "Continue with this constraint."
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -1939,8 +2066,12 @@ def test_fable_early_planning_intervention_dispatches_its_persisted_guidance(har
         started = asyncio.Event()
         release = asyncio.Event()
         prompts: list[str] = []
+        ready_before_claim: list[tuple[object, object, object]] = []
 
         async def fable_probe() -> tuple[bool, str]:
+            record = harness.store.intervention("early-fable")
+            task = harness.store.get_task("task-1", 0)
+            ready_before_claim.append((record.status if record is not None else None, task.state, task.fable_session_id))
             return True, "subscription_ready"
 
         async def sol_probe() -> str:
@@ -1991,8 +2122,25 @@ def test_fable_early_planning_intervention_dispatches_its_persisted_guidance(har
         await workflows.continue_intervention(prepared)
         await initial
 
-        assert prompts == ["Build the bridge", "Build the bridge\n\nIntervention guidance:\nKeep the deployment bounded."]
+        assert prompts[0] == "Build the bridge"
+        restarted_prompt = json.loads(prompts[1])
+        assert restarted_prompt["operation"] == "fable_plan"
+        assert restarted_prompt["original_request"] == "Build the bridge"
+        assert restarted_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 0,
+            "continuation_generation": 2,
+            "state": "fable_planning",
+        }
+        assert restarted_prompt["approved_brief"] is None
+        assert restarted_prompt["partial_evidence"] == []
+        assert restarted_prompt["intervention"] == "Keep the deployment bounded."
+        assert ready_before_claim == [(store_module.InterventionStatus.READY, TaskState.INTERRUPTED, None)]
         assert harness.store.intervention("early-fable").status.value == "resumed"  # type: ignore[union-attr]
+        assert [event.payload["text"] for event in harness.store.events_after("session-1", 0)
+                if event.kind == "conversation" and event.payload["sender"] == "system"] == [
+            "Fable continuity could not be preserved; a new Fable session was started.",
+        ]
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -2063,6 +2211,169 @@ def test_interrupted_intervention_adapter_result_remains_unknown_with_exact_owne
     asyncio.run(scenario())
 
 
+def test_intervention_sol_rejects_a_wrong_contract_before_exposing_partial_events(
+    harness: CoordinatorHarness,
+) -> None:
+    """A claimed continuation never exposes an unvalidated Sol result."""
+    async def scenario() -> None:
+        ready = await _ready_sol_intervention(
+            harness, intervention_id="wrong-sol-contract",
+        )
+
+        async def wrong_contract(
+            *, run_id: str, thread_id: str, prompt: str,
+        ) -> AgentRunResult:
+            harness.sol.resume_threads.append(thread_id)
+            return _result(
+                run_id,
+                _verdict(harness.fable.brief).to_dict(),
+                session_id=thread_id,
+                events=(_command_event(TEST_COMMAND),),
+            )
+
+        harness.sol.resume = wrong_contract  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="intervention result contract"):
+            await harness.coordinator.dispatch_ready_intervention(ready.intervention_id)
+
+        record = harness.store.intervention(ready.intervention_id)
+        task = harness.store.get_task("task-1", 1)
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.SOL_RUNNING
+        assert record.resume_run_id is not None
+        assert harness.store.agent_run(record.resume_run_id).status == "interrupted"
+        assert harness.sol.resume_threads == [THREAD_ID]
+        assert [event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "agent_event"] == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "stored_thread_id",
+    (
+        None,
+        "--resume",
+        "not-a-canonical-thread",
+        "0199a213-81c0-7800-8aa1-bbab2a035a54",
+    ),
+)
+def test_intervention_sol_rejects_missing_malformed_or_changed_stored_thread_before_call(
+    harness: CoordinatorHarness,
+    stored_thread_id: str | None,
+) -> None:
+    """A restored task cannot invoke Sol with a missing, forged, or other-task ID."""
+    async def scenario() -> None:
+        ready = await _ready_sol_intervention(
+            harness, intervention_id="invalid-stored-sol-thread",
+        )
+        harness.store._connection.execute(
+            "UPDATE tasks SET sol_thread_id = ? WHERE task_id = ? AND revision = ?",
+            (stored_thread_id, "task-1", 1),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="intervention stored provider identity is invalid",
+        ):
+            await harness.coordinator.dispatch_ready_intervention(ready.intervention_id)
+
+        record = harness.store.intervention(ready.intervention_id)
+        task = harness.store.get_task("task-1", 1)
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.READY
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.SOL_RUNNING
+        assert harness.sol.resume_threads == []
+        assert [event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "agent_event"] == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "stored_session_id",
+    (None, "--resume", "fable session", "fable-session-2"),
+)
+def test_intervention_fable_rejects_missing_malformed_or_changed_stored_session_before_call(
+    harness: CoordinatorHarness,
+    stored_session_id: str | None,
+) -> None:
+    """A stored Fable ID is validated before resume_plan can receive it."""
+    async def scenario() -> None:
+        ready = await _ready_fable_planning_intervention(
+            harness, intervention_id="invalid-stored-fable-session",
+        )
+        harness.store._connection.execute(
+            "UPDATE tasks SET fable_session_id = ? WHERE task_id = ? AND revision = ?",
+            (stored_session_id, "task-1", 0),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="intervention stored provider identity is invalid",
+        ):
+            await harness.coordinator.dispatch_ready_intervention(ready.intervention_id)
+
+        record = harness.store.intervention(ready.intervention_id)
+        task = harness.store.get_task("task-1", 0)
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.READY
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.FABLE_PLANNING
+        assert harness.fable.resume_plan_sessions == []
+        assert [event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "agent_event"] == []
+
+    asyncio.run(scenario())
+
+
+def test_intervention_fable_rejects_a_mismatched_returned_session_before_events(
+    harness: CoordinatorHarness,
+) -> None:
+    """A changed Fable result ID cannot update the task or expose its event."""
+    async def scenario() -> None:
+        ready = await _ready_fable_planning_intervention(
+            harness, intervention_id="mismatched-returned-fable-session",
+        )
+
+        async def mismatched_session(
+            *,
+            run_id: str,
+            session_id: str,
+            task_id: str,
+            prompt: str,
+            context: str,
+        ) -> AgentRunResult:
+            harness.fable.resume_plan_sessions.append(session_id)
+            return _result(
+                run_id,
+                harness.fable.brief.to_dict(),
+                session_id="fable-session-2",
+                events=({"type": "assistant"},),
+            )
+
+        harness.fable.resume_plan = mismatched_session  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="intervention result identity is invalid"):
+            await harness.coordinator.dispatch_ready_intervention(ready.intervention_id)
+
+        record = harness.store.intervention(ready.intervention_id)
+        task = harness.store.get_task("task-1", 0)
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert task.state is TaskState.INTERRUPTED
+        assert task.continuation_state is TaskState.FABLE_PLANNING
+        assert task.fable_session_id == "fable-session-1"
+        assert record.resume_run_id is not None
+        assert harness.store.agent_run(record.resume_run_id).status == "interrupted"
+        assert harness.fable.resume_plan_sessions == ["fable-session-1"]
+        assert [event for event in harness.store.events_after("session-1", 0)
+                if event.kind == "agent_event"] == []
+
+    asyncio.run(scenario())
+
+
 def test_fable_clarification_intervention_resumes_exact_session_with_durable_guidance(
     harness: CoordinatorHarness,
 ) -> None:
@@ -2121,10 +2432,18 @@ def test_fable_clarification_intervention_resumes_exact_session_with_durable_gui
         assert record.routed_to is ConversationTarget.FABLE
         assert record.status.value == "resumed"
         assert harness.fable.clarification_sessions == [task.fable_session_id] * 2
-        assert harness.fable.clarification_prompts[-1] == (
-            f"{harness.fable.clarification_prompts[0]}\n"
-            "User answer: Keep this clarification narrow."
-        )
+        resumed_prompt = json.loads(harness.fable.clarification_prompts[-1])
+        assert resumed_prompt["operation"] == "fable_clarify"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 1,
+            "continuation_generation": 2,
+            "state": "fable_clarifying",
+        }
+        assert resumed_prompt["approved_brief"] == harness.fable.brief.to_dict()
+        assert resumed_prompt["continuation"] == {"kind": "fable_clarification"}
+        assert resumed_prompt["intervention"] == "Keep this clarification narrow."
+        assert resumed_prompt["partial_evidence"] == []
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -2188,10 +2507,24 @@ def test_fable_review_intervention_resumes_exact_session_with_durable_guidance(
         assert record.routed_to is ConversationTarget.FABLE
         assert record.status.value == "resumed"
         assert harness.fable.review_sessions == [task.fable_session_id] * 2
-        assert harness.fable.review_prompts[-1] == (
-            f"{harness.fable.review_prompts[0]}\n"
-            "User answer: Review the evidence boundary."
-        )
+        resumed_prompt = json.loads(harness.fable.review_prompts[-1])
+        assert resumed_prompt["operation"] == "fable_review"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 1,
+            "continuation_generation": 2,
+            "state": "fable_reviewing",
+        }
+        assert resumed_prompt["approved_brief"] == harness.fable.brief.to_dict()
+        assert resumed_prompt["continuation"] == {
+            "kind": "fable_review",
+            "completion_allowed": True,
+        }
+        assert resumed_prompt["intervention"] == "Review the evidence boundary."
+        assert resumed_prompt["partial_evidence"] == [{
+            "actor": "sol",
+            "event": _command_event(TEST_COMMAND),
+        }]
         assert harness.store.get_task("task-1", 1).state is TaskState.COMPLETED
         assert lease.snapshot() is None
 
@@ -2220,6 +2553,7 @@ def test_fable_addressed_correction_intervention_uses_exact_fable_clarification(
         assert active is not None
         assert task.state is TaskState.SOL_CORRECTING
         assert task.sol_thread_id == THREAD_ID
+        baseline_id = task.baseline_id
         harness.store.set_agent_run_session(active.run_id, THREAD_ID)
 
         async def fable_probe() -> tuple[bool, str]:
@@ -2260,9 +2594,126 @@ def test_fable_addressed_correction_intervention_uses_exact_fable_clarification(
         assert record.routed_to is ConversationTarget.FABLE
         assert record.status.value == "resumed"
         assert harness.fable.clarification_sessions[-1] == task.fable_session_id
-        assert harness.fable.clarification_prompts[-1] == "Correct only the recorded gap."
+        resumed_prompt = json.loads(harness.fable.clarification_prompts[-1])
+        assert resumed_prompt["operation"] == "fable_clarify"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 1,
+            "continuation_generation": 2,
+            "state": "fable_clarifying",
+        }
+        assert resumed_prompt["approved_brief"] == harness.fable.brief.to_dict()
+        assert resumed_prompt["continuation"] == {"kind": "fable_clarification"}
+        assert resumed_prompt["partial_evidence"] == [{
+            "actor": "sol",
+            "event": _command_event(TEST_COMMAND),
+        }]
+        assert resumed_prompt["intervention"] == "Correct only the recorded gap."
         assert harness.sol.resume_threads[-1] == THREAD_ID
         assert harness.sol.resume_prompts[-1] == "Use the existing approved scope."
+        assert harness.store.get_task("task-1", 1).baseline_id == baseline_id
+        assert lease.snapshot() is None
+
+    asyncio.run(scenario())
+
+
+def test_fable_intervention_scope_change_waits_for_new_approval_without_sol_widening(
+    harness: CoordinatorHarness,
+) -> None:
+    """Fable retains scope authority while an intervention is restoring Sol work."""
+    async def scenario() -> None:
+        source_released = asyncio.Event()
+        correction_started = asyncio.Event()
+        revised = replace(
+            harness.fable.brief,
+            revision=2,
+            allowed_paths=("bridge-output.txt", "bridge-extra.txt"),
+        )
+        harness.sol.on_start = lambda: (harness.repo / "bridge-output.txt").write_text(
+            "revision-one work\n", encoding="utf-8",
+        )
+        harness.sol.queue(_completed())
+        harness.fable.next_verdicts.append(
+            _verdict(harness.fable.brief, status="corrections_required")
+        )
+        harness.fable.next_clarifications.append(
+            _answer("Add only the explicitly scoped path.", True, revised_brief=revised)
+        )
+        harness.sol.hold_resume = source_released
+        harness.sol.on_resume = correction_started.set
+        harness.runner.release_on_stop = source_released
+        await harness.coordinator.handle_user_request("session-1", "Build the bridge")
+        approval = asyncio.create_task(harness.coordinator.approve_task("task-1", revision=1))
+        await correction_started.wait()
+        active = harness.store.active_run_for_task("task-1", 1)
+        task = harness.store.get_task("task-1", 1)
+        assert active is not None
+        assert task.state is TaskState.SOL_CORRECTING
+        assert task.sol_thread_id == THREAD_ID
+        original_baseline_id = task.baseline_id
+        harness.store.set_agent_run_session(active.run_id, THREAD_ID)
+
+        async def fable_probe() -> tuple[bool, str]:
+            return True, "subscription_ready"
+
+        async def sol_probe() -> str:
+            return "ready"
+
+        runtime = SimpleNamespace(
+            project_id=harness.coordinator.project_id, store=harness.store,
+            coordinator=harness.coordinator,
+            readiness=RuntimeReadiness(
+                initial=RuntimeStatus(True, "subscription_ready", "ready"),
+                fable_probe=fable_probe, sol_probe=sol_probe,
+            ),
+        )
+        lease = ActiveAgentLease()
+        lease.acquire(project_id=runtime.project_id, session_id="session-1", task_id="task-1")
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id=runtime.project_id, session_id="session-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="fable-scope-change",
+                message="Add only the explicitly scoped path.",
+                addressed_to=ConversationTarget.FABLE, revision=1,
+                continuation_generation=task.continuation_generation,
+            ),
+        )
+        harness.sol.hold_resume = None
+
+        await workflows.continue_intervention(prepared)
+        await approval
+
+        record = harness.store.intervention("fable-scope-change")
+        awaiting = harness.store.latest_task("task-1")
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.RESUMED
+        assert awaiting is not None
+        assert awaiting.revision == 2
+        assert awaiting.state is TaskState.AWAITING_SCOPE_APPROVAL
+        assert awaiting.approved_at is None
+        assert awaiting.fable_session_id == task.fable_session_id
+        assert awaiting.sol_thread_id == THREAD_ID
+        assert awaiting.baseline_id == original_baseline_id
+        assert harness.sol.resume_threads == [THREAD_ID]
+        assert all(
+            "Add only the explicitly scoped path." not in prompt
+            for prompt in harness.sol.resume_prompts
+        )
+
+        await harness.coordinator.approve_task("task-1", revision=2)
+
+        completed = harness.store.latest_task("task-1")
+        assert completed is not None
+        assert completed.revision == 2
+        assert completed.state is TaskState.COMPLETED
+        assert completed.baseline_id == original_baseline_id
+        assert harness.sol.resume_threads == [THREAD_ID, THREAD_ID]
+        assert '"changed_paths":["bridge-output.txt"]' in harness.fable.review_prompts[-1]
+        assert "+revision-one work" in harness.fable.review_prompts[-1]
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -4399,7 +4850,21 @@ def test_hub_directed_sol_intervention_resumes_the_exact_sol_continuation(
         assert record.resume_run_id is not None
         assert harness.sol.resume_run_ids[-1] == record.resume_run_id
         assert harness.sol.resume_threads[-1] == THREAD_ID
-        assert harness.sol.resume_prompts[-1] == "Resume only the approved work."
+        resumed_prompt = json.loads(harness.sol.resume_prompts[-1])
+        assert resumed_prompt["operation"] == "sol_resume"
+        assert resumed_prompt["original_request"] == "Build the bridge"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 1,
+            "continuation_generation": waiting.continuation_generation,
+            "state": "sol_running",
+        }
+        assert resumed_prompt["approved_brief"] == harness.fable.brief.to_dict()
+        assert resumed_prompt["continuation"] == {
+            "kind": "sol_resume",
+            "baseline_id": harness.store.get_task("task-1", 1).baseline_id,
+        }
+        assert resumed_prompt["intervention"] == "Resume only the approved work."
         assert len(harness.fable.answer_sol_question_prompts) == 1
         assert lease.snapshot() is None
         harness.store.set_setting("agent_bridge.active_session_id", "session-1")
@@ -4469,9 +4934,19 @@ def test_hub_fable_planning_intervention_resumes_existing_session_with_guidance(
         assert record is not None
         assert record.status.value == "resumed"
         assert harness.fable.resume_plan_sessions == ["fable-session-1"]
-        assert harness.fable.resume_plan_prompts == [
-            "Build the bridge\n\nIntervention guidance:\nKeep the original scope."
-        ]
+        assert len(harness.fable.resume_plan_prompts) == 1
+        resumed_prompt = json.loads(harness.fable.resume_plan_prompts[0])
+        assert resumed_prompt["operation"] == "fable_resume_plan"
+        assert resumed_prompt["original_request"] == "Build the bridge"
+        assert resumed_prompt["task"] == {
+            "task_id": "task-1",
+            "revision": 0,
+            "continuation_generation": 2,
+            "state": "fable_planning",
+        }
+        assert resumed_prompt["approved_brief"] is None
+        assert resumed_prompt["partial_evidence"] == []
+        assert resumed_prompt["intervention"] == "Keep the original scope."
         assert lease.snapshot() is None
 
     asyncio.run(scenario())
@@ -6984,6 +7459,10 @@ def test_hub_unknown_ack_reopen_recovers_one_same_or_cross_route_attempt(
     async def scenario() -> None:
         initial = harness.store.save_task(
             "session-1", harness.fable.brief, TaskState.AWAITING_USER_APPROVAL,
+        )
+        harness.store.append_event(
+            "session-1", initial.task_id, "user", "message",
+            {"text": "Build the bridge"},
         )
         approved = harness.store.approve_task(
             initial.task_id, initial.revision, baseline_id="baseline-1",

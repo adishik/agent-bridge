@@ -432,6 +432,29 @@ def test_sol_resume_uses_exact_thread_and_validates_outcome(
     asyncio.run(scenario())
 
 
+def test_intervention_sol_resume_keeps_guidance_prompt_out_of_argv(
+    fake_codex: Path, tmp_path: Path,
+) -> None:
+    """Guidance cannot replace the persisted Sol thread positional argument."""
+    async def scenario() -> None:
+        prompt = "Intervention: --last --sandbox danger --cd /outside"
+        result = await _adapter(fake_codex, tmp_path).resume(
+            run_id="intervention-sol-resume", thread_id=THREAD_ID, prompt=prompt,
+        )
+
+        assert result.cli_session_id == THREAD_ID
+        argv = json.loads((tmp_path / "captured-codex-argv.json").read_text())
+        assert argv[-2] == THREAD_ID
+        assert argv.count(THREAD_ID) == 1
+        assert prompt not in argv[:-1]
+        assert prompt in argv[-1]
+        assert "latest exact user-approved TaskBrief revision" in argv[-1]
+        assert "--sandbox" not in argv[:-1]
+        assert "--cd" not in argv[:-1]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "thread_id",
     (
@@ -626,7 +649,7 @@ def test_interrupted_resume_mismatch_never_exposes_wrong_continuation_thread(
         ))
         await _wait_for_capture(tmp_path)
         await _wait_for_partials(tmp_path)
-        await runner.stop("run-interrupted-wrong-thread")
+        await runner.stop("run-interrupted-wrong-thread", timeout_seconds=1)
 
         with pytest.raises(CodexRunError, match="different thread") as raised:
             await run
@@ -687,7 +710,7 @@ def test_interrupted_resume_parse_error_never_exposes_wrong_continuation_thread(
         ))
         await _wait_for_capture(tmp_path)
         await _wait_for_partials(tmp_path)
-        await runner.stop("run-interrupted-conflicting-thread")
+        await runner.stop("run-interrupted-conflicting-thread", timeout_seconds=1)
 
         with pytest.raises(CodexRunError, match="conflicting") as raised:
             await run
@@ -726,7 +749,7 @@ def test_interrupted_sol_run_returns_partial_result_only_after_observed_thread(
         await _wait_for_capture(tmp_path)
         if mode == "slow_after_thread":
             await _wait_for_partials(tmp_path)
-        await runner.stop(f"run-{mode}")
+        await runner.stop(f"run-{mode}", timeout_seconds=1)
         result = await run
 
         assert result.interrupted is True

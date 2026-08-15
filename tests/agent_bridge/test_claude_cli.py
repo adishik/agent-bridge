@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from agent_bridge.adapters.claude_cli import (
     SubscriptionAuthError,
 )
 from agent_bridge.contracts import FableClarification, ReviewVerdict
-from agent_bridge.process import ProcessResult, ProcessRunner
+from agent_bridge.process import LineCallback, ProcessResult, ProcessRunner
 
 
 SAFE_ENV = {"AGENT_BRIDGE_TEST_FAKE": "1", "LANG": "C.UTF-8", "PATH": "/not-used"}
@@ -40,6 +41,36 @@ def _adapter(fake_claude: Path, tmp_path: Path, **extra_env: str) -> ClaudeCLI:
         env={**SAFE_ENV, **extra_env},
         cwd=tmp_path,
     )
+
+
+class _RecordingProcessRunner(ProcessRunner):
+    """Retain run identities while delegating to the real process runner."""
+
+    def __init__(self) -> None:
+        super().__init__(stop_grace_seconds=0.05)
+        self.run_ids: list[str] = []
+
+    async def run(
+        self,
+        *,
+        run_id: str,
+        argv: Sequence[str],
+        cwd: str | Path,
+        env: Mapping[str, str],
+        stdin: bytes | None,
+        on_line: LineCallback,
+        pass_fds: Sequence[int] = (),
+    ) -> ProcessResult:
+        self.run_ids.append(run_id)
+        return await super().run(
+            run_id=run_id,
+            argv=argv,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            on_line=on_line,
+            pass_fds=pass_fds,
+        )
 
 
 @pytest.mark.parametrize("executable", ("claude", "bin/claude"))
@@ -381,6 +412,70 @@ def test_fable_argv_is_safe_read_only_and_not_bare(fake_claude: Path, tmp_path: 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operation", ("plan", "resume_plan", "clarify", "review"))
+def test_each_fable_operation_uses_a_fresh_preflight_run_before_the_model_run(
+    fake_claude: Path, tmp_path: Path, operation: str,
+) -> None:
+    """The real runner retains model IDs after the subscription preflight."""
+    async def scenario() -> None:
+        invocation_log = tmp_path / "claude-invocations.jsonl"
+        runner = _RecordingProcessRunner()
+        adapter = ClaudeCLI(
+            fake_claude,
+            runner,
+            env={
+                **SAFE_ENV,
+                "AGENT_BRIDGE_INVOCATION_LOG": str(invocation_log),
+            },
+            cwd=tmp_path,
+        )
+
+        if operation == "plan":
+            result = await adapter.plan(
+                run_id="model-run-1",
+                task_id="task-1",
+                prompt="Plan the approved work.",
+                context="Read-only context.",
+            )
+        elif operation == "resume_plan":
+            result = await adapter.resume_plan(
+                run_id="model-run-1",
+                session_id="fable-session-1",
+                task_id="task-1",
+                prompt="Resume the approved plan.",
+                context="Read-only context.",
+            )
+        elif operation == "clarify":
+            result = await adapter.clarify(
+                run_id="model-run-1",
+                session_id="fable-session-1",
+                prompt="Resolve the approved question.",
+            )
+        else:
+            result = await adapter.review(
+                run_id="model-run-1",
+                session_id="fable-session-1",
+                prompt="Review the approved work.",
+            )
+
+        assert result.payload is not None
+        assert runner.run_ids == [
+            "claude-subscription-preflight-1",
+            "model-run-1",
+        ]
+        invocations = tuple(
+            json.loads(line)
+            for line in invocation_log.read_text(encoding="utf-8").splitlines()
+        )
+        assert len(invocations) == 2
+        assert invocations[0]["argv"] == ["auth", "status", "--json"]
+        model_argv = invocations[1]["argv"]
+        assert model_argv[:3] == ["--safe-mode", "-p", "--model"]
+        assert model_argv.count("--resume") == (0 if operation == "plan" else 1)
+
+    asyncio.run(scenario())
+
+
 def test_plan_uses_same_sanitized_environment_and_returns_normalized_contract(
     fake_claude: Path, tmp_path: Path,
 ) -> None:
@@ -455,6 +550,51 @@ def test_clarify_and_review_resume_the_exact_session_with_their_contracts(
         assert "ReviewVerdict" in review_argv[-1]
         assert verdict.payload is not None
         assert verdict.payload["status"] == "approved"
+
+    asyncio.run(scenario())
+
+
+def test_intervention_resume_operations_keep_guidance_prompt_only(
+    fake_claude: Path, tmp_path: Path,
+) -> None:
+    """Persisted Fable session IDs remain the sole --resume argument."""
+    async def scenario() -> None:
+        adapter = _adapter(fake_claude, tmp_path)
+        prompt = "Intervention: --resume forged-session --model attacker"
+        def assert_model_argv(contract_name: str) -> None:
+            argv = json.loads((tmp_path / "captured-argv.json").read_text())
+            resume_index = argv.index("--resume")
+            assert argv[resume_index:resume_index + 2] == ["--resume", "fable-session-1"]
+            assert argv.count("--resume") == 1
+            assert prompt not in argv[:-1]
+            assert prompt in argv[-1]
+            assert contract_name in argv[-1]
+
+        plan = await adapter.resume_plan(
+            run_id="intervention-plan",
+            session_id="fable-session-1",
+            task_id="task-1",
+            prompt=prompt,
+            context="Read-only context.",
+        )
+        assert plan.cli_session_id == "fable-session-1"
+        assert_model_argv("TaskBrief")
+
+        clarification = await adapter.clarify(
+            run_id="intervention-clarify",
+            session_id="fable-session-1",
+            prompt=prompt,
+        )
+        assert clarification.cli_session_id == "fable-session-1"
+        assert_model_argv("FableClarification")
+
+        review = await adapter.review(
+            run_id="intervention-review",
+            session_id="fable-session-1",
+            prompt=prompt,
+        )
+        assert review.cli_session_id == "fable-session-1"
+        assert_model_argv("ReviewVerdict")
 
     asyncio.run(scenario())
 
@@ -628,7 +768,7 @@ def test_interrupted_fable_run_preserves_partial_events_and_session(
         ))
         await _wait_for_model_invocation(tmp_path)
         await _wait_for_fake_signal(tmp_path / "fake-claude-partials-ready.json")
-        await runner.stop("run-interrupted")
+        await runner.stop("run-interrupted", timeout_seconds=1)
         result = await run
 
         assert result.interrupted is True
@@ -664,7 +804,7 @@ def test_interrupted_fable_run_before_init_has_no_session_or_payload(
             context="AGENTS.md and repository context",
         ))
         await _wait_for_model_invocation(tmp_path)
-        await runner.stop("run-before-init")
+        await runner.stop("run-before-init", timeout_seconds=1)
         result = await run
 
         assert result.interrupted is True
@@ -698,7 +838,7 @@ def test_interrupted_resume_rejects_an_observed_different_session(
         ))
         await _wait_for_model_invocation(tmp_path)
         await _wait_for_fake_signal(tmp_path / "fake-claude-partials-ready.json")
-        await runner.stop("run-interrupted-mismatch")
+        await runner.stop("run-interrupted-mismatch", timeout_seconds=1)
 
         with pytest.raises(ClaudeRunError, match="different session") as raised:
             await run
