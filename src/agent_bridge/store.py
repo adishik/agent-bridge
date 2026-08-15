@@ -12864,9 +12864,25 @@ class SQLiteStore:
                 _prepared_identifier(acknowledgment_id, "acknowledgment_id")
             except ValueError:
                 return False
+            if record.status not in {
+                InterventionStatus.READY,
+                InterventionStatus.RESUMING,
+                InterventionStatus.RESUMED,
+                InterventionStatus.CANCELED_BY_STOP,
+            }:
+                return False
             if (
-                record.status is InterventionStatus.PENDING_STOP
-                or record.resume_generation != task.continuation_generation
+                record.resume_generation != task.continuation_generation
+                or (
+                    binding is None
+                    and record.resume_generation != record.source_generation + 2
+                )
+                or (
+                    binding is not None
+                    and record.status is InterventionStatus.READY
+                    and binding.kind == "initial"
+                    and record.resume_generation != binding.question_generation + 1
+                )
             ):
                 return False
         elif record.resume_generation != task.continuation_generation:

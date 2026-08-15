@@ -4108,6 +4108,55 @@ def test_intervention_migration_is_additive_idempotent_and_preserves_current_row
     assert path.read_bytes() == first_migration_bytes
 
 
+def _seed_visible_intervention(
+    store: SQLiteStore,
+    valid_brief,
+    *,
+    status: store_module.InterventionStatus,
+    suffix: str | None = None,
+) -> store_module.InterventionRecord:
+    """Build one ordinary persisted UI state through Store transitions only."""
+    suffix = status.value if suffix is None else suffix
+    brief = replace(valid_brief, task_id=f"visible-{suffix}")
+    store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(brief.task_id, brief.revision, f"thread-{suffix}")
+    store.set_pending_context(
+        brief.task_id, brief.revision, expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": f"source-{suffix}", "prompt": "continue exactly"},
+    )
+    store.start_agent_run(f"source-{suffix}", brief.task_id, brief.revision, "sol")
+    store.set_agent_run_session(f"source-{suffix}", f"thread-{suffix}")
+    record = store.create_intervention_and_request_stop(
+        intervention_id=f"intervention-{suffix}", session_id="session-1",
+        task_id=brief.task_id, revision=brief.revision,
+        expected_source_generation=1, message=f"Keep {suffix} exact.",
+        addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
+        run_id=f"source-{suffix}",
+    )
+    if status is store_module.InterventionStatus.PENDING_STOP:
+        return record
+    store.finish_agent_run(f"source-{suffix}", status="interrupted", exit_code=-15)
+    record = store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+    if status is store_module.InterventionStatus.READY:
+        return record
+    store.begin_intervention_resume(
+        record.intervention_id, expected_resume_generation=record.resume_generation,
+        resume_attempt_id=f"attempt-{suffix}", resume_run_id=f"resume-{suffix}",
+    )
+    record = store.intervention(record.intervention_id)
+    assert record is not None
+    if status is store_module.InterventionStatus.RESUMING:
+        return record
+    store.mark_resume_outcome_unknown(
+        record.intervention_id, resume_attempt_id=record.resume_attempt_id,
+        resume_run_id=record.resume_run_id,
+    )
+    store.recover_active_tasks()
+    record = store.intervention(record.intervention_id)
+    assert record is not None
+    return record
+
+
 def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read_only(
     tmp_path, valid_brief,
 ) -> None:
@@ -4116,49 +4165,8 @@ def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read
     store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
     store.create_session("session-1", "/repo")
 
-    def seed(status: store_module.InterventionStatus) -> store_module.InterventionRecord:
-        suffix = status.value
-        brief = replace(valid_brief, task_id=f"visible-{suffix}")
-        store.save_task("session-1", brief, TaskState.SOL_RUNNING)
-        store.set_sol_thread(brief.task_id, brief.revision, f"thread-{suffix}")
-        store.set_pending_context(
-            brief.task_id, brief.revision, expected=TaskState.SOL_RUNNING,
-            pending={"sol_run_id": f"source-{suffix}", "prompt": "continue exactly"},
-        )
-        store.start_agent_run(f"source-{suffix}", brief.task_id, brief.revision, "sol")
-        store.set_agent_run_session(f"source-{suffix}", f"thread-{suffix}")
-        record = store.create_intervention_and_request_stop(
-            intervention_id=f"intervention-{suffix}", session_id="session-1",
-            task_id=brief.task_id, revision=brief.revision,
-            expected_source_generation=1, message=f"Keep {suffix} exact.",
-            addressed_to=ConversationTarget.FABLE, routed_to=ConversationTarget.FABLE,
-            run_id=f"source-{suffix}",
-        )
-        if status is store_module.InterventionStatus.PENDING_STOP:
-            return record
-        store.finish_agent_run(f"source-{suffix}", status="interrupted", exit_code=-15)
-        record = store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
-        if status is store_module.InterventionStatus.READY:
-            return record
-        store.begin_intervention_resume(
-            record.intervention_id, expected_resume_generation=record.resume_generation,
-            resume_attempt_id=f"attempt-{suffix}", resume_run_id=f"resume-{suffix}",
-        )
-        record = store.intervention(record.intervention_id)
-        assert record is not None
-        if status is store_module.InterventionStatus.RESUMING:
-            return record
-        store.mark_resume_outcome_unknown(
-            record.intervention_id, resume_attempt_id=record.resume_attempt_id,
-            resume_run_id=record.resume_run_id,
-        )
-        store.recover_active_tasks()
-        record = store.intervention(record.intervention_id)
-        assert record is not None
-        return record
-
     records = {
-        status: seed(status) for status in (
+        status: _seed_visible_intervention(store, valid_brief, status=status) for status in (
             store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
             store_module.InterventionStatus.PENDING_STOP,
             store_module.InterventionStatus.READY,
@@ -4209,6 +4217,194 @@ def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read
     assert other.current_visible_intervention_for_task(unknown.task_id, unknown.revision) is None
     other.close()
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.PENDING_STOP,
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    ),
+)
+@pytest.mark.parametrize("mutation", ("source", "resume", "task"))
+def test_visible_intervention_generation_tampering_fails_closed_without_repair(
+    tmp_path, valid_brief, status: store_module.InterventionStatus, mutation: str,
+) -> None:
+    """Every displayed phase authenticates its event source and both generation links."""
+    path = tmp_path / f"visible-{status.value}-{mutation}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _seed_visible_intervention(store, valid_brief, status=status)
+    if mutation == "source":
+        store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "UPDATE interventions SET source_generation = source_generation + 1 "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "resume":
+        store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "UPDATE interventions SET resume_generation = resume_generation + 1 "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "task":
+        store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+            "UPDATE tasks SET continuation_generation = continuation_generation + 1 "
+            "WHERE task_id = ? AND revision = ?",
+            (record.task_id, record.revision),
+        )
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    store.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.current_visible_intervention_for_task(record.task_id, record.revision)
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    if status is store_module.InterventionStatus.READY:
+        with pytest.raises(RuntimeError, match="not ready to resume"):
+            reopened.begin_intervention_resume(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+                resume_attempt_id="tamper-attempt",
+                resume_run_id="tamper-run",
+            )
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    ),
+)
+def test_visible_intervention_rejects_injected_safe_acknowledgment_without_mutation(
+    tmp_path, valid_brief, status: store_module.InterventionStatus,
+) -> None:
+    """Only an authenticated UNKNOWN retry may leave a non-null acknowledgment."""
+    path = tmp_path / f"visible-ack-{status.value}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    store.create_session("session-1", "/repo")
+    record = _seed_visible_intervention(store, valid_brief, status=status)
+    store._connection.execute(  # noqa: SLF001 - durable tamper fixture
+        "UPDATE interventions SET acknowledgment_id = 'safe-injected-ack' "
+        "WHERE intervention_id = ?",
+        (record.intervention_id,),
+    )
+    store.close()
+    tampered_bytes = path.read_bytes()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.current_visible_intervention_for_task(record.task_id, record.revision)
+    with pytest.raises(RuntimeError, match="authenticated"):
+        reopened.authenticated_intervention(record.intervention_id)
+    with pytest.raises(RuntimeError, match="recovery state is invalid"):
+        reopened.recover_active_tasks()
+    if status is store_module.InterventionStatus.READY:
+        with pytest.raises(RuntimeError, match="not ready to resume"):
+            reopened.begin_intervention_resume(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+                resume_attempt_id="tamper-ack-attempt",
+                resume_run_id="tamper-ack-run",
+            )
+    reopened.close()
+    assert path.read_bytes() == tampered_bytes
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        store_module.InterventionStatus.READY,
+        store_module.InterventionStatus.RESUMING,
+        store_module.InterventionStatus.RESUMED,
+        store_module.InterventionStatus.CANCELED_BY_STOP,
+    ),
+)
+def test_authenticated_intervention_retains_only_the_one_acknowledged_retry_lineage(
+    tmp_path, valid_brief, status: store_module.InterventionStatus,
+) -> None:
+    """A real UNKNOWN authorization remains valid through retry, completion, or Stop."""
+    store = SQLiteStore(
+        tmp_path / f"acknowledged-{status.value}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+    )
+    store.create_session("session-1", "/repo")
+    store.save_task("session-1", valid_brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(valid_brief.task_id, valid_brief.revision, "sol-thread-1")
+    store._connection.execute(  # noqa: SLF001 - exact eligible Sol fixture
+        "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", "baseline-1", valid_brief.task_id, valid_brief.revision),
+    )
+    store.set_pending_context(
+        valid_brief.task_id, valid_brief.revision, expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "source-run", "prompt": "continue exactly"},
+    )
+    store.start_agent_run("source-run", valid_brief.task_id, valid_brief.revision, "sol")
+    store.set_agent_run_session("source-run", "sol-thread-1")
+    initial = store.create_intervention_and_request_stop(
+        intervention_id="acknowledged-intervention", session_id="session-1",
+        task_id=valid_brief.task_id, revision=valid_brief.revision,
+        expected_source_generation=1, message="Continue the exact Sol path.",
+        addressed_to=ConversationTarget.SOL, routed_to=ConversationTarget.SOL,
+        run_id="source-run",
+    )
+    store.finish_agent_run("source-run", status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(initial.intervention_id, run_id=initial.run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id, expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="first-attempt", resume_run_id="first-run",
+    )
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 0)
+    unknown = store.authenticated_intervention(initial.intervention_id)
+    assert unknown is not None
+    assert store._connection.execute(  # noqa: SLF001 - exact NULL lifecycle assertion
+        "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+        (initial.intervention_id,),
+    ).fetchone()["acknowledgment_id"] is None
+    acknowledged = store.authorize_retry_after_unknown(
+        initial.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="authorized-retry-ack",
+    )
+    assert acknowledged.status is store_module.InterventionStatus.READY
+    assert store.authenticated_intervention(initial.intervention_id) == acknowledged
+
+    if status is store_module.InterventionStatus.CANCELED_BY_STOP:
+        result = store.cancel_intervention_by_stop(
+            acknowledged.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+        )
+    elif status is store_module.InterventionStatus.READY:
+        result = acknowledged
+    else:
+        store.begin_intervention_resume(
+            acknowledged.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+            resume_attempt_id="retry-attempt",
+            resume_run_id="retry-run",
+        )
+        result = store.intervention(acknowledged.intervention_id)
+        assert result is not None
+        if status is store_module.InterventionStatus.RESUMED:
+            result = store.complete_intervention(
+                acknowledged.intervention_id,
+                expected_resume_generation=acknowledged.resume_generation,
+                resume_attempt_id="retry-attempt",
+                resume_run_id="retry-run",
+            )
+
+    assert result.status is status
+    assert store.authenticated_intervention(initial.intervention_id) == result
 
 
 def test_directed_intervention_binding_migration_is_additive_idempotent_and_preserves_rows(
