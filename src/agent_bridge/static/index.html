@@ -27,7 +27,7 @@
           id="task-drawer-toggle"
           class="button button-quiet"
           type="button"
-          aria-controls="project-navigation task-list"
+          aria-controls="project-navigation"
           aria-expanded="false"
           aria-haspopup="dialog"
         >
@@ -37,7 +37,7 @@
           id="inspector-drawer-toggle"
           class="button button-quiet"
           type="button"
-          aria-controls="task-inspector"
+          aria-controls="task-inspector-panel"
           aria-expanded="false"
           aria-haspopup="dialog"
         >
@@ -179,6 +179,8 @@
         id="task-inspector-panel"
         aria-label="Task inspector"
         aria-labelledby="task-inspector-heading"
+        data-drawer="mobile"
+        tabindex="-1"
       >
         <div class="panel-heading">
           <p class="eyebrow">Selected work</p>
@@ -187,8 +189,6 @@
         <div
           id="task-inspector"
           aria-labelledby="task-inspector-heading"
-          data-drawer="mobile"
-          tabindex="-1"
         ></div>
         <dl id="task-inspector-summary">
           <dt>Task revision</dt>

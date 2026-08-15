@@ -23,6 +23,7 @@ class _RenderedLayout(HTMLParser):
         super().__init__()
         self.elements: list[tuple[str, dict[str, str | None]]] = []
         self.ids: set[str] = set()
+        self.id_counts: dict[str, int] = {}
         self.text: list[str] = []
         self.ancestors: dict[str, tuple[str, ...]] = {}
         self._open_elements: list[tuple[str, dict[str, str | None]]] = []
@@ -35,6 +36,7 @@ class _RenderedLayout(HTMLParser):
         if values.get("id") is not None:
             element_id = str(values["id"])
             self.ids.add(element_id)
+            self.id_counts[element_id] = self.id_counts.get(element_id, 0) + 1
             self.ancestors[element_id] = tuple(
                 str(open_attrs["id"])
                 for _open_tag, open_attrs in self._open_elements
@@ -140,11 +142,11 @@ def test_index_uses_one_semantic_three_pane_application_workspace() -> None:
     )
     assert "open" not in rendered.element("details", "activity-audit")
     assert rendered.element("button", "task-drawer-toggle")["aria-controls"] == (
-        "project-navigation task-list"
+        "project-navigation"
     )
     assert rendered.element("button", "inspector-drawer-toggle")[
         "aria-controls"
-    ] == "task-inspector"
+    ] == "task-inspector-panel"
     assert "open" not in rendered.element("dialog", "usage-modal")
     modal_markup = html[html.index('<dialog\n      id="usage-modal"'):html.index("</dialog>")]
     assert 'id="bootstrap-retry"' in modal_markup
@@ -213,7 +215,7 @@ def test_index_keeps_conversation_first_with_single_mobile_drawer_controls() -> 
     assert element_ids.index("conversation") < element_ids.index("task-inspector")
     for panel_id, heading_id in (
         ("project-navigation", "project-navigation-heading"),
-        ("task-inspector", "task-inspector-heading"),
+        ("task-inspector-panel", "task-inspector-heading"),
     ):
         panel = next(
             attrs
@@ -232,6 +234,42 @@ def test_index_keeps_conversation_first_with_single_mobile_drawer_controls() -> 
     assert "panel.inert" in script
     assert "focusTarget?.focus()" in script
     assert "@media (prefers-reduced-motion: reduce)" in styles
+
+
+def test_drawer_controls_target_complete_unique_panels_and_resolvable_idrefs() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    drawer_contracts = (
+        (
+            "task-drawer-toggle",
+            "project-navigation",
+            ("project-list", "chat-list", "new-chat", "fable-status", "sol-status"),
+        ),
+        (
+            "inspector-drawer-toggle",
+            "task-inspector-panel",
+            ("task-inspector", "task-inspector-summary", "task-controls", "activity-audit"),
+        ),
+    )
+    for toggle_id, panel_id, required_children in drawer_contracts:
+        toggle = rendered.element("button", toggle_id)
+        assert toggle["aria-controls"] == panel_id
+        assert rendered.id_counts[panel_id] == 1
+        for child_id in required_children:
+            assert panel_id in rendered.ancestors[child_id]
+
+    for _tag, attrs in rendered.elements:
+        for attribute in ("aria-controls", "aria-describedby", "aria-labelledby", "for"):
+            value = attrs.get(attribute)
+            if value is None:
+                continue
+            for reference in value.split():
+                assert rendered.id_counts[reference] == 1
+        href = attrs.get("href")
+        if href is not None and href.startswith("#"):
+            assert rendered.id_counts[href[1:]] == 1
 
 
 def test_static_shells_survive_controller_replacement_roots() -> None:
