@@ -774,7 +774,7 @@ def test_injected_bootstrap_and_events_build_latest_task_state_without_live_call
     _run_module_harness(harness)
 
 
-def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> None:
+def test_every_persisted_event_kind_reduces_without_raw_conversation_details() -> None:
     harness = r"""
       class Node {
         constructor(tag) {
@@ -836,12 +836,13 @@ def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> N
       if (task.state !== "failed") process.exit(2);
       if (task.history.length !== events.length - 1 || task.history[0].sequence !== 2) process.exit(3);
       if (task.activity.command_sha256 !== "hash-only") process.exit(23);
+      if (task.activity.type !== "agent_event") process.exit(29);
       if (task.outcome.architecture_docs !== "unchanged") process.exit(4);
       if (task.clarification.question_for_user !== "Choose one") process.exit(5);
       if (task.review.question_for_user !== "Review question") process.exit(6);
       const fullText = created.map((node) => node.textContent).join("\n");
-      for (const expected of ["why_it_matters", "changed.py", "RuntimeError", "Review question"]) {
-        if (!fullText.includes(expected)) process.exit(7);
+      for (const rawDetail of ["why_it_matters", "command_sha256", "exit_code"]) {
+        if (fullText.includes(rawDetail)) process.exit(7);
       }
       if (created.some((node) => node.textContent === "Command Execution")) process.exit(24);
       const statusRows = conversation.children.filter(
@@ -1383,6 +1384,15 @@ def test_action_requests_send_csrf_json_without_agent_text_in_urls() -> None:
       if (call.options.headers["Content-Type"] !== "application/json") process.exit(6);
       if (call.options.body !== '{{"revision":3}}') process.exit(7);
       if (JSON.parse(calls[1].options.body).text !== {json.dumps(unsafe)}) process.exit(9);
+      try {{
+        await bridge.postJson(
+          async () => ({{ok: false, status: 409, json: async () => ({{detail: "current revision differs"}})}}),
+          "/api/tasks/task-1/approve", {{revision: 3}}, "csrf-token",
+        );
+        process.exit(10);
+      }} catch (error) {{
+        if (!(error instanceof bridge.HttpError) || error.status !== 409 || error.message !== "current revision differs") process.exit(11);
+      }}
       if (JSON.parse(calls[2].options.body).answer !== {json.dumps(unsafe)}) process.exit(10);
       if (JSON.parse(calls[3].options.body).title !== {json.dumps(unsafe)}) process.exit(11);
       let rejected = false;
@@ -1575,6 +1585,8 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
     forbidden = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
     assert all(token not in script for token in forbidden)
     assert "JSON.stringify(asObject(task.activity)" not in script
+    assert "JSON.stringify(projection, null, 2)" not in script
+    assert "const details = element(documentRoot, \"details\")" not in script
     assert re.search(r"grid-template-columns\s*:\s*18rem\s+minmax\(0,\s*1fr\)\s+22rem", styles)
     assert re.search(r"@media\s*\(max-width:\s*899px\)", styles)
     assert "#project-navigation.drawer-open" in styles
@@ -1607,6 +1619,8 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     assert "#6a4d91" not in styles.lower()
     assert re.search(r"outline:\s*(?:2|3)px solid var\(--focus-ring\)", styles)
     assert "min-height: 44px" in styles
+    assert re.search(r"\.skip-link\s*\{[^}]*min-height:\s*44px", styles, re.S)
+    assert re.search(r"\.field-group input\s*,\s*\.field-group textarea\s*\{[^}]*min-height:\s*44px", styles, re.S)
     assert "select:focus-visible" in styles
     assert "summary:focus-visible" in styles
     assert "@media (max-width: 899px)" in styles

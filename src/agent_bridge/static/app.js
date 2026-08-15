@@ -397,22 +397,6 @@ export function renderMessage(documentRoot, event, associatedRevision = null) {
     "message-metadata",
   );
   article.append(actor, messageNode, metadata);
-  const projection = {
-    sequence: Number.isSafeInteger(event?.sequence) ? event.sequence : null,
-    session_id: typeof event?.session_id === "string" ? event.session_id : null,
-    task_id: typeof event?.task_id === "string" ? event.task_id : null,
-    revision,
-    actor: typeof event?.actor === "string" ? event.actor : null,
-    kind: typeof event?.kind === "string" ? event.kind : null,
-    payload,
-    created_at: typeof event?.created_at === "string" ? event.created_at : null,
-  };
-  const details = element(documentRoot, "details");
-  details.append(
-    element(documentRoot, "summary", "Inspect structured event"),
-    element(documentRoot, "pre", JSON.stringify(projection, null, 2)),
-  );
-  article.append(details);
   if (
     typeof event?.created_at === "string"
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(event.created_at)
@@ -691,14 +675,36 @@ function activitySummary(value) {
 }
 
 
+function activityRows(value) {
+  const activity = asObject(value);
+  const allowed = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
+  const type = typeof activity.type === "string" && allowed.has(activity.type)
+    ? stateLabel(activity.type)
+    : "No structured activity recorded";
+  const rows = [["Type", type]];
+  if (typeof activity.status === "string") {
+    rows.push(["Status", stateLabel(activity.status)]);
+  }
+  if (typeof activity.command_sha256 === "string" && /^[a-f0-9]{32,128}$/i.test(activity.command_sha256)) {
+    rows.push(["Command digest", activity.command_sha256]);
+  }
+  return rows;
+}
+
+
 function renderActivityAudit(documentRoot, task) {
   const audit = documentRoot.querySelector("#activity-audit");
   if (!audit || audit.open !== true) {
     return;
   }
+  const rows = element(documentRoot, "dl", undefined, "activity-audit-rows");
+  rows.append(...activityRows(task?.activity).flatMap(([label, value]) => [
+    element(documentRoot, "dt", label), element(documentRoot, "dd", value),
+  ]));
   audit.replaceChildren(
     element(documentRoot, "summary", "Activity and audit"),
     element(documentRoot, "p", activitySummary(task?.activity)),
+    rows,
   );
 }
 
@@ -736,6 +742,7 @@ function renderPersistentInspector(documentRoot, task, options) {
       ]));
     }
     if (controls) {
+      controls.hidden = false;
       const heading = element(documentRoot, "h3", "Task controls");
       heading.id = "task-controls-heading";
       controls.replaceChildren(
@@ -768,32 +775,7 @@ function renderPersistentInspector(documentRoot, task, options) {
   if (!controls) {
     return;
   }
-  const heading = element(documentRoot, "h3", "Task controls");
-  heading.id = "task-controls-heading";
-  const actions = element(documentRoot, "div", undefined, "task-actions");
-  const gate = normalizeInspectorGate(options);
-  const taskControls = controlsForState(String(task?.state ?? ""), gate);
-  const approvalBlocked = APPROVAL_STATES.has(String(task?.state ?? ""))
-    && brief !== null && brief.open_questions.length > 0;
-  const unusableBrief = brief === null && (APPROVAL_STATES.has(String(task?.state ?? ""))
-    || (task?.brief !== null && task?.brief !== undefined));
-  const descriptors = [
-    ["Approve & run", "approve", unusableBrief ? control(false, false) : (approvalBlocked ? control(true, false) : taskControls.approve), "button-primary"],
-    ["Edit", "edit", unusableBrief ? control(false, false) : taskControls.edit, ""],
-    ["Reject", "reject", taskControls.reject, "button-danger"],
-    ["Stop", "stop", taskControls.stop, "button-danger"],
-    ["Resume", "resume", taskControls.resume, "button-primary"],
-  ];
-  for (const [label, action, descriptor, className] of descriptors) {
-    const button = actionButton(
-      documentRoot, label, action, descriptor,
-      () => options.onAction?.(action, task), className,
-    );
-    if (button) {
-      actions.append(button);
-    }
-  }
-  controls.replaceChildren(heading, actions);
+  controls.hidden = true;
 }
 
 
@@ -1730,6 +1712,15 @@ export function renderPendingConversationCards(documentRoot, tasks, handlers = {
 }
 
 
+export class HttpError extends Error {
+  constructor(status, detail) {
+    super(detail);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+
 export async function postJson(fetchFunction, path, payload, csrfToken) {
   if (typeof path !== "string" || !path.startsWith("/api/") || path.includes("?")) {
     throw new Error("mutation path must be a body-only API path");
@@ -1751,7 +1742,7 @@ export async function postJson(fetchFunction, path, payload, csrfToken) {
     } catch (_error) {
       // The status is sufficient when an error response has no JSON body.
     }
-    throw new Error(detail);
+    throw new HttpError(response.status, detail);
   }
   return response;
 }
@@ -2953,7 +2944,7 @@ export function reduceTaskEvent(tasks, event) {
   } else if (event.kind === "review") {
     updated = {...updated, review: payload};
   } else if (["agent_event", "resume_drift", "stop_error", "action_error"].includes(event.kind)) {
-    updated = {...updated, activity: payload};
+    updated = {...updated, activity: {...payload, type: event.kind}};
   }
   return upsertTask(tasks, updated);
 }
@@ -3206,10 +3197,11 @@ export function startBrowserApp(documentRoot, windowRoot) {
       : presentation.disabled;
     if (composerRecipient) {
       composerRecipient.disabled = interventionMode ? activeInterventionDraft.submitted : presentation.recipientDisabled;
+      const eligibleRecipients = interventionMode ? interventionRecipients(activeTask) : null;
       for (const option of Array.from(composerRecipient.options ?? [])) {
-        option.disabled = interventionMode && !interventionRecipients(activeTask).includes(option.value);
+        option.disabled = interventionMode && !eligibleRecipients.includes(option.value);
       }
-      if (interventionMode && composerRecipient.value === "team") {
+      if (interventionMode && !eligibleRecipients.includes(composerRecipient.value)) {
         composerRecipient.value = "fable";
       }
     }
@@ -3290,6 +3282,13 @@ export function startBrowserApp(documentRoot, windowRoot) {
       return;
     }
     if (presentation.kind === "unknown") {
+      if (
+        acknowledgementDraft !== null
+        && (acknowledgementDraft.interventionId !== presentation.interventionId
+          || acknowledgementDraft.resumeGeneration !== presentation.resumeGeneration)
+      ) {
+        acknowledgementDraft = null;
+      }
       if (interventionContext) {
         interventionContext.textContent = `Warning: ${presentation.warning}`;
         interventionContext.setAttribute("role", "alert");
@@ -3516,9 +3515,8 @@ export function startBrowserApp(documentRoot, windowRoot) {
       unknownWarningId = null;
       await controller?.refreshSelectedBootstrap();
     } catch (error) {
-      if (String(error.message ?? error).includes("409")) {
-        activeInterventionDraft = null;
-        messageInput.value = "";
+      if (error?.status === 409) {
+        acknowledgementDraft = null;
       }
       showToast(documentRoot, String(error.message ?? error), true);
     }
@@ -3631,7 +3629,7 @@ export function startBrowserApp(documentRoot, windowRoot) {
       if (activeInterventionDraft?.submitted) {
         activeInterventionDraft = Object.freeze({...activeInterventionDraft, submitted: false});
       }
-      if (String(error.message ?? error).includes("409")) {
+      if (error?.status === 409) {
         activeInterventionDraft = null;
         messageInput.value = "";
       }

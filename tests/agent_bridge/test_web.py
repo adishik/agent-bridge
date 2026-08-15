@@ -732,7 +732,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         "toast-region", "fable-status", "sol-status", "repository-status",
         "connection-status", "task-drawer-toggle", "inspector-drawer-toggle",
         "bootstrap-retry", "project-list", "chat-list", "new-chat",
-            "selected-project-name", "selected-chat-name", "task-inspector-summary",
+            "selected-project-name", "selected-chat-name", "task-inspector-summary", "composer-recipient",
+            "composer-label",
             "task-controls", "activity-audit", "intervention-context", "intervene-control",
             "stop-control", "conversation-status", "conversation-context",
       ];
@@ -743,6 +744,11 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       nodes["message-input"].tag = "textarea";
       nodes["intervene-control"].tag = "button"; nodes["stop-control"].tag = "button";
       nodes["activity-audit"].tag = "details";
+      nodes["composer-recipient"].tag = "select";
+      nodes["composer-recipient"].value = "sol";
+      nodes["composer-recipient"].options = ["fable", "sol", "team"].map((value) => {{
+        const option = new Node("option"); option.value = value; return option;
+      }});
       nodes["usage-credits-confirm"].tag = "input";
       nodes["task-drawer-toggle"].setAttribute("aria-expanded", "false");
       nodes["inspector-drawer-toggle"].setAttribute("aria-expanded", "false");
@@ -756,15 +762,29 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const drawerSummary = new Node("summary", "drawer-summary");
       drawerSummary.textContent = "Drawer navigation";
       nodes["project-navigation"].append(disabledDrawerControl, drawerSummary, nodes["task-list"]);
-      nodes["task-inspector-panel"].append(nodes["task-inspector"]);
+      nodes["task-inspector-panel"].append(
+        nodes["task-inspector"], nodes["task-inspector-summary"], nodes["task-controls"],
+        nodes["activity-audit"],
+      );
+      nodes["composer"].append(
+        nodes["composer-label"], nodes["message-input"], nodes["composer-recipient"],
+        nodes["composer-submit"], nodes["composer-guidance"],
+      );
+      nodes["conversation-shell"].append(nodes["conversation-context"], nodes["composer"]);
       const isDescendantOf = (node, ancestor) => {{
         for (let current = node; current; current = current.parent) {{
           if (current === ancestor) return true;
         }}
         return false;
       }};
-      interactionAllowed = (node) => !nodes["usage-modal"].open
-        || isDescendantOf(node, nodes["usage-modal"]);
+      const hasInertAncestor = (node) => {{
+        for (let current = node; current; current = current.parent) {{
+          if (current.inert) return true;
+        }}
+        return false;
+      }};
+      interactionAllowed = (node) => (!nodes["usage-modal"].open
+        || isDescendantOf(node, nodes["usage-modal"])) && !hasInertAncestor(node);
       const launcher = new Node("button", "launcher");
       documentRoot = {{
         activeElement: launcher,
@@ -818,13 +838,15 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
           if (url.endsWith("/tasks/intervene-task/intervene")) {{
             interventionAttempts += 1;
             return interventionAttempts === 1
-              ? {{ok: false, status: 409, json: async () => ({{}})}}
+              ? {{ok: false, status: 409, json: async () => ({{detail: "task revision conflicts"}})}}
               : {{ok: true, status: 202, json: async () => ({{}})}};
           }}
           if (url.endsWith("/authorize-retry")) {{
             acknowledgementAttempts += 1;
             return acknowledgementAttempts === 1
               ? {{ok: false, status: 503, json: async () => ({{}})}}
+              : acknowledgementAttempts === 4
+                ? {{ok: false, status: 409, json: async () => ({{detail: "resume generation conflicts"}})}}
               : {{ok: true, status: 202, json: async () => ({{}})}};
           }}
           return {{ok: true, status: 202, json: async () => ({{}})}};
@@ -846,7 +868,10 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
       if (!nodes["task-inspector-summary"].textContent.includes("Question budget")) process.exit(34);
+      if (!nodes["task-controls"].hidden) process.exit(49);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
+      media.matches = false;
+      media.emit();
       if (nodes["repository-status"].textContent !== "Project: PROJECT-A · Branch: feat/agent-bridge") {{
         process.exit(9);
       }}
@@ -898,6 +923,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (documentRoot.activeElement !== reconnectFocus) process.exit(24);
       if (nodes["message-input"].disabled) process.exit(28);
 
+      media.matches = true;
+      media.emit();
       await nodes["task-drawer-toggle"].emit("click");
       if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert || nodes["project-navigation"].attributes.role !== "dialog" || nodes["project-navigation"].attributes["aria-modal"] !== "true") process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
@@ -909,9 +936,11 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (nodes["project-navigation"].classList.contains("drawer-open") || nodes["project-navigation"].attributes.role !== undefined || nodes["project-navigation"].attributes["aria-modal"] !== undefined) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
       if (globalThis.pwned === true) process.exit(18);
+      await nodes["inspector-drawer-toggle"].emit("click");
       nodes["activity-audit"].open = true;
       await nodes["activity-audit"].emit("toggle");
       if (!nodes["activity-audit"].textContent.includes("Agent Event · Ready · audit-a")) process.exit(37);
+      if (!nodes["activity-audit"].textContent.includes("TypeAgent EventStatusReady")) process.exit(50);
       media.matches = false;
       media.emit();
       if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);
@@ -935,6 +964,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await refreshFromEvent(persistedEvent.sequence + 50);
       if (controller.state.gate.canCompose || !nodes["message-input"].disabled) process.exit(41);
       await nodes["intervene-control"].emit("click");
+      if (nodes["composer-recipient"].value !== "fable" || !nodes["composer-recipient"].options[1].disabled) process.exit(47);
       nodes["message-input"].value = "Keep scope exact.";
       await nodes["message-input"].emit("input");
       if (nodes["composer-submit"].disabled) process.exit(32);
@@ -942,6 +972,7 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const intervention = fetchCalls.find((call) => call.url === "/api/projects/project-a/chats/session-1/tasks/intervene-task/intervene");
       if (!intervention || JSON.parse(intervention.options.body).message !== "Keep scope exact.") process.exit(33);
       if (!nodes["message-input"].disabled || !nodes["composer-submit"].disabled) process.exit(39);
+      if (!nodes["toast-region"].textContent.includes("task revision conflicts")) process.exit(51);
       await nodes["intervene-control"].emit("click");
       nodes["message-input"].value = "Use the fresh intervention identity.";
       await nodes["message-input"].emit("input");
@@ -970,11 +1001,18 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
       const thirdAcknowledgement = JSON.parse(acknowledgements()[2].options.body);
       if (thirdAcknowledgement.acknowledgment_id === firstAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 5) process.exit(44);
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 6}};
+      await refreshFromEvent(persistedEvent.sequence + 53);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const conflictAcknowledgement = JSON.parse(acknowledgements()[3].options.body);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const freshAcknowledgement = JSON.parse(acknowledgements()[4].options.body);
+      if (conflictAcknowledgement.acknowledgment_id === freshAcknowledgement.acknowledgment_id || freshAcknowledgement.expected_resume_generation !== 6 || freshAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(48);
       for (const status of ["pending_stop", "ready", "resuming", "resume_outcome_unknown"]) {{
         projectBootstrap.tasks[1].intervention = {{
           intervention_id: `stop-${{status}}`, status, resume_generation: 6, eligible: false,
         }};
-        await refreshFromEvent(persistedEvent.sequence + 53 + acknowledgements().length);
+        await refreshFromEvent(persistedEvent.sequence + 54 + acknowledgements().length);
         if (nodes["stop-control"].hidden || nodes["stop-control"].disabled) process.exit(45);
         await nodes["stop-control"].emit("click");
       }}

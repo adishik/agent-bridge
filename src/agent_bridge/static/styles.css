@@ -88,6 +88,7 @@ summary:focus-visible,
   color: #fff;
   background: var(--brand-strong);
   border-radius: 0.45rem;
+  min-height: 44px;
   transform: translateY(-150%);
 }
 
@@ -680,6 +681,11 @@ dialog h2 {
   border: 1px solid var(--line-strong);
   border-radius: 0.55rem;
   resize: vertical;
+}
+
+.field-group input,
+.field-group textarea {
+  min-height: 44px;
 }
 
 #composer {
