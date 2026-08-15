@@ -1675,6 +1675,67 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in styles
     assert "@media (forced-colors: active)" in styles
 
+    root = re.search(r":root\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert root is not None
+    tokens = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", root.group("body")))
+
+    declarations: dict[tuple[str, str], list[str]] = {}
+    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
+        properties = re.findall(r"([\w-]+)\s*:\s*([^;{}]+);", body)
+        for selector in (item.strip() for item in header.split(",")):
+            for property_name, value in properties:
+                declarations.setdefault((selector, property_name), []).append(value.strip())
+
+    color_atom = re.compile(
+        r"var\(--[\w-]+\)|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{3}(?![0-9a-fA-F])|"
+        r"rgb\([^)]*\)|transparent"
+    )
+
+    def parsed_color(
+        selector: str,
+        property_name: str,
+        *,
+        occurrence: int = 0,
+        atom: int = -1,
+    ) -> str:
+        value = declarations[(selector, property_name)][occurrence]
+        colors = color_atom.findall(value)
+        assert colors, f"missing measurable color in {selector} {property_name}: {value}"
+        return colors[atom]
+
+    def resolve(value: str, backdrop: str) -> str:
+        value = value.strip()
+        match = re.fullmatch(r"var\((--[\w-]+)\)", value)
+        if match:
+            token_value = tokens[match.group(1)]
+            token_colors = color_atom.findall(token_value)
+            return resolve(token_colors[-1] if token_colors else token_value, backdrop)
+        if value == "transparent":
+            return resolve(backdrop, "#ffffff")
+        if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
+            return "#" + "".join(channel * 2 for channel in value[1:])
+        rgb = re.fullmatch(
+            r"rgb\(\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})(?:\s*/\s*(\d{1,3})%)?\s*\)",
+            value,
+        )
+        if rgb:
+            red, green, blue = (int(channel) for channel in rgb.group(1, 2, 3))
+            assert all(0 <= channel <= 255 for channel in (red, green, blue))
+            opacity = int(rgb.group(4) or "100") / 100
+            if opacity < 1:
+                resolved_backdrop = resolve(backdrop, "#ffffff")
+                base = tuple(
+                    int(resolved_backdrop[index:index + 2], 16)
+                    for index in (1, 3, 5)
+                )
+                red, green, blue = (
+                    round(channel * opacity + under * (1 - opacity))
+                    for channel, under in zip((red, green, blue), base)
+                )
+            return f"#{red:02x}{green:02x}{blue:02x}"
+        assert re.fullmatch(r"#[0-9a-fA-F]{6}", value), value
+        return value.lower()
+
     def luminance(hex_color: str) -> float:
         channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
         linear = [
@@ -1687,214 +1748,331 @@ def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
         lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
         return (lighter + 0.05) / (darker + 0.05)
 
-    root = re.search(r":root\s*\{(?P<body>.*?)\}", styles, re.S)
-    assert root is not None
-    tokens = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", root.group("body")))
+    def pairing(
+        foreground: str,
+        background: str,
+        backdrop: str,
+        threshold: float,
+        label: str,
+    ) -> tuple[str, str, str, float, str]:
+        return foreground, background, backdrop, threshold, label
 
-    def declaration(selector: str, property_name: str) -> str:
-        for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
-            selectors = {item.strip() for item in header.split(",")}
-            if selector not in selectors:
-                continue
-            match = re.search(rf"(?:^|;)\s*{re.escape(property_name)}\s*:\s*([^;]+);", body)
-            if match:
-                return match.group(1).strip()
-        raise AssertionError(f"missing {property_name} declaration for {selector}")
+    surface = parsed_color("body", "background")
+    ink = parsed_color("body", "color")
+    panel = tokens["--panel"]
+    muted = tokens["--muted"]
+    coordinator_soft = tokens["--coordinator-soft"]
+    body_tint = resolve(parsed_color("body", "background", atom=0), surface)
+    nav_surface = resolve(parsed_color("#project-navigation", "background"), surface)
+    inspector_surface = resolve(parsed_color("#task-inspector-panel", "background"), surface)
+    composer_surface = resolve(parsed_color("#composer", "background"), surface)
 
-    def resolve(value: str) -> str:
-        value = value.strip()
-        match = re.fullmatch(r"var\((--[\w-]+)\)", value)
-        if match:
-            return resolve(tokens[match.group(1)])
-        if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
-            return "#" + "".join(channel * 2 for channel in value[1:])
-        rgb = re.fullmatch(
-            r"rgb\(\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})(?:\s*/\s*(\d{1,3})%)?\s*\)",
-            value,
+    adjacencies: dict[
+        tuple[str, str], list[tuple[str, str, str, float, str]]
+    ] = {}
+
+    def put(
+        selector: str,
+        property_name: str,
+        *cases: tuple[str, str, str, float, str],
+    ) -> None:
+        key = (selector, property_name)
+        assert key not in adjacencies, key
+        adjacencies[key] = list(cases)
+
+    def text_case(foreground: str, background: str, backdrop: str, label: str):
+        return pairing(foreground, background, backdrop, 4.5, label)
+
+    def indicator_case(foreground: str, background: str, backdrop: str, label: str):
+        return pairing(foreground, background, backdrop, 3, label)
+
+    # Explicit text declarations and the concrete surfaces reached through the
+    # cascade. Repeated cases are intentional where one declaration is inherited
+    # on multiple actor/state surfaces.
+    text_surfaces = {
+        "body": [(ink, surface, surface, "body text")],
+        ".skip-link": [(parsed_color(".skip-link", "color"), parsed_color(".skip-link", "background"), surface, "skip-link text")],
+        ".brand-block span": [(muted, parsed_color("#app-header", "background"), body_tint, "header metadata")],
+        ".project-navigation-label": [(muted, panel, surface, "navigation label")],
+        ".project-navigation-label strong": [(ink, panel, surface, "navigation label emphasis")],
+        ".project-navigation-button": [(muted, panel, surface, "navigation button")],
+        ".project-navigation-button:hover:not(:disabled)": [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation hover")],
+        '.project-navigation-button[aria-current="true"]': [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation current")],
+        ".project-navigation-button:disabled": [("var(--ink-800)", panel, surface, "navigation disabled")],
+        ".status-pill": [(muted, coordinator_soft, surface, "presence badge")],
+        ".state-badge": [(muted, coordinator_soft, panel, "task state badge")],
+        ".eyebrow": [("var(--brand)", panel, surface, "eyebrow")],
+        ".empty-state": [(muted, panel, surface, "empty state")],
+        ".form-guidance": [(muted, composer_surface, surface, "composer guidance")],
+        ".metadata": [(muted, panel, surface, "metadata")],
+        ".task-meta": [(muted, panel, surface, "task metadata")],
+        ".task-list-button": [(ink, panel, nav_surface, "task button inherited text")],
+        ".conversation-intro > p:last-child": [(muted, parsed_color(".conversation-intro", "background"), body_tint, "conversation intro")],
+        ".message-avatar": [(parsed_color(".message-avatar", "color"), parsed_color(".message-avatar", "background"), panel, "coordinator avatar")],
+        ".message time": [
+            (muted, parsed_color(selector, "background"), panel, f"{selector.removeprefix('.message-')} message time")
+            for selector in (".message-user", ".message-fable", ".message-sol", ".message-coordinator")
+        ],
+        ".conversation-status": [(muted, parsed_color(".conversation-status", "background"), surface, "conversation status")],
+        ".task-section-empty": [(muted, panel, inspector_surface, "empty task section")],
+        ".button": [(ink, panel, surface, "button text")],
+        ".button:disabled": [("var(--ink-800)", "var(--cream-100)", surface, "disabled button")],
+        ".button-primary": [(parsed_color(".button-primary", "color"), "var(--brand)", surface, "primary button")],
+        ".button-danger": [("var(--danger)", panel, surface, "danger button")],
+        ".field-group textarea": [(ink, panel, inspector_surface, "field textarea")],
+        ".field-group input": [(ink, panel, inspector_surface, "field input")],
+        "#message-input": [(ink, panel, composer_surface, "message textarea")],
+        "#composer-recipient": [(ink, panel, composer_surface, "recipient select")],
+        "#conversation-context": [(muted, "var(--cream-100)", surface, "conversation context")],
+        ".composer-recipient": [(muted, composer_surface, surface, "recipient label")],
+        ".composer-binding": [(muted, composer_surface, surface, "composer binding")],
+        "dialog": [(ink, panel, surface, "dialog text")],
+        ".form-error": [("var(--danger)", panel, surface, "form error")],
+        ".toast": [(parsed_color(".toast", "color"), "var(--brand-strong)", surface, "toast text")],
+    }
+    for selector, cases in text_surfaces.items():
+        declared_color = declarations[(selector, "color")][0]
+        actual_foreground = (
+            parsed_color(selector, "color")
+            if color_atom.findall(declared_color)
+            else ink
         )
-        if rgb:
-            red, green, blue = (int(channel) for channel in rgb.group(1, 2, 3))
-            assert all(0 <= channel <= 255 for channel in (red, green, blue))
-            opacity = int(rgb.group(4) or "100") / 100
-            if opacity < 1:
-                backdrop = resolve(tokens["--surface"])
-                base = tuple(int(backdrop[index:index + 2], 16) for index in (1, 3, 5))
-                red, green, blue = (
-                    round(channel * opacity + under * (1 - opacity))
-                    for channel, under in zip((red, green, blue), base)
+        put(
+            selector,
+            "color",
+            *(
+                text_case(actual_foreground, background, backdrop, label)
+                for _foreground, background, backdrop, label in cases
+            ),
+        )
+
+    # Surfaces are keyed independently so changing only a background cannot
+    # evade the same rendered text contrast calculation.
+    background_surfaces = {
+        "body": [(ink, surface, surface, "body base surface"), (ink, parsed_color("body", "background", atom=0), surface, "body gradient tint")],
+        ".skip-link": [(parsed_color(".skip-link", "color"), parsed_color(".skip-link", "background"), surface, "skip-link surface")],
+        "#app-header": [(ink, parsed_color("#app-header", "background"), body_tint, "header surface")],
+        ".project-navigation-button": [(muted, panel, surface, "navigation button surface")],
+        ".project-navigation-button:hover:not(:disabled)": [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation hover surface")],
+        '.project-navigation-button[aria-current="true"]': [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation current surface")],
+        ".status-pill": [(muted, coordinator_soft, surface, "presence badge surface")],
+        ".state-badge": [(muted, coordinator_soft, panel, "task state badge surface")],
+        "#project-navigation": [(ink, parsed_color("#project-navigation", "background"), surface, "desktop project pane"), (ink, parsed_color("#project-navigation", "background", occurrence=1), surface, "mobile project drawer")],
+        "#task-inspector-panel": [(ink, parsed_color("#task-inspector-panel", "background"), surface, "desktop inspector pane"), (ink, parsed_color("#task-inspector-panel", "background", occurrence=1), surface, "mobile inspector drawer")],
+        "#task-list": [(ink, parsed_color("#task-list", "background"), nav_surface, "task list surface")],
+        "#task-inspector": [(ink, parsed_color("#task-inspector", "background"), inspector_surface, "task inspector surface")],
+        ".task-list-button": [(ink, panel, nav_surface, "task button surface")],
+        ".conversation-intro": [(ink, parsed_color(".conversation-intro", "background"), body_tint, "conversation intro surface")],
+        ".message": [(ink, panel, surface, "base message surface")],
+        ".message-avatar": [(parsed_color(".message-avatar", "color"), "var(--coordinator)", panel, "coordinator avatar surface")],
+        ".message-user .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--user)", "var(--user-soft)", "user avatar surface")],
+        ".message-fable .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--fable)", "var(--fable-soft)", "Fable avatar surface")],
+        ".message-sol .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--sol)", "var(--sol-soft)", "Sol avatar surface")],
+        ".conversation-action-card": [(ink, panel, surface, "action card surface")],
+        ".message-user": [(ink, "var(--user-soft)", surface, "user message text")],
+        ".message-fable": [(ink, "var(--fable-soft)", surface, "Fable message text")],
+        ".message-sol": [(ink, "var(--sol-soft)", surface, "Sol message text")],
+        ".message-coordinator": [(ink, coordinator_soft, surface, "coordinator message text")],
+        ".conversation-status": [(muted, parsed_color(".conversation-status", "background"), surface, "status surface")],
+        ".task-section": [(ink, panel, inspector_surface, "task section surface")],
+        ".button": [(ink, panel, surface, "button surface")],
+        ".button:disabled": [("var(--ink-800)", "var(--cream-100)", surface, "disabled surface")],
+        ".button-primary": [(parsed_color(".button-primary", "color"), "var(--brand)", surface, "primary surface")],
+        ".button-primary:hover:not(:disabled)": [(parsed_color(".button-primary", "color"), "var(--brand-strong)", surface, "primary hover surface")],
+        ".button-quiet": [(ink, "transparent", panel, "quiet button on panel"), (ink, "transparent", "var(--cream-100)", "quiet button on context")],
+        ".field-group textarea": [(ink, panel, inspector_surface, "field textarea surface")],
+        ".field-group input": [(ink, panel, inspector_surface, "field input surface")],
+        "#message-input": [(ink, panel, composer_surface, "message input surface")],
+        "#composer-recipient": [(ink, panel, composer_surface, "select surface")],
+        "#composer": [(muted, parsed_color("#composer", "background"), surface, "composer surface")],
+        "#conversation-context": [(muted, "var(--cream-100)", surface, "context surface")],
+        "dialog": [(ink, panel, surface, "dialog surface")],
+        ".acknowledgement-row": [(ink, "var(--brand-soft)", panel, "acknowledgement surface")],
+        ".toast": [(parsed_color(".toast", "color"), "var(--brand-strong)", surface, "toast surface")],
+        ".toast-error": [(parsed_color(".toast", "color"), "var(--danger)", surface, "error toast surface")],
+    }
+    for selector, cases in background_surfaces.items():
+        if selector == "body":
+            put(selector, "background", *(text_case(*case) for case in cases))
+            continue
+        actual_backgrounds = [
+            parsed_color(selector, "background", occurrence=occurrence)
+            for occurrence in range(len(declarations[(selector, "background")]))
+        ]
+        put(
+            selector,
+            "background",
+            *(
+                text_case(
+                    foreground,
+                    (
+                        actual_backgrounds[index]
+                        if len(actual_backgrounds) == len(cases)
+                        else actual_backgrounds[0]
+                    ),
+                    backdrop,
+                    label,
                 )
-            return f"#{red:02x}{green:02x}{blue:02x}"
-        assert re.fullmatch(r"#[0-9a-fA-F]{6}", value), value
-        return value.lower()
-
-    # These are selector/property sources, resolved from the shipped CSS rather
-    # than a duplicated palette. The inventory below also ensures a future
-    # color declaration cannot silently bypass this concrete surface matrix.
-    adjacencies = (
-        ("body", "color", ":root", "--surface", 4.5),
-        (".brand-block span", "color", "#app-header", "background", 4.5),
-        (".project-navigation-label", "color", "#app-header", "background", 4.5),
-        (".project-navigation-label strong", "color", "#app-header", "background", 4.5),
-        (".project-navigation-button", "color", ":root", "--panel", 4.5),
-        (".project-navigation-button:hover:not(:disabled)", "color", ":root", "--brand-soft", 4.5),
-        (".project-navigation-button:disabled", "color", ":root", "--panel", 4.5),
-        (".status-pill", "color", ":root", "--coordinator-soft", 4.5),
-        (".eyebrow", "color", "#task-list", "background", 4.5),
-        (".conversation-intro > p:last-child", "color", ".conversation-intro", "background", 4.5),
-        (".message time", "color", ".message-user", "background", 4.5),
-        (".message time", "color", ".message-fable", "background", 4.5),
-        (".message time", "color", ".message-sol", "background", 4.5),
-        (".message time", "color", ".message-coordinator", "background", 4.5),
-        (".conversation-status", "color", ".conversation-status", "background", 4.5),
-        (".message-avatar", "color", ":root", "--coordinator", 4.5),
-        (".message-fable .message-avatar", "color", ":root", "--fable", 4.5),
-        (".message-sol .message-avatar", "color", ":root", "--sol", 4.5),
-        (".button", "color", ":root", "--panel", 4.5),
-        (".button:disabled", "color", ":root", "--cream-100", 4.5),
-        (".button-primary", "color", ":root", "--brand", 4.5),
-        (".button-danger", "color", ":root", "--panel", 4.5),
-        (".field-group textarea", "color", ":root", "--panel", 4.5),
-        ("#conversation-context", "color", ":root", "--cream-100", 4.5),
-        (".composer-recipient", "color", ":root", "--panel", 4.5),
-        (".composer-binding", "color", ":root", "--panel", 4.5),
-        ("dialog", "color", ":root", "--panel", 4.5),
-        (".form-error", "color", ":root", "--panel", 4.5),
-        (".toast", "color", ":root", "--brand-strong", 4.5),
-        (".toast-error", "color", ":root", "--danger", 4.5),
-        (".skip-link", "color", ":root", "--brand-strong", 4.5),
-        ("button:focus-visible", "outline-color", ":root", "--surface", 3),
-        ("textarea:focus-visible", "outline-color", "#composer", "background", 3),
-        ("input:focus-visible", "outline-color", "dialog", "background", 3),
-        ("select:focus-visible", "outline-color", "#composer", "background", 3),
-        ("a:focus-visible", "outline-color", ":root", "--surface", 3),
-        ("summary:focus-visible", "outline-color", ":root", "--panel", 3),
-        ("[tabindex]:focus-visible", "outline-color", ":root", "--panel", 3),
-        (".status-pill::before", "background", ":root", "--coordinator-soft", 3),
-        (".status-ready::before", "background", ":root", "--coordinator-soft", 3),
-        (".status-running::before", "background", ":root", "--cream-100", 3),
-        (".status-error::before", "background", ":root", "--coordinator-soft", 3),
-        (".task-list-button:hover", "border-color", ":root", "--panel", 3),
-        (".button", "border", ":root", "--panel", 3),
-        (".button-primary", "border-color", ":root", "--panel", 3),
-        (".button-danger", "border-color", ":root", "--panel", 3),
-        (".toast", "border", ":root", "--brand-strong", 3),
-        (".message-user", "border-left-color", ":root", "--user-soft", 3),
-        (".message-fable", "border-left-color", ":root", "--fable-soft", 3),
-        (".message-sol", "border-left-color", ":root", "--sol-soft", 3),
-        (".message-coordinator", "border-left-color", ":root", "--coordinator-soft", 3),
+                for index, (foreground, _background, backdrop, label) in enumerate(cases)
+            ),
+        )
+    put(
+        "dialog::backdrop",
+        "background",
+        indicator_case(
+            parsed_color("dialog::backdrop", "background"),
+            surface,
+            surface,
+            "modal backdrop",
+        ),
     )
-    for selector, foreground_property, background_selector, background_property, minimum in adjacencies:
-        if foreground_property == "outline-color":
-            foreground = declaration(selector, "outline").split()[-1]
-        elif foreground_property == "border":
-            foreground = declaration(selector, "border").split()[-1]
+
+    container = coordinator_soft
+    base_dots = (".status-pill::before", ".state-badge::before")
+    ready_dots = (".status-ready::before", ".state-completed::before")
+    error_dots = (".status-error::before", ".state-failed::before", ".state-interrupted::before")
+    running_dots = (
+        ".status-running::before", ".state-sol_running::before",
+        ".state-sol_correcting::before", ".state-fable_planning::before",
+        ".state-fable_clarifying::before", ".state-fable_reviewing::before",
+    )
+    for selector in base_dots + ready_dots + error_dots:
+        put(selector, "background", indicator_case(parsed_color(selector, "background"), container, panel, f"{selector} fill against container"))
+    for selector in running_dots:
+        halo = parsed_color(selector, "box-shadow")
+        put(selector, "background", indicator_case(parsed_color(selector, "background"), halo, container, f"{selector} fill against halo"))
+        put(selector, "box-shadow", indicator_case(halo, container, panel, f"{selector} halo against container"))
+
+    # Focus rings are outside their controls (2px offset), so their actual
+    # adjacency is the containing surface, not the control fill.
+    focus_surfaces = {
+        "button:focus-visible": (surface, panel, "var(--cream-100)", "var(--brand-soft)", composer_surface),
+        "textarea:focus-visible": (composer_surface, panel),
+        "input:focus-visible": (panel, "var(--brand-soft)"),
+        "select:focus-visible": (composer_surface,),
+        "a:focus-visible": (surface,),
+        "summary:focus-visible": (panel,),
+        "[tabindex]:focus-visible": (surface, panel),
+    }
+    for selector, surfaces in focus_surfaces.items():
+        ring = parsed_color(selector, "outline")
+        put(selector, "outline", *(indicator_case(ring, adjacent, surface, f"{selector} on {adjacent}") for adjacent in surfaces))
+
+    border_surfaces = {
+        ("#app-header", "border-bottom"): (body_tint, "header bottom line"),
+        (".project-navigation-button", "border"): (panel, "navigation button line"),
+        (".project-navigation-button:hover:not(:disabled)", "border-color"): (panel, "navigation hover indicator"),
+        ('.project-navigation-button[aria-current="true"]', "border-color"): (panel, "navigation current indicator"),
+        (".status-pill", "border"): (coordinator_soft, "presence badge line"),
+        (".state-badge", "border"): (coordinator_soft, "state badge line"),
+        ("#project-navigation", "border-right"): (surface, "project pane line"),
+        ("#task-inspector-panel", "border-left"): (surface, "inspector pane line"),
+        (".panel-heading", "border-bottom"): (panel, "panel heading line"),
+        (".task-list-button", "border"): (panel, "task button line"),
+        (".task-list-button:hover", "border-color"): (panel, "task hover indicator"),
+        ('.task-list-button[aria-current="true"]', "border-color"): (panel, "task current indicator"),
+        (".conversation-intro", "border"): (surface, "conversation card line"),
+        (".message", "border"): (surface, "message card outer line"),
+        (".conversation-action-card", "border"): (panel, "action card strong line"),
+        (".conversation-action-card", "border-left"): (panel, "action card state indicator"),
+        (".message-user", "border-left-color"): ("var(--user-soft)", "user message indicator"),
+        (".message-fable", "border-left-color"): ("var(--fable-soft)", "Fable message indicator"),
+        (".message-sol", "border-left-color"): ("var(--sol-soft)", "Sol message indicator"),
+        (".message-coordinator", "border-left-color"): (coordinator_soft, "coordinator message indicator"),
+        (".conversation-status", "border-left"): (parsed_color(".conversation-status", "background"), "status line"),
+        (".task-section", "border"): (panel, "task section line"),
+        (".button", "border"): (panel, "button strong line"),
+        (".button:hover:not(:disabled)", "border-color"): (panel, "button hover indicator"),
+        (".button-primary", "border-color"): (panel, "primary button boundary"),
+        (".button-danger", "border-color"): (panel, "danger button boundary"),
+        (".field-group textarea", "border"): (panel, "textarea strong line"),
+        (".field-group input", "border"): (panel, "input strong line"),
+        ("#message-input", "border"): (panel, "message input strong line"),
+        ("#composer-recipient", "border"): (panel, "select strong line"),
+        ("#composer", "border-top"): (surface, "composer line"),
+        ("#conversation-context", "border-top"): (surface, "context top line"),
+        ("#conversation-context", "border-bottom"): (surface, "context bottom line"),
+        ("dialog", "border"): (panel, "dialog strong line"),
+        (".acknowledgement-row", "border"): ("var(--brand-soft)", "acknowledgement strong line"),
+        (".toast", "border"): ("var(--brand-strong)", "toast line"),
+    }
+    for (selector, property_name), (adjacent, label) in border_surfaces.items():
+        values = declarations[(selector, property_name)]
+        measurable = [value for value in values if color_atom.findall(value) and "CanvasText" not in value]
+        cases = [
+            indicator_case(color_atom.findall(value)[-1], adjacent, surface, label)
+            for value in measurable
+        ]
+        put(selector, property_name, *cases)
+
+    for selector in (".task-list-button:hover", '.task-list-button[aria-current="true"]'):
+        put(selector, "box-shadow", indicator_case(parsed_color(selector, "box-shadow"), panel, nav_surface, f"{selector} inset selection indicator"))
+
+    def is_relevant(key: tuple[str, str], values: list[str]) -> bool:
+        selector, property_name = key
+        if property_name in {"color", "background", "outline"}:
+            return True
+        if property_name.startswith("border"):
+            return any(color_atom.findall(value) and "CanvasText" not in value for value in values)
+        return property_name == "box-shadow" and (
+            selector in running_dots
+            or selector in {".task-list-button:hover", '.task-list-button[aria-current="true"]'}
+        )
+
+    shipped_relevant_inventory = {
+        key for key, values in declarations.items() if is_relevant(key, values)
+    }
+
+    def require_exhaustive(mapping: dict[tuple[str, str], list[tuple[str, str, str, float, str]]]) -> None:
+        assert mapping.keys() == shipped_relevant_inventory
+        assert all(mapping.values())
+
+    require_exhaustive(adjacencies)
+
+    def assert_pair(case: tuple[str, str, str, float, str]) -> None:
+        foreground, background, backdrop, threshold, label = case
+        rendered_background = resolve(background, backdrop)
+        rendered_foreground = resolve(foreground, rendered_background)
+        ratio = contrast(rendered_foreground, rendered_background)
+        assert ratio >= threshold, f"{label}: {ratio:.3f}:1 < {threshold}:1"
+
+    for cases in adjacencies.values():
+        for case in cases:
+            assert_pair(case)
+
+    # Meta/mutation checks prove both halves of the contract can turn red.
+    missing_case = {key: list(cases) for key, cases in adjacencies.items()}
+    missing_case.pop(("body", "color"))
+    try:
+        require_exhaustive(missing_case)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a missing adjacency key escaped exhaustive coverage")
+
+    empty_case = {key: list(cases) for key, cases in adjacencies.items()}
+    empty_case[("body", "color")] = []
+    try:
+        require_exhaustive(empty_case)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("an empty adjacency list escaped exhaustive coverage")
+
+    low_contrast_mutations = {
+        "badge": pairing("var(--brand-soft)", coordinator_soft, panel, 4.5, "mutated badge"),
+        "message": pairing("var(--line)", "var(--fable-soft)", surface, 4.5, "mutated message"),
+        "input": pairing("var(--line)", panel, surface, 4.5, "mutated input"),
+        "border": pairing("var(--line)", "var(--fable-soft)", surface, 3, "mutated border"),
+        "dot": pairing("#ffe2ae", coordinator_soft, panel, 3, "mutated dot halo"),
+    }
+    for mutation, case in low_contrast_mutations.items():
+        try:
+            assert_pair(case)
+        except AssertionError:
+            pass
         else:
-            try:
-                foreground = declaration(selector, foreground_property)
-            except AssertionError:
-                # Avatar variants only replace their surface; their readable
-                # foreground is inherited from the base avatar declaration.
-                foreground = declaration(".message-avatar", foreground_property)
-        background = tokens[background_property] if background_selector == ":root" else declaration(background_selector, background_property)
-        assert contrast(resolve(foreground), resolve(background)) >= minimum
-
-    audited_color_selectors = {
-        "body", ".skip-link", ".brand-block span", ".project-navigation-label",
-        ".project-navigation-label strong", ".project-navigation-button",
-        ".project-navigation-button:hover:not(:disabled)",
-        ".project-navigation-button[aria-current=\"true\"]",
-        ".project-navigation-button:disabled", ".status-pill", ".state-badge",
-        ".eyebrow", ".empty-state", ".form-guidance", ".metadata", ".task-meta",
-        ".task-list-button", ".conversation-intro > p:last-child", ".message-avatar",
-        ".message time", ".conversation-status", ".task-section-empty", ".button",
-        ".button:disabled", ".button-primary", ".button-danger", ".field-group textarea",
-        ".field-group input", "#message-input", "#composer-recipient", "#conversation-context",
-        ".composer-recipient", ".composer-binding", "dialog", ".form-error", ".toast",
-    }
-    shipped_color_selectors: set[str] = set()
-    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
-        if re.search(r"(?:^|;)\s*color\s*:", body):
-            shipped_color_selectors.update(item.strip() for item in header.split(","))
-    assert shipped_color_selectors <= audited_color_selectors
-
-    # The rendered-adjacency table above is intentionally coupled to this
-    # complete declaration inventory.  Keep structural styling such as radius
-    # out of the proof, but require every shipped foreground, surface, border,
-    # focus ring, and status halo declaration to be represented by its actual
-    # selector/property source.
-    rendered_model = {
-        "body": {"color", "background"},
-        "button:focus-visible": {"outline"}, "textarea:focus-visible": {"outline"},
-        "input:focus-visible": {"outline"}, "select:focus-visible": {"outline"},
-        "a:focus-visible": {"outline"}, "summary:focus-visible": {"outline"},
-        "[tabindex]:focus-visible": {"outline"},
-        ".skip-link": {"color", "background"},
-        "#app-header": {"background", "border-bottom", "box-shadow"},
-        ".brand-block span": {"color"},
-        ".project-navigation-label": {"color"}, ".project-navigation-label strong": {"color"},
-        ".project-navigation-button": {"color", "background", "border"},
-        ".project-navigation-button:hover:not(:disabled)": {"color", "background", "border-color"},
-        ".project-navigation-button[aria-current=\"true\"]": {"color", "background", "border-color"},
-        ".project-navigation-button:disabled": {"color"},
-        ".status-pill": {"color", "background", "border"}, ".state-badge": {"color", "background", "border"},
-        ".status-pill::before": {"background", "border"},
-        ".state-badge::before": {"background", "border"},
-        ".status-ready::before": {"background"}, ".state-completed::before": {"background"},
-        ".status-running::before": {"background", "box-shadow"},
-        ".state-sol_running::before": {"background", "box-shadow"},
-        ".state-sol_correcting::before": {"background", "box-shadow"},
-        ".state-fable_planning::before": {"background", "box-shadow"},
-        ".state-fable_clarifying::before": {"background", "box-shadow"},
-        ".state-fable_reviewing::before": {"background", "box-shadow"},
-        ".status-error::before": {"background"}, ".state-failed::before": {"background"},
-        ".state-interrupted::before": {"background"},
-        "#project-navigation": {"background", "border-right", "box-shadow"},
-        "#task-inspector-panel": {"background", "border-left", "box-shadow"},
-        "#task-list": {"background", "border-right"}, "#task-inspector": {"background", "border-left"},
-        ".panel-heading": {"border-bottom"}, ".eyebrow": {"color"},
-        ".empty-state": {"color"}, ".form-guidance": {"color"}, ".metadata": {"color"}, ".task-meta": {"color"},
-        ".task-list-button": {"color", "background", "border"},
-        ".task-list-button:hover": {"border-color", "box-shadow"},
-        ".task-list-button[aria-current=\"true\"]": {"border-color", "box-shadow"},
-        ".conversation-intro": {"background", "border", "box-shadow"},
-        ".conversation-intro > p:last-child": {"color"},
-        ".message": {"background", "border", "box-shadow"},
-        ".message-avatar": {"color", "background"},
-        ".message-user .message-avatar": {"background"}, ".message-fable .message-avatar": {"background"},
-        ".message-sol .message-avatar": {"background"},
-        ".conversation-action-card": {"background", "border", "border-left", "box-shadow"},
-        ".message time": {"color"}, ".message-user": {"background", "border-left-color"},
-        ".message-fable": {"background", "border-left-color"}, ".message-sol": {"background", "border-left-color"},
-        ".message-coordinator": {"background", "border-left-color"},
-        ".conversation-status": {"color", "background", "border-left"},
-        ".task-section": {"background", "border"}, ".task-section-empty": {"color"},
-        ".button": {"color", "background", "border"}, ".button:hover:not(:disabled)": {"border-color"},
-        ".button:disabled": {"color", "background"}, ".button-primary": {"color", "background", "border-color"},
-        ".button-primary:hover:not(:disabled)": {"background"}, ".button-danger": {"color", "border-color"},
-        ".button-quiet": {"background"},
-        ".field-group textarea": {"color", "background", "border"}, ".field-group input": {"color", "background", "border"},
-        "#message-input": {"color", "background", "border"}, "#composer-recipient": {"color", "background", "border"},
-        "#composer": {"background", "border-top"}, "#conversation-context": {"color", "background", "border-top", "border-bottom"},
-        ".composer-recipient": {"color"}, ".composer-binding": {"color"},
-        "dialog": {"color", "background", "border", "box-shadow"}, "dialog::backdrop": {"background"},
-        ".acknowledgement-row": {"background", "border"}, ".form-error": {"color"},
-        ".toast": {"color", "background", "border", "box-shadow"}, ".toast-error": {"background"},
-    }
-    relevant_properties = re.compile(
-        r"(?:^|;)\s*(color|background|border(?:-(?:top|right|bottom|left)(?:-color)?|-color)?|outline|box-shadow)\s*:",
-    )
-    shipped_rendered_properties: set[tuple[str, str]] = set()
-    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
-        properties = set(relevant_properties.findall(body))
-        if properties:
-            for selector in (item.strip() for item in header.split(",")):
-                shipped_rendered_properties.update((selector, property_name) for property_name in properties)
-    model_properties = {
-        (selector, property_name)
-        for selector, properties in rendered_model.items()
-        for property_name in properties
-    }
-    assert shipped_rendered_properties == model_properties
+            raise AssertionError(f"low-contrast {mutation} mutation was accepted")
 
 
 def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:

@@ -270,8 +270,8 @@ summary:focus-visible,
 .state-fable_planning::before,
 .state-fable_clarifying::before,
 .state-fable_reviewing::before {
-  background: #b56a00;
-  box-shadow: 0 0 0 3px #ffe2ae;
+  background: #ffe2ae;
+  box-shadow: 0 0 0 3px #b56a00;
 }
 
 .status-error::before,
