@@ -7992,6 +7992,135 @@ def test_intervention_allows_early_fable_planning_only_before_a_session_exists(t
     assert event.task_id is None
 
 
+def test_early_fable_session_binding_is_atomic_and_authenticates_after_reopen(
+    tmp_path,
+) -> None:
+    """A stopped first Fable session must bind its run, task, and intervention together."""
+    path = tmp_path / "early-fable-session-binding.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store.create_session("session-1", str(repo))
+    task = store.create_planning_task("session-1", "early-fable-task")
+    store.start_agent_run("early-fable-run", task.task_id, task.revision, "fable")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="early-fable-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Pause before the initial Fable session.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="early-fable-run",
+    )
+
+    bound = store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=created.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id=None,
+        expected_resume_run_id=None,
+        fable_session_id="fable-session-1",
+        continuation=TaskState.FABLE_PLANNING,
+    )
+
+    assert bound.fable_session_id == "fable-session-1"
+    assert store.get_task(task.task_id, task.revision).fable_session_id == "fable-session-1"
+    assert store.agent_run(created.run_id).cli_session_id == "fable-session-1"
+    assert store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=created.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id=None,
+        expected_resume_run_id=None,
+        fable_session_id="fable-session-1",
+        continuation=TaskState.FABLE_PLANNING,
+    ) == bound
+
+    store.finish_agent_run(created.run_id, status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+    store.close()
+
+    reopened = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    assert reopened.authenticated_intervention(ready.intervention_id) == ready
+    reopened.audit_legacy_project_ownership(str(repo))
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("project", "generation", "source", "resume_owner", "provider", "continuation"),
+)
+def test_early_fable_session_binding_rejects_mismatch_without_partial_write(
+    tmp_path,
+    mutation: str,
+) -> None:
+    """Every identity coordinate is a CAS guard for the fresh Fable binding."""
+    store = _store(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store.create_session("session-1", str(repo))
+    task = store.create_planning_task("session-1", "early-fable-task")
+    store.start_agent_run("early-fable-run", task.task_id, task.revision, "fable")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="early-fable-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Pause before the initial Fable session.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="early-fable-run",
+    )
+    arguments: dict[str, object] = {
+        "project_id": project_id_for_root(repo),
+        "intervention_id": created.intervention_id,
+        "session_id": "session-1",
+        "task_id": task.task_id,
+        "revision": task.revision,
+        "expected_source_generation": created.source_generation,
+        "expected_resume_generation": created.resume_generation,
+        "source_run_id": created.run_id,
+        "expected_resume_attempt_id": None,
+        "expected_resume_run_id": None,
+        "fable_session_id": "fable-session-1",
+        "continuation": TaskState.FABLE_PLANNING,
+    }
+    if mutation == "project":
+        arguments["project_id"] = "other-project"
+    elif mutation == "generation":
+        arguments["expected_source_generation"] = created.source_generation + 1
+    elif mutation == "source":
+        arguments["source_run_id"] = "other-source-run"
+    elif mutation == "resume_owner":
+        arguments["expected_resume_attempt_id"] = "claimed-attempt"
+    elif mutation == "provider":
+        arguments["fable_session_id"] = "--forged-session"
+    elif mutation == "continuation":
+        arguments["continuation"] = TaskState.SOL_RUNNING
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    before = {
+        "task": store.get_task(task.task_id, task.revision),
+        "record": store.intervention(created.intervention_id),
+        "run": store.agent_run(created.run_id),
+        "events": store.events_after("session-1", 0),
+    }
+
+    with pytest.raises((RuntimeError, ValueError)):
+        store.bind_fresh_fable_session_to_pending_intervention(**arguments)  # type: ignore[arg-type]
+
+    assert {
+        "task": store.get_task(task.task_id, task.revision),
+        "record": store.intervention(created.intervention_id),
+        "run": store.agent_run(created.run_id),
+        "events": store.events_after("session-1", 0),
+    } == before
+
+
 def test_intervention_status_transitions_are_exact_owner_bound_and_idempotent(
     tmp_path, valid_brief,
 ) -> None:
@@ -9351,6 +9480,76 @@ def test_nested_fable_clarification_evidence_pauses_and_restores_exact_context(
     assert [event.payload["message_type"] for event in store.events_after("session-1", 0)] == [
         "question", "answer",
     ]
+
+
+def test_interrupt_directed_answer_for_stop_preserves_an_exact_nested_child(
+    tmp_path,
+    valid_brief,
+) -> None:
+    """A nested Sol child must keep its pause when its exact run is terminalized."""
+    store = _store(tmp_path)
+    store.create_session("session-1", "/repo")
+    brief = replace(valid_brief, task_id="nested-stop", revision=1)
+    _save_active_directed_task(store, "session-1", brief)
+    pending = {
+        "clarification_prompt": "Resolve the exact approved ambiguity.",
+        "sol_run_id": "sol-run-1",
+        "prompt": "Resume only the approved work.",
+    }
+    store._connection.execute(
+        """
+        UPDATE tasks SET state = ?, approved_at = ?, fable_session_id = ?, sol_thread_id = ?,
+            baseline_id = ?, pending_json = ? WHERE task_id = ? AND revision = ?
+        """,
+        (
+            TaskState.FABLE_CLARIFYING.value, "2026-08-10T12:00:00Z",
+            "fable-session-1", "sol-thread-1", "baseline-1",
+            json.dumps(pending, separators=(",", ":"), sort_keys=True),
+            brief.task_id, brief.revision,
+        ),
+    )
+    _, nested = store.reserve_fable_clarification_evidence_question(
+        session_id="session-1", task_id=brief.task_id, revision=brief.revision,
+        expected_generation=1, question_id="nested-stop-question",
+        request_key="nested-stop-request", text="Which approved rule is verified?",
+        event=_conversation_question(
+            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL, task_id=brief.task_id,
+            revision=brief.revision, generation=1,
+            question_id="nested-stop-question", text="Which approved rule is verified?",
+        ),
+    )
+    store.start_agent_run("nested-stop-run", brief.task_id, brief.revision, "sol")
+    store.set_agent_run_session("nested-stop-run", "sol-thread-1")
+    before = (
+        store.get_task(brief.task_id, brief.revision),
+        store.question(nested.question_id),
+        store.agent_run("nested-stop-run"),
+        store.events_after("session-1", 0),
+    )
+
+    with pytest.raises(RuntimeError):
+        store.interrupt_directed_answer_for_stop(
+            brief.task_id, brief.revision,
+            run_id="nested-stop-run", question_id="other-question",
+        )
+    assert (
+        store.get_task(brief.task_id, brief.revision),
+        store.question(nested.question_id),
+        store.agent_run("nested-stop-run"),
+        store.events_after("session-1", 0),
+    ) == before
+
+    interrupted = store.interrupt_directed_answer_for_stop(
+        brief.task_id, brief.revision,
+        run_id="nested-stop-run", question_id=nested.question_id,
+    )
+
+    assert interrupted.state is TaskState.INTERRUPTED
+    assert interrupted.continuation_state is TaskState.FABLE_CLARIFYING
+    assert store.question(nested.question_id) == nested
+    assert store.agent_run("nested-stop-run").status == "running"
+    assert store.events_after("session-1", 0) == before[3]
 
 
 def test_nested_fable_answer_evidence_binds_outer_question_and_reopens_idempotently(

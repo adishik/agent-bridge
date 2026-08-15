@@ -8437,19 +8437,39 @@ class SQLiteStore:
         return self.get_task(task_id, revision)
 
     def interrupt_directed_answer_for_stop(
-        self, task_id: str, revision: int, *, run_id: str,
+        self,
+        task_id: str,
+        revision: int,
+        *,
+        run_id: str,
+        question_id: str | None = None,
     ) -> TaskRecord:
-        """Interrupt only an in-flight routed answer without consuming its pause."""
+        """Interrupt one exact routed answer without consuming its durable pause."""
         task_id = _require_string(task_id, "task_id")
         revision = _require_integer(revision, "revision")
         run_id = _prepared_identifier(run_id, "run_id")
+        if question_id is not None:
+            question_id = _prepared_identifier(question_id, "question_id")
         with self._immediate_transaction():
             task = self.get_task(task_id, revision)
-            question = self._unanswered_question_for_task(task_id, revision)
+            question = (
+                self._unanswered_question_for_task(task_id, revision)
+                if question_id is None
+                else self.question(question_id)
+            )
             if (
                 task.state is not TaskState.AWAITING_USER_INPUT
                 or task.continuation_state not in _ACTIVE_TASK_STATES
                 or question is None
+                or (
+                    question_id is not None
+                    and (
+                        question.nested_parent_kind is None
+                        or question.task_id != task_id
+                        or question.revision != revision
+                        or question.answer_text is not None
+                    )
+                )
                 or question.routed_to not in {
                     ConversationTarget.FABLE, ConversationTarget.SOL,
                 }
@@ -10106,6 +10126,138 @@ class SQLiteStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention status changed concurrently")
+        return self._intervention_required(intervention_id)
+
+    def bind_fresh_fable_session_to_pending_intervention(
+        self,
+        *,
+        project_id: str,
+        intervention_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        expected_source_generation: int,
+        expected_resume_generation: int,
+        source_run_id: str,
+        expected_resume_attempt_id: str | None,
+        expected_resume_run_id: str | None,
+        fable_session_id: str,
+        continuation: TaskState,
+    ) -> InterventionRecord:
+        """Atomically retain a newly observed first Fable session for one Stop."""
+        project_id, session_id, task_id, revision, expected_source_generation = (
+            self._prepared_identity(
+                project_id, session_id, task_id, revision, expected_source_generation,
+            )
+        )
+        intervention_id = _prepared_identifier(intervention_id, "intervention_id")
+        source_run_id = _prepared_identifier(source_run_id, "source_run_id")
+        expected_resume_generation = _require_integer(
+            expected_resume_generation, "expected_resume_generation",
+        )
+        fable_session_id = _prepared_identifier(fable_session_id, "fable_session_id")
+        if expected_resume_generation < 1:
+            raise ValueError("expected_resume_generation must be positive")
+        if expected_resume_attempt_id is not None:
+            expected_resume_attempt_id = _prepared_identifier(
+                expected_resume_attempt_id, "expected_resume_attempt_id",
+            )
+        if expected_resume_run_id is not None:
+            expected_resume_run_id = _prepared_identifier(
+                expected_resume_run_id, "expected_resume_run_id",
+            )
+        if continuation is not TaskState.FABLE_PLANNING:
+            raise ValueError("fresh Fable binding requires FABLE_PLANNING")
+
+        with self._immediate_transaction():
+            self._verify_prepared_project_identity(project_id, session_id)
+            task = self._prepared_task_exact(session_id, task_id, revision)
+            record = self._intervention_required(intervention_id)
+            source_run = self.agent_run(source_run_id)
+            if (
+                record.session_id != session_id
+                or record.task_id != task_id
+                or record.revision != revision
+                or record.run_id != source_run_id
+                or record.source_generation != expected_source_generation
+                or record.resume_generation != expected_resume_generation
+                or record.resume_attempt_id != expected_resume_attempt_id
+                or record.resume_run_id != expected_resume_run_id
+                or record.status is not InterventionStatus.PENDING_STOP
+                or record.routed_to is not ConversationTarget.FABLE
+                or record.continuation_state is not continuation
+                or task.state is not TaskState.INTERRUPTED
+                or task.continuation_state is not continuation
+                or task.continuation_generation != expected_resume_generation
+                or source_run.task_id != task_id
+                or source_run.revision != revision
+                or source_run.agent != ConversationTarget.FABLE.value
+                or source_run.status != "running"
+            ):
+                raise RuntimeError("fresh Fable intervention identity changed")
+            stopped = (task.pending or {}).get("intervention")
+            if (
+                not isinstance(stopped, Mapping)
+                or stopped.get("intervention_id") != intervention_id
+                or stopped.get("source_generation") != expected_source_generation
+                or stopped.get("source_run_id") != source_run_id
+            ):
+                raise RuntimeError("fresh Fable intervention continuation changed")
+            ids = (
+                source_run.cli_session_id,
+                task.fable_session_id,
+                record.fable_session_id,
+            )
+            if ids == (fable_session_id, fable_session_id, fable_session_id):
+                return record
+            if ids != (None, None, None):
+                raise RuntimeError("fresh Fable intervention session changed")
+            run_cursor = self._connection.execute(
+                """
+                UPDATE agent_runs SET cli_session_id = ?
+                WHERE run_id = ? AND task_id = ? AND revision = ? AND agent = ?
+                  AND status = 'running' AND cli_session_id IS NULL
+                """,
+                (
+                    fable_session_id, source_run_id, task_id, revision,
+                    ConversationTarget.FABLE.value,
+                ),
+            )
+            task_cursor = self._connection.execute(
+                """
+                UPDATE tasks SET fable_session_id = ?
+                WHERE task_id = ? AND revision = ? AND session_id = ?
+                  AND state = ? AND continuation_state = ?
+                  AND continuation_generation = ? AND fable_session_id IS NULL
+                """,
+                (
+                    fable_session_id, task_id, revision, session_id,
+                    TaskState.INTERRUPTED.value, continuation.value,
+                    expected_resume_generation,
+                ),
+            )
+            intervention_cursor = self._connection.execute(
+                """
+                UPDATE interventions SET fable_session_id = ?
+                WHERE intervention_id = ? AND session_id = ? AND task_id = ? AND revision = ?
+                  AND run_id = ? AND source_generation = ? AND resume_generation = ?
+                  AND resume_attempt_id IS NULL AND resume_run_id IS NULL
+                  AND status = ? AND continuation_state = ? AND routed_to = ?
+                  AND fable_session_id IS NULL
+                """,
+                (
+                    fable_session_id, intervention_id, session_id, task_id, revision,
+                    source_run_id, expected_source_generation, expected_resume_generation,
+                    InterventionStatus.PENDING_STOP.value, continuation.value,
+                    ConversationTarget.FABLE.value,
+                ),
+            )
+            if (
+                run_cursor.rowcount != 1
+                or task_cursor.rowcount != 1
+                or intervention_cursor.rowcount != 1
+            ):
+                raise RuntimeError("fresh Fable intervention changed concurrently")
         return self._intervention_required(intervention_id)
 
     def claim_intervention_resume(
