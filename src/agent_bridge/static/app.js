@@ -1370,7 +1370,9 @@ function interventionIdentity(task) {
 
 export function interventionRecipients(task) {
   const active = interventionIdentity(task);
-  return Object.freeze(active.state === "fable_planning" ? ["fable"] : ["fable", "sol"]);
+  return Object.freeze(["sol_running", "sol_correcting"].includes(active.state)
+    ? ["fable", "sol"]
+    : ["fable"]);
 }
 
 

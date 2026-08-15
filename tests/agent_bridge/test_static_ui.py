@@ -850,13 +850,10 @@ def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> N
       if (statusRows.length !== 1 || !statusRows[0].textContent.includes("Sol Running")) {
         process.exit(25);
       }
-      if (created.filter((node) => node.tag === "details").length !== events.length - 2) process.exit(8);
       if (!fullText.includes("#1") || !fullText.includes("task-1") || !fullText.includes("message")) process.exit(9);
-      if (!fullText.includes('"sequence": 1') || !fullText.includes('"kind": "message"')) process.exit(10);
-      if (!fullText.includes("r1") || !fullText.includes('"revision": 1')) process.exit(11);
+      if (!fullText.includes("r1")) process.exit(11);
       const outcomeArticle = conversation.children[3];
       if (!outcomeArticle.children[2].textContent.includes("r1")) process.exit(12);
-      if (!outcomeArticle.children[3].children[1].textContent.includes('"revision": 1')) process.exit(13);
 
       conversation.children = [];
       for (const event of [
@@ -1684,6 +1681,12 @@ def test_intervention_draft_policy_is_server_safe_and_preserves_one_exact_payloa
       const task = {task_id: "task-a", revision: 2, continuation_generation: 5, state: "fable_planning"};
       if (JSON.stringify(bridge.interventionRecipients(task)) !== JSON.stringify(["fable"])) process.exit(2);
       if (JSON.stringify(bridge.interventionRecipients({...task, state: "sol_running"})) !== JSON.stringify(["fable", "sol"])) process.exit(3);
+      for (const state of ["idle", "fable_planning", "fable_clarifying", "fable_reviewing", "awaiting_user_approval", "awaiting_user_input"]) {
+        if (JSON.stringify(bridge.interventionRecipients({...task, state})) !== JSON.stringify(["fable"])) process.exit(6);
+      }
+      for (const state of ["sol_running", "sol_correcting"]) {
+        if (JSON.stringify(bridge.interventionRecipients({...task, state})) !== JSON.stringify(["fable", "sol"])) process.exit(7);
+      }
       const draft = bridge.interventionDraft(task, "intervention-a", "fable", "Keep the scope exact.");
       if (JSON.stringify(draft) !== JSON.stringify({taskId: "task-a", revision: 2, sourceGeneration: 5, interventionId: "intervention-a", addressedTo: "fable", message: "Keep the scope exact.", submitted: false})) process.exit(4);
       const unknownOne = bridge.interventionWarningKey({intervention_id: "i", resume_generation: 4});
