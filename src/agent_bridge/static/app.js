@@ -81,6 +81,7 @@ const TASK_ACTIONS = new Set([
   "answer",
   "stop",
   "resume",
+  "intervene",
 ]);
 
 const LIST_FIELDS = Object.freeze([
@@ -872,10 +873,16 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
     appendListSection(documentRoot, card, "Acceptance evidence", criteria);
   }
   if (task?.activity) {
+    const activityValue = asObject(task.activity);
+    const activitySummary = [
+      typeof activityValue.type === "string" ? stateLabel(activityValue.type) : "Agent activity",
+      typeof activityValue.status === "string" ? stateLabel(activityValue.status) : null,
+      typeof activityValue.command_sha256 === "string" ? activityValue.command_sha256 : null,
+    ].filter(Boolean).join(" · ");
     const activity = element(documentRoot, "details", undefined, "task-section");
     activity.append(
       element(documentRoot, "summary", "Latest agent activity"),
-      element(documentRoot, "pre", JSON.stringify(asObject(task.activity), null, 2)),
+      element(documentRoot, "p", activitySummary),
     );
     card.append(activity);
   }
@@ -1191,6 +1198,17 @@ export function projectTaskActionPath(projectId, sessionId, taskId, action) {
 }
 
 
+export function projectInterventionPath(projectId, sessionId, interventionId, action) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  requireSafeId(interventionId, "intervention_id");
+  if (action !== "resume" && action !== "authorize-retry") {
+    throw new Error("intervention action is unavailable");
+  }
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/interventions/${encodeURIComponent(interventionId)}/${action}`;
+}
+
+
 function composerIdentity(state) {
   const current = asObject(state);
   return {
@@ -1320,8 +1338,119 @@ export function composerPresentation(state, binding, recipient = "fable") {
     disabled,
     recipientDisabled: disabled || binding?.kind === "question",
     label: boundReply ? "Bound reply" : `Message ${selectedRecipient}`,
-    submit: boundReply ? "Send reply" : `Send to ${selectedRecipient}`,
+    submit: boundReply ? "Send reply" : "Send",
     guidance: composerGuidance(current, binding, recipient),
+  });
+}
+
+
+function interventionIdentity(task) {
+  const candidate = asObject(task);
+  if (
+    typeof candidate.task_id !== "string"
+    || !SAFE_ID.test(candidate.task_id)
+    || !Number.isInteger(candidate.revision)
+    || candidate.revision < 1
+    || !Number.isInteger(candidate.continuation_generation)
+    || candidate.continuation_generation < 1
+  ) {
+    throw new Error("active task identity is unavailable");
+  }
+  return candidate;
+}
+
+
+export function interventionRequest(state, task, message, interventionId, recipient = "fable") {
+  const current = composerIdentity(state);
+  const active = interventionIdentity(task);
+  requireSafeId(interventionId, "intervention_id");
+  if (recipient !== "fable" && recipient !== "sol") {
+    throw new Error("intervention recipient is unavailable");
+  }
+  if (typeof message !== "string" || !message.trim() || message.length > 16 * 1024) {
+    throw new Error("intervention message is required");
+  }
+  return Object.freeze({
+    path: projectTaskActionPath(current.projectId, current.sessionId, active.task_id, "intervene"),
+    payload: Object.freeze({
+      intervention_id: interventionId,
+      message,
+      addressed_to: recipient,
+      revision: active.revision,
+      continuation_generation: active.continuation_generation,
+    }),
+  });
+}
+
+
+export function interventionPresentation(state, task) {
+  const current = composerIdentity(state);
+  const active = interventionIdentity(task);
+  const record = asObject(active.intervention);
+  if (Object.keys(record).length === 0) {
+    return Object.freeze({kind: "new", submit: "Intervene", warning: null});
+  }
+  if (
+    typeof record.intervention_id !== "string"
+    || !SAFE_ID.test(record.intervention_id)
+    || !Number.isInteger(record.resume_generation)
+    || record.resume_generation < 1
+  ) {
+    return Object.freeze({kind: "unavailable", submit: "Intervention unavailable", warning: null});
+  }
+  if (record.status === "pending_stop" || record.status === "resuming") {
+    return Object.freeze({kind: "pending", submit: "Intervention pending", warning: null});
+  }
+  if (record.status === "canceled_by_stop") {
+    return Object.freeze({kind: "canceled", submit: "Intervention canceled by Stop", warning: null});
+  }
+  if (record.status === "ready" && record.eligible === true) {
+    return Object.freeze({
+      kind: "resume",
+      submit: "Resume intervention",
+      warning: null,
+      interventionId: record.intervention_id,
+      resumeGeneration: record.resume_generation,
+      path: projectInterventionPath(current.projectId, current.sessionId, record.intervention_id, "resume"),
+      payload: Object.freeze({expected_resume_generation: record.resume_generation}),
+    });
+  }
+  if (record.status === "resume_outcome_unknown") {
+    const warning = typeof record.warning === "string" && record.warning
+      ? record.warning
+      : "The prior resume outcome is unknown and may have executed.";
+    return Object.freeze({
+      kind: "unknown",
+      submit: "Acknowledge possible prior execution",
+      warning,
+      interventionId: record.intervention_id,
+      resumeGeneration: record.resume_generation,
+    });
+  }
+  return Object.freeze({kind: "unavailable", submit: "Intervention unavailable", warning: null});
+}
+
+
+export function interventionRetryRequest(state, presentation, acknowledgmentId) {
+  const current = composerIdentity(state);
+  const unknown = asObject(presentation);
+  if (
+    unknown.kind !== "unknown"
+    || typeof unknown.interventionId !== "string"
+    || !SAFE_ID.test(unknown.interventionId)
+    || !Number.isInteger(unknown.resumeGeneration)
+    || unknown.resumeGeneration < 1
+  ) {
+    throw new Error("unknown intervention acknowledgement is unavailable");
+  }
+  requireSafeId(acknowledgmentId, "acknowledgment_id");
+  return Object.freeze({
+    path: projectInterventionPath(current.projectId, current.sessionId, unknown.interventionId, "authorize-retry"),
+    payload: Object.freeze({
+      expected_resume_generation: unknown.resumeGeneration,
+      acknowledgment_id: acknowledgmentId,
+      acknowledge_possible_prior_execution: true,
+    }),
   });
 }
 
@@ -2691,6 +2820,31 @@ function setStatus(node, text, variant) {
 }
 
 
+function activeTaskForControls(state) {
+  const leaseTaskId = typeof state?.activeLease?.taskId === "string"
+    ? state.activeLease.taskId
+    : null;
+  const tasks = Array.isArray(state?.tasks) ? state.tasks : [];
+  return tasks.find((task) => taskIdentity(task) === leaseTaskId)
+    ?? tasks.find((task) => ACTIVE_STATES.has(task?.state))
+    ?? tasks.find((task) => Object.keys(asObject(task?.intervention)).length > 0)
+    ?? null;
+}
+
+
+let generatedControlId = 0;
+
+
+function newControlId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.();
+  if (typeof random === "string" && SAFE_ID.test(random)) {
+    return `${prefix}-${random}`;
+  }
+  generatedControlId += 1;
+  return `${prefix}-${Date.now().toString(36)}-${generatedControlId}`;
+}
+
+
 function showToast(documentRoot, text, isError = false) {
   const region = documentRoot.querySelector("#toast-region");
   if (!region) {
@@ -2707,13 +2861,16 @@ function showToast(documentRoot, text, isError = false) {
 }
 
 
-function closeDrawer(documentRoot, id, button, isMobileDrawer) {
+function closeDrawer(documentRoot, id, button, isMobileDrawer, restoreFocus = false) {
   const panel = documentRoot.querySelector(id);
   if (panel) {
     panel.classList.remove("drawer-open");
     panel.inert = isMobileDrawer();
   }
   button.setAttribute("aria-expanded", "false");
+  if (restoreFocus) {
+    button.focus?.();
+  }
 }
 
 
@@ -2724,6 +2881,7 @@ function wireDrawer(
   otherButtonId,
   otherPanelId,
   isMobileDrawer,
+  syncInert,
 ) {
   const button = documentRoot.querySelector(buttonId);
   const panel = documentRoot.querySelector(panelId);
@@ -2737,9 +2895,12 @@ function wireDrawer(
     panel.classList.toggle("drawer-open", opening);
     panel.inert = isMobileDrawer() && !opening;
     button.setAttribute("aria-expanded", opening ? "true" : "false");
+    syncInert?.();
     if (opening) {
       const focusTarget = panel.querySelector("button, textarea, input, select, [tabindex]");
       focusTarget?.focus();
+    } else {
+      button.focus?.();
     }
   });
 }
@@ -2763,6 +2924,9 @@ export function startBrowserApp(documentRoot, windowRoot) {
   let controller = null;
   let ready = Promise.resolve(false);
   let composerBinding = null;
+  let interventionDraft = null;
+  let acknowledgementDraft = null;
+  let unknownWarningId = null;
 
   const composer = documentRoot.querySelector("#composer");
   const messageInput = documentRoot.querySelector("#message-input");
@@ -2773,6 +2937,11 @@ export function startBrowserApp(documentRoot, windowRoot) {
   const composerBindingText = documentRoot.querySelector("#composer-binding-text");
   const composerClearBinding = documentRoot.querySelector("#composer-clear-binding");
   const guidance = documentRoot.querySelector("#composer-guidance");
+  const interventionContext = documentRoot.querySelector("#intervention-context");
+  const interveneControl = documentRoot.querySelector("#intervene-control");
+  const stopControl = documentRoot.querySelector("#stop-control");
+  const conversationStatus = documentRoot.querySelector("#conversation-status");
+  const conversationContext = documentRoot.querySelector("#conversation-context");
   const usageModal = documentRoot.querySelector("#usage-modal");
   const usageForm = documentRoot.querySelector("#usage-credits-form");
   const usageCheckbox = documentRoot.querySelector("#usage-credits-confirm");
@@ -2838,18 +3007,42 @@ export function startBrowserApp(documentRoot, windowRoot) {
       const branch = typeof state.branch === "string" ? state.branch : "checking";
       repoNode.textContent = `Project: ${project} · Branch: ${branch}`;
     }
+    let activeTask = activeTaskForControls(state);
+    let activePresentation = null;
+    if (activeTask !== null) {
+      try {
+        activePresentation = interventionPresentation(state, activeTask);
+      } catch (_error) {
+        // A websocket state update can arrive before its bounded bootstrap
+        // projection contains the exact continuation identity.
+        activeTask = null;
+      }
+    }
+    if (
+      interventionDraft !== null
+      && (activeTask === null || interventionDraft.taskId !== taskIdentity(activeTask))
+    ) {
+      interventionDraft = null;
+    }
+    const interventionMode = interventionDraft !== null;
     const boundReply = composerBinding !== null;
     const selectedRecipient = composerRecipient?.value ?? "fable";
     const presentation = composerPresentation(state, composerBinding, selectedRecipient);
-    messageInput.disabled = presentation.disabled;
-    composerSubmit.disabled = presentation.disabled;
+    messageInput.disabled = interventionMode ? false : presentation.disabled;
+    composerSubmit.disabled = interventionMode ? !String(messageInput.value ?? "").trim() : presentation.disabled;
     if (composerRecipient) {
-      composerRecipient.disabled = presentation.recipientDisabled;
+      composerRecipient.disabled = interventionMode ? false : presentation.recipientDisabled;
+      for (const option of Array.from(composerRecipient.options ?? [])) {
+        option.disabled = interventionMode && option.value === "team";
+      }
+      if (interventionMode && composerRecipient.value === "team") {
+        composerRecipient.value = "fable";
+      }
     }
     if (composerLabel) {
-      composerLabel.textContent = presentation.label;
+      composerLabel.textContent = interventionMode ? "Intervention guidance" : presentation.label;
     }
-    composerSubmit.textContent = presentation.submit;
+    composerSubmit.textContent = interventionMode ? "Intervene" : presentation.submit;
     if (composerBindingNode) {
       composerBindingNode.hidden = !boundReply;
     }
@@ -2862,6 +3055,90 @@ export function startBrowserApp(documentRoot, windowRoot) {
     guidance.textContent = state.sessionId === null
       ? `${presentation.guidance} Waiting for the server session identifier.`
       : presentation.guidance;
+    if (interventionMode) {
+      guidance.textContent = "Guidance will interrupt the exact active run. Choose Fable or Sol; the server verifies eligibility.";
+    }
+    renderInterventionControls(activeTask, activePresentation);
+  }
+
+  function removeUnknownAcknowledgement() {
+    const existing = conversationContext?.querySelector?.("#intervention-acknowledge-control");
+    existing?.remove?.();
+  }
+
+  function renderInterventionControls(activeTask, presentation) {
+    if (!interveneControl || !stopControl) {
+      return;
+    }
+    const activeRun = activeTask !== null && ACTIVE_STATES.has(activeTask.state);
+    interveneControl.hidden = activeTask === null;
+    stopControl.hidden = !activeRun;
+    stopControl.disabled = !activeRun;
+    removeUnknownAcknowledgement();
+    if (activeTask === null || presentation === null) {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention controls appear for an active run.");
+      return;
+    }
+    interveneControl.textContent = presentation.submit;
+    interveneControl.disabled = presentation.kind === "pending"
+      || presentation.kind === "canceled"
+      || presentation.kind === "unavailable";
+    if (presentation.kind === "new") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = interventionDraft === null
+        ? "An agent is running. Intervene with exact guidance for Fable or Sol, or Stop the run separately."
+        : "Intervention guidance is bound to this exact active run.");
+      return;
+    }
+    if (presentation.kind === "pending") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention accepted; waiting for the exact source run to stop.");
+      return;
+    }
+    if (presentation.kind === "resume") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "The interruption is ready to resume from its stored continuation.");
+      return;
+    }
+    if (presentation.kind === "canceled") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention canceled by Stop.");
+      return;
+    }
+    if (presentation.kind === "unknown") {
+      if (interventionContext) {
+        interventionContext.textContent = `Warning: ${presentation.warning}`;
+        interventionContext.setAttribute("role", "alert");
+        interventionContext.setAttribute("tabindex", "-1");
+        if (unknownWarningId !== presentation.interventionId) {
+          unknownWarningId = presentation.interventionId;
+          interventionContext.focus?.();
+        }
+      }
+      interveneControl.hidden = true;
+      const acknowledge = element(
+        documentRoot,
+        "button",
+        "Acknowledge possible prior execution",
+        "button button-danger",
+      );
+      acknowledge.id = "intervention-acknowledge-control";
+      acknowledge.type = "button";
+      acknowledge.addEventListener("click", () => {
+        acknowledgementDraft ??= {
+          interventionId: presentation.interventionId,
+          acknowledgmentId: newControlId("acknowledgment"),
+        };
+        void submitUnknownAcknowledgement(presentation);
+      });
+      conversationContext?.append?.(acknowledge);
+    }
   }
 
   function renderWorkspace() {
@@ -3013,6 +3290,79 @@ export function startBrowserApp(documentRoot, windowRoot) {
     setStatus(connection, label, variant);
   }
 
+  async function submitInterventionResume(presentation) {
+    try {
+      await postJson(
+        windowRoot.fetch.bind(windowRoot),
+        presentation.path,
+        presentation.payload,
+        state.csrfToken,
+      );
+      conversationStatus && (conversationStatus.textContent = "Intervention resume accepted.");
+      await controller?.refreshSelectedBootstrap();
+    } catch (error) {
+      showToast(documentRoot, String(error.message ?? error), true);
+    }
+  }
+
+  async function submitUnknownAcknowledgement(presentation) {
+    if (acknowledgementDraft?.interventionId !== presentation.interventionId) {
+      return;
+    }
+    try {
+      const request = interventionRetryRequest(
+        state,
+        presentation,
+        acknowledgementDraft.acknowledgmentId,
+      );
+      await postJson(
+        windowRoot.fetch.bind(windowRoot), request.path, request.payload, state.csrfToken,
+      );
+      conversationStatus && (conversationStatus.textContent = "Possible prior execution acknowledged; retry accepted.");
+      await controller?.refreshSelectedBootstrap();
+    } catch (error) {
+      showToast(documentRoot, String(error.message ?? error), true);
+    }
+  }
+
+  interveneControl?.addEventListener("click", () => {
+    const activeTask = activeTaskForControls(state);
+    if (activeTask === null) {
+      return;
+    }
+    const presentation = interventionPresentation(state, activeTask);
+    if (presentation.kind === "new") {
+      interventionDraft ??= {
+        taskId: taskIdentity(activeTask),
+        interventionId: newControlId("intervention"),
+      };
+      renderStatus();
+      messageInput.focus?.();
+      return;
+    }
+    if (presentation.kind === "resume") {
+      void submitInterventionResume(presentation);
+    }
+  });
+
+  stopControl?.addEventListener("click", () => {
+    const activeTask = activeTaskForControls(state);
+    if (activeTask === null || !ACTIVE_STATES.has(activeTask.state)) {
+      return;
+    }
+    void (async () => {
+      try {
+        await sendTaskAction("stop", activeTask, null);
+        interventionDraft = null;
+        acknowledgementDraft = null;
+        conversationStatus && (conversationStatus.textContent = "Stop accepted; any pending intervention is canceled by the server.");
+        await controller?.refreshSelectedBootstrap();
+      } catch (error) {
+        showToast(documentRoot, String(error.message ?? error), true);
+      }
+    })();
+  });
+
   composer.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = String(messageInput.value ?? "");
@@ -3021,13 +3371,27 @@ export function startBrowserApp(documentRoot, windowRoot) {
       || !state.projectId
       || !state.sessionId
       || !text.trim()
-      || (composerBinding === null && state.activeLease !== null)
+      || (composerBinding === null && state.activeLease !== null && interventionDraft === null)
     ) {
       return;
     }
     let request;
     try {
-      request = composerRequest(state, composerBinding, text, composerRecipient?.value ?? "fable");
+      if (interventionDraft !== null) {
+        const activeTask = activeTaskForControls(state);
+        if (activeTask === null || interventionDraft.taskId !== taskIdentity(activeTask)) {
+          throw new Error("intervention source is no longer active");
+        }
+        request = interventionRequest(
+          state,
+          activeTask,
+          text,
+          interventionDraft.interventionId,
+          composerRecipient?.value ?? "fable",
+        );
+      } else {
+        request = composerRequest(state, composerBinding, text, composerRecipient?.value ?? "fable");
+      }
     } catch (error) {
       showToast(documentRoot, String(error.message ?? error), true);
       return;
@@ -3042,7 +3406,10 @@ export function startBrowserApp(documentRoot, windowRoot) {
         state.csrfToken,
       );
       messageInput.value = "";
-      if (composerBinding !== null) {
+      if (interventionDraft !== null) {
+        conversationStatus && (conversationStatus.textContent = "Intervention accepted; waiting for server status.");
+        void controller?.refreshSelectedBootstrap().catch(() => {});
+      } else if (composerBinding !== null) {
         composerBinding = null;
         void controller?.refreshSelectedBootstrap().catch(() => {});
       }
@@ -3084,28 +3451,24 @@ export function startBrowserApp(documentRoot, windowRoot) {
     }
   });
 
-  wireDrawer(
-    documentRoot,
-    "#task-drawer-toggle",
-    "#task-list",
-    "#inspector-drawer-toggle",
-    "#task-inspector",
-    isMobileDrawer,
-  );
-  wireDrawer(
-    documentRoot,
-    "#inspector-drawer-toggle",
-    "#task-inspector",
-    "#task-drawer-toggle",
-    "#task-list",
-    isMobileDrawer,
-  );
+  const projectDrawerId = documentRoot.querySelector("#project-navigation")
+    ? "#project-navigation"
+    : "#task-list";
+  const inspectorDrawerId = documentRoot.querySelector("#task-inspector-panel")
+    ? "#task-inspector-panel"
+    : "#task-inspector";
 
   function syncDrawerMode() {
-    for (const [panelId, buttonId] of [
-      ["#task-list", "#task-drawer-toggle"],
-      ["#task-inspector", "#inspector-drawer-toggle"],
-    ]) {
+    const conversationShell = documentRoot.querySelector("#conversation-shell")
+      ?? documentRoot.querySelector("#conversation");
+    const drawers = [
+      [projectDrawerId, "#task-drawer-toggle"],
+      [inspectorDrawerId, "#inspector-drawer-toggle"],
+    ];
+    const openPanel = drawers.find(([panelId]) => (
+      documentRoot.querySelector(panelId)?.classList.contains("drawer-open")
+    ))?.[0] ?? null;
+    for (const [panelId, buttonId] of drawers) {
       const panel = documentRoot.querySelector(panelId);
       const button = documentRoot.querySelector(buttonId);
       if (!panel || !button) {
@@ -3113,11 +3476,36 @@ export function startBrowserApp(documentRoot, windowRoot) {
       }
       if (!isMobileDrawer()) {
         panel.classList.remove("drawer-open");
+        panel.inert = false;
         button.setAttribute("aria-expanded", "false");
+      } else {
+        panel.inert = panelId !== openPanel;
       }
-      panel.inert = isMobileDrawer() && !panel.classList.contains("drawer-open");
+    }
+    if (conversationShell) {
+      conversationShell.inert = isMobileDrawer() && openPanel !== null;
     }
   }
+
+  wireDrawer(
+    documentRoot,
+    "#task-drawer-toggle",
+    projectDrawerId,
+    "#inspector-drawer-toggle",
+    inspectorDrawerId,
+    isMobileDrawer,
+    syncDrawerMode,
+  );
+  wireDrawer(
+    documentRoot,
+    "#inspector-drawer-toggle",
+    inspectorDrawerId,
+    "#task-drawer-toggle",
+    projectDrawerId,
+    isMobileDrawer,
+    syncDrawerMode,
+  );
+
   syncDrawerMode();
   if (typeof drawerMedia.addEventListener === "function") {
     drawerMedia.addEventListener("change", syncDrawerMode);
@@ -3126,19 +3514,39 @@ export function startBrowserApp(documentRoot, windowRoot) {
   }
 
   documentRoot.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && isMobileDrawer()) {
+      const openPanel = [projectDrawerId, inspectorDrawerId]
+        .map((panelId) => documentRoot.querySelector(panelId))
+        .find((panel) => panel?.classList.contains("drawer-open"));
+      const focusable = typeof openPanel?.querySelectorAll === "function"
+        ? Array.from(openPanel.querySelectorAll("button, textarea, input, select, [tabindex]"))
+          .filter((node) => !node.disabled && node.getAttribute?.("tabindex") !== "-1")
+        : [openPanel?.querySelector?.("button, textarea, input, select, [tabindex]")]
+          .filter((node) => node && !node.disabled);
+      if (focusable.length > 0) {
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if ((!event.shiftKey && documentRoot.activeElement === last)
+          || (event.shiftKey && documentRoot.activeElement === first)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus?.();
+          return;
+        }
+      }
+    }
     if (event.key !== "Escape") {
       return;
     }
     for (const [panelId, buttonId] of [
-      ["#task-list", "#task-drawer-toggle"],
-      ["#task-inspector", "#inspector-drawer-toggle"],
+      [projectDrawerId, "#task-drawer-toggle"],
+      [inspectorDrawerId, "#inspector-drawer-toggle"],
     ]) {
       const panel = documentRoot.querySelector(panelId);
       const button = documentRoot.querySelector(buttonId);
       if (panel?.classList.contains("drawer-open") && button) {
         event.preventDefault();
-        closeDrawer(documentRoot, panelId, button, isMobileDrawer);
-        button.focus();
+        closeDrawer(documentRoot, panelId, button, isMobileDrawer, true);
+        syncDrawerMode();
       }
     }
   });

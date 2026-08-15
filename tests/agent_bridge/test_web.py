@@ -716,7 +716,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       }}
 
       const ids = [
-        "task-list", "conversation", "task-inspector", "composer", "message-input",
+        "task-list", "conversation", "conversation-shell", "project-navigation",
+        "task-inspector", "task-inspector-panel", "composer", "message-input",
         "composer-submit", "composer-guidance", "usage-modal", "usage-credits-form",
         "usage-credits-confirm", "usage-credits-acknowledge", "usage-error",
         "toast-region", "fable-status", "sol-status", "repository-status",
@@ -737,6 +738,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         nodes["usage-credits-confirm"], nodes["usage-credits-acknowledge"],
         nodes["usage-error"], nodes["bootstrap-retry"],
       );
+      nodes["project-navigation"].append(nodes["task-list"]);
+      nodes["task-inspector-panel"].append(nodes["task-inspector"]);
       const isDescendantOf = (node, ancestor) => {{
         for (let current = node; current; current = current.parent) {{
           if (current === ancestor) return true;
@@ -864,18 +867,18 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (nodes["message-input"].disabled) process.exit(28);
 
       await nodes["task-drawer-toggle"].emit("click");
-      if (!nodes["task-list"].classList.contains("drawer-open")) process.exit(14);
+      if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert) process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
       await documentRoot.emit("keydown", {{key: "Escape", preventDefault() {{}}}});
-      if (nodes["task-list"].classList.contains("drawer-open")) process.exit(16);
+      if (nodes["project-navigation"].classList.contains("drawer-open")) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
       if (globalThis.pwned === true) process.exit(18);
       media.matches = false;
       media.emit();
-      if (nodes["task-list"].inert || nodes["task-inspector"].inert) process.exit(19);
+      if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);
       const taskButton = nodes["task-list"].children[1].querySelector("button");
       await taskButton.emit("click");
-      if (nodes["task-list"].inert) process.exit(20);
+      if (nodes["project-navigation"].inert) process.exit(20);
     """
     result = subprocess.run(
         [

@@ -1174,7 +1174,7 @@ def test_composer_guidance_preserves_recipient_routing_through_lease_and_binding
       const boundGuidance = bridge.composerGuidance(leased, {kind: "question"}, "sol");
       if (!boundGuidance.includes("exact task and continuation") || boundGuidance.includes("An agent is active")) process.exit(6);
       const sol = bridge.composerPresentation(ready, null, "sol");
-      if (sol.disabled || sol.recipientDisabled || sol.label !== "Message Sol" || sol.submit !== "Send to Sol" || !sol.guidance.includes("routed through Fable")) process.exit(7);
+      if (sol.disabled || sol.recipientDisabled || sol.label !== "Message Sol" || sol.submit !== "Send" || !sol.guidance.includes("routed through Fable")) process.exit(7);
       const lease = bridge.composerPresentation(leased, null, "team");
       if (!lease.disabled || !lease.recipientDisabled || !lease.guidance.includes("routed through Fable")) process.exit(8);
       const bound = bridge.composerPresentation(leased, {kind: "question"}, "sol");
@@ -1578,14 +1578,104 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
 
     forbidden = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
     assert all(token not in script for token in forbidden)
+    assert "JSON.stringify(asObject(task.activity)" not in script
     assert re.search(r"grid-template-columns\s*:\s*18rem\s+minmax\(0,\s*1fr\)\s+22rem", styles)
     assert re.search(r"@media\s*\(max-width:\s*899px\)", styles)
-    assert "#task-list.drawer-open" in styles
-    assert "#task-inspector.drawer-open" in styles
+    assert "#project-navigation.drawer-open" in styles
+    assert "#task-inspector-panel.drawer-open" in styles
     assert ".message-user" in styles
     assert ".message-fable" in styles
     assert ".message-sol" in styles
     assert ".message-coordinator" in styles
+
+
+def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
+    styles = (STATIC / "styles.css").read_text(encoding="utf-8")
+
+    required_tokens = {
+        "--ink-950": "#211a17",
+        "--ink-800": "#3b302b",
+        "--cream-50": "#fffaf3",
+        "--cream-100": "#f6ecdf",
+        "--copper-700": "#9a4524",
+        "--copper-600": "#b65a31",
+        "--copper-100": "#f4d8c7",
+        "--green-700": "#49634e",
+        "--green-100": "#dce8da",
+        "--danger-700": "#8b2f2f",
+        "--focus-ring": "#176b87",
+    }
+    for token, color in required_tokens.items():
+        assert re.search(rf"{re.escape(token)}\s*:\s*{color}\s*;", styles)
+    assert "slack" not in styles.lower()
+    assert "#6a4d91" not in styles.lower()
+    assert re.search(r"outline:\s*(?:2|3)px solid var\(--focus-ring\)", styles)
+    assert "min-height: 2.75rem" in styles
+    assert "@media (max-width: 899px)" in styles
+    assert "@media (prefers-reduced-motion: reduce)" in styles
+    assert "@media (forced-colors: active)" in styles
+
+    def luminance(hex_color: str) -> float:
+        channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(foreground: str, background: str) -> float:
+        lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+        return (lighter + 0.05) / (darker + 0.05)
+
+    for foreground in (
+        "#211a17", "#3b302b", "#9a4524", "#49634e", "#8b2f2f",
+    ):
+        assert contrast(foreground, "#fffaf3") >= 4.5
+    assert contrast("#176b87", "#fffaf3") >= 3
+
+
+def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:
+    harness = r"""
+      const state = {
+        projectId: "project-a", sessionId: "chat-a", csrfToken: "csrf",
+        gate: {canCompose: true}, activeLease: {task_id: "task-a"},
+      };
+      const task = {
+        task_id: "task-a", revision: 4, continuation_generation: 7,
+        state: "fable_planning",
+      };
+      const first = bridge.interventionRequest(state, task, "Hold this boundary.", "intervention-a", "sol");
+      if (first.path !== "/api/projects/project-a/chats/chat-a/tasks/task-a/intervene") process.exit(2);
+      if (JSON.stringify(first.payload) !== JSON.stringify({
+        intervention_id: "intervention-a", message: "Hold this boundary.", addressed_to: "sol",
+        revision: 4, continuation_generation: 7,
+      })) process.exit(3);
+      const pending = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "pending_stop", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: true,
+      }});
+      if (pending.kind !== "pending" || pending.submit !== "Intervention pending") process.exit(4);
+      const ready = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "ready", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: true,
+      }});
+      if (ready.kind !== "resume" || ready.path !== "/api/projects/project-a/chats/chat-a/interventions/intervention-a/resume" || ready.payload.expected_resume_generation !== 8) process.exit(5);
+      const unknown = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "resume_outcome_unknown", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: false,
+        warning: "prior resume outcome is unknown and may have executed",
+      }});
+      if (unknown.kind !== "unknown" || !unknown.warning.includes("may have executed")) process.exit(6);
+      const retry = bridge.interventionRetryRequest(state, unknown, "acknowledgment-a");
+      if (retry.path !== "/api/projects/project-a/chats/chat-a/interventions/intervention-a/authorize-retry") process.exit(7);
+      if (JSON.stringify(retry.payload) !== JSON.stringify({
+        expected_resume_generation: 8, acknowledgment_id: "acknowledgment-a",
+        acknowledge_possible_prior_execution: true,
+      })) process.exit(8);
+      if (bridge.composerPresentation({...state, activeLease: null}, null, "fable").submit !== "Send") process.exit(9);
+      if (!bridge.composerPresentation(state, null, "fable").disabled) process.exit(10);
+    """
+    _run_module_harness(harness)
 
 
 def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() -> None:
