@@ -12414,14 +12414,15 @@ class SQLiteStore:
     def audit_legacy_project_ownership(self, canonical_repo_root: str) -> None:
         """Fail closed unless a legacy database belongs to one exact project root."""
         canonical_repo_root = _require_string(canonical_repo_root, "canonical_repo_root")
-        self._connection.execute("BEGIN")
-        try:
-            reasons = self._legacy_project_ownership_reasons(canonical_repo_root)
-        except BaseException:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.rollback()
+        with self._event_listener_lock:
+            self._connection.execute("BEGIN")
+            try:
+                reasons = self._legacy_project_ownership_reasons(canonical_repo_root)
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.rollback()
         if reasons:
             summary = ", ".join(sorted(reasons)[:_MAX_LEGACY_AUDIT_REASONS])
             raise RuntimeError(f"legacy project ownership audit failed: {summary}")
@@ -12432,14 +12433,15 @@ class SQLiteStore:
         expected_project_id = hashlib.sha256(
             os.fsencode(canonical_repo_root)
         ).hexdigest()[:32]
-        self._connection.execute("BEGIN")
-        try:
-            reasons = self._directed_fable_answer_checkpoint_reasons(expected_project_id)
-        except BaseException:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.rollback()
+        with self._event_listener_lock:
+            self._connection.execute("BEGIN")
+            try:
+                reasons = self._directed_fable_answer_checkpoint_reasons(expected_project_id)
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.rollback()
         if reasons:
             summary = ", ".join(sorted(reasons)[:_MAX_LEGACY_AUDIT_REASONS])
             raise RuntimeError(f"directed Fable answer checkpoint audit failed: {summary}")

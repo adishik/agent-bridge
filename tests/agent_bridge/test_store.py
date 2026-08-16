@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from dataclasses import replace
 import inspect
@@ -4559,6 +4560,8 @@ def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> No
         "checkpoint_directed_fable_scope_answer",
         "interrupt_claimed_fable_answer_checkpoint",
         "recover_unfinished_prepared_actions",
+        "audit_legacy_project_ownership",
+        "audit_directed_fable_answer_checkpoints",
     )
     for name in methods:
         source = inspect.getsource(getattr(SQLiteStore, name))
@@ -4568,6 +4571,232 @@ def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> No
             or "with self._event_listener_lock:" in before_begin
             or "with self._scope_revision_event_transaction(" in before_begin
         ), name
+
+
+def test_intervention_transaction_ast_inventory_classifies_raw_and_delegated_begins() -> None:
+    """Every transaction path reaching a lifecycle reader is classified lock-first."""
+    source_path = inspect.getsourcefile(SQLiteStore)
+    assert source_path is not None
+    tree = ast.parse(Path(source_path).read_text(encoding="utf-8"))
+    store_class = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SQLiteStore"
+    )
+    methods = {
+        node.name: node for node in store_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def method_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        return {
+            call.func.attr for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        }
+
+    def raw_begins(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
+        statements: list[str] = []
+        for call in ast.walk(node):
+            if (
+                not isinstance(call, ast.Call)
+                or not isinstance(call.func, ast.Attribute)
+                or call.func.attr != "execute"
+                or not call.args
+            ):
+                continue
+            receiver = call.func.value
+            if not (
+                isinstance(receiver, ast.Attribute)
+                and receiver.attr == "_connection"
+                and isinstance(receiver.value, ast.Name)
+                and receiver.value.id == "self"
+            ):
+                continue
+            statement = call.args[0]
+            if (
+                isinstance(statement, ast.Constant)
+                and isinstance(statement.value, str)
+                and statement.value.startswith("BEGIN")
+            ):
+                statements.append(statement.value)
+        return tuple(statements)
+
+    call_graph = {name: method_calls(node) for name, node in methods.items()}
+    locked_projections = {
+        "intervention",
+        "authenticated_intervention",
+        "current_visible_intervention_for_task",
+        "active_intervention_for_task",
+        "prepared_nested_intervention_run",
+        "directed_fable_answer_checkpoint",
+    }
+
+    def reaches_locked_projection(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        if name in seen:
+            return False
+        calls = call_graph[name]
+        return bool(calls & locked_projections) or any(
+            reaches_locked_projection(callee, seen | {name})
+            for callee in calls & methods.keys()
+        )
+
+    raw_begin_paths = {
+        name: raw_begins(node) for name, node in methods.items() if raw_begins(node)
+    }
+    assert raw_begin_paths == {
+        "_migrate": ("BEGIN",),
+        "_immediate_transaction": ("BEGIN IMMEDIATE",),
+        "audit_legacy_project_ownership": ("BEGIN",),
+        "audit_directed_fable_answer_checkpoints": ("BEGIN",),
+    }
+    assert {
+        name for name in raw_begin_paths if reaches_locked_projection(name)
+    } == {
+        "_migrate",
+        "audit_legacy_project_ownership",
+        "audit_directed_fable_answer_checkpoints",
+    }
+
+    direct_immediate_paths = {
+        name for name, calls in call_graph.items()
+        if "_immediate_transaction" in calls and reaches_locked_projection(name)
+    }
+    assert direct_immediate_paths == {
+        "_answer_nested_fable_evidence_question",
+        "_reserve_nested_fable_evidence_question",
+        "answer_question_and_prepare_resume",
+        "create_intervention_and_request_stop",
+        "handoff_directed_fable_answer_same_scope",
+        "handoff_next_fable_intervention_clarification_to_sol",
+        "mark_intervention_ready",
+        "pause_fable_answer_evidence_permission",
+        "pause_fable_clarification_evidence_permission",
+        "prepare_resume_action",
+        "replace_pending_for_continuation",
+    }
+    delegated_lifecycle_paths = {
+        name for name, calls in call_graph.items()
+        if (
+            {"_intervention_transaction", "_scope_revision_event_transaction"} & calls
+            and reaches_locked_projection(name)
+        )
+    }
+    assert delegated_lifecycle_paths == {
+        "authorize_retry_after_unknown",
+        "begin_intervention_resume",
+        "bind_fresh_fable_session_to_pending_intervention",
+        "cancel_intervention_by_stop",
+        "checkpoint_directed_fable_scope_answer",
+        "claim_intervention_resume",
+        "complete_intervention",
+        "finish_next_fable_intervention_stage",
+        "interrupt_claimed_fable_answer_checkpoint",
+        "mark_resume_outcome_unknown",
+        "recover_active_tasks",
+        "recover_unfinished_prepared_actions",
+        "save_scope_revision",
+        "start_next_fable_intervention_stage",
+    }
+    for name in direct_immediate_paths:
+        source = inspect.getsource(getattr(SQLiteStore, name))
+        assert "with self._event_listener_lock:" in source.split(
+            "with self._immediate_transaction()", 1,
+        )[0], name
+    for name in (
+        "audit_legacy_project_ownership",
+        "audit_directed_fable_answer_checkpoints",
+    ):
+        source = inspect.getsource(getattr(SQLiteStore, name))
+        assert "with self._event_listener_lock:" in source.split(
+            'self._connection.execute("BEGIN")', 1,
+        )[0], name
+
+
+@pytest.mark.parametrize(
+    ("audit_name", "reason_method"),
+    (
+        ("legacy", "_legacy_project_ownership_reasons"),
+        ("directed", "_directed_fable_answer_checkpoint_reasons"),
+    ),
+)
+def test_startup_audits_block_a_lock_first_intervention_writer_until_rollback(
+    tmp_path, valid_brief, monkeypatch: pytest.MonkeyPatch,
+    audit_name: str, reason_method: str,
+) -> None:
+    """A rollback-only startup audit owns the shared lifecycle image while it reads."""
+    store = SQLiteStore(
+        tmp_path / f"startup-audit-{audit_name}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    store.create_session("session-1", "/repo")
+    pending = _seed_visible_intervention(
+        store, valid_brief, status=store_module.InterventionStatus.PENDING_STOP,
+        suffix=f"startup-audit-{audit_name}",
+    )
+    store.finish_agent_run(pending.run_id, status="interrupted", exit_code=-15)
+    store._connection.execute(  # noqa: SLF001 - exact startup ownership fixture
+        "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+        (store_module._ACTIVE_SESSION_SETTING, json.dumps("session-1")),
+    )
+    if audit_name == "legacy":
+        audit = lambda: store.audit_legacy_project_ownership("/repo")
+    else:
+        audit = lambda: store.audit_directed_fable_answer_checkpoints("/repo")
+    audit_entered = threading.Event()
+    release_audit = threading.Event()
+    writer_started = threading.Event()
+    writer_completed = threading.Event()
+    failures: list[BaseException] = []
+    statements: list[str] = []
+    original_reasons = getattr(store, reason_method)
+
+    def hold_audit_reasons(*args: object) -> object:
+        audit_entered.set()
+        if not release_audit.wait(timeout=1):
+            raise AssertionError("test did not release the startup audit")
+        return original_reasons(*args)
+
+    monkeypatch.setattr(store, reason_method, hold_audit_reasons)
+    store._connection.set_trace_callback(statements.append)
+
+    def run_audit() -> None:
+        try:
+            audit()
+        except BaseException as error:
+            failures.append(error)
+
+    def mark_ready() -> None:
+        writer_started.set()
+        try:
+            store.mark_intervention_ready(pending.intervention_id, run_id=pending.run_id)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            writer_completed.set()
+
+    audit_thread = threading.Thread(target=run_audit)
+    audit_thread.start()
+    assert audit_entered.wait(timeout=1)
+    writer = threading.Thread(target=mark_ready)
+    writer.start()
+    assert writer_started.wait(timeout=1)
+    assert writer_completed.wait(timeout=0.1) is False
+    release_audit.set()
+    audit_thread.join(timeout=1)
+    writer.join(timeout=1)
+
+    assert audit_thread.is_alive() is False
+    assert writer.is_alive() is False
+    assert failures == []
+    assert store._connection.in_transaction is False  # noqa: SLF001 - audit rolled back
+    assert statements[0] == "BEGIN"
+    assert statements.index("ROLLBACK") < statements.index("BEGIN IMMEDIATE")
+    ready = store.intervention(pending.intervention_id)
+    assert ready is not None and ready.status is store_module.InterventionStatus.READY
+    store.close()
 
 
 @pytest.mark.parametrize(
