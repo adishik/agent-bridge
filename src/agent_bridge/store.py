@@ -6458,7 +6458,7 @@ class SQLiteStore:
     ) -> None:
         """Consume one checkpoint only after its reconstructed route succeeded."""
         record = self._checkpoint_record(record)
-        with self._immediate_transaction():
+        with self._event_listener_lock, self._immediate_transaction():
             cursor = self._connection.execute(
                 """
                 UPDATE directed_fable_answer_checkpoints SET status = 'CONSUMED'
@@ -8816,7 +8816,7 @@ class SQLiteStore:
         run_id = _prepared_identifier(run_id, "run_id")
         if question_id is not None:
             question_id = _prepared_identifier(question_id, "question_id")
-        with self._immediate_transaction():
+        with self._event_listener_lock, self._immediate_transaction():
             task = self.get_task(task_id, revision)
             question = (
                 self._unanswered_question_for_task(task_id, revision)

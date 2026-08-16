@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import tracemalloc
@@ -4623,6 +4624,61 @@ def test_intervention_transaction_ast_inventory_classifies_raw_and_delegated_beg
                 statements.append(statement.value)
         return tuple(statements)
 
+    lifecycle_tables = {
+        "interventions",
+        "directed_fable_answer_checkpoints",
+        "prepared_actions",
+        "agent_runs",
+        "tasks",
+        "settings",
+    }
+    core_lifecycle_tables = {
+        "interventions",
+        "directed_fable_answer_checkpoints",
+    }
+    table_pattern = re.compile(
+        r"\b(" + "|".join(sorted(lifecycle_tables)) + r")\b", re.IGNORECASE,
+    )
+
+    def sql_literals(node: ast.AST) -> tuple[str, ...]:
+        literals: list[str] = []
+        for call in ast.walk(node):
+            if (
+                not isinstance(call, ast.Call)
+                or not isinstance(call.func, ast.Attribute)
+                or call.func.attr not in {"execute", "executemany", "executescript"}
+                or not call.args
+            ):
+                continue
+            statement = call.args[0]
+            if isinstance(statement, ast.Constant) and isinstance(statement.value, str):
+                literals.append(statement.value)
+            elif isinstance(statement, ast.JoinedStr):
+                literals.extend(
+                    value.value for value in statement.values
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                )
+        return tuple(literals)
+
+    direct_sql_tables = {
+        name: {
+            table.lower() for statement in sql_literals(node)
+            for table in table_pattern.findall(statement)
+        }
+        for name, node in methods.items()
+    }
+    private_lineage_access = {
+        name: any(
+            isinstance(value, ast.Name)
+            and (
+                value.id.startswith("_INTERVENTION_ACKNOWLEDGMENT")
+                or value.id.startswith("_NESTED_INTERVENTION_CHILD")
+            )
+            for value in ast.walk(node)
+        )
+        for name, node in methods.items()
+    }
+
     call_graph = {name: method_calls(node) for name, node in methods.items()}
     locked_projections = {
         "intervention",
@@ -4640,6 +4696,47 @@ def test_intervention_transaction_ast_inventory_classifies_raw_and_delegated_beg
         return bool(calls & locked_projections) or any(
             reaches_locked_projection(callee, seen | {name})
             for callee in calls & methods.keys()
+        )
+
+    def transitive_sql_tables(
+        name: str, seen: frozenset[str] = frozenset(),
+    ) -> frozenset[str]:
+        if name in seen:
+            return frozenset()
+        return frozenset(direct_sql_tables[name]).union(*(
+            transitive_sql_tables(callee, seen | {name})
+            for callee in call_graph[name] & methods.keys()
+        ))
+
+    def transitive_private_lineage_access(
+        name: str, seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        if name in seen:
+            return False
+        return private_lineage_access[name] or any(
+            transitive_private_lineage_access(callee, seen | {name})
+            for callee in call_graph[name] & methods.keys()
+        )
+
+    def lifecycle_table_footprint(name: str) -> frozenset[str]:
+        footprint = transitive_sql_tables(name)
+        if footprint & core_lifecycle_tables or transitive_private_lineage_access(name):
+            return footprint
+        return frozenset()
+
+    def reaches_transaction_opener(
+        name: str, seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        if name in seen:
+            return False
+        if raw_begins(methods[name]) or (
+            {"_immediate_transaction", "_intervention_transaction", "_scope_revision_event_transaction"}
+            & call_graph[name]
+        ):
+            return True
+        return any(
+            reaches_transaction_opener(callee, seen | {name})
+            for callee in call_graph[name] & methods.keys()
         )
 
     raw_begin_paths = {
@@ -4712,6 +4809,92 @@ def test_intervention_transaction_ast_inventory_classifies_raw_and_delegated_beg
         assert "with self._event_listener_lock:" in source.split(
             'self._connection.execute("BEGIN")', 1,
         )[0], name
+
+    direct_table_aware_transactions = {
+        name for name in methods
+        if lifecycle_table_footprint(name)
+        and (raw_begins(methods[name]) or "_immediate_transaction" in call_graph[name])
+    }
+    assert direct_table_aware_transactions == {
+        "_answer_nested_fable_evidence_question",
+        "_migrate",
+        "_reserve_nested_fable_evidence_question",
+        "answer_question_and_prepare_resume",
+        "audit_directed_fable_answer_checkpoints",
+        "audit_legacy_project_ownership",
+        "consume_directed_fable_answer_checkpoint",
+        "create_intervention_and_request_stop",
+        "handoff_directed_fable_answer_same_scope",
+        "handoff_next_fable_intervention_clarification_to_sol",
+        "interrupt_directed_answer_for_stop",
+        "interrupt_fable_login_expired",
+        "mark_intervention_ready",
+        "pause_fable_answer_evidence_permission",
+        "pause_fable_clarification_evidence_permission",
+        "prepare_resume_action",
+        "replace_pending_for_continuation",
+    }
+    assert lifecycle_table_footprint("consume_directed_fable_answer_checkpoint") == {
+        "directed_fable_answer_checkpoints", "prepared_actions",
+    }
+    assert lifecycle_table_footprint("interrupt_directed_answer_for_stop") >= {
+        "agent_runs", "interventions", "tasks",
+    }
+    assert {
+        name for name in methods
+        if lifecycle_table_footprint(name) and reaches_transaction_opener(name)
+    } == {
+        "__init__",
+        "_answer_nested_fable_evidence_question",
+        "_migrate",
+        "_reserve_nested_fable_evidence_question",
+        "answer_fable_answer_evidence_question",
+        "answer_fable_clarification_evidence_question_and_resume",
+        "answer_question_and_prepare_resume",
+        "audit_directed_fable_answer_checkpoints",
+        "audit_legacy_project_ownership",
+        "authorize_retry_after_unknown",
+        "begin_intervention_resume",
+        "bind_fresh_fable_session_to_pending_intervention",
+        "cancel_intervention_by_stop",
+        "checkpoint_directed_fable_scope_answer",
+        "claim_intervention_resume",
+        "complete_intervention",
+        "consume_directed_fable_answer_checkpoint",
+        "create_intervention_and_request_stop",
+        "finish_next_fable_intervention_stage",
+        "handoff_directed_fable_answer_same_scope",
+        "handoff_next_fable_intervention_clarification_to_sol",
+        "interrupt_claimed_fable_answer_checkpoint",
+        "interrupt_directed_answer_for_stop",
+        "interrupt_fable_login_expired",
+        "mark_intervention_ready",
+        "mark_resume_outcome_unknown",
+        "pause_fable_answer_evidence_permission",
+        "pause_fable_clarification_evidence_permission",
+        "prepare_resume_action",
+        "recover_active_tasks",
+        "recover_unfinished_prepared_actions",
+        "replace_pending_for_continuation",
+        "reserve_fable_answer_evidence_question",
+        "reserve_fable_clarification_evidence_question",
+        "save_scope_revision",
+        "start_next_fable_intervention_stage",
+    }
+    for name in direct_table_aware_transactions - {"_migrate"}:
+        source = inspect.getsource(getattr(SQLiteStore, name))
+        if raw_begins(methods[name]):
+            before_begin = source.split('self._connection.execute("BEGIN")', 1)[0]
+            assert "with self._event_listener_lock:" in before_begin, name
+        else:
+            nested_lock = "with self._event_listener_lock:" in source.split(
+                "with self._immediate_transaction()", 1,
+            )[0]
+            combined_lock = (
+                "with self._event_listener_lock, self._immediate_transaction()"
+                in source
+            )
+            assert nested_lock or combined_lock, name
 
 
 @pytest.mark.parametrize(
@@ -4796,6 +4979,158 @@ def test_startup_audits_block_a_lock_first_intervention_writer_until_rollback(
     assert statements.index("ROLLBACK") < statements.index("BEGIN IMMEDIATE")
     ready = store.intervention(pending.intervention_id)
     assert ready is not None and ready.status is store_module.InterventionStatus.READY
+    store.close()
+
+
+@pytest.mark.parametrize("outcome", ("commit", "rollback"))
+@pytest.mark.parametrize("operation", ("consume", "interrupt"))
+def test_direct_lifecycle_sql_writers_hold_checkpoint_and_intervention_readers(
+    tmp_path, valid_brief, operation: str, outcome: str,
+) -> None:
+    """Direct checkpoint/Stop writers share one image with readers and another writer."""
+    store = SQLiteStore(
+        tmp_path / f"direct-lifecycle-{operation}-{outcome}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    checkpoint_brief = replace(valid_brief, task_id=f"{operation}-checkpoint")
+    prepared, stage, checkpoint, _, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store, checkpoint_brief, prefix=f"{operation}-checkpoint",
+    )
+    if operation == "consume":
+        store.create_session("session-1", "/repo")
+        interrupted_before = None
+        interrupted_task_before = None
+
+        def invoke_target() -> None:
+            store.consume_directed_fable_answer_checkpoint(
+                prepared, question_id=checkpoint.question_id,
+            )
+
+        target_intervention_id = stage.intervention_id
+    else:
+        interrupted_before = _nested_parent_intervention_claim_for_tamper_matrix(
+            store, valid_brief,
+        )
+        interrupted_task_before = store.get_task(
+            valid_brief.task_id, valid_brief.revision,
+        )
+        binding = interrupted_before.directed_binding
+        assert binding is not None
+
+        def invoke_target() -> None:
+            store.interrupt_directed_answer_for_stop(
+                valid_brief.task_id,
+                valid_brief.revision,
+                run_id=binding.source_run_id,
+                question_id=binding.question_id,
+            )
+
+        target_intervention_id = interrupted_before.intervention_id
+
+    parallel_brief = replace(valid_brief, task_id=f"{operation}-parallel")
+    parallel = _seed_visible_intervention(
+        store,
+        parallel_brief,
+        status=store_module.InterventionStatus.PENDING_STOP,
+        suffix=f"{operation}-parallel",
+    )
+    store.finish_agent_run(parallel.run_id, status="interrupted", exit_code=-15)
+
+    target_entered = threading.Event()
+    release_target = threading.Event()
+    reader_started = {name: threading.Event() for name in ("checkpoint", "intervention")}
+    reader_completed = {name: threading.Event() for name in reader_started}
+    parallel_started = threading.Event()
+    parallel_completed = threading.Event()
+    observed: dict[str, list[object]] = {name: [] for name in reader_started}
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction
+    transaction_count = 0
+
+    @contextmanager
+    def hold_target_transaction():
+        nonlocal transaction_count
+        with original_transaction():
+            transaction_count += 1
+            if transaction_count == 1:
+                target_entered.set()
+                if not release_target.wait(timeout=1):
+                    raise AssertionError("test did not release the direct lifecycle writer")
+                yield
+                if outcome == "rollback":
+                    raise RuntimeError("controlled direct lifecycle rollback")
+            else:
+                yield
+
+    store._immediate_transaction = hold_target_transaction  # type: ignore[method-assign]
+
+    def run_target() -> None:
+        try:
+            invoke_target()
+        except BaseException as error:
+            if outcome != "rollback" or str(error) != "controlled direct lifecycle rollback":
+                failures.append(error)
+
+    def read_checkpoint() -> None:
+        reader_started["checkpoint"].set()
+        try:
+            observed["checkpoint"].append(store.directed_fable_answer_checkpoint(prepared))
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed["checkpoint"].set()
+
+    def read_intervention() -> None:
+        reader_started["intervention"].set()
+        try:
+            observed["intervention"].append(store.intervention(target_intervention_id))
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed["intervention"].set()
+
+    def run_parallel_writer() -> None:
+        parallel_started.set()
+        try:
+            store.mark_intervention_ready(parallel.intervention_id, run_id=parallel.run_id)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            parallel_completed.set()
+
+    target = threading.Thread(target=run_target)
+    target.start()
+    assert target_entered.wait(timeout=1)
+    readers = [threading.Thread(target=read_checkpoint), threading.Thread(target=read_intervention)]
+    for reader in readers:
+        reader.start()
+    for name in reader_started:
+        assert reader_started[name].wait(timeout=1)
+        assert reader_completed[name].wait(timeout=0.1) is False
+    parallel_thread = threading.Thread(target=run_parallel_writer)
+    parallel_thread.start()
+    assert parallel_started.wait(timeout=1)
+    assert parallel_completed.wait(timeout=0.1) is False
+    release_target.set()
+    target.join(timeout=1)
+    for reader in readers:
+        reader.join(timeout=1)
+    parallel_thread.join(timeout=1)
+
+    assert target.is_alive() is False
+    assert all(reader.is_alive() is False for reader in readers)
+    assert parallel_thread.is_alive() is False
+    assert failures == []
+    assert observed["checkpoint"] == [None if outcome == "commit" and operation == "consume" else checkpoint]
+    assert observed["intervention"] == [store.intervention(target_intervention_id)]
+    assert store.intervention(parallel.intervention_id).status is store_module.InterventionStatus.READY  # type: ignore[union-attr]
+    if operation == "interrupt":
+        task = store.get_task(valid_brief.task_id, valid_brief.revision)
+        if outcome == "commit":
+            assert task.state is TaskState.INTERRUPTED
+        else:
+            assert task == interrupted_task_before
     store.close()
 
 
