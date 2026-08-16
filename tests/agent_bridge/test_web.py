@@ -3690,7 +3690,9 @@ def test_stop_scheduler_rejection_cancels_only_its_reservation_without_mutating_
         assert response.status_code == 503
         assert runtime.store.get_task(valid_brief.task_id, valid_brief.revision).state is TaskState.FABLE_PLANNING
         assert runtime.store.events_after("shared-chat", 0) == ()
-        assert harness.lease.snapshot() is (None if owner_finishes else token)
+        # A deferred owner finalizer cannot surrender the exact retry authority
+        # while this failed Stop reservation is being cancelled.
+        assert harness.lease.snapshot() is token
         assert harness.app.state.active_coroutines == set()
     finally:
         harness.close()
