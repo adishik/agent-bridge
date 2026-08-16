@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import inspect
 import json
 import os
 from pathlib import Path
@@ -4430,6 +4431,135 @@ def test_intervention_readers_wait_for_each_lifecycle_commit_or_rollback(
         assert observed[0] is not None
         assert observed[0].status is expected_status
     store.close()
+
+
+@pytest.mark.parametrize(
+    "projection", ("intervention", "authenticated", "visible", "active", "nested"),
+)
+@pytest.mark.parametrize("outcome", ("commit", "rollback"))
+def test_next_fable_stage_readers_wait_for_its_commit_or_rollback(
+    tmp_path, valid_brief, projection: str, outcome: str,
+) -> None:
+    """A staged next-Fable terminal CAS exposes only one lifecycle image."""
+    store = SQLiteStore(
+        tmp_path / f"next-fable-reader-{projection}-{outcome}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    stage = _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief)
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    store.start_next_fable_intervention_stage(
+        stage.intervention_id, run_id=binding.next_run_id,
+    )
+
+    def read_projection() -> object:
+        try:
+            if projection == "intervention":
+                return store.intervention(stage.intervention_id)
+            if projection == "authenticated":
+                return store.authenticated_intervention(stage.intervention_id)
+            if projection == "visible":
+                return store.current_visible_intervention_for_task(
+                    stage.task_id, stage.revision,
+                )
+            if projection == "active":
+                return store.active_intervention_for_task(stage.task_id, stage.revision)
+            return store.prepared_nested_intervention_run(
+                question_id=binding.question_id,
+                run_id=binding.source_run_id,
+            )
+        except RuntimeError as error:
+            # This reader validates a multi-row stage.  Its intentional
+            # pre/post rejection is still an image and must not become a
+            # mid-transaction SQLite InterfaceError.
+            return ("runtime-error", str(error))
+
+    before = read_projection()
+    writer_entered = threading.Event()
+    allow_writer_commit = threading.Event()
+    reader_started = threading.Event()
+    reader_completed = threading.Event()
+    observed: list[object] = []
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction
+
+    @contextmanager
+    def hold_actual_next_fable_transaction():
+        with original_transaction():
+            writer_entered.set()
+            if not allow_writer_commit.wait(timeout=1):
+                raise AssertionError("test did not release the staged Fable writer")
+            yield
+            if outcome == "rollback":
+                raise RuntimeError("controlled next Fable rollback")
+
+    store._immediate_transaction = hold_actual_next_fable_transaction  # type: ignore[method-assign]
+
+    def finish_stage() -> None:
+        try:
+            store.finish_next_fable_intervention_stage(
+                stage.intervention_id, run_id=binding.next_run_id, exit_code=0,
+            )
+        except BaseException as error:
+            if outcome != "rollback" or str(error) != "controlled next Fable rollback":
+                failures.append(error)
+
+    def read_in_parallel() -> None:
+        reader_started.set()
+        try:
+            observed.append(read_projection())
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed.set()
+
+    writer = threading.Thread(target=finish_stage)
+    writer.start()
+    assert writer_entered.wait(timeout=1)
+    reader = threading.Thread(target=read_in_parallel)
+    reader.start()
+    assert reader_started.wait(timeout=1)
+    assert reader_completed.wait(timeout=0.1) is False
+    allow_writer_commit.set()
+    writer.join(timeout=1)
+    reader.join(timeout=1)
+
+    assert writer.is_alive() is False
+    assert reader.is_alive() is False
+    assert failures == []
+    assert len(observed) == 1
+    after = read_projection()
+    assert observed == [after]
+    if outcome == "rollback":
+        assert after == before
+    store.close()
+
+
+def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> None:
+    """Every known intervention lifecycle writer acquires the shared RLock first."""
+    methods = (
+        "start_next_fable_intervention_stage",
+        "finish_next_fable_intervention_stage",
+        "handoff_next_fable_intervention_clarification_to_sol",
+        "create_intervention_and_request_stop",
+        "mark_intervention_ready",
+        "bind_fresh_fable_session_to_pending_intervention",
+        "claim_intervention_resume",
+        "begin_intervention_resume",
+        "complete_intervention",
+        "cancel_intervention_by_stop",
+        "mark_resume_outcome_unknown",
+        "authorize_retry_after_unknown",
+        "recover_active_tasks",
+    )
+    for name in methods:
+        source = inspect.getsource(getattr(SQLiteStore, name))
+        before_begin = source.split("with self._immediate_transaction()", 1)[0]
+        assert (
+            "with self._intervention_transaction()" in before_begin
+            or "with self._event_listener_lock:" in before_begin
+        ), name
 
 
 def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read_only(

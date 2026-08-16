@@ -9873,21 +9873,22 @@ class SQLiteStore:
         self, task_id: str, revision: int,
     ) -> InterventionRecord | None:
         """Return the sole Stop-capable intervention for one exact task revision."""
-        row = self._connection.execute(
-            """
-            SELECT * FROM interventions
-            WHERE task_id = ? AND revision = ?
-              AND status IN ('pending_stop', 'ready', 'resuming')
-            ORDER BY created_at DESC, intervention_id DESC LIMIT 1
-            """,
-            (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
-        ).fetchone()
-        if row is None:
-            return None
-        record = self._intervention_from_row(row)
-        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
-            raise RuntimeError("intervention binding is not authenticated")
-        return record
+        with self._event_listener_lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM interventions
+                WHERE task_id = ? AND revision = ?
+                  AND status IN ('pending_stop', 'ready', 'resuming')
+                ORDER BY created_at DESC, intervention_id DESC LIMIT 1
+                """,
+                (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._intervention_from_row(row)
+            if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+                raise RuntimeError("intervention binding is not authenticated")
+            return record
 
     def current_visible_intervention_for_task(
         self, task_id: str, revision: int,
@@ -9920,44 +9921,45 @@ class SQLiteStore:
         question_id = _prepared_identifier(question_id, "question_id")
         if run_id is not None:
             run_id = _prepared_identifier(run_id, "run_id")
-        rows = self._connection.execute(
-            """
-            SELECT intervention.*
-            FROM interventions AS intervention
-            JOIN questions AS question
-              ON question.session_id = intervention.session_id
-             AND question.task_id = intervention.task_id
-             AND question.revision = intervention.revision
-            WHERE question.question_id = ? AND intervention.status = ?
-            ORDER BY intervention.intervention_id LIMIT 2
-            """,
-            (question_id, InterventionStatus.RESUMING.value),
-        ).fetchall()
-        matches: list[tuple[InterventionRecord, object]] = []
-        for row in rows:
-            record = self._intervention_from_row(row)
+        with self._event_listener_lock:
+            rows = self._connection.execute(
+                """
+                SELECT intervention.*
+                FROM interventions AS intervention
+                JOIN questions AS question
+                  ON question.session_id = intervention.session_id
+                 AND question.task_id = intervention.task_id
+                 AND question.revision = intervention.revision
+                WHERE question.question_id = ? AND intervention.status = ?
+                ORDER BY intervention.intervention_id LIMIT 2
+                """,
+                (question_id, InterventionStatus.RESUMING.value),
+            ).fetchall()
+            matches: list[tuple[InterventionRecord, object]] = []
+            for row in rows:
+                record = self._intervention_from_row(row)
+                binding = record.directed_binding
+                if (
+                    binding is not None
+                    and binding.kind == "nested_resume"
+                    and binding.question_id == question_id
+                    and (run_id is None or binding.source_run_id == run_id)
+                ):
+                    matches.append((record, row["acknowledgment_id"]))
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise RuntimeError("prepared nested intervention child is ambiguous")
+            record, acknowledgment_id = matches[0]
+            if not self._intervention_is_authenticated(record, acknowledgment_id):
+                raise RuntimeError("prepared nested intervention child is not authenticated")
             binding = record.directed_binding
-            if (
-                binding is not None
-                and binding.kind == "nested_resume"
-                and binding.question_id == question_id
-                and (run_id is None or binding.source_run_id == run_id)
-            ):
-                matches.append((record, row["acknowledgment_id"]))
-        if not matches:
-            return None
-        if len(matches) != 1:
-            raise RuntimeError("prepared nested intervention child is ambiguous")
-        record, acknowledgment_id = matches[0]
-        if not self._intervention_is_authenticated(record, acknowledgment_id):
-            raise RuntimeError("prepared nested intervention child is not authenticated")
-        binding = record.directed_binding
-        if binding is None:
-            raise RuntimeError("prepared nested intervention child binding is missing")
-        child = self.agent_run(binding.source_run_id)
-        if child.status != "running":
-            raise RuntimeError("prepared nested intervention child is not active")
-        return child
+            if binding is None:
+                raise RuntimeError("prepared nested intervention child binding is missing")
+            child = self.agent_run(binding.source_run_id)
+            if child.status != "running":
+                raise RuntimeError("prepared nested intervention child is not active")
+            return child
 
     def start_next_fable_intervention_stage(
         self, intervention_id: str, *, run_id: str,
@@ -9965,7 +9967,7 @@ class SQLiteStore:
         """Start only the exact Fable stage preallocated by a child-answer CAS."""
         intervention_id = _prepared_identifier(intervention_id, "intervention_id")
         run_id = _prepared_identifier(run_id, "run_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self.authenticated_intervention(intervention_id)
             if record is None:
                 raise RuntimeError("intervention not found")
@@ -10148,7 +10150,7 @@ class SQLiteStore:
         run_id = _prepared_identifier(run_id, "run_id")
         if exit_code is not None:
             exit_code = _require_integer(exit_code, "exit_code")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self.authenticated_intervention(intervention_id)
             if record is None:
                 raise RuntimeError("intervention not found")
@@ -12206,7 +12208,7 @@ class SQLiteStore:
         tasks_interrupted = 0
         preserved_scope_run_ids: list[str] = []
         preserved_scope_intervention_ids: list[str] = []
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             self._validate_nested_question_rows_in_transaction()
             for row in self._connection.execute(
                 "SELECT * FROM interventions WHERE status = 'resuming' ORDER BY intervention_id"
