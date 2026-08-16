@@ -3305,12 +3305,18 @@ def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
                 f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['edit']}/edit",
                 json=edited, headers=headers,
             ).status_code == 202
-            _wait_until(lambda: runtime_a.store.latest_task(task_ids["edit"]).revision == 2)  # type: ignore[union-attr]
+            # TestClient owns the route coroutine on its portal thread; wait
+            # for it instead of probing this Store connection concurrently.
+            _wait_until(lambda: harness.app.state.active_coroutines == set())
+            edited_task = runtime_a.store.latest_task(task_ids["edit"])
+            assert edited_task is not None and edited_task.revision == 2
             assert client.post(
                 f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['reject']}/reject",
                 headers=headers,
             ).status_code == 202
-            _wait_until(lambda: runtime_a.store.latest_task(task_ids["reject"]).state is TaskState.FAILED)  # type: ignore[union-attr]
+            _wait_until(lambda: harness.app.state.active_coroutines == set())
+            rejected_task = runtime_a.store.latest_task(task_ids["reject"])
+            assert rejected_task is not None and rejected_task.state is TaskState.FAILED
 
             monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
             for path, body in (
