@@ -4173,10 +4173,11 @@ def _seed_visible_intervention(
     return record
 
 
-def test_intervention_read_serializes_with_an_inflight_writer(
-    tmp_path, valid_brief,
+@pytest.mark.parametrize("projection", ("intervention", "authenticated", "visible"))
+def test_intervention_readers_wait_for_mark_ready_commit(
+    tmp_path, valid_brief, projection: str,
 ) -> None:
-    """A cross-thread browser read cannot use the shared connection mid-write."""
+    """Every intervention projection sees only a committed READY lifecycle image."""
     store = SQLiteStore(
         tmp_path / "intervention-read-lock.sqlite3",
         clock=lambda: "2026-08-10T12:00:00Z",
@@ -4188,31 +4189,246 @@ def test_intervention_read_serializes_with_an_inflight_writer(
         valid_brief,
         status=store_module.InterventionStatus.PENDING_STOP,
     )
-    started = threading.Event()
-    completed = threading.Event()
+    store.finish_agent_run(expected.run_id, status="interrupted", exit_code=-15)
+    writer_entered = threading.Event()
+    allow_writer_commit = threading.Event()
+    reader_started = threading.Event()
+    reader_completed = threading.Event()
     observed: list[store_module.InterventionRecord | None] = []
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction
+
+    @contextmanager
+    def hold_actual_mark_ready_transaction():
+        with original_transaction():
+            writer_entered.set()
+            if not allow_writer_commit.wait(timeout=1):
+                raise AssertionError("test did not release the ready writer")
+            yield
+
+    store._immediate_transaction = hold_actual_mark_ready_transaction  # type: ignore[method-assign]
+
+    readers = {
+        "intervention": lambda: store.intervention(expected.intervention_id),
+        "authenticated": lambda: store.authenticated_intervention(expected.intervention_id),
+        "visible": lambda: store.current_visible_intervention_for_task(
+            expected.task_id, expected.revision,
+        ),
+    }
 
     def read_intervention() -> None:
-        started.set()
-        observed.append(store.intervention(expected.intervention_id))
-        completed.set()
+        reader_started.set()
+        try:
+            observed.append(readers[projection]())
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed.set()
 
-    with store._event_listener_lock:  # noqa: SLF001 - exact writer exclusion seam
-        reader = threading.Thread(target=read_intervention)
-        reader.start()
-        assert started.wait(timeout=1)
-        assert completed.wait(timeout=0.1) is False
-        with pytest.raises(RuntimeError, match="controlled writer failure"):
-            with store._immediate_transaction():  # noqa: SLF001 - writer rollback seam
-                store._connection.execute(  # noqa: SLF001 - exact rollback fixture
-                    "UPDATE interventions SET message = ? WHERE intervention_id = ?",
-                    ("must roll back", expected.intervention_id),
-                )
-                raise RuntimeError("controlled writer failure")
+    def mark_ready() -> None:
+        try:
+            store.mark_intervention_ready(expected.intervention_id, run_id=expected.run_id)
+        except BaseException as error:
+            failures.append(error)
+
+    writer = threading.Thread(target=mark_ready)
+    writer.start()
+    assert writer_entered.wait(timeout=1)
+    reader = threading.Thread(target=read_intervention)
+    reader.start()
+    assert reader_started.wait(timeout=1)
+    assert reader_completed.wait(timeout=0.1) is False
+    allow_writer_commit.set()
+    writer.join(timeout=1)
     reader.join(timeout=1)
 
+    assert writer.is_alive() is False
     assert reader.is_alive() is False
-    assert observed == [expected]
+    assert failures == []
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert observed[0].status is store_module.InterventionStatus.READY
+    store.close()
+
+
+@pytest.mark.parametrize("projection", ("intervention", "authenticated", "visible"))
+@pytest.mark.parametrize(
+    ("lifecycle", "expected_status"),
+    (
+        ("claim", store_module.InterventionStatus.RESUMING),
+        ("unknown", store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN),
+        ("complete", store_module.InterventionStatus.RESUMED),
+        ("rollback", store_module.InterventionStatus.PENDING_STOP),
+    ),
+)
+def test_intervention_readers_wait_for_each_lifecycle_commit_or_rollback(
+    tmp_path, valid_brief, projection: str, lifecycle: str,
+    expected_status: store_module.InterventionStatus,
+) -> None:
+    """Cross-thread readers observe only terminal lifecycle transaction images."""
+    store = SQLiteStore(
+        tmp_path / f"intervention-{lifecycle}-reader.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    store.create_session("session-1", "/repo")
+    if lifecycle == "rollback":
+        record = _seed_visible_intervention(
+            store, valid_brief, status=store_module.InterventionStatus.PENDING_STOP,
+            suffix="rollback-reader",
+        )
+        store.finish_agent_run(record.run_id, status="interrupted", exit_code=-15)
+
+        def invoke() -> None:
+            store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+
+    else:
+        brief = replace(valid_brief, task_id=f"{lifecycle}-reader")
+        store.save_task("session-1", brief, TaskState.SOL_RUNNING)
+        store.set_sol_thread(brief.task_id, brief.revision, f"thread-{lifecycle}")
+        store._connection.execute(  # noqa: SLF001 - exact eligible lifecycle fixture
+            "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+            ("2026-08-10T12:00:00Z", "baseline-1", brief.task_id, brief.revision),
+        )
+        store.start_agent_run(f"source-{lifecycle}", brief.task_id, brief.revision, "sol")
+        store.set_agent_run_session(f"source-{lifecycle}", f"thread-{lifecycle}")
+        record = store.create_intervention_and_request_stop(
+            intervention_id=f"intervention-{lifecycle}-reader",
+            session_id="session-1",
+            task_id=brief.task_id,
+            revision=brief.revision,
+            expected_source_generation=1,
+            message="Keep the lifecycle image exact.",
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            run_id=f"source-{lifecycle}",
+        )
+        store.finish_agent_run(record.run_id, status="interrupted", exit_code=-15)
+        ready = store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+        if lifecycle == "claim":
+
+            def invoke() -> None:
+                store.claim_intervention_resume(
+                    ready.intervention_id,
+                    expected_resume_generation=ready.resume_generation,
+                    resume_attempt_id="claim-attempt",
+                    resume_run_id="claim-run",
+                )
+
+        else:
+            record = store.claim_intervention_resume(
+                ready.intervention_id,
+                expected_resume_generation=ready.resume_generation,
+                resume_attempt_id=f"{lifecycle}-attempt",
+                resume_run_id=f"{lifecycle}-run",
+            )
+            if lifecycle == "unknown":
+                store.start_agent_run(
+                    record.resume_run_id, brief.task_id, brief.revision, "sol",
+                )
+                store.set_agent_run_session(record.resume_run_id, f"thread-{lifecycle}")
+                store.finish_agent_run(record.resume_run_id, status="interrupted", exit_code=-15)
+                store._connection.execute(  # noqa: SLF001 - exact recovery image
+                    "UPDATE tasks SET state = ?, continuation_state = ? "
+                    "WHERE task_id = ? AND revision = ?",
+                    (
+                        TaskState.INTERRUPTED.value,
+                        TaskState.SOL_RUNNING.value,
+                        brief.task_id,
+                        brief.revision,
+                    ),
+                )
+
+                def invoke() -> None:
+                    store.mark_resume_outcome_unknown(
+                        record.intervention_id,
+                        resume_attempt_id=record.resume_attempt_id,
+                        resume_run_id=record.resume_run_id,
+                    )
+
+            else:
+                store._connection.execute(  # noqa: SLF001 - exact completed owner image
+                    "UPDATE tasks SET state = ?, continuation_state = NULL "
+                    "WHERE task_id = ? AND revision = ?",
+                    (TaskState.SOL_RUNNING.value, brief.task_id, brief.revision),
+                )
+                store.start_agent_run(
+                    record.resume_run_id, brief.task_id, brief.revision, "sol",
+                )
+                store.set_agent_run_session(record.resume_run_id, f"thread-{lifecycle}")
+                store.finish_agent_run(record.resume_run_id, status="completed", exit_code=0)
+
+                def invoke() -> None:
+                    store.complete_intervention(
+                        record.intervention_id,
+                        expected_resume_generation=record.resume_generation,
+                        resume_attempt_id=record.resume_attempt_id,
+                        resume_run_id=record.resume_run_id,
+                    )
+
+    writer_entered = threading.Event()
+    allow_writer_commit = threading.Event()
+    reader_started = threading.Event()
+    reader_completed = threading.Event()
+    observed: list[store_module.InterventionRecord | None] = []
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction
+
+    @contextmanager
+    def hold_actual_lifecycle_transaction():
+        with original_transaction():
+            writer_entered.set()
+            if not allow_writer_commit.wait(timeout=1):
+                raise AssertionError("test did not release the lifecycle writer")
+            yield
+            if lifecycle == "rollback":
+                raise RuntimeError("controlled lifecycle rollback")
+
+    store._immediate_transaction = hold_actual_lifecycle_transaction  # type: ignore[method-assign]
+    readers = {
+        "intervention": lambda: store.intervention(record.intervention_id),
+        "authenticated": lambda: store.authenticated_intervention(record.intervention_id),
+        "visible": lambda: store.current_visible_intervention_for_task(
+            record.task_id, record.revision,
+        ),
+    }
+
+    def read_projection() -> None:
+        reader_started.set()
+        try:
+            observed.append(readers[projection]())
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed.set()
+
+    def write_lifecycle() -> None:
+        try:
+            invoke()
+        except BaseException as error:
+            if lifecycle != "rollback" or str(error) != "controlled lifecycle rollback":
+                failures.append(error)
+
+    writer = threading.Thread(target=write_lifecycle)
+    writer.start()
+    assert writer_entered.wait(timeout=1)
+    reader = threading.Thread(target=read_projection)
+    reader.start()
+    assert reader_started.wait(timeout=1)
+    assert reader_completed.wait(timeout=0.1) is False
+    allow_writer_commit.set()
+    writer.join(timeout=1)
+    reader.join(timeout=1)
+
+    assert writer.is_alive() is False
+    assert reader.is_alive() is False
+    assert failures == []
+    assert len(observed) == 1
+    if projection == "visible" and lifecycle == "complete":
+        assert observed == [None]
+    else:
+        assert observed[0] is not None
+        assert observed[0].status is expected_status
     store.close()
 
 

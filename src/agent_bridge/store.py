@@ -3138,6 +3138,13 @@ class SQLiteStore:
         else:
             self._connection.commit()
 
+    @contextmanager
+    def _intervention_transaction(self) -> Iterator[None]:
+        """Serialize one intervention lifecycle image on a shared SQLite connection."""
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                yield
+
     def _timestamp(self) -> str:
         return _require_string(self._clock(), "clock result")
 
@@ -9850,16 +9857,17 @@ class SQLiteStore:
 
     def authenticated_intervention(self, intervention_id: str) -> InterventionRecord | None:
         """Return one intervention only when its current durable binding is intact."""
-        row = self._connection.execute(
-            "SELECT * FROM interventions WHERE intervention_id = ?",
-            (_prepared_identifier(intervention_id, "intervention_id"),),
-        ).fetchone()
-        if row is None:
-            return None
-        record = self._intervention_from_row(row)
-        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
-            raise RuntimeError("intervention binding is not authenticated")
-        return record
+        with self._event_listener_lock:
+            row = self._connection.execute(
+                "SELECT * FROM interventions WHERE intervention_id = ?",
+                (_prepared_identifier(intervention_id, "intervention_id"),),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._intervention_from_row(row)
+            if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+                raise RuntimeError("intervention binding is not authenticated")
+            return record
 
     def active_intervention_for_task(
         self, task_id: str, revision: int,
@@ -9885,24 +9893,25 @@ class SQLiteStore:
         self, task_id: str, revision: int,
     ) -> InterventionRecord | None:
         """Read one fully authenticated intervention safe for the current task UI."""
-        rows = self._connection.execute(
-            """
-            SELECT * FROM interventions
-            WHERE task_id = ? AND revision = ?
-              AND status IN ('pending_stop', 'ready', 'resuming', 'resume_outcome_unknown')
-            ORDER BY created_at DESC, intervention_id DESC LIMIT 2
-            """,
-            (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
-        ).fetchall()
-        if not rows:
-            return None
-        if len(rows) != 1:
-            raise RuntimeError("current intervention is ambiguous")
-        row = rows[0]
-        record = self._intervention_from_row(row)
-        if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
-            raise RuntimeError("intervention binding is not authenticated")
-        return record
+        with self._event_listener_lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM interventions
+                WHERE task_id = ? AND revision = ?
+                  AND status IN ('pending_stop', 'ready', 'resuming', 'resume_outcome_unknown')
+                ORDER BY created_at DESC, intervention_id DESC LIMIT 2
+                """,
+                (_prepared_identifier(task_id, "task_id"), _require_integer(revision, "revision")),
+            ).fetchall()
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise RuntimeError("current intervention is ambiguous")
+            row = rows[0]
+            record = self._intervention_from_row(row)
+            if not self._intervention_is_authenticated(record, row["acknowledgment_id"]):
+                raise RuntimeError("intervention binding is not authenticated")
+            return record
 
     def prepared_nested_intervention_run(
         self, *, question_id: str, run_id: str | None = None,
@@ -10581,30 +10590,31 @@ class SQLiteStore:
     ) -> InterventionRecord:
         intervention_id = _prepared_identifier(intervention_id, "intervention_id")
         run_id = _prepared_identifier(run_id, "run_id")
-        with self._immediate_transaction():
-            record = self._intervention_required(intervention_id)
-            if record.run_id != run_id:
-                raise RuntimeError("intervention source run changed")
-            if record.status is InterventionStatus.READY:
-                return record
-            if record.status is not InterventionStatus.PENDING_STOP:
-                raise RuntimeError("intervention is not pending stop")
-            source_run = self.agent_run(run_id)
-            if source_run.status == "running":
-                raise RuntimeError("intervention source run is still active")
-            cursor = self._connection.execute(
-                """
-                UPDATE interventions SET status = ?
-                WHERE intervention_id = ? AND run_id = ? AND status = ?
-                """,
-                (
-                    InterventionStatus.READY.value, intervention_id, run_id,
-                    InterventionStatus.PENDING_STOP.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("intervention status changed concurrently")
-        return self._intervention_required(intervention_id)
+        with self._event_listener_lock:
+            with self._immediate_transaction():
+                record = self._intervention_required(intervention_id)
+                if record.run_id != run_id:
+                    raise RuntimeError("intervention source run changed")
+                if record.status is InterventionStatus.READY:
+                    return record
+                if record.status is not InterventionStatus.PENDING_STOP:
+                    raise RuntimeError("intervention is not pending stop")
+                source_run = self.agent_run(run_id)
+                if source_run.status == "running":
+                    raise RuntimeError("intervention source run is still active")
+                cursor = self._connection.execute(
+                    """
+                    UPDATE interventions SET status = ?
+                    WHERE intervention_id = ? AND run_id = ? AND status = ?
+                    """,
+                    (
+                        InterventionStatus.READY.value, intervention_id, run_id,
+                        InterventionStatus.PENDING_STOP.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention status changed concurrently")
+            return self._intervention_required(intervention_id)
 
     def bind_fresh_fable_session_to_pending_intervention(
         self,
@@ -10647,7 +10657,7 @@ class SQLiteStore:
         if continuation is not TaskState.FABLE_PLANNING:
             raise ValueError("fresh Fable binding requires FABLE_PLANNING")
 
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             self._verify_prepared_project_identity(project_id, session_id)
             task = self._prepared_task_exact(session_id, task_id, revision)
             record = self._intervention_required(intervention_id)
@@ -10847,7 +10857,7 @@ class SQLiteStore:
         )
         resume_attempt_id = _prepared_identifier(resume_attempt_id, "resume_attempt_id")
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._intervention_required(intervention_id)
             row = self._connection.execute(
                 "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
@@ -10917,7 +10927,7 @@ class SQLiteStore:
         )
         resume_attempt_id = _prepared_identifier(resume_attempt_id, "resume_attempt_id")
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._intervention_required(intervention_id)
             row = self._connection.execute(
                 "SELECT acknowledgment_id, directed_binding_json FROM interventions WHERE intervention_id = ?",
@@ -11183,7 +11193,7 @@ class SQLiteStore:
         )
         resume_attempt_id = _prepared_identifier(resume_attempt_id, "resume_attempt_id")
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._intervention_required(intervention_id)
             row = self._connection.execute(
                 "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
@@ -11382,7 +11392,7 @@ class SQLiteStore:
         expected_resume_generation = _require_integer(
             expected_resume_generation, "expected_resume_generation",
         )
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self.authenticated_intervention(intervention_id)
             if record is None:
                 raise RuntimeError("intervention not found")
@@ -11558,7 +11568,7 @@ class SQLiteStore:
         intervention_id = _prepared_identifier(intervention_id, "intervention_id")
         resume_attempt_id = _prepared_identifier(resume_attempt_id, "resume_attempt_id")
         resume_run_id = _prepared_identifier(resume_run_id, "resume_run_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._intervention_required(intervention_id)
             row = self._connection.execute(
                 "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
@@ -11644,7 +11654,7 @@ class SQLiteStore:
             expected_resume_generation, "expected_resume_generation",
         )
         acknowledgment_id = _prepared_identifier(acknowledgment_id, "acknowledgment_id")
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._intervention_required(intervention_id)
             row = self._connection.execute(
                 "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",

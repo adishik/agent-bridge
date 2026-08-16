@@ -252,8 +252,12 @@ The automated end-to-end coverage uses only temporary Git repositories and
 absolute fake Claude/Codex executables behind the real registry, hub, FastAPI,
 coordinator, SQLite, and browser-controller boundaries. It makes no live
 provider or network calls. It validates scoped baseline preservation, including
-an allowed partial Sol edit, but it is not evidence about live provider
-behavior, real user deployments, clinical use, or clinical outcomes.
+an allowed partial Sol edit written and provenance-recorded by the fake Codex
+executable itself. It also hard-kills a separate fake-only bridge process both
+after a durable claim before provider spawn and while the exact fake provider
+is live, then reopens the SQLite state. These are bounded fake-process checks,
+not evidence about live provider behavior, real user deployments, clinical
+use, or clinical outcomes.
 
 ## Troubleshooting
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -271,6 +272,7 @@ def _apply_mutations(payload: dict[str, object]) -> None:
     if repo_root_value is None or not isinstance(mutations, list):
         raise _FakeConfigurationError("fake mutations are invalid")
     repo_root = Path(repo_root_value).resolve(strict=True)
+    provenance: list[dict[str, str]] = []
     for mutation in mutations:
         if not isinstance(mutation, dict):
             raise _FakeConfigurationError("fake mutation is not an object")
@@ -286,6 +288,16 @@ def _apply_mutations(payload: dict[str, object]) -> None:
             raise _FakeConfigurationError("fake mutation escaped the repository")
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(content, encoding="utf-8")
+        provenance.append({
+            "path": path_value,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        })
+    if provenance:
+        _write_capture("fake-codex-mutations.json", {
+            "executable": str(Path(sys.argv[0]).resolve()),
+            "pid": os.getpid(),
+            "mutations": provenance,
+        })
 
 
 def _main() -> int:
@@ -400,6 +412,8 @@ def _main() -> int:
             "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a55",
             "account": "SECRET_ACCOUNT_SENTINEL",
         })
+    if mode in {"slow_after_thread", "slow_after_conflicting_thread"}:
+        _apply_mutations(payload)
     _write_capture("fake-codex-partials-ready.json", True)
     print("SECRET_STDERR_SENTINEL", file=sys.stderr, flush=True)
 

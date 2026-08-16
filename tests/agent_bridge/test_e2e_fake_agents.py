@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sqlite3
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1060,14 +1062,15 @@ def test_fake_agent_model_invocation_refuses_missing_sentinel(
 
 
 def test_stop_interrupts_only_the_active_fake_child(fake_bridge: FakeBridge) -> None:
-    fake_bridge.configure(codex_modes=["slow_after_thread"])
+    fake_bridge.configure(codex_modes=["slow_before_thread"])
 
-    async def wait_for_marker(path: Path) -> None:
+    async def wait_for_active_run(task_id: str):
         for _ in range(250):
-            if path.exists():
-                return
+            active = fake_bridge.store.active_run_for_task(task_id, 1)
+            if active is not None and fake_bridge.runner.is_running(active.run_id):
+                return active
             await asyncio.sleep(0.02)
-        raise AssertionError("fake Codex did not reach its controlled stop marker")
+        raise AssertionError("fake Codex did not start its controlled child")
 
     async def scenario() -> None:
         task_id = await fake_bridge.coordinator.handle_user_request(
@@ -1076,9 +1079,7 @@ def test_stop_interrupts_only_the_active_fake_child(fake_bridge: FakeBridge) -> 
         approval = asyncio.create_task(
             fake_bridge.coordinator.approve_task(task_id, revision=1)
         )
-        await wait_for_marker(fake_bridge.captures / "fake-codex-partials-ready.json")
-        active = fake_bridge.store.active_run_for_task(task_id, 1)
-        assert active is not None
+        active = await wait_for_active_run(task_id)
         await fake_bridge.coordinator.stop_task(task_id)
         await approval
 
@@ -1435,6 +1436,216 @@ def _model_invocations(bridge: FakeBridge) -> tuple[dict[str, Any], ...]:
     )
 
 
+def _crash_recovery_bridge_layout(
+    root: Path,
+    *,
+    fake_claude: Path,
+    fake_codex: Path,
+) -> Any:
+    """Describe the immutable alpha fixture layout left by a killed worker."""
+    bridge_root = root / "first-parent"
+    state = bridge_root / "external-state"
+    captures = bridge_root / "external-captures"
+    binaries = bridge_root / "fake-bin"
+    repo = bridge_root / "same-name"
+    return SimpleNamespace(
+        root=bridge_root,
+        repo=repo,
+        database=state / "bridge.sqlite3",
+        artifacts=bridge_root / "external-artifacts",
+        schemas=bridge_root / "external-schemas",
+        captures=captures,
+        scenario_path=captures / "scenario.json",
+        invocation_log=captures / "resolved-executables.jsonl",
+        fake_claude=fake_claude.resolve(strict=True),
+        fake_codex=fake_codex.resolve(strict=True),
+        fake_git=binaries / "git",
+        fake_bash=binaries / "bash",
+        fake_sh=binaries / "sh",
+        environment={
+            "AGENT_BRIDGE_TEST_FAKE": "1",
+            "AGENT_BRIDGE_INVOCATION_LOG": str(captures / "resolved-executables.jsonl"),
+            "FAKE_AGENT_CAPTURE_DIR": str(captures),
+            "FAKE_AGENT_SCENARIO": str(captures / "scenario.json"),
+            "FAKE_BRIDGE_REPO_ROOT": str(repo),
+            "FAKE_BRIDGE_TEST_COMMAND": TEST_COMMAND,
+            "FAKE_CLAUDE_TASK_ID": "task-1",
+            "FAKE_CLAUDE_SESSION_ID": "fable-alpha-session",
+            "FAKE_CODEX_THREAD_ID": "0199a213-81c0-7800-8aa1-bbab2a035a51",
+            "HOME": str(state),
+            "PATH": "/path-resolution-is-forbidden",
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        fable_session_id="fable-alpha-session",
+        sol_thread_id="0199a213-81c0-7800-8aa1-bbab2a035a51",
+        session_id=SESSION_ID,
+    )
+
+
+def _subprocess_intervention_crash_worker_source() -> str:
+    """Run the actual fake hub until a durable crash boundary, then wait forever."""
+    return r'''
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+import runpy
+import threading
+import time
+
+from fastapi.testclient import TestClient
+
+module = runpy.run_path(os.environ["TASK8_E2E_MODULE"])
+FakeHub = module["FakeHub"]
+InterventionStatus = module["InterventionStatus"]
+TaskState = module["TaskState"]
+_authenticate_hub = module["_authenticate_hub"]
+_brief = module["_brief"]
+_clarification = module["_clarification"]
+_completed = module["_completed"]
+_project_path = module["_project_path"]
+_question = module["_question"]
+_review = module["_review"]
+_wait_for = module["_wait_for"]
+
+root = Path(os.environ["TASK8_CRASH_ROOT"])
+control = Path(os.environ["TASK8_CRASH_CONTROL"])
+phase = os.environ["TASK8_CRASH_PHASE"]
+hub = FakeHub.create(
+    root=root,
+    fake_claude=Path(os.environ["TASK8_FAKE_CLAUDE"]),
+    fake_codex=Path(os.environ["TASK8_FAKE_CODEX"]),
+)
+bridge = hub.bridges["alpha"]
+bridge.configure(
+    plans=[_brief(task_id="$TASK_ID")],
+    outcomes=[
+        _question(),
+        _completed(content="source allowed partial\n"),
+        _completed(content="possibly executed continuation\n"),
+        _completed(content="acknowledged exact retry\n"),
+    ],
+    clarifications=[_clarification()],
+    reviews=[_review()],
+    codex_modes=[
+        None,
+        "slow_after_thread",
+        "slow_after_thread" if phase == "provider_spawned" else None,
+    ],
+)
+
+async def wait_for_ready(**kwargs):
+    raise RuntimeError("controlled durable ready boundary")
+
+def publish(*, provider_pid=None):
+    record = bridge.store.intervention("intervention-subprocess-crash")
+    if record is None or record.status is not InterventionStatus.RESUMING:
+        raise RuntimeError("resume claim was not durable at the crash boundary")
+    control.write_text(json.dumps({
+        "worker_pid": os.getpid(),
+        "task_id": record.task_id,
+        "revision": record.revision,
+        "intervention_id": record.intervention_id,
+        "resume_generation": record.resume_generation,
+        "resume_run_id": record.resume_run_id,
+        "provider_pid": provider_pid,
+    }, sort_keys=True), encoding="utf-8")
+
+async def post_claim_pre_spawn(intervention_id, *, resume_attempt_id, resume_run_id):
+    publish()
+    await asyncio.Event().wait()
+
+with TestClient(hub.app) as client:
+    headers = _authenticate_hub(client)
+    project = _project_path(hub, "alpha")
+    session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+    response = client.post(
+        f"{project}/chats/{session_id}/messages",
+        json={"text": "Reach a durable Sol crash boundary."},
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"message was not accepted: {response.status_code}")
+    _wait_for(
+        lambda: bool(bridge.store.latest_task_overviews(session_id))
+        and bridge.store.latest_task_overviews(session_id)[0].task.state
+        is TaskState.AWAITING_USER_APPROVAL,
+    )
+    task = bridge.store.latest_task_overviews(session_id)[0].task
+    response = client.post(
+        f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+        json={"revision": task.revision},
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"approval was not accepted: {response.status_code}")
+    state_path = bridge.captures / "scenario-state-codex.json"
+    _wait_for(
+        lambda: state_path.exists()
+        and json.loads(state_path.read_text(encoding="utf-8")) == {"outcome": 2},
+    )
+    source_marker = bridge.captures / "fake-codex-partials-ready.json"
+    _wait_for(source_marker.exists)
+    task = bridge.store.latest_task(task.task_id)
+    if task is None or task.state is not TaskState.SOL_RUNNING:
+        raise RuntimeError("live Sol source was not installed")
+    source = bridge.store.active_run_for_task(task.task_id, task.revision)
+    if source is None or source.agent != "sol":
+        raise RuntimeError("live Sol source run was not installed")
+    _wait_for(lambda: bridge.runner.is_running(source.run_id))
+    original_readiness = hub.runtime("alpha").readiness.require_model_start_ready
+    hub.runtime("alpha").readiness.require_model_start_ready = wait_for_ready
+    response = client.post(
+        f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+        json={
+            "intervention_id": "intervention-subprocess-crash",
+            "message": "Keep this exact continuation bounded.",
+            "addressed_to": "sol",
+            "revision": task.revision,
+            "continuation_generation": task.continuation_generation,
+        },
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"intervention was not accepted: {response.status_code}")
+    _wait_for(
+        lambda: (
+            (record := bridge.store.intervention("intervention-subprocess-crash"))
+            is not None and record.status is InterventionStatus.READY
+        ),
+    )
+    hub.runtime("alpha").readiness.require_model_start_ready = original_readiness
+    for path in (
+        bridge.captures / "fake-codex-partials-ready.json",
+        bridge.captures / "fake-codex-mutations.json",
+    ):
+        path.unlink()
+    if phase == "post_claim_pre_spawn":
+        bridge.coordinator.run_intervention_resume = post_claim_pre_spawn
+    record = bridge.store.intervention("intervention-subprocess-crash")
+    if record is None:
+        raise RuntimeError("ready intervention disappeared")
+    def dispatch() -> None:
+        asyncio.run(bridge.coordinator.dispatch_ready_intervention(record.intervention_id))
+    threading.Thread(target=dispatch, daemon=True).start()
+    if phase == "provider_spawned":
+        mutation_path = bridge.captures / "fake-codex-mutations.json"
+        _wait_for(mutation_path.exists)
+        provenance = json.loads(mutation_path.read_text(encoding="utf-8"))
+        provider_pid = provenance.get("pid")
+        if not isinstance(provider_pid, int) or provider_pid <= 0:
+            raise RuntimeError("fake Codex did not record its provider PID")
+        publish(provider_pid=provider_pid)
+    else:
+        _wait_for(control.exists)
+    while True:
+        time.sleep(0.1)
+'''
+
+
 def test_intervention_early_fable_is_visible_before_its_exact_owned_stop(
     tmp_path: Path,
     fake_claude: Path,
@@ -1627,7 +1838,7 @@ def test_intervention_sol_preserves_allowed_partial_work_and_exact_thread(
         plans=[_brief(task_id="$TASK_ID")],
         outcomes=[
             _question(),
-            _completed(content="interrupted source must not apply this output\n"),
+            _completed(content="allowed partial Sol edit\n"),
             _completed(content="resumed exact Sol output\n"),
         ],
         clarifications=[_clarification()],
@@ -1680,8 +1891,18 @@ def test_intervention_sol_preserves_allowed_partial_work_and_exact_thread(
             _wait_for(lambda: bridge.runner.is_running(source.run_id))
             baseline = bridge.coordinator._load_baseline(task)  # noqa: SLF001 - E2E invariant
             partial_path = bridge.repo / "bridge_work" / "output.txt"
-            partial_path.parent.mkdir(parents=True, exist_ok=True)
-            partial_path.write_text("allowed partial Sol edit\n", encoding="utf-8")
+            assert partial_path.read_text(encoding="utf-8") == "allowed partial Sol edit\n"
+            provenance = json.loads(
+                (bridge.captures / "fake-codex-mutations.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            assert isinstance(provenance["pid"], int) and provenance["pid"] > 0
+            assert provenance["executable"] == str(bridge.fake_codex)
+            assert provenance["mutations"] == [{
+                "path": "bridge_work/output.txt",
+                "sha256": hashlib.sha256(b"allowed partial Sol edit\n").hexdigest(),
+            }]
             assert bridge.tracker.compare(baseline).changed_paths == ("bridge_work/output.txt",)
             active_lease = hub.workflows.active_lease_snapshot()
             assert active_lease is not None
@@ -2399,6 +2620,153 @@ def test_intervention_claim_crash_stays_unknown_until_one_acknowledged_retry(
     finally:
         release_source_stop.set()
         hub.close()
+
+
+@pytest.mark.parametrize("phase", ("post_claim_pre_spawn", "provider_spawned"))
+def test_abrupt_subprocess_intervention_crash_is_unknown_until_one_retry(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    phase: str,
+) -> None:
+    """A SIGKILL loses no durable claim and never triggers automatic replay.
+
+    This deliberately kills the separate hub process without letting FastAPI's
+    lifespan or the coordinator's ``finally`` handlers convert the interrupted
+    invocation into a normal outcome.  The provider-spawned boundary is the
+    fake Codex process itself, identified only by its durable fixture capture.
+    """
+    root = tmp_path / f"subprocess-{phase}"
+    control = root / "crash-boundary.json"
+    package_root = Path(__file__).parents[2]
+    python_path = os.environ.get("PYTHONPATH")
+    worker_environment = {
+        **os.environ,
+        "PYTHONPATH": str(package_root / "src") + (
+            "" if not python_path else os.pathsep + python_path
+        ),
+        "TASK8_E2E_MODULE": str(Path(__file__).resolve(strict=True)),
+        "TASK8_CRASH_ROOT": str(root),
+        "TASK8_CRASH_CONTROL": str(control),
+        "TASK8_CRASH_PHASE": phase,
+        "TASK8_FAKE_CLAUDE": str(fake_claude.resolve(strict=True)),
+        "TASK8_FAKE_CODEX": str(fake_codex.resolve(strict=True)),
+    }
+    worker = subprocess.Popen(
+        [str(Path(sys.executable).absolute()), "-c", _subprocess_intervention_crash_worker_source()],
+        cwd=package_root,
+        env=worker_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    provider_pid: int | None = None
+    worker_output = ""
+    worker_errors = ""
+    try:
+        deadline = time.monotonic() + 5
+        checkpoint: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            if control.exists():
+                candidate = json.loads(control.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    checkpoint = candidate
+                    break
+            if worker.poll() is not None:
+                worker_output, worker_errors = worker.communicate(timeout=1)
+                raise AssertionError(
+                    "subprocess fake hub exited before its durable boundary:\n"
+                    f"stdout={worker_output}\nstderr={worker_errors}"
+                )
+            time.sleep(0.01)
+        assert checkpoint is not None, "subprocess fake hub missed the crash boundary"
+        assert checkpoint["worker_pid"] == worker.pid
+        assert checkpoint["intervention_id"] == "intervention-subprocess-crash"
+        assert isinstance(checkpoint["resume_generation"], int)
+        assert isinstance(checkpoint["resume_run_id"], str)
+        if phase == "post_claim_pre_spawn":
+            assert checkpoint["provider_pid"] is None
+        else:
+            provider_pid = checkpoint["provider_pid"]
+            assert isinstance(provider_pid, int) and provider_pid > 0
+            provider_cmdline = Path(f"/proc/{provider_pid}/cmdline").read_bytes()
+            assert str(fake_codex.resolve(strict=True)).encode() in provider_cmdline
+
+        # SIGKILL is intentionally the only worker shutdown: no TestClient,
+        # Hub, Coordinator, or ProcessRunner cleanup is invoked in that process.
+        worker.kill()
+        worker_output, worker_errors = worker.communicate(timeout=3)
+        assert worker.returncode == -signal.SIGKILL
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        if worker.returncode is None:
+            worker_output, worker_errors = worker.communicate(timeout=3)
+        if provider_pid is not None:
+            try:
+                os.kill(provider_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    layout = _crash_recovery_bridge_layout(
+        root, fake_claude=fake_claude, fake_codex=fake_codex,
+    )
+    reopened, recovered = _reopen_fake_bridge(layout)
+    try:
+        record = reopened.store.intervention("intervention-subprocess-crash")
+        assert record is not None
+        assert record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert record.resume_run_id == checkpoint["resume_run_id"]
+        assert reopened.store.get_task(record.task_id, record.revision).state is TaskState.INTERRUPTED
+        assert recovered.tasks_interrupted == 1
+        if phase == "post_claim_pre_spawn":
+            # Claiming reserves the exact identifier but no child exists until
+            # the adapter crosses its spawn boundary.
+            with pytest.raises(RuntimeError, match="agent run not found"):
+                reopened.store.agent_run(record.resume_run_id)
+            assert recovered.agent_runs_interrupted == 0
+        else:
+            assert reopened.store.agent_run(record.resume_run_id).status == "interrupted"
+            assert recovered.agent_runs_interrupted == 1
+        calls_at_crash = _model_invocations(reopened)
+    finally:
+        reopened.close()
+
+    repeated, repeated_recovery = _reopen_fake_bridge(layout)
+    try:
+        unknown = repeated.store.intervention("intervention-subprocess-crash")
+        assert unknown is not None
+        assert unknown.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert repeated_recovery == store_module.RecoverySummary(0, 0, 0)
+        assert _model_invocations(repeated) == calls_at_crash
+
+        authorized = repeated.store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id=f"subprocess-ack-{phase}",
+        )
+        assert authorized.status is InterventionStatus.READY
+        duplicate = repeated.store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id=f"subprocess-ack-{phase}",
+        )
+        assert duplicate == authorized
+        codex_calls_before_retry = [
+            call for call in _model_invocations(repeated) if call["kind"] == "codex"
+        ]
+        asyncio.run(repeated.coordinator.dispatch_ready_intervention(authorized.intervention_id))
+        completed = repeated.store.intervention(authorized.intervention_id)
+        assert completed is not None
+        assert completed.status is InterventionStatus.RESUMED
+        codex_calls_after_retry = [
+            call for call in _model_invocations(repeated) if call["kind"] == "codex"
+        ]
+        assert len(codex_calls_after_retry) == len(codex_calls_before_retry) + 1
+        assert repeated.live_call_count == 0
+    finally:
+        repeated.close()
 
 
 def test_directed_conversation_uses_exact_visible_fake_workflow_boundaries(
