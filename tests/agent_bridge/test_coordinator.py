@@ -2076,6 +2076,44 @@ def test_continue_intervention_freshly_gates_claims_dispatches_and_releases_leas
     asyncio.run(scenario())
 
 
+def test_resumed_sol_persists_its_exact_thread_before_provider_invocation(harness) -> None:
+    """A live resumed Sol run is eligible for an exact interruption immediately."""
+    async def scenario() -> None:
+        ready = await _ready_sol_intervention(
+            harness, intervention_id="resume-thread-before-provider",
+        )
+        provider_entered = asyncio.Event()
+        release_provider = asyncio.Event()
+        observed_sessions: list[str | None] = []
+
+        def inspect_active_run() -> None:
+            run_id = harness.sol.resume_run_ids[-1]
+            active = harness.store.agent_run(run_id)
+            assert active.status == "running"
+            observed_sessions.append(active.cli_session_id)
+            provider_entered.set()
+
+        harness.sol.on_resume = inspect_active_run
+        harness.sol.hold_resume = release_provider
+        dispatch = asyncio.create_task(
+            harness.coordinator.dispatch_ready_intervention(ready.intervention_id),
+        )
+        await provider_entered.wait()
+        resumed_run_id = harness.sol.resume_run_ids[-1]
+        active = harness.store.agent_run(resumed_run_id)
+        assert observed_sessions == [THREAD_ID]
+        assert active.cli_session_id == THREAD_ID
+        release_provider.set()
+        await dispatch
+
+        record = harness.store.intervention(ready.intervention_id)
+        assert record is not None
+        assert record.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert record.resume_run_id == resumed_run_id
+
+    asyncio.run(scenario())
+
+
 def test_fable_early_planning_intervention_dispatches_its_persisted_guidance(harness) -> None:
     """An early Fable continuation must receive durable guidance before a new plan starts."""
     async def scenario() -> None:
@@ -2711,7 +2749,7 @@ def test_fable_review_intervention_resumes_exact_session_with_durable_guidance(
         assert active is not None
         assert task.state is TaskState.FABLE_REVIEWING
         assert task.fable_session_id is not None
-        harness.store.set_agent_run_session(active.run_id, task.fable_session_id)
+        assert active.cli_session_id == task.fable_session_id
 
         async def fable_probe() -> tuple[bool, str]:
             return True, "subscription_ready"
@@ -6504,7 +6542,9 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
                 clarification_calls += 1
                 if clarification_calls == 2:
                     capture_crash_image()
-                    raise RuntimeError("controlled crash during next Fable provider")
+                    raise asyncio.CancelledError(
+                        "controlled process loss during next Fable provider"
+                    )
                 return await clarify(**kwargs)
 
             harness.fable.clarify = crash_during_next_fable  # type: ignore[method-assign]
@@ -6521,6 +6561,9 @@ def test_cross_route_nested_unknown_recovers_twice_then_retries_one_bound_questi
 
         if not continuing.done():
             continuing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await continuing
+        elif crash_boundary == "during_next_fable":
             with pytest.raises(asyncio.CancelledError):
                 await continuing
         else:

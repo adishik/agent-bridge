@@ -2418,6 +2418,7 @@ class Coordinator:
             else:
                 if task.sol_thread_id is None:
                     raise RuntimeError("Sol resume requires an exact thread")
+                self._store.set_agent_run_session(run_id, task.sol_thread_id)
                 result = await self._sol.resume(
                     run_id=run_id,
                     thread_id=task.sol_thread_id,
@@ -3411,7 +3412,12 @@ class Coordinator:
                 run_id, status="completed", exit_code=result.exit_code,
             )
         except asyncio.CancelledError:
-            self._finish_interrupted_run(run_id, exit_code=-1)
+            if intervention_invocation is None:
+                self._finish_interrupted_run(run_id, exit_code=-1)
+            else:
+                self._interrupt_intervention_invocation(
+                    run_id, task.task_id, task.revision, task.state,
+                )
             raise
         except _InterventionValidationError:
             self._interrupt_intervention_invocation(
@@ -4062,6 +4068,7 @@ class Coordinator:
         ):
             raise RuntimeError("intervention review invocation changed")
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+        self._store.set_agent_run_session(run_id, task.fable_session_id)
         completion = self._track_run(run_id)
         try:
             result = await self._fable.review(
@@ -4967,7 +4974,10 @@ class Coordinator:
                     and binding.kind == "nested_resume"
                     and binding.stage == "active_question"
                     and binding.source_agent is ConversationTarget.SOL
-                    and binding.source_run_id == run_id
+                    and (
+                        binding.source_run_id == run_id
+                        or intervention.resume_run_id == run_id
+                    )
                 )
                 else None
             )

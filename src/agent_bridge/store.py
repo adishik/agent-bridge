@@ -73,6 +73,10 @@ _INTERVENTION_ACKNOWLEDGMENT_MIGRATION_SETTING_KEY = (
     "agent_bridge.internal.intervention_acknowledgment_migration.v1"
 )
 _INTERVENTION_ACKNOWLEDGMENT_MIGRATION_VERSION = 1
+_NESTED_INTERVENTION_CHILD_LINEAGE_SETTING_PREFIX = (
+    "agent_bridge.internal.nested_intervention_child."
+)
+_NESTED_INTERVENTION_CHILD_LINEAGE_VERSION = 1
 _INTERNAL_SETTING_PREFIX = "agent_bridge.internal."
 _MAX_LEGACY_AUDIT_REASONS = 8
 _MAX_PREPARED_TEXT_LENGTH = 16 * 1024
@@ -1483,6 +1487,116 @@ class _InterventionAcknowledgmentLineage:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _NestedInterventionChildLineage:
+    """Private immutable identity for one active nested Sol child."""
+
+    intervention_id: str
+    session_id: str
+    task_id: str
+    revision: int
+    source_generation: int
+    resume_generation: int
+    resume_attempt_id: str | None
+    resume_run_id: str | None
+    fable_session_id: str
+    sol_thread_id: str
+    directed_binding_json: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "intervention_id", "session_id", "task_id", "fable_session_id",
+            "sol_thread_id",
+        ):
+            object.__setattr__(self, name, _prepared_identifier(getattr(self, name), name))
+        for name in ("resume_attempt_id", "resume_run_id"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _prepared_identifier(value, name))
+        if (self.resume_attempt_id is None) != (self.resume_run_id is None):
+            raise ValueError("nested intervention child lineage owner is incomplete")
+        for name in ("revision", "source_generation", "resume_generation"):
+            value = _require_integer(getattr(self, name), name)
+            if value < (0 if name == "revision" else 1):
+                raise ValueError("nested intervention child lineage generation is invalid")
+            object.__setattr__(self, name, value)
+        raw = _require_string(
+            self.directed_binding_json, "nested intervention child lineage binding",
+        )
+        binding = _decode_intervention_directed_binding(raw)
+        if (
+            binding is None
+            or raw != _encode_intervention_directed_binding(binding)
+            or binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.source_agent is not ConversationTarget.SOL
+        ):
+            raise ValueError("nested intervention child lineage binding is invalid")
+        object.__setattr__(self, "directed_binding_json", raw)
+
+    @classmethod
+    def from_record(
+        cls, record: InterventionRecord, binding: _InterventionDirectedBinding,
+    ) -> "_NestedInterventionChildLineage":
+        if record.fable_session_id is None or record.sol_thread_id is None:
+            raise RuntimeError("nested intervention child lineage owner is incomplete")
+        return cls(
+            intervention_id=record.intervention_id,
+            session_id=record.session_id,
+            task_id=record.task_id,
+            revision=record.revision,
+            source_generation=record.source_generation,
+            resume_generation=record.resume_generation,
+            resume_attempt_id=record.resume_attempt_id,
+            resume_run_id=record.resume_run_id,
+            fable_session_id=record.fable_session_id,
+            sol_thread_id=record.sol_thread_id,
+            directed_binding_json=_encode_intervention_directed_binding(binding),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "directed_binding_json": self.directed_binding_json,
+            "fable_session_id": self.fable_session_id,
+            "intervention_id": self.intervention_id,
+            "resume_attempt_id": self.resume_attempt_id,
+            "resume_generation": self.resume_generation,
+            "resume_run_id": self.resume_run_id,
+            "revision": self.revision,
+            "session_id": self.session_id,
+            "sol_thread_id": self.sol_thread_id,
+            "source_generation": self.source_generation,
+            "task_id": self.task_id,
+            "version": _NESTED_INTERVENTION_CHILD_LINEAGE_VERSION,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "_NestedInterventionChildLineage":
+        expected_keys = {
+            "directed_binding_json", "fable_session_id", "intervention_id",
+            "resume_attempt_id", "resume_generation", "resume_run_id", "revision",
+            "session_id", "sol_thread_id", "source_generation", "task_id", "version",
+        }
+        if (
+            set(value) != expected_keys
+            or value.get("version") != _NESTED_INTERVENTION_CHILD_LINEAGE_VERSION
+        ):
+            raise ValueError("nested intervention child lineage is invalid")
+        return cls(
+            intervention_id=value["intervention_id"],
+            session_id=value["session_id"],
+            task_id=value["task_id"],
+            revision=value["revision"],
+            source_generation=value["source_generation"],
+            resume_generation=value["resume_generation"],
+            resume_attempt_id=value["resume_attempt_id"],
+            resume_run_id=value["resume_run_id"],
+            fable_session_id=value["fable_session_id"],
+            sol_thread_id=value["sol_thread_id"],
+            directed_binding_json=value["directed_binding_json"],
+        )
+
+
 @dataclass(frozen=True)
 class TaskOverview:
     """Safe task-list metadata without agent continuation identities or PIDs."""
@@ -2496,6 +2610,9 @@ class SQLiteStore:
                     raise RuntimeError(
                         "intervention directed binding migration is unauthenticated"
                     )
+                self._refresh_nested_intervention_child_lineage_after_binding_migration(
+                    record,
+                )
 
     def _migrate_intervention_directed_binding_row(self, row: sqlite3.Row) -> bool:
         raw = row["directed_binding_json"]
@@ -4014,6 +4131,13 @@ class SQLiteStore:
                         raise RuntimeError(
                             "nested intervention binding changed concurrently"
                         )
+                    rebound = self._intervention_required(intervention.intervention_id)
+                    if rebound.directed_binding != binding:
+                        raise RuntimeError("nested intervention binding changed concurrently")
+                    self._insert_nested_intervention_child_lineage(
+                        record=rebound,
+                        binding=binding,
+                    )
                 if completed_stage is not None:
                     emitted.append(self._insert_event_in_transaction(
                         session_id,
@@ -4226,6 +4350,10 @@ class SQLiteStore:
                         raise RuntimeError(
                             "nested intervention next Fable binding changed concurrently"
                         )
+                    self._delete_nested_intervention_child_lineage(
+                        record=intervention,
+                        binding=binding,
+                    )
                 emitted.append(self._insert_conversation_event_in_transaction(
                     session_id=session_id, task_id=task_id, event=event,
                 ))
@@ -8759,7 +8887,10 @@ class SQLiteStore:
                         or binding.continuation_pause_id != question_pause
                         or binding.continuation_state is not continuation
                         or binding.question_generation != task.continuation_generation
-                        or binding.source_run_id != run_id
+                        or (
+                            binding.source_run_id != run_id
+                            and owner.resume_run_id != run_id
+                        )
                         or binding.source_agent is not ConversationTarget.SOL
                         or binding.source_provider_id != source.cli_session_id
                         or binding.asked_by is not question.asked_by
@@ -9710,10 +9841,11 @@ class SQLiteStore:
         return 0 if row is None else int(row["sequence"])
 
     def intervention(self, intervention_id: str) -> InterventionRecord | None:
-        row = self._connection.execute(
-            "SELECT * FROM interventions WHERE intervention_id = ?",
-            (_prepared_identifier(intervention_id, "intervention_id"),),
-        ).fetchone()
+        with self._event_listener_lock:
+            row = self._connection.execute(
+                "SELECT * FROM interventions WHERE intervention_id = ?",
+                (_prepared_identifier(intervention_id, "intervention_id"),),
+            ).fetchone()
         return None if row is None else self._intervention_from_row(row)
 
     def authenticated_intervention(self, intervention_id: str) -> InterventionRecord | None:
@@ -10519,6 +10651,11 @@ class SQLiteStore:
             self._verify_prepared_project_identity(project_id, session_id)
             task = self._prepared_task_exact(session_id, task_id, revision)
             record = self._intervention_required(intervention_id)
+            row = self._connection.execute(
+                "SELECT acknowledgment_id FROM interventions WHERE intervention_id = ?",
+                (intervention_id,),
+            ).fetchone()
+            acknowledgment_id = None if row is None else row["acknowledgment_id"]
             source_run = self.agent_run(source_run_id)
             if (
                 record.session_id != session_id
@@ -10684,6 +10821,14 @@ class SQLiteStore:
                     or intervention_cursor.rowcount != 1
                 ):
                     raise RuntimeError("fresh Fable intervention changed concurrently")
+                if acknowledgment_id is not None:
+                    self._refresh_intervention_acknowledgment_fable_session(
+                        record=record,
+                        acknowledgment_id=_prepared_identifier(
+                            acknowledgment_id, "acknowledgment_id",
+                        ),
+                        fable_session_id=fable_session_id,
+                    )
             else:
                 raise RuntimeError("fresh Fable intervention continuation changed")
         return self._intervention_required(intervention_id)
@@ -10736,6 +10881,16 @@ class SQLiteStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention resume claim changed concurrently")
+            claimed = self._intervention_required(intervention_id)
+            binding = record.directed_binding
+            if binding is not None and binding.kind == "nested_resume" and (
+                binding.stage == "active_question"
+            ):
+                self._advance_nested_intervention_child_lineage(
+                    record=record,
+                    acknowledged=claimed,
+                    binding=binding,
+                )
             if acknowledgment_id is not None:
                 self._replace_intervention_acknowledgment_retry_owner(
                     record=record,
@@ -10996,6 +11151,15 @@ class SQLiteStore:
                 )
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention resume claim changed concurrently")
+            resumed = self._intervention_required(intervention_id)
+            if binding is not None and binding.kind == "nested_resume" and (
+                binding.stage == "active_question"
+            ):
+                self._advance_nested_intervention_child_lineage(
+                    record=record,
+                    acknowledged=resumed,
+                    binding=binding,
+                )
             if acknowledgment_id is not None:
                 self._replace_intervention_acknowledgment_retry_owner(
                     record=record,
@@ -11406,14 +11570,46 @@ class SQLiteStore:
                 or record.resume_run_id != resume_run_id
             ):
                 raise RuntimeError("intervention resume owner changed")
-            if not self._intervention_is_authenticated(
-                record, acknowledgment_id, terminal_outcome="unknown",
-            ):
+            if not self._intervention_is_authenticated(record, acknowledgment_id):
                 raise RuntimeError("intervention binding is not authenticated")
             if record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN:
                 return record
             if record.status is not InterventionStatus.RESUMING:
                 raise RuntimeError("intervention outcome is not pending")
+            completed_nested_child = (
+                self._completed_nested_child_before_answer_is_authenticated(
+                    record=record,
+                    task=self.get_task(record.task_id, record.revision),
+                )
+            )
+            if not completed_nested_child and not self._intervention_is_authenticated(
+                record, acknowledgment_id, terminal_outcome="unknown",
+            ):
+                raise RuntimeError("intervention binding is not authenticated")
+            if completed_nested_child:
+                task = self.get_task(record.task_id, record.revision)
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state = ?
+                    WHERE task_id = ? AND revision = ? AND session_id = ?
+                      AND state = ? AND continuation_state = ?
+                      AND continuation_generation = ? AND pending_json = ?
+                      AND continuation_pause_id = ?
+                    """,
+                    (
+                        TaskState.INTERRUPTED.value,
+                        record.task_id,
+                        record.revision,
+                        record.session_id,
+                        TaskState.AWAITING_USER_INPUT.value,
+                        TaskState.FABLE_CLARIFYING.value,
+                        record.resume_generation,
+                        _encode_json(task.pending),
+                        record.directed_binding.continuation_pause_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("intervention completed child state changed")
             cursor = self._connection.execute(
                 """
                 UPDATE interventions SET status = ?, acknowledgment_id = NULL
@@ -11594,6 +11790,14 @@ class SQLiteStore:
             if cursor.rowcount != 1:
                 raise RuntimeError("intervention retry authorization changed concurrently")
             acknowledged = self._intervention_required(intervention_id)
+            if binding is not None and binding.kind == "nested_resume" and (
+                binding.stage == "active_question"
+            ):
+                self._advance_nested_intervention_child_lineage(
+                    record=record,
+                    acknowledged=acknowledged,
+                    binding=binding,
+                )
             if not self._intervention_is_authenticated(
                 acknowledged,
                 acknowledgment_id,
@@ -12425,6 +12629,8 @@ class SQLiteStore:
             self._validate_nested_question_rows_in_transaction()
         except RuntimeError:
             reasons.add("question_integrity")
+        if not self._nested_intervention_child_lineages_are_valid():
+            reasons.add("nested_child_lineage_integrity")
         if has_row(
             """
             SELECT 1 FROM sessions
@@ -13241,6 +13447,39 @@ class SQLiteStore:
         if cursor.rowcount != 1:
             raise RuntimeError("intervention acknowledgment lineage changed concurrently")
 
+    def _refresh_intervention_acknowledgment_fable_session(
+        self,
+        *,
+        record: InterventionRecord,
+        acknowledgment_id: str,
+        fable_session_id: str,
+    ) -> None:
+        """Bind an acknowledged fresh-plan retry to its sole first Fable session."""
+        if record.fable_session_id is not None:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+        lineage = self._intervention_acknowledgment_lineage(record)
+        if (
+            lineage is None
+            or not self._intervention_acknowledgment_lineage_matches(
+                lineage, record, acknowledgment_id,
+            )
+        ):
+            raise RuntimeError("intervention acknowledgment lineage is not authenticated")
+        next_lineage = replace(lineage, fable_session_id=fable_session_id)
+        key = self._intervention_acknowledgment_lineage_key(record.intervention_id)
+        cursor = self._connection.execute(
+            """
+            UPDATE settings SET value_json = ?
+            WHERE key = ? AND value_json = ?
+            """,
+            (
+                _encode_json(next_lineage.to_dict()), key,
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("intervention acknowledgment lineage changed concurrently")
+
     def _delete_intervention_acknowledgment_lineage(
         self, record: InterventionRecord, acknowledgment_id: str,
     ) -> None:
@@ -13282,6 +13521,252 @@ class SQLiteStore:
         except (RuntimeError, ValueError, TypeError):
             return False
 
+    @staticmethod
+    def _nested_intervention_child_lineage_key(intervention_id: str) -> str:
+        return (
+            f"{_NESTED_INTERVENTION_CHILD_LINEAGE_SETTING_PREFIX}"
+            f"{_prepared_identifier(intervention_id, 'intervention_id')}"
+        )
+
+    def _nested_intervention_child_lineage_is_unique(
+        self, *, intervention_id: str, key: str,
+    ) -> bool:
+        rows = self._connection.execute(
+            """
+            SELECT key FROM settings
+            WHERE key LIKE ?
+              AND CASE WHEN json_valid(value_json)
+                       THEN json_extract(value_json, '$.intervention_id') END = ?
+            ORDER BY key LIMIT 2
+            """,
+            (f"{_NESTED_INTERVENTION_CHILD_LINEAGE_SETTING_PREFIX}%", intervention_id),
+        ).fetchall()
+        return len(rows) == 1 and rows[0]["key"] == key
+
+    def _nested_intervention_child_lineage(
+        self, record: InterventionRecord,
+    ) -> _NestedInterventionChildLineage | None:
+        key = self._nested_intervention_child_lineage_key(record.intervention_id)
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise RuntimeError("nested intervention child lineage is invalid")
+        try:
+            raw = _require_string(rows[0]["value_json"], "nested intervention child lineage")
+            lineage = _NestedInterventionChildLineage.from_dict(
+                _decode_mapping(raw, "nested intervention child lineage")
+            )
+        except (RuntimeError, ValueError, TypeError) as error:
+            raise RuntimeError("nested intervention child lineage is invalid") from error
+        if (
+            raw != _encode_json(lineage.to_dict())
+            or lineage.intervention_id != record.intervention_id
+            or not self._nested_intervention_child_lineage_is_unique(
+                intervention_id=record.intervention_id, key=key,
+            )
+        ):
+            raise RuntimeError("nested intervention child lineage is invalid")
+        return lineage
+
+    @staticmethod
+    def _nested_intervention_child_lineage_matches(
+        lineage: _NestedInterventionChildLineage,
+        record: InterventionRecord,
+        binding: _InterventionDirectedBinding,
+    ) -> bool:
+        return (
+            lineage.intervention_id == record.intervention_id
+            and lineage.session_id == record.session_id
+            and lineage.task_id == record.task_id
+            and lineage.revision == record.revision
+            and lineage.source_generation == record.source_generation
+            and lineage.resume_generation == record.resume_generation
+            and lineage.resume_attempt_id == record.resume_attempt_id
+            and lineage.resume_run_id == record.resume_run_id
+            and lineage.fable_session_id == record.fable_session_id
+            and lineage.sol_thread_id == record.sol_thread_id
+            and lineage.directed_binding_json == _encode_intervention_directed_binding(binding)
+        )
+
+    def _refresh_nested_intervention_child_lineage_after_binding_migration(
+        self, record: InterventionRecord,
+    ) -> None:
+        """Advance a private anchor only after the strict binding migration succeeds."""
+        lineage = self._nested_intervention_child_lineage(record)
+        if lineage is None:
+            return
+        binding = record.directed_binding
+        if binding is None:
+            raise RuntimeError("nested intervention child lineage is unauthenticated")
+        if (
+            lineage.intervention_id != record.intervention_id
+            or lineage.session_id != record.session_id
+            or lineage.task_id != record.task_id
+            or lineage.revision != record.revision
+            or lineage.source_generation != record.source_generation
+            or lineage.resume_generation != record.resume_generation
+            or lineage.resume_attempt_id != record.resume_attempt_id
+            or lineage.resume_run_id != record.resume_run_id
+            or lineage.fable_session_id != record.fable_session_id
+            or lineage.sol_thread_id != record.sol_thread_id
+        ):
+            raise RuntimeError("nested intervention child lineage is unauthenticated")
+        if self._nested_intervention_child_lineage_matches(lineage, record, binding):
+            return
+        next_lineage = _NestedInterventionChildLineage.from_record(record, binding)
+        cursor = self._connection.execute(
+            """
+            UPDATE settings SET value_json = ?
+            WHERE key = ? AND value_json = ?
+            """,
+            (
+                _encode_json(next_lineage.to_dict()),
+                self._nested_intervention_child_lineage_key(record.intervention_id),
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+
+    def _insert_nested_intervention_child_lineage(
+        self,
+        *,
+        record: InterventionRecord,
+        binding: _InterventionDirectedBinding,
+    ) -> None:
+        if (
+            binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.source_agent is not ConversationTarget.SOL
+        ):
+            raise RuntimeError("nested intervention child lineage owner is incomplete")
+        lineage = _NestedInterventionChildLineage.from_record(record, binding)
+        key = self._nested_intervention_child_lineage_key(record.intervention_id)
+        if self._connection.execute(
+            "SELECT 1 FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchone() is not None:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+        if self._connection.execute(
+            """
+            SELECT 1 FROM settings
+            WHERE key LIKE ?
+              AND CASE WHEN json_valid(value_json)
+                       THEN json_extract(value_json, '$.intervention_id') END = ?
+            LIMIT 1
+            """,
+            (
+                f"{_NESTED_INTERVENTION_CHILD_LINEAGE_SETTING_PREFIX}%",
+                record.intervention_id,
+            ),
+        ).fetchone() is not None:
+            raise RuntimeError("nested intervention child lineage is ambiguous")
+        encoded = _encode_json(lineage.to_dict())
+        try:
+            self._connection.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)", (key, encoded),
+            )
+        except sqlite3.IntegrityError as error:
+            raise RuntimeError(
+                "nested intervention child lineage changed concurrently"
+            ) from error
+        rows = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ? LIMIT 2", (key,),
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["value_json"] != encoded:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+
+    def _advance_nested_intervention_child_lineage(
+        self,
+        *,
+        record: InterventionRecord,
+        acknowledged: InterventionRecord,
+        binding: _InterventionDirectedBinding,
+    ) -> None:
+        lineage = self._nested_intervention_child_lineage(record)
+        if lineage is None:
+            return
+        if not self._nested_intervention_child_lineage_matches(lineage, record, binding):
+            raise RuntimeError("nested intervention child lineage is not authenticated")
+        acknowledged_binding = acknowledged.directed_binding
+        if acknowledged_binding is None:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+        next_lineage = _NestedInterventionChildLineage.from_record(
+            acknowledged, acknowledged_binding,
+        )
+        key = self._nested_intervention_child_lineage_key(record.intervention_id)
+        cursor = self._connection.execute(
+            """
+            UPDATE settings SET value_json = ?
+            WHERE key = ? AND value_json = ?
+            """,
+            (
+                _encode_json(next_lineage.to_dict()),
+                key,
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+
+    def _delete_nested_intervention_child_lineage(
+        self,
+        *,
+        record: InterventionRecord,
+        binding: _InterventionDirectedBinding,
+    ) -> None:
+        lineage = self._nested_intervention_child_lineage(record)
+        if lineage is None:
+            return
+        if not self._nested_intervention_child_lineage_matches(lineage, record, binding):
+            raise RuntimeError("nested intervention child lineage is not authenticated")
+        cursor = self._connection.execute(
+            "DELETE FROM settings WHERE key = ? AND value_json = ?",
+            (
+                self._nested_intervention_child_lineage_key(record.intervention_id),
+                _encode_json(lineage.to_dict()),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("nested intervention child lineage changed concurrently")
+
+    def _nested_intervention_child_lineages_are_valid(self) -> bool:
+        """Validate every private nested-child anchor during the startup audit."""
+        for row in self._connection.execute(
+            """
+            SELECT key, value_json FROM settings
+            WHERE key LIKE ? ORDER BY key
+            """,
+            (f"{_NESTED_INTERVENTION_CHILD_LINEAGE_SETTING_PREFIX}%",),
+        ):
+            try:
+                key = _require_string(row["key"], "nested intervention child lineage key")
+                raw = _require_string(
+                    row["value_json"], "nested intervention child lineage",
+                )
+                lineage = _NestedInterventionChildLineage.from_dict(
+                    _decode_mapping(raw, "nested intervention child lineage")
+                )
+                record = self._intervention_required(lineage.intervention_id)
+                binding = record.directed_binding
+                if (
+                    key != self._nested_intervention_child_lineage_key(
+                        lineage.intervention_id,
+                    )
+                    or raw != _encode_json(lineage.to_dict())
+                    or binding is None
+                    or not self._nested_intervention_child_lineage_matches(
+                        lineage, record, binding,
+                    )
+                    or self._nested_intervention_child_lineage(record) != lineage
+                ):
+                    return False
+            except (RuntimeError, ValueError, TypeError):
+                return False
+        return True
+
     def _intervention_resume_run_is_authenticated(
         self, record: InterventionRecord, task: TaskRecord,
     ) -> bool:
@@ -13318,6 +13803,7 @@ class SQLiteStore:
                     expected_agent = binding.source_agent
                     expected_provider = binding.source_provider_id
                 elif record.resume_run_id != binding.next_predecessor_run_id:
+                    expected_run_id = binding.source_run_id
                     expected_agent = binding.source_agent
                     expected_provider = binding.source_provider_id
         if expected_run_id is None or (
@@ -13443,6 +13929,69 @@ class SQLiteStore:
         except RuntimeError:
             return False
         return child.status == "interrupted"
+
+    def _completed_nested_child_before_answer_is_authenticated(
+        self,
+        *,
+        record: InterventionRecord,
+        task: TaskRecord,
+    ) -> bool:
+        """Recognize only the atomic completed-child/pre-answer crash image."""
+        binding = record.directed_binding
+        if (
+            record.status is not InterventionStatus.RESUMING
+            or binding is None
+            or binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.source_agent is not ConversationTarget.SOL
+            or binding.continuation_state is not TaskState.FABLE_CLARIFYING
+            or record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state not in _SOL_TASK_STATES
+            or record.resume_run_id is None
+            or binding.next_predecessor_run_id != record.resume_run_id
+            or task.state is not TaskState.AWAITING_USER_INPUT
+            or task.continuation_state is not TaskState.FABLE_CLARIFYING
+            or task.continuation_generation != record.resume_generation
+        ):
+            return False
+        try:
+            question, continuation, pending, pause = self._question_exact(
+                session_id=record.session_id,
+                task_id=record.task_id,
+                revision=record.revision,
+                expected_generation=record.resume_generation,
+                question_id=binding.question_id,
+            )
+            child = self.agent_run(binding.source_run_id)
+            predecessor = self.agent_run(binding.next_predecessor_run_id)
+        except (RuntimeError, ValueError):
+            return False
+        try:
+            lineage = self._nested_intervention_child_lineage(record)
+        except RuntimeError:
+            return False
+        return (
+            lineage is not None
+            and self._nested_intervention_child_lineage_matches(
+                lineage, record, binding,
+            )
+            and
+            question.answer_text is None
+            and question.answered_by is None
+            and continuation is TaskState.FABLE_CLARIFYING
+            and pending == task.pending
+            and pause == binding.continuation_pause_id
+            and child.task_id == record.task_id
+            and child.revision == record.revision
+            and child.agent == ConversationTarget.SOL.value
+            and child.cli_session_id == binding.source_provider_id
+            and child.status == "completed"
+            and predecessor.task_id == record.task_id
+            and predecessor.revision == record.revision
+            and predecessor.agent == ConversationTarget.FABLE.value
+            and predecessor.cli_session_id == record.fable_session_id
+            and predecessor.status == "completed"
+        )
 
     def _intervention_is_authenticated(
         self,

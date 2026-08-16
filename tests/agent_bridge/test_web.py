@@ -1212,6 +1212,55 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       }}
       const stopRequests = fetchCalls.filter((call) => call.url.endsWith("/tasks/intervene-task/stop"));
       if (stopRequests.length !== 4 || stopRequests.some((call) => call.options.body !== "null")) process.exit(46);
+      projectBootstrap.fable_ready = true;
+      projectBootstrap.fable_status = "subscription_ready";
+      projectBootstrap.sol_status = "ready";
+      projectBootstrap.tasks[1] = {{...projectBootstrap.tasks[1], state: "fable_planning", intervention: {{
+        intervention_id: "safe-resume", status: "ready", resume_generation: 8, eligible: true,
+      }}}};
+      await refreshFromEvent(persistedEvent.sequence + 140);
+      await nodes["intervene-control"].emit("click");
+      await flush();
+      const safeResume = fetchCalls.find((call) => call.url.endsWith("/interventions/safe-resume/resume"));
+      if (!safeResume || safeResume.options.body !== '{{"expected_resume_generation":8}}'
+          || !nodes["conversation-status"].textContent.includes("resume accepted")) process.exit(67);
+
+      projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], revision: 1,
+        continuation_generation: 8, state: "awaiting_user_input", intervention: null,
+        pending_question: {{question_id: "browser-question-1", asked_by: "sol", addressed_to: "user",
+          routed_to: "user", text: "Which exact approved option should Sol use?",
+          revision: 1, continuation_generation: 8}},
+        exchange_permission: {{request_id: "browser-grant-1", revision: 1, continuation_generation: 8}},
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 141);
+      await nodes["task-list"].children[1].children[0].querySelector("button").emit("click");
+      const actionCards = nodes["conversation"].children.filter((node) => node.className === "conversation-action-card");
+      const questionCard = actionCards.find((card) => card.textContent.includes("Which exact approved option"));
+      const permissionCard = actionCards.find((card) => card.textContent.includes("Automatic exchange limit"));
+      if (!questionCard || !permissionCard || !questionCard.textContent.includes("Sol → You")
+          || !permissionCard.textContent.includes("Allow 3 more exchanges")) process.exit(68);
+      await questionCard.querySelector("button").emit("click");
+      nodes["message-input"].value = "Use the exact option already approved.";
+      await nodes["composer"].emit("submit");
+      await flush();
+      const answer = fetchCalls.find((call) => call.url.endsWith("/tasks/task-1/answer"));
+      if (!answer || answer.options.body !== '{{"text":"Use the exact option already approved.","revision":1,"question_id":"browser-question-1","continuation_generation":8}}') process.exit(69);
+      const refreshedPermission = nodes["conversation"].children.find((card) => card.className === "conversation-action-card" && card.textContent.includes("Automatic exchange limit"));
+      await refreshedPermission.querySelectorAll("button").at(-1).emit("click");
+      await flush();
+      const grant = fetchCalls.find((call) => call.url.endsWith("/tasks/task-1/exchanges/grant"));
+      if (!grant || grant.options.body !== '{{"revision":1,"continuation_generation":8,"request_id":"browser-grant-1"}}') process.exit(70);
+
+      projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], revision: 2,
+        continuation_generation: 9, state: "awaiting_user_approval", pending_question: null,
+        exchange_permission: null, brief: {{...projectBootstrap.tasks[0].brief, revision: 2}},
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 142);
+      await nodes["task-list"].children[1].children[0].querySelector("button").emit("click");
+      await nodes["task-inspector"].children[0].querySelector("button").emit("click");
+      await flush();
+      const approvals = fetchCalls.filter((call) => call.url.endsWith("/tasks/task-1/approve"));
+      if (approvals.at(-1).options.body !== '{{"revision":2}}') process.exit(71);
     """
     result = subprocess.run(
         [

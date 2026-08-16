@@ -117,11 +117,20 @@ remote loopback listener; it does not make Agent Bridge public.
 7. A bounded correction stays tied to the same task and revision lineage. If
    the requested change widens scope or cannot be resolved safely, the bridge
    escalates to the user instead of guessing.
-8. Use **Stop** to interrupt an active run. An interruption is recorded and
-   does not silently continue.
-9. Use **Resume** only after explicitly choosing to resume the interrupted
-   task. Reconnect first if the browser was closed; a historical process ID is
-   not evidence that work is still running.
+8. Use **Stop** to interrupt an active run. Stop wins over a pending
+   intervention, records the cancellation, and never silently continues the
+   interrupted process.
+9. Use **Intervene** to add a durable, visible instruction to the active
+   Fable or Sol run. The bridge persists that instruction before signaling the
+   exact owned process. Once a safe stop is confirmed, normal intervention
+   continuation is automatic; it is not a second browser-side agent launch.
+10. A planning interruption before Fable has issued its first session starts a
+    new Fable session and visibly says that continuity could not be preserved.
+    After either agent has a published session/thread, continuation uses that
+    exact identity instead of creating a substitute.
+11. Use **Resume** only for a safe, explicitly eligible interrupted task.
+    Reconnect first if the browser was closed; a historical process ID is not
+    evidence that work is still running.
 
 There is one hub-wide active workflow, not one per project. While a model
 workflow owns that lease, model-starting actions and opening another
@@ -151,7 +160,23 @@ asks the user to allow exactly three more; it never grants an open-ended agent
 conversation. A scope-changing answer creates the next revision and requires
 approval of that exact revision before Sol can continue. The user remains the
 control point for approvals, question answers, Stop, and Resume. Directed
-intervention and cross-project handoffs remain out of scope pending Phase 3.
+questions, interventions, and cross-project routing are bound to the selected
+project, chat, task, revision, and continuation generation; an identity mismatch
+fails closed.
+
+## Workspace controls and accessibility
+
+The project and task drawers support keyboard opening, focus containment, and
+Escape to return focus to the controlling button. Activity is an expandable,
+sanitized audit summary rather than raw provider output. Labels such as Fable,
+Sol, task state, and connection status remain visible alongside the warm-copper
+color treatment; color alone is not the state signal.
+
+The browser cannot grant itself authority. It submits only the selected
+project/chat/task identity and server-issued generations. Questions are answered
+through their exact visible cards; the +3 exchange control grants only that
+bounded increment for its exact permission. Intervene, Stop, Resume, and an
+unknown-outcome acknowledgement all remain server-authorized actions.
 
 ## Repository safety
 
@@ -208,6 +233,27 @@ On startup, the latest active revision is recovered as interrupted rather than
 being assumed safe to continue. Historical process IDs and process-group IDs
 are inert records for audit and recovery; they are never treated as permission
 to signal or resume a process. Resume is always an explicit user action.
+
+An intervention claim that is interrupted by a bridge crash is deliberately
+more conservative: its outcome becomes **unknown** and the bridge performs no
+automatic replay, including after repeated restarts. The workspace warns that
+the prior attempt may have executed. A new attempt requires an authenticated,
+unique acknowledgement of that risk; ordinary Resume is unavailable for that
+state. This produces one newly identified retry only after the acknowledgement.
+
+The provider CLIs do not offer a transactional idempotency key. Accordingly,
+Agent Bridge does not claim exactly-once provider execution across a crash.
+The UNKNOWN path is a safety boundary, not proof that a provider call did or
+did not happen.
+
+## Verification limits
+
+The automated end-to-end coverage uses only temporary Git repositories and
+absolute fake Claude/Codex executables behind the real registry, hub, FastAPI,
+coordinator, SQLite, and browser-controller boundaries. It makes no live
+provider or network calls. It validates scoped baseline preservation, including
+an allowed partial Sol edit, but it is not evidence about live provider
+behavior, real user deployments, clinical use, or clinical outcomes.
 
 ## Troubleshooting
 

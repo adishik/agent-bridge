@@ -4173,6 +4173,49 @@ def _seed_visible_intervention(
     return record
 
 
+def test_intervention_read_serializes_with_an_inflight_writer(
+    tmp_path, valid_brief,
+) -> None:
+    """A cross-thread browser read cannot use the shared connection mid-write."""
+    store = SQLiteStore(
+        tmp_path / "intervention-read-lock.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    store.create_session("session-1", "/repo")
+    expected = _seed_visible_intervention(
+        store,
+        valid_brief,
+        status=store_module.InterventionStatus.PENDING_STOP,
+    )
+    started = threading.Event()
+    completed = threading.Event()
+    observed: list[store_module.InterventionRecord | None] = []
+
+    def read_intervention() -> None:
+        started.set()
+        observed.append(store.intervention(expected.intervention_id))
+        completed.set()
+
+    with store._event_listener_lock:  # noqa: SLF001 - exact writer exclusion seam
+        reader = threading.Thread(target=read_intervention)
+        reader.start()
+        assert started.wait(timeout=1)
+        assert completed.wait(timeout=0.1) is False
+        with pytest.raises(RuntimeError, match="controlled writer failure"):
+            with store._immediate_transaction():  # noqa: SLF001 - writer rollback seam
+                store._connection.execute(  # noqa: SLF001 - exact rollback fixture
+                    "UPDATE interventions SET message = ? WHERE intervention_id = ?",
+                    ("must roll back", expected.intervention_id),
+                )
+                raise RuntimeError("controlled writer failure")
+    reader.join(timeout=1)
+
+    assert reader.is_alive() is False
+    assert observed == [expected]
+    store.close()
+
+
 def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read_only(
     tmp_path, valid_brief,
 ) -> None:
@@ -6596,30 +6639,99 @@ def _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief):
             continuation_generation=created.resume_generation,
             question_id="nested-question",
         ),
+        intervention_id=created.intervention_id,
+        child_run_id="nested-source-run",
     )
-    store.start_agent_run(
-        "nested-source-run", valid_brief.task_id, valid_brief.revision, "sol",
-    )
-    store.set_agent_run_session("nested-source-run", "provider-1")
-    store._connection.execute(
-        "UPDATE interventions SET directed_binding_json = NULL WHERE intervention_id = ?",
-        (created.intervention_id,),
-    )
-    with store._immediate_transaction():
-        rebound = store._bind_nested_intervention_resume_in_transaction(
-            store.intervention(created.intervention_id),
-            store.get_task(valid_brief.task_id, valid_brief.revision),
-        )
-    store._connection.execute(
-        """
-        UPDATE agent_runs SET agent = 'sol', cli_session_id = 'provider-1'
-        WHERE run_id = 'original-source-run'
-        """
-    )
+    rebound = store.intervention(created.intervention_id)
+    assert rebound is not None
     assert rebound.directed_binding is not None
     assert rebound.directed_binding.parent_question_id == "original-question"
     assert child.parent_question_id == "original-question"
     return rebound
+
+
+def test_nested_child_reservation_rolls_back_when_private_lineage_write_fails(
+    tmp_path, valid_brief, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed private child-lineage write must not publish a question or child run."""
+    store = _store(tmp_path)
+    created = _directed_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store._connection.execute(
+        "UPDATE tasks SET approved_at = ?, baseline_id = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", "baseline-1", valid_brief.task_id, valid_brief.revision),
+    )
+    store.start_agent_run("resume-run-1", valid_brief.task_id, valid_brief.revision, "fable")
+    store.set_agent_run_session("resume-run-1", "provider-1")
+    store.finish_agent_run("resume-run-1", status="completed", exit_code=0)
+    tables = (
+        "tasks", "interventions", "agent_runs", "questions", "exchange_reservations",
+        "events", "settings",
+    )
+    before = {
+        table: tuple(tuple(row) for row in store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    }
+
+    def fail_lineage(**_: object) -> None:
+        raise RuntimeError("injected child lineage failure")
+
+    monkeypatch.setattr(
+        store, "_insert_nested_intervention_child_lineage", fail_lineage,
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="injected child lineage failure"):
+        store.reserve_fable_answer_evidence_question(
+            session_id="session-1", task_id=valid_brief.task_id,
+            revision=valid_brief.revision, expected_generation=created.resume_generation,
+            outer_question_id="original-question", question_id="nested-question",
+            request_key="nested-request", text="Which exact nested fact applies?",
+            event=ConversationEnvelope(
+                sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                message_type=ConversationMessageType.QUESTION,
+                text="Which exact nested fact applies?", task_id=valid_brief.task_id,
+                revision=valid_brief.revision,
+                continuation_generation=created.resume_generation,
+                question_id="nested-question",
+            ),
+            intervention_id=created.intervention_id,
+            child_run_id="nested-source-run",
+        )
+
+    assert {
+        table: tuple(tuple(row) for row in store._connection.execute(  # noqa: SLF001
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ))
+        for table in tables
+    } == before
+
+
+@pytest.mark.parametrize("tamper", ("malformed", "duplicate"))
+def test_startup_audit_rejects_invalid_nested_child_lineage(
+    tmp_path, valid_brief, tamper: str,
+) -> None:
+    """The private child anchor is canonical and unique at startup."""
+    store = _store(tmp_path)
+    record = _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief)
+    key = store._nested_intervention_child_lineage_key(record.intervention_id)  # noqa: SLF001
+    if tamper == "malformed":
+        store._connection.execute(  # noqa: SLF001 - exact persisted corruption
+            "UPDATE settings SET value_json = ? WHERE key = ?", ("not-json", key),
+        )
+    else:
+        value = store._connection.execute(  # noqa: SLF001 - exact duplicate identity
+            "SELECT value_json FROM settings WHERE key = ?", (key,),
+        ).fetchone()["value_json"]
+        store._connection.execute(  # noqa: SLF001 - duplicate private identity
+            "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+            (f"{key}.duplicate", value),
+        )
+    store.set_setting("agent_bridge.active_session_id", "session-1")
+
+    with pytest.raises(RuntimeError, match="nested_child_lineage_integrity"):
+        store.audit_legacy_project_ownership("/repo")
 
 
 def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
@@ -6651,6 +6763,147 @@ def _next_fable_intervention_stage_for_tamper_matrix(store, valid_brief):
     assert stage is not None and stage.directed_binding is not None
     assert stage.directed_binding.stage == "next_fable"
     return stage
+
+
+def _completed_nested_child_before_answer_for_unknown(store, valid_brief):
+    """Build the sole exact completed-child/pre-answer crash image."""
+    claimed = _nested_parent_intervention_claim_for_tamper_matrix(store, valid_brief)
+    store.finish_agent_run("nested-source-run", status="completed", exit_code=0)
+    record = store.intervention(claimed.intervention_id)
+    assert record is not None and record.directed_binding is not None
+    assert record.directed_binding.stage == "active_question"
+    question = store.question(record.directed_binding.question_id)
+    task = store.get_task(record.task_id, record.revision)
+    assert question is not None and question.answer_text is None
+    assert task.state is TaskState.AWAITING_USER_INPUT
+    return record
+
+
+def test_completed_nested_child_before_answer_becomes_recoverable_unknown(
+    tmp_path, valid_brief,
+) -> None:
+    """Dropping the atomic pre-answer crash transition would strand one exact child."""
+    store = _store(tmp_path)
+    record = _completed_nested_child_before_answer_for_unknown(store, valid_brief)
+    assert record.resume_attempt_id is not None
+    assert record.resume_run_id is not None
+    binding = record.directed_binding
+    assert binding is not None
+    before_question = store.question(binding.question_id)
+    assert before_question is not None
+    before_pause = store._connection.execute(  # noqa: SLF001 - exact persisted pause
+        "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+        (record.task_id, record.revision),
+    ).fetchone()["continuation_pause_id"]
+
+    unknown = store.mark_resume_outcome_unknown(
+        record.intervention_id,
+        resume_attempt_id=record.resume_attempt_id,
+        resume_run_id=record.resume_run_id,
+    )
+
+    task = store.get_task(record.task_id, record.revision)
+    question = store.question(binding.question_id)
+    assert unknown.status is store_module.InterventionStatus.RESUME_OUTCOME_UNKNOWN
+    assert task.state is TaskState.INTERRUPTED
+    assert task.continuation_state is TaskState.FABLE_CLARIFYING
+    assert question == before_question
+    assert question is not None and question.answer_text is None
+    assert store._connection.execute(  # noqa: SLF001 - exact preserved pause
+        "SELECT continuation_pause_id FROM tasks WHERE task_id = ? AND revision = ?",
+        (record.task_id, record.revision),
+    ).fetchone()["continuation_pause_id"] == before_pause
+
+    acknowledged = store.authorize_retry_after_unknown(
+        unknown.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="completed-child-ack",
+    )
+    assert acknowledged.status is store_module.InterventionStatus.READY
+    assert acknowledged.resume_generation == unknown.resume_generation + 1
+    with pytest.raises(RuntimeError, match="generation changed"):
+        store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id="completed-child-second-ack",
+        )
+    claimed = store.claim_intervention_resume(
+        acknowledged.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="completed-child-retry-attempt",
+        resume_run_id="completed-child-retry-run",
+    )
+    assert claimed.resume_run_id == "completed-child-retry-run"
+    with pytest.raises(RuntimeError, match="owner changed"):
+        store.claim_intervention_resume(
+            acknowledged.intervention_id,
+            expected_resume_generation=acknowledged.resume_generation,
+            resume_attempt_id="completed-child-substituted-attempt",
+            resume_run_id="completed-child-substituted-run",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("other_completed_child", "predecessor", "question_pause", "late_answer"),
+)
+def test_completed_nested_child_before_answer_rejects_tampering_atomically(
+    tmp_path, valid_brief, mutation: str,
+) -> None:
+    """A substituted child, predecessor, pause, or answer cannot become UNKNOWN."""
+    path = tmp_path / f"completed-child-tamper-{mutation}.sqlite3"
+    store = SQLiteStore(path, clock=lambda: "2026-08-10T12:00:00Z")
+    record = _completed_nested_child_before_answer_for_unknown(store, valid_brief)
+    assert record.resume_attempt_id is not None
+    assert record.resume_run_id is not None
+    if mutation == "other_completed_child":
+        store.start_agent_run(
+            "other-completed-child", record.task_id, record.revision, "sol",
+        )
+        store.set_agent_run_session("other-completed-child", "provider-1")
+        store.finish_agent_run("other-completed-child", status="completed", exit_code=0)
+        store._connection.execute(  # noqa: SLF001 - exact durable substitution
+            "UPDATE interventions SET directed_binding_json = json_set("
+            "directed_binding_json, '$.source_run_id', 'other-completed-child') "
+            "WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "predecessor":
+        store.start_agent_run(
+            "other-completed-predecessor", record.task_id, record.revision, "fable",
+        )
+        store.set_agent_run_session("other-completed-predecessor", "provider-1")
+        store.finish_agent_run(
+            "other-completed-predecessor", status="completed", exit_code=0,
+        )
+        store._connection.execute(  # noqa: SLF001 - exact durable substitution
+            "UPDATE interventions SET directed_binding_json = json_set("
+            "directed_binding_json, '$.next_predecessor_run_id', "
+            "'other-completed-predecessor') WHERE intervention_id = ?",
+            (record.intervention_id,),
+        )
+    elif mutation == "question_pause":
+        store._connection.execute(  # noqa: SLF001 - exact durable substitution
+            "UPDATE questions SET continuation_pause_id = 'substituted-pause' "
+            "WHERE question_id = 'nested-question'",
+        )
+    elif mutation == "late_answer":
+        store._connection.execute(  # noqa: SLF001 - simulate a late child CAS
+            "UPDATE questions SET answer_text = 'late answer', answered_by = 'sol' "
+            "WHERE question_id = 'nested-question'",
+        )
+    else:
+        raise AssertionError(f"unknown completed-child mutation: {mutation}")
+    before = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="authenticated"):
+        store.mark_resume_outcome_unknown(
+            record.intervention_id,
+            resume_attempt_id=record.resume_attempt_id,
+            resume_run_id=record.resume_run_id,
+        )
+
+    assert path.read_bytes() == before
 
 
 def _prepare_staged_scope_checkpoint_owner(
@@ -9469,9 +9722,208 @@ def test_claimed_fresh_fable_plan_session_binds_without_rewriting_no_id_source(
     reopened.close()
 
 
+def test_acknowledged_fresh_fable_retry_binds_first_session_and_completes(
+    tmp_path,
+) -> None:
+    """An UNKNOWN retry keeps its sole acknowledgment valid through first-session publication."""
+    store = _store(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store.create_session("session-1", str(repo))
+    task = store.create_planning_task("session-1", "acknowledged-fresh-fable-task")
+    store.start_agent_run("acknowledged-fresh-source", task.task_id, task.revision, "fable")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="acknowledged-fresh-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Retry the safe fresh Fable plan.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="acknowledged-fresh-source",
+    )
+    store.finish_agent_run(created.run_id, status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id, expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="first-attempt", resume_run_id="first-run",
+    )
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 0)
+    unknown = store.authenticated_intervention(created.intervention_id)
+    assert unknown is not None
+    acknowledged = store.authorize_retry_after_unknown(
+        unknown.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="fresh-session-ack",
+    )
+    assert acknowledged.status is store_module.InterventionStatus.READY
+    raw_lineage = store._connection.execute(  # noqa: SLF001 - private durable authority
+        "SELECT value_json FROM settings WHERE key = ?",
+        ("agent_bridge.internal.intervention_acknowledgment."
+         "acknowledged-fresh-intervention",),
+    ).fetchone()
+    assert raw_lineage is not None
+    assert json.loads(raw_lineage["value_json"])["fable_session_id"] is None
+
+    resumed = store.begin_intervention_resume(
+        acknowledged.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="acknowledged-attempt", resume_run_id="acknowledged-run",
+    )
+    assert resumed.state is TaskState.FABLE_PLANNING
+    store.start_agent_run("acknowledged-run", task.task_id, task.revision, "fable")
+    bound = store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=acknowledged.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id="acknowledged-attempt",
+        expected_resume_run_id="acknowledged-run",
+        fable_session_id="acknowledged-fresh-session",
+        continuation=TaskState.FABLE_PLANNING,
+    )
+
+    assert bound.fable_session_id == "acknowledged-fresh-session"
+    assert store.authenticated_intervention(created.intervention_id) == bound
+    raw_lineage = store._connection.execute(  # noqa: SLF001 - exact private refresh
+        "SELECT value_json FROM settings WHERE key = ?",
+        ("agent_bridge.internal.intervention_acknowledgment."
+         "acknowledged-fresh-intervention",),
+    ).fetchone()
+    assert raw_lineage is not None
+    assert json.loads(raw_lineage["value_json"])["fable_session_id"] == (
+        "acknowledged-fresh-session"
+    )
+    assert store.bind_fresh_fable_session_to_pending_intervention(
+        project_id=project_id_for_root(repo),
+        intervention_id=created.intervention_id,
+        session_id="session-1",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_source_generation=created.source_generation,
+        expected_resume_generation=acknowledged.resume_generation,
+        source_run_id=created.run_id,
+        expected_resume_attempt_id="acknowledged-attempt",
+        expected_resume_run_id="acknowledged-run",
+        fable_session_id="acknowledged-fresh-session",
+        continuation=TaskState.FABLE_PLANNING,
+    ) == bound
+    with pytest.raises(RuntimeError, match="session changed"):
+        store.bind_fresh_fable_session_to_pending_intervention(
+            project_id=project_id_for_root(repo),
+            intervention_id=created.intervention_id,
+            session_id="session-1",
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_source_generation=created.source_generation,
+            expected_resume_generation=acknowledged.resume_generation,
+            source_run_id=created.run_id,
+            expected_resume_attempt_id="acknowledged-attempt",
+            expected_resume_run_id="acknowledged-run",
+            fable_session_id="second-fresh-session",
+            continuation=TaskState.FABLE_PLANNING,
+        )
+    store.finish_agent_run("acknowledged-run", status="completed", exit_code=0)
+    completed = store.complete_intervention(
+        created.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="acknowledged-attempt",
+        resume_run_id="acknowledged-run",
+    )
+    assert completed.status is store_module.InterventionStatus.RESUMED
+    assert store.authenticated_intervention(created.intervention_id) == completed
+
+
+def test_acknowledged_fresh_fable_retry_rolls_back_when_lineage_refresh_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No task/run/session publication may survive a failed private lineage refresh."""
+    store = _store(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store.create_session("session-1", str(repo))
+    task = store.create_planning_task("session-1", "refresh-rollback-task")
+    store.start_agent_run("refresh-rollback-source", task.task_id, task.revision, "fable")
+    created = store.create_intervention_and_request_stop(
+        intervention_id="refresh-rollback-intervention", session_id="session-1",
+        task_id=task.task_id, revision=task.revision, expected_source_generation=1,
+        message="Retry one fresh Fable plan.", addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, run_id="refresh-rollback-source",
+    )
+    store.finish_agent_run(created.run_id, status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(created.intervention_id, run_id=created.run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id, expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="refresh-first-attempt", resume_run_id="refresh-first-run",
+    )
+    assert store.recover_active_tasks() == store_module.RecoverySummary(0, 1, 0)
+    unknown = store.authenticated_intervention(created.intervention_id)
+    assert unknown is not None
+    acknowledged = store.authorize_retry_after_unknown(
+        unknown.intervention_id,
+        expected_resume_generation=unknown.resume_generation,
+        acknowledgment_id="refresh-rollback-ack",
+    )
+    store.begin_intervention_resume(
+        acknowledged.intervention_id,
+        expected_resume_generation=acknowledged.resume_generation,
+        resume_attempt_id="refresh-attempt", resume_run_id="refresh-run",
+    )
+    store.start_agent_run("refresh-run", task.task_id, task.revision, "fable")
+    before = {
+        "task": store.get_task(task.task_id, task.revision),
+        "record": store.intervention(created.intervention_id),
+        "source": store.agent_run(created.run_id),
+        "claimed": store.agent_run("refresh-run"),
+        "lineage": store._connection.execute(  # noqa: SLF001 - durable transaction image
+            "SELECT value_json FROM settings WHERE key = ?",
+            ("agent_bridge.internal.intervention_acknowledgment."
+             "refresh-rollback-intervention",),
+        ).fetchone()["value_json"],
+    }
+
+    def fail_lineage_refresh(**kwargs: object) -> None:
+        raise RuntimeError("controlled lineage refresh failure")
+
+    monkeypatch.setattr(
+        store, "_refresh_intervention_acknowledgment_fable_session", fail_lineage_refresh,
+    )
+    with pytest.raises(RuntimeError, match="controlled lineage refresh failure"):
+        store.bind_fresh_fable_session_to_pending_intervention(
+            project_id=project_id_for_root(repo),
+            intervention_id=created.intervention_id,
+            session_id="session-1",
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_source_generation=created.source_generation,
+            expected_resume_generation=acknowledged.resume_generation,
+            source_run_id=created.run_id,
+            expected_resume_attempt_id="refresh-attempt",
+            expected_resume_run_id="refresh-run",
+            fable_session_id="would-partially-publish",
+            continuation=TaskState.FABLE_PLANNING,
+        )
+
+    assert {
+        "task": store.get_task(task.task_id, task.revision),
+        "record": store.intervention(created.intervention_id),
+        "source": store.agent_run(created.run_id),
+        "claimed": store.agent_run("refresh-run"),
+        "lineage": store._connection.execute(  # noqa: SLF001 - durable transaction image
+            "SELECT value_json FROM settings WHERE key = ?",
+            ("agent_bridge.internal.intervention_acknowledgment."
+             "refresh-rollback-intervention",),
+        ).fetchone()["value_json"],
+    } == before
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ("project", "generation", "source", "resume_owner", "provider", "continuation"),
+    (
+        "project", "task", "revision", "generation", "source", "resume_owner",
+        "provider", "continuation",
+    ),
 )
 def test_early_fable_session_binding_rejects_mismatch_without_partial_write(
     tmp_path,
@@ -9506,6 +9958,10 @@ def test_early_fable_session_binding_rejects_mismatch_without_partial_write(
     }
     if mutation == "project":
         arguments["project_id"] = "other-project"
+    elif mutation == "task":
+        arguments["task_id"] = "other-task"
+    elif mutation == "revision":
+        arguments["revision"] = task.revision + 1
     elif mutation == "generation":
         arguments["expected_source_generation"] = created.source_generation + 1
     elif mutation == "source":
