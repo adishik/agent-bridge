@@ -6719,7 +6719,7 @@ class SQLiteStore:
     def recover_unfinished_prepared_actions(self) -> RecoverySummary:
         prepared_actions_recovered = 0
         tasks_interrupted = 0
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             self._validate_nested_question_rows_in_transaction()
             last_preparation_id = ""
             while True:
@@ -7202,32 +7202,33 @@ class SQLiteStore:
         self, record: PreparedActionRecord,
     ) -> DirectedFableAnswerCheckpoint | None:
         """Load one still-pending, exact Fable-answer recovery checkpoint."""
-        record = self._checkpoint_record(record)
-        row = self._connection.execute(
-            """
-            SELECT * FROM directed_fable_answer_checkpoints
-            WHERE preparation_id = ? AND project_id = ? AND session_id = ?
-              AND task_id = ? AND revision = ? AND status = 'PENDING'
-            ORDER BY rowid DESC LIMIT 1
-            """,
-            (
-                record.preparation_id, record.project_id, record.session_id,
-                record.task_id, record.revision,
-            ),
-        ).fetchone()
-        if row is None:
-            return None
-        checkpoint = self._directed_fable_answer_checkpoint_from_row(row)
-        if checkpoint.stage_kind == "next_fable":
-            self._validated_checkpoint_stage_owner(record, checkpoint)
-        elif self._matching_next_fable_scope_stages(
-            session_id=record.session_id,
-            task_id=record.task_id,
-            revision=record.revision,
-            parent_question_id=checkpoint.question_id,
-        ):
-            raise RuntimeError("Fable answer checkpoint stage owner is missing")
-        return checkpoint
+        with self._event_listener_lock:
+            record = self._checkpoint_record(record)
+            row = self._connection.execute(
+                """
+                SELECT * FROM directed_fable_answer_checkpoints
+                WHERE preparation_id = ? AND project_id = ? AND session_id = ?
+                  AND task_id = ? AND revision = ? AND status = 'PENDING'
+                ORDER BY rowid DESC LIMIT 1
+                """,
+                (
+                    record.preparation_id, record.project_id, record.session_id,
+                    record.task_id, record.revision,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            checkpoint = self._directed_fable_answer_checkpoint_from_row(row)
+            if checkpoint.stage_kind == "next_fable":
+                self._validated_checkpoint_stage_owner(record, checkpoint)
+            elif self._matching_next_fable_scope_stages(
+                session_id=record.session_id,
+                task_id=record.task_id,
+                revision=record.revision,
+                parent_question_id=checkpoint.question_id,
+            ):
+                raise RuntimeError("Fable answer checkpoint stage owner is missing")
+            return checkpoint
 
     def checkpoint_directed_fable_scope_answer(
         self,
@@ -7261,7 +7262,7 @@ class SQLiteStore:
             completed_next_fable_run_id = _prepared_identifier(
                 completed_next_fable_run_id, "completed_next_fable_run_id",
             )
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._checkpoint_record(record)
             if record.status not in {"CLAIMED", "INTERRUPTED", "RECOVERED"}:
                 raise RuntimeError("Fable answer has no exact recoverable preparation")
@@ -7386,7 +7387,7 @@ class SQLiteStore:
         self, preparation_id: str, *, generation: int,
     ) -> PreparedActionRecord:
         """Atomically preserve an answered Fable continuation for explicit resume."""
-        with self._immediate_transaction():
+        with self._intervention_transaction():
             record = self._prepared_required(preparation_id)
             self._require_record_generation(record, generation)
             checkpoint = self.directed_fable_answer_checkpoint(record)

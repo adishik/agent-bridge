@@ -4537,11 +4537,15 @@ def test_next_fable_stage_readers_wait_for_its_commit_or_rollback(
 
 
 def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> None:
-    """Every known intervention lifecycle writer acquires the shared RLock first."""
+    """Audited transaction callers reaching intervention lineage lock before BEGIN."""
     methods = (
+        "_reserve_nested_fable_evidence_question",
+        "prepare_resume_action",
+        "handoff_directed_fable_answer_same_scope",
         "start_next_fable_intervention_stage",
         "finish_next_fable_intervention_stage",
         "handoff_next_fable_intervention_clarification_to_sol",
+        "save_scope_revision",
         "create_intervention_and_request_stop",
         "mark_intervention_ready",
         "bind_fresh_fable_session_to_pending_intervention",
@@ -4552,6 +4556,9 @@ def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> No
         "mark_resume_outcome_unknown",
         "authorize_retry_after_unknown",
         "recover_active_tasks",
+        "checkpoint_directed_fable_scope_answer",
+        "interrupt_claimed_fable_answer_checkpoint",
+        "recover_unfinished_prepared_actions",
     )
     for name in methods:
         source = inspect.getsource(getattr(SQLiteStore, name))
@@ -4559,7 +4566,122 @@ def test_intervention_lifecycle_transaction_inventory_locks_before_begin() -> No
         assert (
             "with self._intervention_transaction()" in before_begin
             or "with self._event_listener_lock:" in before_begin
+            or "with self._scope_revision_event_transaction(" in before_begin
         ), name
+
+
+@pytest.mark.parametrize(
+    "projection", ("intervention", "authenticated", "visible", "active", "checkpoint"),
+)
+@pytest.mark.parametrize("outcome", ("commit", "rollback"))
+@pytest.mark.parametrize("writer", ("checkpoint", "interrupt"))
+def test_claimed_scope_checkpoint_lifecycle_readers_wait_for_commit_or_rollback(
+    tmp_path, valid_brief, projection: str, outcome: str, writer: str,
+) -> None:
+    """Checkpoint and interrupt hold one lifecycle image on the shared connection."""
+    store = SQLiteStore(
+        tmp_path / f"scope-checkpoint-{writer}-{projection}-{outcome}.sqlite3",
+        clock=lambda: "2026-08-10T12:00:00Z",
+        check_same_thread=False,
+    )
+    prepared, stage, checkpoint, clarification, _ = _staged_scope_checkpoint_for_owner_matrix(
+        store, valid_brief,
+    )
+    binding = stage.directed_binding
+    assert binding is not None and binding.next_run_id is not None
+    if writer == "checkpoint":
+        store._connection.execute(  # noqa: SLF001 - exact pre-insert lifecycle image
+            "DELETE FROM directed_fable_answer_checkpoints WHERE preparation_id = ?",
+            (prepared.preparation_id,),
+        )
+
+        def invoke() -> None:
+            store.checkpoint_directed_fable_scope_answer(
+                prepared,
+                question_id=checkpoint.question_id,
+                continuation_generation=checkpoint.continuation_generation,
+                clarification=clarification,
+                completed_next_fable_intervention_id=stage.intervention_id,
+                completed_next_fable_run_id=binding.next_run_id,
+            )
+
+    else:
+
+        def invoke() -> None:
+            store.interrupt_claimed_fable_answer_checkpoint(
+                prepared.preparation_id, generation=prepared.generation,
+            )
+
+    def read_projection() -> object:
+        if projection == "intervention":
+            return store.intervention(stage.intervention_id)
+        if projection == "authenticated":
+            return store.authenticated_intervention(stage.intervention_id)
+        if projection == "visible":
+            return store.current_visible_intervention_for_task(
+                stage.task_id, stage.revision,
+            )
+        if projection == "active":
+            return store.active_intervention_for_task(stage.task_id, stage.revision)
+        return store.directed_fable_answer_checkpoint(prepared)
+
+    before = read_projection()
+    writer_entered = threading.Event()
+    allow_writer_commit = threading.Event()
+    reader_started = threading.Event()
+    reader_completed = threading.Event()
+    observed: list[object] = []
+    failures: list[BaseException] = []
+    original_transaction = store._immediate_transaction
+
+    @contextmanager
+    def hold_actual_scope_checkpoint_transaction():
+        with original_transaction():
+            writer_entered.set()
+            if not allow_writer_commit.wait(timeout=1):
+                raise AssertionError("test did not release the checkpoint writer")
+            yield
+            if outcome == "rollback":
+                raise RuntimeError("controlled scope checkpoint rollback")
+
+    store._immediate_transaction = hold_actual_scope_checkpoint_transaction  # type: ignore[method-assign]
+
+    def write_lifecycle() -> None:
+        try:
+            invoke()
+        except BaseException as error:
+            if outcome != "rollback" or str(error) != "controlled scope checkpoint rollback":
+                failures.append(error)
+
+    def read_in_parallel() -> None:
+        reader_started.set()
+        try:
+            observed.append(read_projection())
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            reader_completed.set()
+
+    thread = threading.Thread(target=write_lifecycle)
+    thread.start()
+    assert writer_entered.wait(timeout=1)
+    reader = threading.Thread(target=read_in_parallel)
+    reader.start()
+    assert reader_started.wait(timeout=1)
+    assert reader_completed.wait(timeout=0.1) is False
+    allow_writer_commit.set()
+    thread.join(timeout=1)
+    reader.join(timeout=1)
+
+    assert thread.is_alive() is False
+    assert reader.is_alive() is False
+    assert failures == []
+    assert len(observed) == 1
+    after = read_projection()
+    assert observed == [after]
+    if outcome == "rollback":
+        assert after == before
+    store.close()
 
 
 def test_current_visible_intervention_for_task_is_authenticated_bounded_and_read_only(
