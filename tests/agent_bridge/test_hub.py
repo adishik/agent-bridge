@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +29,7 @@ from agent_bridge.hub import (
 )
 from agent_bridge.coordinator import InterventionIntent
 from agent_bridge.projects import ProjectSpec
+from agent_bridge.process import ProcessRunner
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
     AnswerPayload,
@@ -742,6 +745,68 @@ def test_registry_close_releases_owned_runtimes_in_reverse_order_after_close_fai
         "coordinator", "tracker", "store", "lock-project-b",
         "coordinator", "tracker", "store", "lock-project-a",
     ]
+
+
+def test_owned_runtime_close_stops_its_runner_before_closing_other_resources() -> None:
+    calls: list[str] = []
+    runtime = _owned_runtime("project-a", calls)
+    runtime.runner = _CloseResource("runner", calls)  # type: ignore[assignment]
+
+    runtime.close()
+
+    assert calls == ["runner", "coordinator", "tracker", "store", "lock-project-a"]
+
+
+def test_owned_runtime_aclose_reaps_provider_group_before_every_resource_close(
+    tmp_path: Path,
+) -> None:
+    """No listener, store, coordinator, or lock may close around a live group."""
+    async def scenario() -> None:
+        events: list[str] = []
+        runtime = _owned_runtime("project-a", events)
+        runner = ProcessRunner(stop_grace_seconds=0.02)
+        ready = asyncio.Event()
+        runtime.runner = runner
+        task = asyncio.create_task(runner.run(
+            run_id="shutdown-provider",
+            argv=(
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)",
+            ),
+            cwd=tmp_path,
+            env=dict(os.environ),
+            stdin=None,
+            on_line=lambda stream, line: ready.set() if line == "ready" else None,
+        ))
+        try:
+            await runner.wait_until_started("shutdown-provider")
+            await ready.wait()
+            group = runner._active_runs["shutdown-provider"].process_group_id
+            assert group is not None
+
+            def assert_reaped(name: str) -> None:
+                assert runner._process_group_exists(group) is False
+                events.append(name)
+
+            runtime.store.remove_event_listener = lambda token: assert_reaped("listener")
+            runtime.store.close = lambda: assert_reaped("store")
+            runtime.coordinator = SimpleNamespace(close=lambda: assert_reaped("coordinator"))  # type: ignore[assignment]
+            runtime.tracker = SimpleNamespace(close=lambda: assert_reaped("tracker"))  # type: ignore[assignment]
+            runtime.state_authority_close = lambda: assert_reaped("authority")
+            runtime.lock = SimpleNamespace(release=lambda: assert_reaped("lock"))  # type: ignore[assignment]
+
+            await runtime.aclose()
+
+            assert (await task).interrupted is True
+            assert events == ["listener", "coordinator", "tracker", "store", "authority", "lock"]
+            await runtime.aclose()
+            assert events == ["listener", "coordinator", "tracker", "store", "authority", "lock"]
+        finally:
+            await runner.aclose()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_registry_close_does_not_close_a_non_owning_runtime() -> None:

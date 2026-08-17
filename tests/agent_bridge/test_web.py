@@ -1689,6 +1689,38 @@ def test_lifespan_cancels_and_awaits_active_actions_without_error_event(
     assert web_harness.app.state.coroutine_observation_failures == []
 
 
+def test_hub_lifespan_awaits_provider_shutdown_without_closing_runtime_resources(
+    tmp_path: Path,
+) -> None:
+    """The app loop reaps providers; the launcher retains resource ownership."""
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    calls: list[str] = []
+
+    class Registry:
+        async def aclose_providers(self) -> None:
+            await asyncio.sleep(0)
+            calls.append("providers")
+
+        def close(self) -> None:
+            calls.append("resources")
+
+    app = create_hub_app(
+        registry=Registry(),  # type: ignore[arg-type]
+        hub_store=object(),  # type: ignore[arg-type]
+        workflows=object(),  # type: ignore[arg-type]
+        static_dir=static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+
+    with TestClient(app):
+        pass
+
+    assert calls == ["providers"]
+
+
 def test_new_actions_are_rejected_once_shutdown_has_started(
     web_harness: WebHarness,
 ) -> None:

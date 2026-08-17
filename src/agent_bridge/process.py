@@ -11,6 +11,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import signal
+import time
 
 
 LineCallback = Callable[[str, str], None]
@@ -22,6 +23,7 @@ MAX_PROCESS_TOTAL_LINES = 8_192
 MAX_PROCESS_TOTAL_BYTES = 512 * 1024
 MAX_TERMINAL_PROCESS_EXITS = 128
 _OUTPUT_LIMIT_ERROR = "provider process output exceeded configured bounds"
+_KILL_REAP_SECONDS = 1.0
 
 
 class ProcessOutputLimitExceeded(RuntimeError):
@@ -99,6 +101,9 @@ class ProcessRunner:
         self._active_runs: dict[str, _ActiveRun] = {}
         self._start_events: dict[str, asyncio.Event] = {}
         self._terminal_process_exits: OrderedDict[str, asyncio.Event] = OrderedDict()
+        self._closed = False
+        self._close_complete = False
+        self._close_task: asyncio.Task[None] | None = None
 
     async def run(
         self,
@@ -112,6 +117,8 @@ class ProcessRunner:
         pass_fds: Sequence[int] = (),
     ) -> ProcessResult:
         """Synchronously await one exec child and collect its output lines."""
+        if self._closed:
+            raise RuntimeError("ProcessRunner is closed")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("run_id must be a non-empty string")
         normalized_argv = tuple(argv)
@@ -287,6 +294,142 @@ class ProcessRunner:
         active = self._active_runs.get(run_id)
         return active is not None and active.process is not None
 
+    async def aclose(self) -> None:
+        """Stop and reap every exact child group before returning."""
+        if self._close_complete:
+            return
+        existing = self._close_task
+        if existing is not None:
+            await asyncio.shield(existing)
+            return
+        self._closed = True
+        closing = asyncio.create_task(self._close_active_runs())
+        self._close_task = closing
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            # Keep the owned shutdown task observable for a later caller.
+            raise
+        except BaseException:
+            if self._close_task is closing:
+                self._close_task = None
+            raise
+        self._close_complete = True
+
+    def close(self) -> None:
+        """Synchronously stop/reap exact groups after the event loop has unwound."""
+        if self._close_complete:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("await ProcessRunner.aclose() while an event loop is running")
+        self._closed = True
+        self._close_active_runs_synchronously()
+        self._close_complete = True
+
+    async def _close_active_runs(self) -> None:
+        active_runs = tuple(self._active_runs.values())
+        for active in active_runs:
+            active.stop_requested = True
+            active.interrupted = True
+        await asyncio.gather(*(self._close_active(active) for active in active_runs))
+
+    async def _close_active(self, active: _ActiveRun) -> None:
+        if not active.launch_finished.is_set():
+            deadline = asyncio.get_running_loop().time() + self._stop_grace_seconds
+            if not await self._wait_for_event_until(active.launch_finished, deadline):
+                raise RuntimeError("provider launch did not finish during shutdown")
+        if active.process is not None:
+            await self._stop_active(active)
+        elif active.process_group_id is not None:
+            raise RuntimeError("provider group has no exact child process")
+        else:
+            active.stop_completed = True
+
+    def _close_active_runs_synchronously(self) -> None:
+        active_runs = tuple(self._active_runs.values())
+        for active in active_runs:
+            active.stop_requested = True
+            active.interrupted = True
+            if not active.launch_finished.is_set():
+                raise RuntimeError("provider launch is still in progress during synchronous shutdown")
+            if active.process is None and active.process_group_id is not None:
+                raise RuntimeError("provider group has no exact child process")
+
+        groups = tuple(
+            active.process_group_id
+            for active in active_runs
+            if active.process_group_id is not None and self._process_group_exists(active.process_group_id)
+        )
+        for process_group_id in groups:
+            with suppress(ProcessLookupError):
+                os.killpg(process_group_id, signal.SIGTERM)
+        remaining_children, remaining_groups = self._wait_for_synchronous_shutdown(
+            active_runs,
+            groups,
+            time.monotonic() + self._stop_grace_seconds,
+        )
+        for process_group_id in remaining_groups:
+            with suppress(ProcessLookupError):
+                os.killpg(process_group_id, signal.SIGKILL)
+        remaining_children, remaining_groups = self._wait_for_synchronous_shutdown(
+            remaining_children,
+            remaining_groups,
+            time.monotonic() + _KILL_REAP_SECONDS,
+        )
+        if remaining_children:
+            raise RuntimeError("owned provider child did not reap during shutdown")
+        if remaining_groups:
+            raise RuntimeError("owned provider group did not exit during shutdown")
+        for active in active_runs:
+            active.stop_completed = True
+
+    def _wait_for_synchronous_shutdown(
+        self,
+        active_runs: Sequence[_ActiveRun],
+        groups: Sequence[int],
+        deadline: float,
+    ) -> tuple[tuple[_ActiveRun, ...], tuple[int, ...]]:
+        """Poll exact children before treating their process groups as gone."""
+        remaining_children = tuple(
+            active for active in active_runs if active.process is not None
+        )
+        remaining_groups = tuple(
+            group for group in groups if self._process_group_exists(group)
+        )
+        while True:
+            remaining_children = tuple(
+                active
+                for active in remaining_children
+                if not self._poll_exact_process_synchronously(active)
+            )
+            remaining_groups = tuple(
+                group for group in remaining_groups if self._process_group_exists(group)
+            )
+            if not remaining_children and not remaining_groups:
+                return remaining_children, remaining_groups
+            if time.monotonic() >= deadline:
+                return remaining_children, remaining_groups
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _poll_exact_process_synchronously(active: _ActiveRun) -> bool:
+        assert active.process is not None
+        try:
+            reaped, _ = os.waitpid(active.process.pid, os.WNOHANG)
+        except ChildProcessError:
+            # The previous asyncio child watcher has already reaped this exact
+            # child while its loop was unwinding.
+            active.process_exited.set()
+            return True
+        if reaped == active.process.pid:
+            active.process_exited.set()
+            return True
+        return False
+
     async def _stop_active(
         self, active: _ActiveRun, *, deadline: float | None = None,
     ) -> None:
@@ -318,6 +461,11 @@ class ProcessRunner:
                 with suppress(ProcessLookupError):
                     os.killpg(active.process_group_id, signal.SIGKILL)
                     active.kill_sent = True
+            if deadline is None and active.kill_sent and not await self._wait_for_process_group_exit(
+                active.process_group_id,
+                deadline=asyncio.get_running_loop().time() + _KILL_REAP_SECONDS,
+            ):
+                raise RuntimeError("owned provider group did not exit during shutdown")
             if deadline is None:
                 await self._observe_process_exit(active, active.process)
                 active.stop_completed = True

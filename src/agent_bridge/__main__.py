@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import shutil
 import socket
 import stat
@@ -35,7 +37,7 @@ if TYPE_CHECKING:
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 _SAFE_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}\Z")
-_SAFE_SLUG_CHAR = re.compile(r"[^a-z0-9._-]+")
+_SAFE_SLUG_CHAR = re.compile(r"[^a-z0-9_-]+")
 _ACTIVE_SESSION_SETTING = "agent_bridge.active_session_id"
 MAX_REPO_CONTEXT_BYTES = 256 * 1024
 PREFLIGHT_TIMEOUT_SECONDS = 10.0
@@ -149,6 +151,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the local Agent Bridge.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="Remote: agent-bridge ssh SSH_DESTINATION --repo /absolute/remote/repository",
     )
     projects = parser.add_mutually_exclusive_group(required=True)
     projects.add_argument(
@@ -252,8 +255,16 @@ def _run_git(
 
 
 def _repository_slug(repo_root: Path) -> str:
-    slug = _SAFE_SLUG_CHAR.sub("-", repo_root.name.lower()).strip("-.")
-    return slug or "repository"
+    name = repo_root.name.lower()
+    legacy = re.sub(r"[^a-z0-9._-]+", "-", name).strip("-.")
+    if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", legacy):
+        return legacy
+    slug = _SAFE_SLUG_CHAR.sub("-", name).strip("-_")
+    if not slug:
+        return "repository"
+    if not slug[0].isalpha():
+        slug = f"repo-{slug}"
+    return slug[:32].rstrip("-_") or "repository"
 
 
 def codex_environment(source: Mapping[str, str]) -> dict[str, str]:
@@ -643,7 +654,7 @@ def ssh_forward_command(*, port: int, user: str, ssh_connection: str) -> str:
     if not 1 <= client_port <= 65535 or not 1 <= server_port <= 65535:
         raise ValueError("SSH_CONNECTION is invalid")
     server_text = f"[{server}]" if server.version == 6 else str(server)
-    return f"ssh -N -L {port}:127.0.0.1:{port} {user}@{server_text}"
+    return f"ssh -N -L 127.0.0.1:{port}:127.0.0.1:{port} {user}@{server_text}"
 
 
 def _secure_regular_file(path: Path, *, directory_fd: int | None = None) -> None:
@@ -1120,11 +1131,42 @@ def main(
     """Assemble the local bridge and run Uvicorn in the foreground."""
     environment = dict(os.environ if environ is None else environ)
     output = sys.stdout if stdout is None else stdout
-    settings = parse_settings(argv, environ=environment)
-    ordered_specs = tuple(sorted(settings.projects, key=lambda spec: spec.project_id))
+    raw_arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if raw_arguments[:1] == ("ssh",):
+        from agent_bridge.ssh import main as ssh_main
+
+        if uvicorn_run is not None:
+            raise ValueError("uvicorn_run is available only for direct launch")
+        return ssh_main(raw_arguments[1:], stdout=output)
+    settings = parse_settings(raw_arguments, environ=environment)
+    with _ssh_disconnect_handler_lifetime(environment):
+        return _run_local_startup(
+            settings,
+            environment=environment,
+            output=output,
+            uvicorn_run=uvicorn_run,
+        )
+
+
+def _run_local_startup(
+    settings: Settings,
+    *,
+    environment: Mapping[str, str],
+    output: TextIO,
+    uvicorn_run: UvicornRun | None,
+) -> int:
+    """Run all resource-owning local startup work inside its SSH lifetime."""
     state_authorities: dict[Path, _StateDirectory] = {}
-    locks: list[object] = []
+    project_locks: dict[str, object] = {}
+    hub_lock: object | None = None
+    ordered_specs: tuple[ProjectSpec, ...] = ()
+    hub_store = None
+    runtimes: list[object] = []
+    opened_states: list[_OpenedProjectState] = []
+    registry = None
+    owned_project_ids: set[str] = set()
     try:
+        ordered_specs = tuple(sorted(settings.projects, key=lambda spec: spec.project_id))
         for state_dir in (settings.hub_state_dir, *(spec.state_dir for spec in ordered_specs)):
             prepare_state_dir(settings, candidate=state_dir)
             state_authorities[state_dir] = _open_state_directory(
@@ -1134,27 +1176,12 @@ def main(
             settings.hub_state_dir / "agent-bridge.lock",
             directory_fd=state_authorities[settings.hub_state_dir].descriptor,
         )
-        locks.append(hub_lock)
-        project_locks: dict[str, object] = {}
         for spec in ordered_specs:
             lock = acquire_instance_lock(
                 spec.state_dir / "agent-bridge.lock",
                 directory_fd=state_authorities[spec.state_dir].descriptor,
             )
-            locks.append(lock)
             project_locks[spec.project_id] = lock
-    except BaseException:
-        _release_locks(locks)
-        for authority in state_authorities.values():
-            authority.close()
-        raise
-
-    hub_store = None
-    runtimes: list[object] = []
-    opened_states: list[_OpenedProjectState] = []
-    registry = None
-    owned_project_ids: set[str] = set()
-    try:
         from agent_bridge.app import create_hub_app
         from agent_bridge.hub import ActiveAgentLease, HubWorkflowOrchestrator, ProjectRegistry
         from agent_bridge.hub_store import HubStore
@@ -1264,16 +1291,43 @@ def main(
                 hub_store.close()
             except BaseException:
                 pass
-        _release_locks((
-            hub_lock,
-            *(
-                project_locks[spec.project_id]
-                for spec in ordered_specs
-                if spec.project_id not in owned_project_ids
-            ),
-        ))
+        remaining_locks = [hub_lock]
+        remaining_locks.extend(
+            project_locks[spec.project_id]
+            for spec in ordered_specs
+            if (
+                spec.project_id not in owned_project_ids
+                and spec.project_id in project_locks
+            )
+        )
+        _release_locks(
+            tuple(lock for lock in remaining_locks if lock is not None)
+        )
         for authority in state_authorities.values():
             authority.close()
+
+
+@contextmanager
+def _ssh_disconnect_handler_lifetime(environment: Mapping[str, str]):
+    """Turn SSH terminal signals into normal unwinding for all startup work."""
+    previous: dict[int, object] = {}
+
+    def disconnect(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        if environment.get("SSH_CONNECTION"):
+            for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, disconnect)
+        yield
+    finally:
+        _restore_signal_handlers(previous)
+
+
+def _restore_signal_handlers(previous: Mapping[int, object]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

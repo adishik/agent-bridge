@@ -5,6 +5,7 @@ from contextlib import suppress
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 
 import pytest
@@ -80,6 +81,130 @@ def test_stop_targets_only_the_named_run(tmp_path: Path) -> None:
             await asyncio.gather(first, second, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_close_stops_and_reaps_only_its_active_sleeper_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime owner can close every exact provider group without PID discovery."""
+    async def scenario() -> None:
+        runner = ProcessRunner(stop_grace_seconds=0.02)
+        signals: list[tuple[int, signal.Signals | int]] = []
+        original_killpg = process_module.os.killpg
+
+        def record_killpg(process_group_id: int, sig: signal.Signals | int) -> None:
+            signals.append((process_group_id, sig))
+            original_killpg(process_group_id, sig)
+
+        monkeypatch.setattr(process_module.os, "killpg", record_killpg)
+        task = asyncio.create_task(_run_sleeper(runner, "disconnect-sleeper", tmp_path))
+        try:
+            await runner.wait_until_started("disconnect-sleeper")
+            await runner.aclose()
+            result = await task
+
+            assert result.interrupted is True
+            assert runner.is_running("disconnect-sleeper") is False
+            assert [(group, sig) for group, sig in signals if sig != 0] == [
+                (result.process_group_id, signal.SIGTERM)
+            ]
+        finally:
+            await runner.aclose()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_aclose_waits_for_term_to_kill_and_exact_group_reap_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime shutdown cannot return while an owned stubborn group still exists."""
+    async def scenario() -> None:
+        runner = ProcessRunner(stop_grace_seconds=0.02)
+        ready = asyncio.Event()
+        signals: list[tuple[int, signal.Signals | int]] = []
+        original_killpg = process_module.os.killpg
+
+        def record_killpg(process_group_id: int, sig: signal.Signals | int) -> None:
+            signals.append((process_group_id, sig))
+            original_killpg(process_group_id, sig)
+
+        monkeypatch.setattr(process_module.os, "killpg", record_killpg)
+        task = asyncio.create_task(runner.run(
+            run_id="stubborn-disconnect-sleeper",
+            argv=(
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)",
+            ),
+            cwd=tmp_path,
+            env=dict(os.environ),
+            stdin=None,
+            on_line=lambda stream, line: ready.set() if line == "ready" else None,
+        ))
+        try:
+            await runner.wait_until_started("stubborn-disconnect-sleeper")
+            await ready.wait()
+            group = runner._active_runs["stubborn-disconnect-sleeper"].process_group_id
+            assert group is not None
+
+            await runner.aclose()
+
+            assert runner._process_group_exists(group) is False
+            result = await task
+            assert result.interrupted is True
+            assert result.exit_code == -signal.SIGKILL
+            assert [(recorded_group, sig) for recorded_group, sig in signals if sig != 0] == [
+                (group, signal.SIGTERM),
+                (group, signal.SIGKILL),
+            ]
+            await runner.aclose()
+        finally:
+            await runner.aclose()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_synchronous_close_reaps_its_exact_child_before_group_absence_check(
+    tmp_path: Path,
+) -> None:
+    """A zombie exact child must not make no-loop shutdown fail or leak."""
+    runner = ProcessRunner(stop_grace_seconds=0.01)
+    child = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ),
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    launched = asyncio.Event()
+    launched.set()
+    active = process_module._ActiveRun(
+        process=child,  # type: ignore[arg-type]
+        process_group_id=child.pid,
+        launch_finished=launched,
+        process_exited=asyncio.Event(),
+        stop_lock=asyncio.Lock(),
+    )
+    runner._active_runs["sync-zombie"] = active
+    try:
+        runner.close()
+
+        assert active.process_exited.is_set()
+        assert runner._process_group_exists(child.pid) is False
+        with pytest.raises(ChildProcessError):
+            os.waitpid(child.pid, os.WNOHANG)
+    finally:
+        if child.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=1)
 
 
 def test_stop_receipt_signals_only_the_registered_run_and_stale_ids_do_nothing(

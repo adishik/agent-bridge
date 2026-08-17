@@ -211,7 +211,32 @@ class OwnedProjectRuntime:
         return self.spec.branch
 
     def close(self) -> None:
-        """Release owned resources once, continuing cleanup after a close error."""
+        """Release resources only after synchronous provider teardown completes."""
+        if self._closed:
+            return
+        runner_close = getattr(self.runner, "close", None)
+        if callable(runner_close):
+            # A running asyncio loop must use ``aclose``.  Do not let a
+            # schedule-and-return runner permit dependent resources to close.
+            runner_close()
+        self._close_resources()
+
+    async def aclose(self) -> None:
+        """Await provider termination/reap before releasing dependent resources."""
+        if self._closed:
+            return
+        await self.aclose_provider()
+        self.close()
+
+    async def aclose_provider(self) -> None:
+        """Await only exact provider teardown while the app still owns its loop."""
+        if self._closed:
+            return
+        runner_aclose = getattr(self.runner, "aclose", None)
+        if callable(runner_aclose):
+            await runner_aclose()
+
+    def _close_resources(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -416,6 +441,41 @@ class ProjectRegistry:
                 continue
             try:
                 close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+    async def aclose(self) -> None:
+        """Await completion-bearing runtime shutdown before marking closed."""
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        for runtime in reversed(self._runtimes):
+            aclose = getattr(runtime, "aclose", None)
+            close = getattr(runtime, "close", None)
+            try:
+                if callable(aclose):
+                    await aclose()
+                elif callable(close):
+                    close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+        self._closed = True
+
+    async def aclose_providers(self) -> None:
+        """Reap runtime provider groups without changing the app's resource ownership."""
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        for runtime in reversed(self._runtimes):
+            aclose_provider = getattr(runtime, "aclose_provider", None)
+            if not callable(aclose_provider):
+                continue
+            try:
+                await aclose_provider()
             except BaseException as error:
                 errors.append(error)
         if errors:

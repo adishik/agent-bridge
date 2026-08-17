@@ -7,18 +7,27 @@ control surface for that handoff, not a public service.
 
 ## Install
 
-With `pipx`:
+For direct local use and the SSH workflow, install the published package-index
+release with `pipx`:
 
 ```bash
-pipx install .
+pipx install agent-bridge
 ```
 
-For a development checkout:
+The SSH launcher sends only an exact published release to the remote host.
+Install that release rather than a local directory, editable checkout, or
+direct URL when you intend to use `agent-bridge ssh`.
+
+For direct local development from a source checkout:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
+
+This checkout installation is for direct local launches only: SSH rejects
+source-checkout, editable, direct-URL, and otherwise unpublished provenance
+instead of substituting unverified remote bytes.
 
 ## Prerequisites
 
@@ -28,6 +37,11 @@ API-key fallback: Fable must use the installed Claude Code subscription
 authentication, and Sol must use the local Codex CLI. Make sure both CLIs are
 available on `PATH`, or provide absolute executable overrides when starting
 the bridge.
+
+For the SSH workflow, the local computer also needs OpenSSH and an SSH alias
+configured in `~/.ssh/config`. The remote host must already provide Python
+3.11 or newer with `venv`, Git, and authenticated Claude and Codex CLIs. Agent
+Bridge does not install or authenticate either remote provider CLI.
 
 ## Subscription and usage safety
 
@@ -86,17 +100,64 @@ executable overrides:
 
 ## SSH access
 
-When the bridge runs on a remote machine, run this command on your local
-computer:
+Run the primary SSH workflow on your local computer:
 
 ```bash
-ssh -N -L 56590:127.0.0.1:56590 YOUR_SSH_ALIAS
+agent-bridge ssh YOUR_SSH_ALIAS --repo /absolute/remote/repository
 ```
 
-Keep that SSH forwarding command open. Then open the keyed loopback URL in a
-browser on your local computer, using the same port and key printed by the
-foreground bridge. The forwarding binds the local loopback interface to the
-remote loopback listener; it does not make Agent Bridge public.
+`YOUR_SSH_ALIAS` is resolved through your existing `~/.ssh/config`, so use
+that configuration for host keys, identity files, ports, or ProxyJump. The
+command bootstraps and starts Agent Bridge on the remote host, creates a
+loopback-only local tunnel, auto-opens the local keyed URL, and remains
+attached until you stop it with Ctrl+C. Pass `--no-open` to print the keyed URL
+without opening a browser.
+
+On first use of a released version, the remote host downloads that exact Agent
+Bridge version from its configured package index into
+`~/.cache/agent-bridge/runtime/<version>`. This is an unprivileged cache: it
+does not require root access or a global installation. The first bootstrap
+therefore needs remote package-index access. Only a published exact Agent
+Bridge version is accepted; a source-checkout-only or unpublished build fails
+clearly instead of substituting a different package or version.
+
+For more than one remote repository, repeat `--project` just as with a direct
+launch:
+
+```bash
+agent-bridge ssh YOUR_SSH_ALIAS \
+  --project app=/absolute/remote/app \
+  --project docs=/absolute/remote/docs \
+  --no-open
+```
+
+`--claude-executable`, `--codex-executable`, `--git-executable`,
+`--bash-executable`, and `--sh-executable` are absolute paths on the remote
+host, not paths on the local computer. `--local-port` selects the local
+loopback forward; `--remote-port` selects the remote loopback listener. Both
+default to an automatically selected port. To force a clean bootstrap after
+the bridge has stopped, remove only the affected remote version directory:
+`rm -rf ~/.cache/agent-bridge/runtime/<version>`. Replace `<version>` with the
+exact release being retried; do not remove normal Agent Bridge state while
+troubleshooting the runtime cache.
+
+### Advanced fallback: manual launch and tunnel
+
+If you intentionally manage the remote bridge yourself, start it in a
+foreground remote terminal, then create a separate local tunnel:
+
+```bash
+# On the remote host
+agent-bridge --repo /absolute/remote/repository
+
+# On the local computer, after noting the remote port
+ssh -N -L 127.0.0.1:56590:127.0.0.1:56590 YOUR_SSH_ALIAS
+```
+
+Keep both foreground processes open. Then open the keyed loopback URL in a
+browser on the local computer, using the same port and key printed by the
+remote bridge. The forwarding binds `127.0.0.1` locally to `127.0.0.1` on the
+remote host; it does not make Agent Bridge public.
 
 ## Workflow
 
@@ -261,6 +322,29 @@ use, or clinical outcomes.
 
 ## Troubleshooting
 
+- **SSH authentication or host-key failure:** confirm that
+  `ssh YOUR_SSH_ALIAS` works using your normal OpenSSH configuration. Correct
+  the host key or authentication configuration there; do not disable host-key
+  checking or expose the bridge on a public interface.
+- **Remote Python or `venv` unavailable:** install or select a remote Python
+  3.11+ with `venv` support, then pass its absolute remote path with
+  `--python` if `python3` is not the correct command.
+- **Unpublished Agent Bridge version:** install a published release locally
+  and retry. SSH bootstrap accepts only the exact published version; editable,
+  direct-URL, and source-checkout-only builds cannot be bootstrapped remotely.
+- **Remote Claude or Codex unavailable:** install and authenticate both CLIs
+  on the remote host, make them available on its `PATH`, or provide their
+  absolute remote paths with `--claude-executable` and `--codex-executable`.
+- **Remote repository rejected:** use an absolute path to a Git top-level on
+  the remote host. The SSH command validates remote repository paths before
+  starting the bridge.
+- **Local or remote port exhausted:** retry with another `--local-port` or
+  `--remote-port`, or omit those options to let Agent Bridge choose ports. Do
+  not change the loopback-only binding.
+- **Keyed URL never becomes ready:** keep the SSH command attached, use the
+  exact keyed URL it prints, and inspect the bounded SSH diagnostics for the
+  remote startup failure. A rejected key or early SSH exit is not a signal to
+  use an unkeyed or public URL.
 - **Missing executable:** install the named tool, put it on `PATH`, or pass an
   absolute path with the matching `--*-executable` option. The launcher checks
   every configured executable before starting the server.

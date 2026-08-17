@@ -614,6 +614,9 @@ def create_hub_app(
                 await asyncio.gather(*active, return_exceptions=True)
                 await asyncio.sleep(0)
                 lifespan_app.state.active_coroutines.difference_update(active)
+            registry_aclose_providers = getattr(registry, "aclose_providers", None)
+            if callable(registry_aclose_providers):
+                await registry_aclose_providers()
 
     app = FastAPI(title="Agent Bridge", version="0.1.0", lifespan=lifespan)
     app.add_exception_handler(RequestValidationError, _bounded_request_validation_error)
