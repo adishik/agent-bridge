@@ -22,8 +22,16 @@ from agent_bridge.app import (
     create_app,
     create_hub_app,
 )
-from agent_bridge.contracts import StreamEvent, TaskBrief
-from agent_bridge.coordinator import Coordinator
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    DirectedAgentQuestion,
+    StreamEvent,
+    TaskBrief,
+)
+from agent_bridge.coordinator import Coordinator, InterventionIntent
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -33,8 +41,9 @@ from agent_bridge.hub import (
     RuntimeStatus,
 )
 from agent_bridge.projects import project_id_for_root
+from agent_bridge.process import ProcessRunner, StopReceipt
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import SQLiteStore
+from agent_bridge.store import InterventionStatus, SQLiteStore
 
 
 SESSION_ID = "session-1"
@@ -443,6 +452,7 @@ def test_bootstrap_is_complete_authoritative_and_omits_runtime_secrets(
                 "outcome": None,
                 "review": None,
                 "clarification": None,
+                "activity_kind": None,
                 "activity": None,
             }
         ],
@@ -475,7 +485,7 @@ def test_bootstrap_keeps_current_revision_evidence_outside_recent_chat_window(
         "outcome": {"summary": "durable outcome"},
         "review": {"summary": "durable review"},
         "clarification": {"reasoning": "durable clarification"},
-        "agent_event": {"status": "durable activity", "command_sha256": "safe-hash"},
+        "agent_event": {"status": "completed", "command_sha256": "a" * 64},
     }
     for kind, payload in evidence.items():
         web_harness.store.append_event(
@@ -495,7 +505,167 @@ def test_bootstrap_keeps_current_revision_evidence_outside_recent_chat_window(
     assert task["outcome"] == evidence["outcome"]
     assert task["review"] == evidence["review"]
     assert task["clarification"] == evidence["clarification"]
+    assert task["activity_kind"] == "agent_event"
     assert task["activity"] == evidence["agent_event"]
+
+
+@pytest.mark.parametrize("kind", ("action_error", "stop_error", "agent_event", "resume_drift"))
+def test_bootstrap_activity_projection_is_allowlisted_and_never_reloads_raw_details(
+    web_harness: WebHarness,
+    kind: str,
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "coordinator", kind,
+        {
+            "status": "completed",
+            "command_sha256": "a" * 64,
+            "run_id": "provider-run-secret",
+            "thread_id": "provider-thread-secret",
+            "session_id": "provider-session-secret",
+            "command": "rm -rf never-render-this",
+            "raw_output": "provider output must not reload",
+            "extra": "hostile-extra",
+            "hostile": '<img src=x onerror="globalThis.pwned=true">' * 200,
+        },
+    )
+
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+
+    assert task["activity_kind"] == kind
+    assert task["activity"] == (
+        {"status": "completed", "command_sha256": "a" * 64}
+        if kind == "agent_event" else {}
+    )
+    serialized = json.dumps(task)
+    for forbidden in (
+        "provider-run-secret", "provider-thread-secret", "provider-session-secret",
+        "rm -rf never-render-this", "provider output must not reload", "hostile-extra",
+        "globalThis.pwned",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize("kind", ("action_error", "stop_error", "agent_event", "resume_drift"))
+def test_hub_bootstrap_activity_projection_is_allowlisted_and_project_scoped(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    kind: str,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_APPROVAL)
+    runtime.store.append_event(
+        "chat-a", valid_brief.task_id, "fable", "task_brief", {"brief": valid_brief.to_dict()},
+    )
+    runtime.store.append_event(
+        "chat-a", valid_brief.task_id, "coordinator", kind,
+        {"status": "completed", "command_sha256": "b" * 64, "run_id": "foreign-provider-run"},
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        payload = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    task = next(item for item in payload["tasks"] if item["task_id"] == valid_brief.task_id)
+    assert task["activity_kind"] == kind
+    assert task["activity"] == (
+        {"status": "completed", "command_sha256": "b" * 64}
+        if kind == "agent_event" else {}
+    )
+    assert "foreign-provider-run" not in json.dumps(payload)
+
+
+def test_bootstrap_activity_projection_drops_invalid_agent_fields(
+    web_harness: WebHarness,
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "coordinator", "agent_event",
+        {
+            "status": "COMPLETED",
+            "command_sha256": "A" * 64,
+            "run_id": "invalid-digest-provider-run",
+        },
+    )
+
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+
+    assert task["activity_kind"] == "agent_event"
+    assert task["activity"] == {}
+    assert "invalid-digest-provider-run" not in json.dumps(task)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        *[(status, {"status": status, "command_sha256": "c" * 64}) for status in (
+            "completed", "declined", "failed", "in_progress", "interrupted",
+        )],
+        *[(status, {"command_sha256": "c" * 64}) for status in (
+            "running", "pending", "success", "error", "COMPLETED",
+        )],
+    ),
+)
+def test_bootstrap_activity_projection_matches_coordinator_agent_event_statuses(
+    web_harness: WebHarness,
+    status: str,
+    expected: dict[str, str],
+) -> None:
+    brief = web_harness.store.task_brief("task-1", 1)
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "fable", "task_brief", {"brief": brief.to_dict()},
+    )
+    web_harness.store.append_event(
+        SESSION_ID, brief.task_id, "sol", "agent_event",
+        {"status": status, "command_sha256": "c" * 64, "run_id": "never-project"},
+    )
+    with _authenticated_client(web_harness) as client:
+        task = client.get("/api/bootstrap").json()["tasks"][0]
+    assert task["activity_kind"] == "agent_event"
+    assert task["activity"] == expected
+    assert "never-project" not in json.dumps(task)
+
+
+@pytest.mark.parametrize(
+    "status", ("completed", "declined", "failed", "in_progress", "interrupted"),
+)
+def test_coordinator_producer_characterizes_the_agent_event_status_contract(
+    status: str,
+) -> None:
+    digest = "d" * 64
+    event = Coordinator._sol_structural_event({
+        "type": "item.completed",
+        "item_type": "command_execution",
+        "status": status,
+        "command_sha256": digest,
+    })
+    assert event is not None
+    assert event["status"] == status
+    assert event["command_sha256"] == digest
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_status"),
+    (("item.started", None), ("item.updated", None), ("item.completed", "completed")),
+)
+def test_coordinator_producer_only_attaches_status_to_completed_agent_events(
+    event_type: str,
+    expected_status: str | None,
+) -> None:
+    event = Coordinator._sol_structural_event({
+        "type": event_type,
+        "item_type": "command_execution",
+        "status": "completed",
+        "command_sha256": "e" * 64,
+    })
+    assert event is not None
+    assert event.get("status") == expected_status
+    assert event["command_sha256"] == "e" * 64
 
 
 def test_default_bootstrap_shape_is_complete_and_fail_closed(
@@ -650,7 +820,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
     harness = f"""
       import * as bridge from {json.dumps(module_uri)};
       const bootstrap = {json.dumps(bootstrap)};
-      const projectBootstrap = {{...bootstrap, project_id: "project-a"}};
+      const hostileActivity = "<img src=x onerror=globalThis.pwned=true>".repeat(200);
+      const projectBootstrap = {{...bootstrap, project_id: "project-a", tasks: [{{...bootstrap.tasks[0], exchange_allowance: 2, exchange_consumed: 1, activity_kind: "agent_event", activity: {{status: hostileActivity, command_sha256: hostileActivity, run_id: hostileActivity, raw_output: hostileActivity}}}}, ...bootstrap.tasks.slice(1), {{task_id: "intervene-task", revision: 1, continuation_generation: 1, state: "fable_planning"}}]}};
       let projectPayload = {{csrf_token: {json.dumps(CSRF_TOKEN)}, usage_credits_acknowledged: true, projects: [{{
         project_id: "project-a", label: "PROJECT-A", branch: "feat/agent-bridge",
         readiness: {{fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
@@ -677,13 +848,14 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
           this.checked = false; this.open = false; this.inert = false; this.listeners = {{}};
         }}
         set textContent(value) {{ this._text = String(value); this.children = []; }}
-        get textContent() {{ return this._text; }}
+        get textContent() {{ return this._text + this.children.map((child) => child.textContent).join(""); }}
         append(...children) {{ for (const child of children) {{ child.parent = this; this.children.push(child); }} }}
         replaceChildren(...children) {{ this.children = []; this.append(...children); this._text = ""; }}
         removeChild(child) {{ this.children.splice(this.children.indexOf(child), 1); }}
         remove() {{ this.parent?.removeChild(this); }}
         setAttribute(name, value) {{ this.attributes[name] = String(value); }}
         removeAttribute(name) {{ delete this.attributes[name]; if (name === "open") this.open = false; }}
+        getAttribute(name) {{ return this.attributes[name] ?? null; }}
         addEventListener(kind, listener) {{ (this.listeners[kind] ??= []).push(listener); }}
             async emit(kind, event = {{}}) {{
               if (!interactionAllowed(this)) return;
@@ -694,32 +866,51 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         focus() {{ documentRoot.activeElement = this; this.focusCount = (this.focusCount ?? 0) + 1; }}
         showModal() {{ this.open = true; this.showModalCount = (this.showModalCount ?? 0) + 1; }}
         close() {{ this.open = false; this.closeCount = (this.closeCount ?? 0) + 1; }}
-        querySelector(selector) {{
-          const wanted = selector.includes("button") ? "button" : null;
+        querySelectorAll(selector) {{
+          const selectors = selector.split(",").map((entry) => entry.trim());
+          const matches = (node) => selectors.some((entry) => (
+            entry === node.tag || entry === "[tabindex]" && node.attributes.tabindex !== undefined
+              || entry.startsWith("#") && node.id === entry.slice(1)
+          ));
+          const result = [];
           const stack = [...this.children];
           while (stack.length) {{
             const child = stack.shift();
-            if (wanted && child.tag === wanted && !child.disabled) return child;
+            if (matches(child)) result.push(child);
             stack.push(...child.children);
           }}
-          return null;
+          return result;
+        }}
+        querySelector(selector) {{
+          return this.querySelectorAll(selector)[0] ?? null;
         }}
       }}
 
       const ids = [
-        "task-list", "conversation", "task-inspector", "composer", "message-input",
+        "task-list", "conversation", "conversation-shell", "project-navigation",
+        "task-inspector", "task-inspector-panel", "composer", "message-input",
         "composer-submit", "composer-guidance", "usage-modal", "usage-credits-form",
         "usage-credits-confirm", "usage-credits-acknowledge", "usage-error",
         "toast-region", "fable-status", "sol-status", "repository-status",
         "connection-status", "task-drawer-toggle", "inspector-drawer-toggle",
         "bootstrap-retry", "project-list", "chat-list", "new-chat",
-        "selected-project-name", "selected-chat-name",
+            "selected-project-name", "selected-chat-name", "task-inspector-summary", "composer-recipient",
+            "composer-label", "task-inspector-empty",
+            "task-controls", "activity-audit", "intervention-context", "intervene-control",
+            "stop-control", "conversation-status", "conversation-context",
       ];
       const nodes = Object.fromEntries(ids.map((id) => [id, new Node(
         id === "usage-modal" ? "dialog" : id.includes("toggle") || id.includes("submit") || id === "bootstrap-retry" || id === "new-chat" ? "button" : id === "composer" || id === "usage-credits-form" ? "form" : "div",
         id,
       )]));
       nodes["message-input"].tag = "textarea";
+      nodes["intervene-control"].tag = "button"; nodes["stop-control"].tag = "button";
+      nodes["activity-audit"].tag = "details";
+      nodes["composer-recipient"].tag = "select";
+      nodes["composer-recipient"].value = "sol";
+      nodes["composer-recipient"].options = ["fable", "sol", "team"].map((value) => {{
+        const option = new Node("option"); option.value = value; return option;
+      }});
       nodes["usage-credits-confirm"].tag = "input";
       nodes["task-drawer-toggle"].setAttribute("aria-expanded", "false");
       nodes["inspector-drawer-toggle"].setAttribute("aria-expanded", "false");
@@ -728,14 +919,36 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
         nodes["usage-credits-confirm"], nodes["usage-credits-acknowledge"],
         nodes["usage-error"], nodes["bootstrap-retry"],
       );
+      const disabledDrawerControl = new Node("button", "disabled-drawer-control");
+      disabledDrawerControl.disabled = true;
+      nodes["project-navigation"].append(disabledDrawerControl, nodes["task-list"]);
+      nodes["task-inspector-panel"].append(
+        nodes["task-inspector"], nodes["task-inspector-summary"], nodes["task-controls"],
+        nodes["task-inspector-empty"], nodes["activity-audit"],
+      );
+      nodes["composer"].append(
+        nodes["composer-label"], nodes["message-input"], nodes["composer-recipient"],
+        nodes["composer-submit"], nodes["composer-guidance"],
+      );
+      nodes["conversation-context"].append(
+        nodes["intervention-context"], nodes["conversation-status"],
+        nodes["intervene-control"], nodes["stop-control"],
+      );
+      nodes["conversation-shell"].append(nodes["conversation-context"], nodes["composer"]);
       const isDescendantOf = (node, ancestor) => {{
         for (let current = node; current; current = current.parent) {{
           if (current === ancestor) return true;
         }}
         return false;
       }};
-      interactionAllowed = (node) => !nodes["usage-modal"].open
-        || isDescendantOf(node, nodes["usage-modal"]);
+      const hasInertAncestor = (node) => {{
+        for (let current = node; current; current = current.parent) {{
+          if (current.inert) return true;
+        }}
+        return false;
+      }};
+      interactionAllowed = (node) => (!nodes["usage-modal"].open
+        || isDescendantOf(node, nodes["usage-modal"])) && !hasInertAncestor(node);
       const launcher = new Node("button", "launcher");
       documentRoot = {{
         activeElement: launcher,
@@ -749,6 +962,8 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       const fetchCalls = [];
       let projectFetchCount = 0;
       let bootstrapFetchCount = 0;
+      let interventionAttempts = 0;
+      let acknowledgementAttempts = 0;
       let releaseReconnectBootstrap;
       const scheduled = [];
       class FakeSocket {{
@@ -784,6 +999,20 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
             }}
             return {{ok: true, status: 200, json: async () => projectBootstrap}};
           }}
+          if (url.endsWith("/tasks/intervene-task/intervene")) {{
+            interventionAttempts += 1;
+            return interventionAttempts === 1
+              ? {{ok: false, status: 409, json: async () => ({{detail: "task revision conflicts"}})}}
+              : {{ok: true, status: 202, json: async () => ({{}})}};
+          }}
+          if (url.endsWith("/authorize-retry")) {{
+            acknowledgementAttempts += 1;
+            return acknowledgementAttempts === 1
+              ? {{ok: false, status: 503, json: async () => ({{}})}}
+              : acknowledgementAttempts === 4
+                ? {{ok: false, status: 409, json: async () => ({{detail: "resume generation conflicts"}})}}
+              : {{ok: true, status: 202, json: async () => ({{}})}};
+          }}
           return {{ok: true, status: 202, json: async () => ({{}})}};
         }},
         setTimeout: (callback, delay) => {{ scheduled.push({{callback, delay}}); return scheduled.length; }},
@@ -796,13 +1025,19 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (documentRoot.activeElement !== nodes["usage-credits-confirm"]) process.exit(3);
       if (await controller.ready) process.exit(4);
       if (nodes["bootstrap-retry"].hidden || !nodes["message-input"].disabled) process.exit(5);
+      if (nodes["task-inspector-empty"].hidden) process.exit(53);
       if (!interactionAllowed(nodes["bootstrap-retry"])) process.exit(25);
       if (!nodes["usage-error"].textContent.includes("No project chats")) process.exit(26);
 
       await nodes["bootstrap-retry"].emit("click");
       if (!(await controller.ready)) process.exit(6);
       if (nodes["message-input"].disabled || nodes["composer-submit"].disabled) process.exit(7);
+      if (!nodes["task-inspector-summary"].textContent.includes("Question budget2 remaining · 1 consumed")) process.exit(34);
+      if (!nodes["task-controls"].hidden) process.exit(49);
+      if (!nodes["task-inspector-empty"].hidden) process.exit(52);
       if (nodes["usage-modal"].closeCount !== 1 || documentRoot.activeElement !== launcher) process.exit(8);
+      media.matches = false;
+      media.emit();
       if (nodes["repository-status"].textContent !== "Project: PROJECT-A · Branch: feat/agent-bridge") {{
         process.exit(9);
       }}
@@ -854,19 +1089,178 @@ def test_browser_controller_uses_exact_bootstrap_and_recovers_from_initial_failu
       if (documentRoot.activeElement !== reconnectFocus) process.exit(24);
       if (nodes["message-input"].disabled) process.exit(28);
 
+      media.matches = true;
+      media.emit();
+      const firstDrawerFocusable = nodes["task-list"].children[1].children[0].querySelector("button");
       await nodes["task-drawer-toggle"].emit("click");
-      if (!nodes["task-list"].classList.contains("drawer-open")) process.exit(14);
+      if (!nodes["project-navigation"].classList.contains("drawer-open") || !nodes["conversation-shell"].inert || nodes["project-navigation"].attributes.role !== "dialog" || nodes["project-navigation"].attributes["aria-modal"] !== "true") process.exit(14);
       if (nodes["task-drawer-toggle"].attributes["aria-expanded"] !== "true") process.exit(15);
+      if (documentRoot.activeElement !== firstDrawerFocusable) process.exit(35);
+      launcher.focus();
+      await documentRoot.emit("keydown", {{key: "Tab", preventDefault() {{ this.prevented = true; }}}});
+      if (documentRoot.activeElement !== firstDrawerFocusable) process.exit(36);
+      const blockedCalls = fetchCalls.length;
+      nodes["message-input"].value = "This cannot send while navigation is inert.";
+      await nodes["composer"].emit("submit");
+      if (fetchCalls.length !== blockedCalls) process.exit(54);
       await documentRoot.emit("keydown", {{key: "Escape", preventDefault() {{}}}});
-      if (nodes["task-list"].classList.contains("drawer-open")) process.exit(16);
+      if (nodes["project-navigation"].classList.contains("drawer-open") || nodes["project-navigation"].attributes.role !== undefined || nodes["project-navigation"].attributes["aria-modal"] !== undefined) process.exit(16);
       if (documentRoot.activeElement !== nodes["task-drawer-toggle"]) process.exit(17);
       if (globalThis.pwned === true) process.exit(18);
+      await nodes["inspector-drawer-toggle"].emit("click");
+      nodes["activity-audit"].open = true;
+      await nodes["activity-audit"].emit("toggle");
+      if (!nodes["activity-audit"].textContent.includes("Agent Event") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(37);
+      if (!nodes["activity-audit"].textContent.includes("TypeAgent Event")) process.exit(50);
       media.matches = false;
       media.emit();
-      if (nodes["task-list"].inert || nodes["task-inspector"].inert) process.exit(19);
-      const taskButton = nodes["task-list"].children[1].querySelector("button");
+      if (nodes["project-navigation"].inert || nodes["task-inspector-panel"].inert || nodes["conversation-shell"].inert) process.exit(19);
+      media.matches = true;
+      media.emit();
+      await nodes["task-drawer-toggle"].emit("click");
+      const taskButton = nodes["task-list"].children[1].children[1].querySelector("button");
       await taskButton.emit("click");
-      if (nodes["task-list"].inert) process.exit(20);
+      if (!nodes["project-navigation"].inert || nodes["project-navigation"].classList.contains("drawer-open") || nodes["conversation-shell"].inert) process.exit(20);
+      if (!nodes["activity-audit"].textContent.includes("No structured activity recorded") || nodes["activity-audit"].textContent.includes(hostileActivity)) process.exit(38);
+      projectBootstrap.fable_ready = false;
+      projectBootstrap.fable_status = "unavailable";
+      projectBootstrap.sol_status = "unavailable";
+      const activeSocket = FakeSocket.instances.at(-1);
+      const refreshFromEvent = async (sequence) => {{
+        activeSocket.listeners.message({{data: JSON.stringify({{...persistedEvent, sequence, task_id: "intervene-task", kind: "conversation", payload: {{text: "refresh"}}}})}});
+        await flush();
+        scheduled.at(-1).callback();
+        await flush();
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 50);
+      const safeDigest = "a".repeat(64);
+      media.matches = false;
+      media.emit();
+      const taskOneButton = nodes["task-list"].children[1].children[0].querySelector("button");
+      await taskOneButton.emit("click");
+      for (const [index, [kind, expected]] of [
+        ["action_error", "Action Error"], ["stop_error", "Stop Error"],
+        ["agent_event", "Agent Event"], ["resume_drift", "Resume Drift"],
+      ].entries()) {{
+        projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], activity_kind: kind, activity: {{
+          status: "completed", command_sha256: safeDigest, run_id: hostileActivity,
+          raw_output: hostileActivity, extra: hostileActivity,
+        }}}};
+        await refreshFromEvent(persistedEvent.sequence + 60 + index);
+        const auditText = nodes["activity-audit"].textContent;
+        if (!auditText.includes(expected) || auditText.includes(hostileActivity)) process.exit(55 + index);
+        if (kind !== "agent_event" && (auditText.includes("Completed") || auditText.includes(safeDigest))) process.exit(56);
+        if (kind === "agent_event" && (!auditText.includes("Completed") || !auditText.includes(safeDigest))) process.exit(57);
+      }}
+      await nodes["task-list"].children[1].children[1].querySelector("button").emit("click");
+      if (controller.state.gate.canCompose || !nodes["message-input"].disabled) process.exit(41);
+      await nodes["intervene-control"].emit("click");
+      if (nodes["composer-recipient"].value !== "fable" || !nodes["composer-recipient"].options[1].disabled) process.exit(47);
+      nodes["message-input"].value = "Keep scope exact.";
+      await nodes["message-input"].emit("input");
+      if (nodes["composer-submit"].disabled) process.exit(32);
+      await nodes["composer"].emit("submit");
+      const intervention = fetchCalls.find((call) => call.url === "/api/projects/project-a/chats/session-1/tasks/intervene-task/intervene");
+      if (!intervention || JSON.parse(intervention.options.body).message !== "Keep scope exact.") process.exit(33);
+      if (!nodes["message-input"].disabled || !nodes["composer-submit"].disabled) process.exit(39);
+      if (!nodes["toast-region"].textContent.includes("task revision conflicts")) process.exit(51);
+      await nodes["intervene-control"].emit("click");
+      nodes["message-input"].value = "Use the fresh intervention identity.";
+      await nodes["message-input"].emit("input");
+      await nodes["composer"].emit("submit");
+      const interventionRequests = fetchCalls.filter((call) => call.url === intervention.url);
+      const firstPayload = JSON.parse(interventionRequests[0].options.body);
+      const secondPayload = JSON.parse(interventionRequests[1].options.body);
+      if (interventionRequests.length !== 2 || firstPayload.intervention_id === secondPayload.intervention_id || secondPayload.message !== "Use the fresh intervention identity.") process.exit(40);
+      projectBootstrap.tasks[1] = {{...projectBootstrap.tasks[1], state: "completed", intervention: {{
+        intervention_id: "unknown-a", status: "resume_outcome_unknown", resume_generation: 4,
+        warning: "may have executed", eligible: false,
+      }}}};
+      await refreshFromEvent(persistedEvent.sequence + 101);
+      const warningFocuses = nodes["intervention-context"].focusCount;
+      const firstAcknowledge = nodes["conversation-context"].querySelector("#intervention-acknowledge-control");
+      await firstAcknowledge.emit("click");
+      const acknowledgements = () => fetchCalls.filter((call) => call.url.endsWith("/authorize-retry"));
+      const firstAcknowledgement = JSON.parse(acknowledgements()[0].options.body);
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 5}};
+      await refreshFromEvent(persistedEvent.sequence + 102);
+      if (nodes["intervention-context"].focusCount <= warningFocuses) process.exit(43);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const secondAcknowledgement = JSON.parse(acknowledgements()[1].options.body);
+      if (firstAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || secondAcknowledgement.expected_resume_generation !== 5 || secondAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(42);
+      const focusBeforeNewGeneration = nodes["intervention-context"].focusCount;
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 6}};
+      await refreshFromEvent(persistedEvent.sequence + 103);
+      if (nodes["intervention-context"].focusCount <= focusBeforeNewGeneration || focusBeforeNewGeneration < warningFocuses) process.exit(43);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const thirdAcknowledgement = JSON.parse(acknowledgements()[2].options.body);
+      if (thirdAcknowledgement.acknowledgment_id === secondAcknowledgement.acknowledgment_id || thirdAcknowledgement.expected_resume_generation !== 6) process.exit(44);
+      projectBootstrap.tasks[1].intervention = {{...projectBootstrap.tasks[1].intervention, resume_generation: 7}};
+      await refreshFromEvent(persistedEvent.sequence + 104);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const conflictAcknowledgement = JSON.parse(acknowledgements()[3].options.body);
+      await nodes["conversation-context"].querySelector("#intervention-acknowledge-control").emit("click");
+      const freshAcknowledgement = JSON.parse(acknowledgements()[4].options.body);
+      if (conflictAcknowledgement.acknowledgment_id === freshAcknowledgement.acknowledgment_id || freshAcknowledgement.expected_resume_generation !== 7 || freshAcknowledgement.acknowledge_possible_prior_execution !== true) process.exit(48);
+      for (const status of ["pending_stop", "ready", "resuming", "resume_outcome_unknown"]) {{
+        projectBootstrap.tasks[1].intervention = {{
+          intervention_id: `stop-${{status}}`, status, resume_generation: 6, eligible: false,
+        }};
+        await refreshFromEvent(persistedEvent.sequence + 105 + acknowledgements().length);
+        if (nodes["stop-control"].hidden || nodes["stop-control"].disabled) process.exit(45);
+        await nodes["stop-control"].emit("click");
+      }}
+      const stopRequests = fetchCalls.filter((call) => call.url.endsWith("/tasks/intervene-task/stop"));
+      if (stopRequests.length !== 4 || stopRequests.some((call) => call.options.body !== "null")) process.exit(46);
+      projectBootstrap.fable_ready = true;
+      projectBootstrap.fable_status = "subscription_ready";
+      projectBootstrap.sol_status = "ready";
+      projectBootstrap.tasks[1] = {{...projectBootstrap.tasks[1], state: "fable_planning", intervention: {{
+        intervention_id: "safe-resume", status: "ready", resume_generation: 8, eligible: true,
+      }}}};
+      await refreshFromEvent(persistedEvent.sequence + 140);
+      await nodes["intervene-control"].emit("click");
+      await flush();
+      const safeResume = fetchCalls.find((call) => call.url.endsWith("/interventions/safe-resume/resume"));
+      if (!safeResume || safeResume.options.body !== '{{"expected_resume_generation":8}}'
+          || !nodes["conversation-status"].textContent.includes("resume accepted")) process.exit(67);
+
+      projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], revision: 1,
+        continuation_generation: 8, state: "awaiting_user_input", intervention: null,
+        pending_question: {{question_id: "browser-question-1", asked_by: "sol", addressed_to: "user",
+          routed_to: "user", text: "Which exact approved option should Sol use?",
+          revision: 1, continuation_generation: 8}},
+        exchange_permission: {{request_id: "browser-grant-1", revision: 1, continuation_generation: 8}},
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 141);
+      await nodes["task-list"].children[1].children[0].querySelector("button").emit("click");
+      const actionCards = nodes["conversation"].children.filter((node) => node.className === "conversation-action-card");
+      const questionCard = actionCards.find((card) => card.textContent.includes("Which exact approved option"));
+      const permissionCard = actionCards.find((card) => card.textContent.includes("Automatic exchange limit"));
+      if (!questionCard || !permissionCard || !questionCard.textContent.includes("Sol → You")
+          || !permissionCard.textContent.includes("Allow 3 more exchanges")) process.exit(68);
+      await questionCard.querySelector("button").emit("click");
+      nodes["message-input"].value = "Use the exact option already approved.";
+      await nodes["composer"].emit("submit");
+      await flush();
+      const answer = fetchCalls.find((call) => call.url.endsWith("/tasks/task-1/answer"));
+      if (!answer || answer.options.body !== '{{"text":"Use the exact option already approved.","revision":1,"question_id":"browser-question-1","continuation_generation":8}}') process.exit(69);
+      const refreshedPermission = nodes["conversation"].children.find((card) => card.className === "conversation-action-card" && card.textContent.includes("Automatic exchange limit"));
+      await refreshedPermission.querySelectorAll("button").at(-1).emit("click");
+      await flush();
+      const grant = fetchCalls.find((call) => call.url.endsWith("/tasks/task-1/exchanges/grant"));
+      if (!grant || grant.options.body !== '{{"revision":1,"continuation_generation":8,"request_id":"browser-grant-1"}}') process.exit(70);
+
+      projectBootstrap.tasks[0] = {{...projectBootstrap.tasks[0], revision: 2,
+        continuation_generation: 9, state: "awaiting_user_approval", pending_question: null,
+        exchange_permission: null, brief: {{...projectBootstrap.tasks[0].brief, revision: 2}},
+      }};
+      await refreshFromEvent(persistedEvent.sequence + 142);
+      await nodes["task-list"].children[1].children[0].querySelector("button").emit("click");
+      await nodes["task-inspector"].children[0].querySelector("button").emit("click");
+      await flush();
+      const approvals = fetchCalls.filter((call) => call.url.endsWith("/tasks/task-1/approve"));
+      if (approvals.at(-1).options.body !== '{{"revision":2}}') process.exit(71);
     """
     result = subprocess.run(
         [
@@ -1295,6 +1689,38 @@ def test_lifespan_cancels_and_awaits_active_actions_without_error_event(
     assert web_harness.app.state.coroutine_observation_failures == []
 
 
+def test_hub_lifespan_awaits_provider_shutdown_without_closing_runtime_resources(
+    tmp_path: Path,
+) -> None:
+    """The app loop reaps providers; the launcher retains resource ownership."""
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    calls: list[str] = []
+
+    class Registry:
+        async def aclose_providers(self) -> None:
+            await asyncio.sleep(0)
+            calls.append("providers")
+
+        def close(self) -> None:
+            calls.append("resources")
+
+    app = create_hub_app(
+        registry=Registry(),  # type: ignore[arg-type]
+        hub_store=object(),  # type: ignore[arg-type]
+        workflows=object(),  # type: ignore[arg-type]
+        static_dir=static_dir,
+        session_key=SESSION_KEY,
+        csrf_token=CSRF_TOKEN,
+    )
+
+    with TestClient(app):
+        pass
+
+    assert calls == ["providers"]
+
+
 def test_new_actions_are_rejected_once_shutdown_has_started(
     web_harness: WebHarness,
 ) -> None:
@@ -1712,6 +2138,7 @@ class _HubWorkflows:
     def __init__(self, runtimes: dict[str, _HubRuntime]) -> None:
         self.runtimes = runtimes
         self.prepared: list[_Prepared] = []
+        self.preparation_calls: list[tuple[str, dict[str, object]]] = []
         self.runs: list[str] = []
         self.aborts: list[tuple[str, str]] = []
         self.stops: list[tuple[str, str, str]] = []
@@ -1817,6 +2244,48 @@ class _HubWorkflows:
             task_id=str(kwargs["task_id"]),
         )
 
+    async def prepare_continuation_message(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("continuation", dict(kwargs)))
+        return self._prepare(
+            action="continuation",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_question_answer(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("question_answer", dict(kwargs)))
+        return self._prepare(
+            action="question_answer",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    async def prepare_exchange_grant(self, **kwargs: object) -> _Prepared:
+        self._require_task(kwargs)
+        self.preparation_calls.append(("exchange_grant", dict(kwargs)))
+        return self._prepare(
+            action="exchange_grant",
+            project_id=str(kwargs["project_id"]),
+            session_id=str(kwargs["session_id"]),
+            task_id=str(kwargs["task_id"]),
+        )
+
+    def _require_task(self, kwargs: object) -> None:
+        if not isinstance(kwargs, dict):
+            raise ValueError("typed preparation arguments are invalid")
+        try:
+            task = self.runtimes[str(kwargs["project_id"])].store.get_task(
+                str(kwargs["task_id"]), int(kwargs["revision"]),
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError) as error:
+            raise LookupError("task not found") from error
+        if task.session_id != kwargs["session_id"]:
+            raise LookupError("task not found")
+
     async def run(self, prepared: _Prepared) -> None:
         self.runs.append(prepared.preparation_id)
         if self.active_lease is not None and self.active_lease.task_id == prepared.task_id:
@@ -1890,6 +2359,29 @@ class _RealHubHarness:
             runtime.store.close()
 
 
+class _InterventionRunner(ProcessRunner):
+    """Controlled process edge; the Hub, Coordinator, and Store stay real."""
+
+    def __init__(self) -> None:
+        super().__init__(stop_grace_seconds=0)
+        self.stores: dict[str, SQLiteStore] = {}
+        self.stops: list[str] = []
+        self.stop_started = asyncio.Event()
+        self.release_stop = asyncio.Event()
+        self.block_stop = False
+
+    async def stop(self, run_id: str, *, timeout_seconds: float) -> StopReceipt:
+        assert timeout_seconds > 0
+        self.stops.append(run_id)
+        self.stop_started.set()
+        if self.block_stop:
+            await self.release_stop.wait()
+        self.stores[run_id].finish_agent_run(
+            run_id, status="interrupted", exit_code=-15,
+        )
+        return StopReceipt(run_id=run_id, was_running=True, process_exited=True)
+
+
 def _real_hub_harness(
     tmp_path: Path,
     *,
@@ -1897,6 +2389,7 @@ def _real_hub_harness(
     sol_results: tuple[object, ...] = ("ready",),
     fable: object | None = None,
     repository: object | None = None,
+    runner: object | None = None,
 ) -> _RealHubHarness:
     static_dir = tmp_path / "real-static"
     static_dir.mkdir()
@@ -1917,7 +2410,7 @@ def _real_hub_harness(
         coordinator = Coordinator(
             store=store,
             repository=object() if repository is None else repository,
-            runner=object(),
+            runner=object() if runner is None else runner,
             fable=object() if fable is None else fable,
             sol=object(),
             ids=_RealIds(),
@@ -2098,7 +2591,7 @@ def test_hub_routes_resolve_project_before_any_foreign_chat_or_task_lookup(
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/edit", edited),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/reject", None),
-        ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+        ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
         ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
     )
@@ -2152,6 +2645,532 @@ def test_hub_duplicate_chat_and_task_ids_remain_bound_to_the_route_project(
     assert hub_harness.workflows.prepared[0].session_id == "shared-chat"
 
 
+def test_hub_directed_routes_require_exact_bound_request_shapes(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    """Directed browser input must use its dedicated exact-bound endpoints."""
+    runtime = hub_harness.runtimes["project-a"]
+    task = replace(valid_brief, task_id="directed-task")
+    runtime.store.save_task("chat-a", task, TaskState.AWAITING_USER_INPUT)
+    headers = {"X-CSRF-Token": CSRF_TOKEN}
+    base = "/api/projects/project-a/chats/chat-a/tasks/directed-task"
+    with _authenticated_hub_client(hub_harness) as client:
+        ordinary = client.post(
+            "/api/projects/project-a/chats/chat-a/messages",
+            json={"text": "please plan this", "addressed_to": "sol"},
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        continuation = client.post(
+            f"{base}/messages",
+            json={
+                "text": "continue exactly this task",
+                "addressed_to": "fable",
+                "revision": 1,
+                "continuation_generation": 1,
+            },
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        answer = client.post(
+            f"{base}/answer",
+            json={
+                "text": "the exact answer",
+                "revision": 1,
+                "question_id": "question-1",
+                "continuation_generation": 1,
+            },
+            headers=headers,
+        )
+        _wait_until(lambda: not hub_harness.workflows.active_lease)
+        grant = client.post(
+            f"{base}/exchanges/grant",
+            json={
+                "revision": 1,
+                "continuation_generation": 1,
+                "request_id": "grant-1",
+            },
+            headers=headers,
+        )
+    assert ordinary.status_code == 202
+    assert continuation.status_code == 202
+    assert answer.status_code == 202
+    assert grant.status_code == 202
+    assert hub_harness.workflows.preparation_calls == [
+        ("continuation", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "text": "continue exactly this task", "addressed_to": ConversationTarget.FABLE}),
+        ("question_answer", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "question_id": "question-1", "answer": "the exact answer"}),
+        ("exchange_grant", {"project_id": "project-a", "session_id": "chat-a", "task_id": "directed-task", "revision": 1, "continuation_generation": 1, "request_id": "grant-1"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "payload"),
+    (
+        ("messages", {"text": " ", "addressed_to": "fable", "revision": 1, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "team", "revision": 1, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "fable", "revision": True, "continuation_generation": 1}),
+        ("messages", {"text": "x", "addressed_to": "fable", "revision": 1, "continuation_generation": 1, "routed_to": "sol"}),
+        ("answer", {"text": "x", "revision": 1, "question_id": "question-1", "continuation_generation": 1, "sender": "user"}),
+        ("answer", {"text": "x", "revision": 1}),
+        ("answer", {"text": "x", "revision": 1, "question_id": "bad/id", "continuation_generation": 1}),
+        ("exchanges/grant", {"revision": 1, "continuation_generation": 1, "request_id": "grant-1", "continuation": "forbidden"}),
+        ("exchanges/grant", {"revision": 1, "continuation_generation": "1", "request_id": "grant-1"}),
+    ),
+)
+def test_hub_directed_requests_reject_untrusted_or_nonexact_browser_fields(
+    hub_harness: _HubHarness,
+    suffix: str,
+    payload: dict[str, object],
+) -> None:
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            f"/api/projects/project-a/chats/chat-a/tasks/task-1/{suffix}",
+            json=payload,
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert hub_harness.workflows.preparation_calls == []
+    assert hub_harness.workflows.prepared == []
+
+
+def test_hub_ordinary_message_rejects_directed_control_fields_and_oversized_text(
+    hub_harness: _HubHarness,
+) -> None:
+    payloads = (
+        {"text": "plan", "routed_to": "fable"},
+        {"text": "plan", "sender": "user"},
+        {"text": "plan", "continuation_generation": 1},
+        {"text": "plan\nwith control"},
+        {"text": "x" * (16 * 1024 + 1)},
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        for payload in payloads:
+            response = client.post(
+                "/api/projects/project-a/chats/chat-a/messages",
+                json=payload,
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 422
+    assert hub_harness.workflows.prepared == []
+
+
+@pytest.mark.parametrize("route", ("messages", "messages-bound", "answer"))
+@pytest.mark.parametrize("invalid_text", ("secret /private/repository/token", "bad\x00control"))
+def test_hub_task5_text_validation_never_reflects_untrusted_values_or_schedules(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    route: str,
+    invalid_text: str,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.AWAITING_USER_INPUT)
+    if route == "messages":
+        path = "/api/projects/project-a/chats/chat-a/messages"
+        payload = {"text": invalid_text, "addressed_to": "fable", "sender": "user"}
+    elif route == "messages-bound":
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/messages"
+        payload = {
+            "text": invalid_text, "addressed_to": "fable", "revision": 1,
+            "continuation_generation": 1, "routed_to": "fable",
+        }
+    else:
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/answer"
+        payload = {
+            "text": invalid_text, "revision": 1, "question_id": "question-1",
+            "continuation_generation": 1, "sender": "user",
+        }
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            path, json=payload, headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert invalid_text not in response.text
+    assert "/private/repository/token" not in response.text
+    assert hub_harness.workflows.prepared == []
+    assert hub_harness.workflows.preparation_calls == []
+    assert runtime.store.events_after("chat-a", 0) == ()
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+@pytest.mark.parametrize("route", ("messages", "messages-bound", "answer"))
+def test_hub_task5_text_validation_rejects_lone_surrogates_without_reflection(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    route: str,
+) -> None:
+    hub_harness.runtimes["project-a"].store.save_task(
+        "chat-a", valid_brief, TaskState.AWAITING_USER_INPUT,
+    )
+    if route == "messages":
+        path = "/api/projects/project-a/chats/chat-a/messages"
+        body = b'{"text":"\\ud800","addressed_to":"fable"}'
+    elif route == "messages-bound":
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/messages"
+        body = b'{"text":"\\ud800","addressed_to":"fable","revision":1,"continuation_generation":1}'
+    else:
+        path = "/api/projects/project-a/chats/chat-a/tasks/task-1/answer"
+        body = b'{"text":"\\ud800","revision":1,"question_id":"question-1","continuation_generation":1}'
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            path,
+            content=body,
+            headers={"X-CSRF-Token": CSRF_TOKEN, "content-type": "application/json"},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert "ud800" not in response.text
+    assert hub_harness.workflows.prepared == []
+    assert hub_harness.workflows.preparation_calls == []
+    assert hub_harness.runtimes["project-a"].store.events_after("chat-a", 0) == ()
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+def test_hub_directed_duplicate_identifiers_stay_in_the_route_project(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 2's deferred route harness covers all directed bound endpoints."""
+    foreign = hub_harness.runtimes["project-b"].store
+    for runtime in hub_harness.runtimes.values():
+        runtime.store.create_session("shared-directed-chat", runtime.repository)
+        for task_id in ("shared-continuation", "shared-question", "shared-grant"):
+            runtime.store.save_task(
+                "shared-directed-chat", replace(valid_brief, task_id=task_id),
+                TaskState.AWAITING_USER_INPUT,
+            )
+
+    def foreign_access(*args: object, **kwargs: object) -> object:
+        raise AssertionError("directed route must not probe the foreign project")
+
+    for name in ("session_exists", "get_task", "latest_task", "chat", "append_event"):
+        monkeypatch.setattr(foreign, name, foreign_access)
+
+    base = "/api/projects/project-a/chats/shared-directed-chat/tasks"
+    with _authenticated_hub_client(hub_harness) as client:
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        responses = []
+        for suffix, payload in (
+            ("shared-continuation/messages", {"text": "continue", "addressed_to": "fable", "revision": 1, "continuation_generation": 1}),
+            ("shared-question/answer", {"text": "answer", "revision": 1, "question_id": "shared-question-id", "continuation_generation": 1}),
+            ("shared-grant/exchanges/grant", {"revision": 1, "continuation_generation": 1, "request_id": "shared-grant-id"}),
+        ):
+            responses.append(client.post(f"{base}/{suffix}", json=payload, headers=headers))
+            _wait_until(lambda: hub_harness.workflows.active_lease is None)
+    assert [response.status_code for response in responses] == [202, 202, 202]
+    assert [call[1]["project_id"] for call in hub_harness.workflows.preparation_calls] == [
+        "project-a", "project-a", "project-a",
+    ]
+    assert all(
+        prepared.project_id == "project-a" for prepared in hub_harness.workflows.prepared
+    )
+
+
+def test_hub_bootstrap_projects_only_safe_exact_user_question_projection(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    runtime = hub_harness.runtimes["project-a"]
+    task = replace(valid_brief, task_id="question-card-task")
+    runtime.store.save_task("chat-a", task, TaskState.SOL_RUNNING)
+    runtime.store.pause_for_question(
+        session_id="chat-a",
+        task_id=task.task_id,
+        revision=task.revision,
+        expected_generation=1,
+        question_id="question-card-1",
+        asked_by=ConversationActor.SOL,
+        addressed_to=ConversationTarget.USER,
+        routed_to=ConversationTarget.USER,
+        text="Which exact approved option should Sol use?",
+        continuation_state=TaskState.SOL_RUNNING,
+        pending_action={"sol_run_id": "secret-run", "prompt": "private prompt"},
+        event=ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.USER,
+            routed_to=ConversationTarget.USER,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact approved option should Sol use?",
+            task_id=task.task_id,
+            revision=task.revision,
+            continuation_generation=1,
+            question_id="question-card-1",
+        ),
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        payload = client.get(
+            "/api/projects/project-a/chats/chat-a/bootstrap"
+        ).json()
+    projected = next(item for item in payload["tasks"] if item["task_id"] == "question-card-task")
+    assert projected["continuation_generation"] == 1
+    assert projected["exchange_allowance"] == 3
+    assert projected["exchange_consumed"] == 0
+    assert projected["pending_question"] == {
+        "question_id": "question-card-1",
+        "asked_by": "sol",
+        "addressed_to": "user",
+        "routed_to": "user",
+        "text": "Which exact approved option should Sol use?",
+        "revision": 1,
+        "continuation_generation": 1,
+    }
+    assert "secret-run" not in json.dumps(payload)
+    assert "private prompt" not in json.dumps(payload)
+
+
+def test_hub_bootstrap_projects_only_current_ungranted_exchange_permission(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    def pause_permission(runtime: _HubRuntime, session_id: str) -> tuple[TaskBrief, str]:
+        task = replace(valid_brief, task_id="permission-card-task")
+        runtime.store.save_task(session_id, task, TaskState.SOL_RUNNING)
+        runtime.store._connection.execute(  # noqa: SLF001 - exact exhausted fixture
+            "UPDATE tasks SET exchange_allowance = 0 WHERE task_id = ? AND revision = ?",
+            (task.task_id, task.revision),
+        )
+        runtime.store.pause_for_exchange_permission(
+            session_id=session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_generation=1,
+            attempted_question=DirectedAgentQuestion(
+                addressed_to="fable",
+                text="A fourth question needs permission.",
+                reason="The exchange allowance is exhausted.",
+            ),
+            continuation_state=TaskState.SOL_RUNNING,
+            pending_action={"provider_id": "must-not-project"},
+            event=ConversationEnvelope(
+                sender=ConversationActor.SYSTEM,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                message_type=ConversationMessageType.STATUS,
+                text="Automatic exchange limit reached. Allow three more internal exchanges to continue.",
+                task_id=task.task_id,
+                revision=task.revision,
+                continuation_generation=1,
+            ),
+        )
+        permission_id = runtime.store._connection.execute(  # noqa: SLF001 - fixture identity
+            "SELECT permission_id FROM exchange_permissions"
+        ).fetchone()[0]
+        return task, permission_id
+
+    project_a = hub_harness.runtimes["project-a"]
+    project_b = hub_harness.runtimes["project-b"]
+    task_a, permission_a = pause_permission(project_a, "chat-a")
+    _task_b, permission_b = pause_permission(project_b, "chat-b")
+
+    with _authenticated_hub_client(hub_harness) as client:
+        first = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    projected = next(item for item in first["tasks"] if item["task_id"] == task_a.task_id)
+    assert projected["exchange_permission"] == {
+        "request_id": permission_a,
+        "revision": 1,
+        "continuation_generation": 1,
+    }
+    assert permission_b not in json.dumps(first)
+    assert "provider_id" not in json.dumps(first)
+
+    project_a.store._connection.execute(  # noqa: SLF001 - stale pause must not project
+        "UPDATE tasks SET continuation_generation = 2 WHERE task_id = ? AND revision = ?",
+        (task_a.task_id, task_a.revision),
+    )
+    with _authenticated_hub_client(hub_harness) as client:
+        stale = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    assert next(item for item in stale["tasks"] if item["task_id"] == task_a.task_id)["exchange_permission"] is None
+
+    project_a.store._connection.execute(  # noqa: SLF001 - restore exact paused fixture
+        "UPDATE tasks SET continuation_generation = 1 WHERE task_id = ? AND revision = ?",
+        (task_a.task_id, task_a.revision),
+    )
+    assert project_a.store.grant_internal_exchanges(
+        session_id="chat-a", task_id=task_a.task_id, revision=1,
+        expected_generation=1, request_id=permission_a,
+    ) == 3
+    with _authenticated_hub_client(hub_harness) as client:
+        granted = client.get("/api/projects/project-a/chats/chat-a/bootstrap").json()
+    assert next(item for item in granted["tasks"] if item["task_id"] == task_a.task_id)["exchange_permission"] is None
+
+
+def test_hub_directed_scheduler_rejection_aborts_the_exact_preparation(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub_harness.runtimes["project-a"].store.save_task(
+        "chat-a", valid_brief, TaskState.AWAITING_USER_INPUT,
+    )
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/messages",
+            json={
+                "text": "continue exactly this task", "addressed_to": "fable",
+                "revision": 1, "continuation_generation": 1,
+            },
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 503
+    assert hub_harness.workflows.aborts == [("continuation-1", "scheduler_unavailable")]
+    assert hub_harness.app.state.active_coroutines == set()
+
+
+@pytest.mark.parametrize(
+    ("addressed_to", "expected_target"),
+    (("sol", ConversationTarget.SOL), ("team", ConversationTarget.TEAM)),
+)
+def test_real_ordinary_recipient_is_persisted_but_always_routed_to_fable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    addressed_to: str,
+    expected_target: ConversationTarget,
+) -> None:
+    harness = _real_hub_harness(tmp_path)
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    runtime = harness.runtimes["a"]
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/messages",
+                json={"text": "Plan this exact request", "addressed_to": addressed_to},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 503
+        event = next(
+            event for event in runtime.store.events_after("shared-chat", 0)
+            if event.actor == "user"
+        )
+        assert event.actor == "user"
+        assert event.kind == "conversation"
+        assert event.payload == ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=expected_target,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Plan this exact request",
+        ).to_dict()
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("addressed_to", ("fable", "sol", "team"))
+def test_real_hub_first_ordinary_recipient_message_titles_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    addressed_to: str,
+) -> None:
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((True, "subscription_ready"),) * 2,
+        sol_results=("ready",) * 2,
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    runtime = harness.runtimes["a"]
+    path = f"/api/projects/{runtime.project_id}/chats/shared-chat/messages"
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            first = client.post(
+                path,
+                json={"text": "  First directed chat title.  ", "addressed_to": addressed_to},
+                headers=headers,
+            )
+            second = client.post(
+                path,
+                json={"text": "Later request cannot rename this chat.", "addressed_to": "fable"},
+                headers=headers,
+            )
+        assert (first.status_code, second.status_code) == (503, 503)
+        chat = runtime.store.chat("shared-chat")
+        assert chat is not None
+        assert chat.title == "First directed chat title."
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("acknowledged", "fable_results", "sol_results", "expected_probes"),
+    (
+        (False, ((True, "subscription_ready"),), ("ready",), (0, 0)),
+        (True, ((False, "subscription_unavailable"),), ("ready",), (1, 1)),
+        (True, ((True, "subscription_ready"),), ("unavailable",), (1, 1)),
+    ),
+)
+def test_real_directed_preparation_runs_the_complete_gate_before_store_or_scheduler(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    acknowledged: bool,
+    fable_results: tuple[object, ...],
+    sol_results: tuple[object, ...],
+    expected_probes: tuple[int, int],
+) -> None:
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=fable_results,
+        sol_results=sol_results,
+    )
+    runtime = harness.runtimes["a"]
+    task = replace(valid_brief, task_id="gated-directed-task")
+    runtime.store.save_task("shared-chat", task, TaskState.SOL_RUNNING)
+    runtime.store.set_sol_thread(task.task_id, task.revision, "gated-sol-thread")
+    runtime.store.pause_for_continuation(
+        task.task_id,
+        task.revision,
+        expected=TaskState.SOL_RUNNING,
+        target=TaskState.AWAITING_USER_INPUT,
+        continuation_state=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": "gated-sol-run", "prompt": "Continue exactly."},
+    )
+    runtime.store._connection.execute(  # noqa: SLF001 - seed exact approved route state
+        "UPDATE tasks SET approved_at = ? WHERE task_id = ? AND revision = ?",
+        ("2026-08-10T12:00:00Z", task.task_id, task.revision),
+    )
+    if not acknowledged:
+        harness.hub_store.acknowledged = False
+    before_events = runtime.store.events_after("shared-chat", 0)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/tasks/{task.task_id}/messages",
+                json={
+                    "text": "continue exactly", "addressed_to": "sol",
+                    "revision": 1, "continuation_generation": 1,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 409
+        assert (harness.probes["a"].fable_calls, harness.probes["a"].sol_calls) == expected_probes
+        assert runtime.store.events_after("shared-chat", 0) == before_events
+        assert runtime.store.latest_prepared_action_for_task(
+            project_id=runtime.project_id, session_id="shared-chat",
+            task_id=task.task_id, revision=1,
+        ) is None
+        assert harness.lease.snapshot() is None
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
 def test_every_duplicate_identifier_route_stays_inside_project_a(
     hub_harness: _HubHarness,
     valid_brief: TaskBrief,
@@ -2190,7 +3209,7 @@ def test_every_duplicate_identifier_route_stays_inside_project_a(
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/approve", {"revision": 1}),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/edit", _edited_brief(shared_brief)),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/reject", None),
-            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
             ("/api/projects/project-a/chats/shared-chat/tasks/shared-task/resume", None),
         ):
             assert client.post(path, json=body, headers=headers).status_code == 202
@@ -2265,6 +3284,10 @@ def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
             continuation_state=TaskState.SOL_RUNNING,
             pending={"prompt": "Answer exactly.", "sol_run_id": "sol-answer-run"},
         )
+        store._connection.execute(  # noqa: SLF001 - seed exact approved routing state
+            "UPDATE tasks SET approved_at = ? WHERE task_id = ? AND revision = ?",
+            ("2026-08-10T12:00:00Z", answer.task_id, answer.revision),
+        )
         store.save_task("shared-chat", resume, TaskState.FABLE_PLANNING)
         store.mark_interrupted(
             resume.task_id, resume.revision, continuation=TaskState.FABLE_PLANNING,
@@ -2314,18 +3337,24 @@ def test_real_duplicate_identifier_mutations_persist_only_in_selected_project(
                 f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['edit']}/edit",
                 json=edited, headers=headers,
             ).status_code == 202
-            _wait_until(lambda: runtime_a.store.latest_task(task_ids["edit"]).revision == 2)  # type: ignore[union-attr]
+            # TestClient owns the route coroutine on its portal thread; wait
+            # for it instead of probing this Store connection concurrently.
+            _wait_until(lambda: harness.app.state.active_coroutines == set())
+            edited_task = runtime_a.store.latest_task(task_ids["edit"])
+            assert edited_task is not None and edited_task.revision == 2
             assert client.post(
                 f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['reject']}/reject",
                 headers=headers,
             ).status_code == 202
-            _wait_until(lambda: runtime_a.store.latest_task(task_ids["reject"]).state is TaskState.FAILED)  # type: ignore[union-attr]
+            _wait_until(lambda: harness.app.state.active_coroutines == set())
+            rejected_task = runtime_a.store.latest_task(task_ids["reject"])
+            assert rejected_task is not None and rejected_task.state is TaskState.FAILED
 
             monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
             for path, body in (
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "only A message"}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['approval']}/approve", {"revision": 1}),
-                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['answer']}/answer", {"answer": "only A answer"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['answer']}/messages", {"text": "only A continuation", "addressed_to": "sol", "revision": 1, "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/{task_ids['resume']}/resume", None),
             ):
                 assert client.post(path, json=body, headers=headers).status_code == 503
@@ -2408,7 +3437,7 @@ def test_real_b_only_identifiers_cannot_change_selected_project_or_foreign_store
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/approve", {"revision": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/edit", _edited_brief(replace(valid_brief, task_id="b-only-task"))),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/reject", None),
-                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/answer", {"answer": "never"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/answer", {"text": "never", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/b-only-chat/tasks/b-only-task/resume", None),
             ):
                 assert client.post(path, json=body, headers=headers).status_code == 404
@@ -2586,7 +3615,7 @@ def test_active_lease_synchronously_gates_navigation_model_mutations_and_exact_s
         for path, body in (
             ("/api/projects/project-a/chats/chat-a/messages", {"text": "plan"}),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/approve", {"revision": 1}),
-            ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"answer": "yes"}),
+            ("/api/projects/project-a/chats/chat-a/tasks/task-1/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/resume", None),
             ("/api/projects/project-a/chats/chat-a/tasks/task-1/stop", None),
         ):
@@ -2699,7 +3728,9 @@ def test_stop_scheduler_rejection_cancels_only_its_reservation_without_mutating_
         assert response.status_code == 503
         assert runtime.store.get_task(valid_brief.task_id, valid_brief.revision).state is TaskState.FABLE_PLANNING
         assert runtime.store.events_after("shared-chat", 0) == ()
-        assert harness.lease.snapshot() is (None if owner_finishes else token)
+        # A deferred owner finalizer cannot surrender the exact retry authority
+        # while this failed Stop reservation is being cancelled.
+        assert harness.lease.snapshot() is token
         assert harness.app.state.active_coroutines == set()
     finally:
         harness.close()
@@ -2988,7 +4019,8 @@ def test_real_foreign_lease_rejects_navigation_and_model_preparation_before_stor
             for path, body in (
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/messages", {"text": "plan"}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/approval-task/approve", {"revision": 1}),
-                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/answer", {"answer": "yes"}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/messages", {"text": "continue", "addressed_to": "sol", "revision": 1, "continuation_generation": 1}),
+                (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/answer-task/answer", {"text": "yes", "revision": 1, "question_id": "question-1", "continuation_generation": 1}),
                 (f"/api/projects/{runtime_a.project_id}/chats/shared-chat/tasks/resume-task/resume", None),
             ):
                 route_before = hub_inventory()
@@ -3141,8 +4173,35 @@ def test_real_http_preparation_refreshes_fable_readiness_after_each_lease_acquis
         assert harness.lease.snapshot() is None
         assert harness.app.state.active_coroutines == set()
         assert [event.kind for event in runtime.store.events_after("shared-chat", 0)] == [
-            "message", "task_state",
+            "conversation", "task_state",
         ]
+    finally:
+        harness.close()
+
+
+def test_hub_bootstrap_immediately_projects_only_invalidated_fable_subscription(
+    tmp_path: Path,
+) -> None:
+    harness = _real_hub_harness(tmp_path)
+    failed = harness.runtimes["a"]
+    unaffected = harness.runtimes["b"]
+    try:
+        failed.readiness.invalidate_fable_subscription()
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            failed_payload = client.get(
+                f"/api/projects/{failed.project_id}/chats/shared-chat/bootstrap"
+            ).json()
+            unaffected_payload = client.get(
+                f"/api/projects/{unaffected.project_id}/chats/shared-chat/bootstrap"
+            ).json()
+
+        assert (failed_payload["fable_ready"], failed_payload["fable_status"]) == (
+            False, "subscription_unavailable",
+        )
+        assert (unaffected_payload["fable_ready"], unaffected_payload["fable_status"]) == (
+            False, "checking",
+        )
     finally:
         harness.close()
 
@@ -3381,7 +4440,7 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert workflows.active_lease_snapshot() is None
         assert app.state.active_coroutines == set()
         assert [event.kind for event in store.events_after("chat-real", 0)] == [
-            "message", "task_state",
+            "conversation", "task_state",
         ]
 
         with TestClient(app) as client:
@@ -3403,7 +4462,18 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert existing.previous_preparation_id == original.preparation_id
         assert workflows.active_lease_snapshot() is None
         assert app.state.active_coroutines == set()
-        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+        conversations = [
+            event for event in store.events_after("chat-real", 0)
+            if event.actor == "user" and event.kind == "conversation"
+        ]
+        assert len(conversations) == 1
+        assert conversations[0].payload == ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="make exactly one durable plan",
+        ).to_dict()
 
         monkeypatch.undo()
         with TestClient(app) as client:
@@ -3423,7 +4493,10 @@ def test_real_hub_scheduler_rejection_returns_exact_resume_identity_without_dupl
         assert retry is not None
         assert retry.action == "resume"
         assert retry.previous_preparation_id == existing.preparation_id
-        assert [event.kind for event in store.events_after("chat-real", 0)].count("message") == 1
+        assert len([
+            event for event in store.events_after("chat-real", 0)
+            if event.actor == "user" and event.kind == "conversation"
+        ]) == 1
     finally:
         coordinator.close()
         store.close()
@@ -3489,3 +4562,700 @@ def test_compatibility_model_starts_use_the_injected_fresh_readiness_check(
         )
     assert response.status_code == 409
     assert web_harness.coordinator.calls == []
+
+
+def test_intervention_request_body_is_strict_before_any_workflow_lookup(
+    hub_harness: _HubHarness,
+) -> None:
+    with _authenticated_hub_client(hub_harness) as client:
+        response = client.post(
+            "/api/projects/project-a/chats/chat-a/tasks/task-1/intervene",
+            json={
+                "intervention_id": "intervention-1", "message": "Keep scope exact.",
+                "addressed_to": "fable", "revision": 1,
+                "continuation_generation": 1, "routed_to": "sol",
+            },
+            headers={"X-CSRF-Token": CSRF_TOKEN},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid request"}
+    assert hub_harness.workflows.prepared == []
+
+
+def _seed_live_fable_intervention_source(
+    harness: _RealHubHarness,
+    *,
+    runtime_key: str,
+    brief: TaskBrief,
+    runner: _InterventionRunner,
+    run_id: str,
+    lease: ActiveAgentLease | None = None,
+) -> tuple[_HubRuntime, LeaseToken]:
+    """Seed only the real persisted source run that an Intervene route owns."""
+    runtime = harness.runtimes[runtime_key]
+    runtime.store.save_task("shared-chat", brief, TaskState.FABLE_PLANNING)
+    runtime.store.start_agent_run(run_id, brief.task_id, brief.revision, "fable")
+    runner.stores[run_id] = runtime.store
+    owner = harness.lease if lease is None else lease
+    return runtime, owner.acquire(
+        project_id=runtime.project_id,
+        session_id="shared-chat",
+        task_id=brief.task_id,
+    )
+
+
+def _seed_unknown_intervention(
+    runtime: _HubRuntime,
+    *,
+    brief: TaskBrief,
+) -> object:
+    """Build a genuine UNKNOWN record without invoking a provider."""
+    store = runtime.store
+    source_run_id = "unknown-source-run"
+    sol_thread_id = "123e4567-e89b-12d3-a456-426614174000"
+    store.save_task("shared-chat", brief, TaskState.SOL_RUNNING)
+    store.set_sol_thread(brief.task_id, brief.revision, sol_thread_id)
+    store.set_pending_context(
+        brief.task_id,
+        brief.revision,
+        expected=TaskState.SOL_RUNNING,
+        pending={"sol_run_id": source_run_id, "prompt": "Continue exactly."},
+    )
+    store.start_agent_run(source_run_id, brief.task_id, brief.revision, "sol")
+    store.set_agent_run_session(source_run_id, sol_thread_id)
+    created = store.create_intervention_and_request_stop(
+        intervention_id="unknown-intervention",
+        session_id="shared-chat",
+        task_id=brief.task_id,
+        revision=brief.revision,
+        expected_source_generation=1,
+        message="Keep the approved boundary exact.",
+        addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE,
+        run_id=source_run_id,
+    )
+    store.finish_agent_run(source_run_id, status="interrupted", exit_code=-15)
+    ready = store.mark_intervention_ready(created.intervention_id, run_id=source_run_id)
+    store.begin_intervention_resume(
+        ready.intervention_id,
+        expected_resume_generation=ready.resume_generation,
+        resume_attempt_id="unknown-attempt",
+        resume_run_id="unknown-resume-run",
+    )
+    unknown = store.mark_resume_outcome_unknown(
+        ready.intervention_id,
+        resume_attempt_id="unknown-attempt",
+        resume_run_id="unknown-resume-run",
+    )
+    store.recover_active_tasks()
+    return unknown
+
+
+def test_intervention_routes_require_keyed_csrf_usage_and_strict_exact_inputs(
+    hub_harness: _HubHarness,
+    valid_brief: TaskBrief,
+) -> None:
+    """A route that accepts any browser input could route hidden process authority."""
+    runtime = hub_harness.runtimes["project-a"]
+    runtime.store.save_task("chat-a", valid_brief, TaskState.FABLE_PLANNING)
+    payload = {
+        "intervention_id": "intervention-1",
+        "message": "Keep the approved scope exact.",
+        "addressed_to": "fable",
+        "revision": valid_brief.revision,
+        "continuation_generation": 1,
+    }
+    path = "/api/projects/project-a/chats/chat-a/tasks/task-1/intervene"
+    with TestClient(hub_harness.app) as unauthenticated:
+        assert unauthenticated.post(path, json=payload).status_code == 403
+    with _authenticated_hub_client(hub_harness) as client:
+        assert client.post(path, json=payload).status_code == 403
+        headers = {"X-CSRF-Token": CSRF_TOKEN}
+        assert client.post(path, json=payload, headers=headers).status_code == 409
+        hub_harness.hub_store.acknowledge_usage_credits()
+        assert client.post(
+            path,
+            json={**payload, "revision": valid_brief.revision + 1},
+            headers=headers,
+        ).status_code == 409
+        invalid_payloads = (
+            {**payload, "intervention_id": "x" * 129},
+            {**payload, "message": " \t"},
+            {**payload, "message": "unsafe\x00text"},
+            {**payload, "message": "x" * (16 * 1024 + 1)},
+            {**payload, "addressed_to": "team"},
+            {**payload, "continuation_generation": 0},
+            {**payload, "routed_to": "sol"},
+            {**payload, "run_id": "run-1"},
+            {**payload, "provider_session_id": "provider-1"},
+            {**payload, "continuation": "fable_planning"},
+            {**payload, "path": "/repo"},
+            {**payload, "command": "unsafe"},
+            {**payload, "env": {"HOME": "/tmp"}},
+        )
+        for invalid in invalid_payloads:
+            response = client.post(path, json=invalid, headers=headers)
+            assert response.status_code == 422
+            assert response.json() == {"detail": "invalid request"}
+    assert hub_harness.workflows.prepared == []
+
+
+def test_intervene_commits_before_blocked_stop_and_rechecks_model_gate(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """If scheduling owned the write, a blocked source could make HTTP lie about intent."""
+    runner = _InterventionRunner()
+    runner.block_stop = True
+    harness = _real_hub_harness(
+        tmp_path,
+        runner=runner,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime, owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="blocked-source-run",
+    )
+    path = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        f"tasks/{valid_brief.task_id}/intervene"
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            stale = client.post(
+                path,
+                json={
+                    "intervention_id": "stale-generation-intervention",
+                    "message": "This stale generation must not claim the source.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation + 1,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert stale.status_code == 409
+            assert runtime.store.intervention("stale-generation-intervention") is None
+            assert runner.stops == []
+            response = client.post(
+                path,
+                json={
+                    "intervention_id": "blocked-intervention",
+                    "message": "Pause at this exact boundary.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert response.status_code == 202
+            accepted = response.json()
+            assert accepted["scheduled"] is True
+            assert accepted["intervention"] == {
+                "intervention_id": "blocked-intervention",
+                "message": "Pause at this exact boundary.",
+                "addressed_to": "fable",
+                "routed_to": "fable",
+                "status": "pending_stop",
+                "task_id": valid_brief.task_id,
+                "revision": valid_brief.revision,
+                "source_generation": owner.generation,
+                "resume_generation": owner.generation + 1,
+                "eligible": True,
+                "visible_discontinuity": True,
+                "warning": None,
+            }
+            committed = runtime.store.intervention("blocked-intervention")
+            assert committed is not None
+            assert committed.status is InterventionStatus.PENDING_STOP
+            assert runtime.store.get_task(
+                valid_brief.task_id, valid_brief.revision,
+            ).state is TaskState.INTERRUPTED
+            client.portal.call(runner.stop_started.wait)
+            assert runner.stops == ["blocked-source-run"]
+            assert harness.lease.snapshot() == owner
+            client.portal.call(runner.release_stop.set)
+            _wait_until(lambda: not harness.app.state.active_coroutines)
+        ready = runtime.store.intervention("blocked-intervention")
+        assert ready is not None
+        assert ready.status is InterventionStatus.READY
+        assert ready.resume_attempt_id is None
+        assert ready.resume_run_id is None
+        assert harness.lease.snapshot() is None
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("final_status", ("pending", "ready"))
+def test_intervention_scheduler_rejection_preserves_source_and_releases_recovery_lease(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+    final_status: str,
+) -> None:
+    """Failed installation must not release a source token or retain a recovery token."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(
+        tmp_path,
+        runner=runner,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime, source_owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="recovery-source-run",
+    )
+    path = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        f"tasks/{valid_brief.task_id}/intervene"
+    )
+
+    def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            accepted = client.post(
+                path,
+                json={
+                    "intervention_id": "recovery-intervention",
+                    "message": "Preserve this durable stop intent.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": source_owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert accepted.status_code == 202
+        assert accepted.json()["scheduled"] is False
+        record = runtime.store.intervention("recovery-intervention")
+        assert record is not None
+        assert record.status is InterventionStatus.PENDING_STOP
+        assert harness.lease.snapshot() == source_owner
+        assert runner.stops == []
+        assert harness.app.state.active_coroutines == set()
+
+        if final_status == "ready":
+            runtime.store.finish_agent_run(
+                "recovery-source-run", status="interrupted", exit_code=-15,
+            )
+            record = runtime.store.mark_intervention_ready(
+                record.intervention_id, run_id=record.run_id,
+            )
+
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        resume_path = (
+            f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+            f"interventions/{record.intervention_id}/resume"
+        )
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            rejected = client.post(
+                resume_path,
+                json={"expected_resume_generation": record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert rejected.status_code == 202
+        assert rejected.json()["scheduled"] is False
+        assert runtime.store.intervention(record.intervention_id) == record
+        assert restarted_lease.snapshot() is None
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+
+        monkeypatch.undo()
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            recovered = client.post(
+                resume_path,
+                json={"expected_resume_generation": record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            assert recovered.status_code == 202
+            assert recovered.json()["scheduled"] is True
+            _wait_until(lambda: not restarted_app.state.active_coroutines)
+        recovered_record = runtime.store.intervention(record.intervention_id)
+        assert recovered_record is not None
+        assert recovered_record.status is InterventionStatus.READY
+        assert recovered_record.resume_attempt_id is None
+        assert restarted_lease.snapshot() is None
+    finally:
+        harness.close()
+
+
+def test_intervention_persistence_failure_is_bounded_and_never_scheduled(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An error before durable commit must not start an unowned stop coroutine."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime, owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="failed-persistence-source",
+    )
+
+    def fail_persistence(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected persistence failure")
+
+    monkeypatch.setattr(
+        runtime.store, "create_intervention_and_request_stop", fail_persistence,
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                f"tasks/{valid_brief.task_id}/intervene",
+                json={
+                    "intervention_id": "failed-persistence-intervention",
+                    "message": "Never schedule an uncommitted stop.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 409
+        assert response.json() == {"detail": "workflow is not currently available"}
+        assert runtime.store.intervention("failed-persistence-intervention") is None
+        assert runtime.store.get_task(
+            valid_brief.task_id, valid_brief.revision,
+        ).state is TaskState.FABLE_PLANNING
+        assert runner.stops == []
+        assert harness.lease.snapshot() == owner
+        assert harness.app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_resume_rejects_an_unauthenticated_intervention_before_scheduling(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """Using the raw row here would let a tampered record obtain a recovery lease."""
+    runner = _InterventionRunner()
+    runner.block_stop = True
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime, source_owner = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="tampered-source-run",
+    )
+    try:
+        prepared = harness.workflows.prepare_intervention(
+            project_id=runtime.project_id,
+            session_id="shared-chat",
+            task_id=valid_brief.task_id,
+            intent=InterventionIntent(
+                intervention_id="tampered-intervention",
+                message="Keep this authenticated.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=valid_brief.revision,
+                continuation_generation=source_owner.generation,
+            ),
+        )
+        runtime.store._connection.execute(
+            "UPDATE interventions SET message = 'tampered' WHERE intervention_id = ?",
+            (prepared.record.intervention_id,),
+        )
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            response = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                "interventions/tampered-intervention/resume",
+                json={"expected_resume_generation": prepared.record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+            missing = client.post(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+                "interventions/missing-intervention/resume",
+                json={"expected_resume_generation": prepared.record.resume_generation},
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert response.status_code == 404
+        assert missing.status_code == 404
+        assert restarted_lease.snapshot() is None
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_unknown_retry_requires_literal_acknowledgement_and_is_not_resume(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """An ordinary resume must never silently authorize a possibly executed retry."""
+    harness = _real_hub_harness(
+        tmp_path,
+        fable_results=((False, "subscription_unavailable"),),
+    )
+    runtime = harness.runtimes["a"]
+    unknown = _seed_unknown_intervention(runtime, brief=valid_brief)
+    assert runtime.store.authenticated_intervention("unknown-intervention") == unknown
+    base = (
+        f"/api/projects/{runtime.project_id}/chats/shared-chat/"
+        "interventions/unknown-intervention"
+    )
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            headers = {"X-CSRF-Token": CSRF_TOKEN}
+            ordinary = client.post(
+                f"{base}/resume",
+                json={"expected_resume_generation": unknown.resume_generation},
+                headers=headers,
+            )
+            assert ordinary.status_code == 409
+            for invalid_acknowledgement in (False, "true"):
+                rejected = client.post(
+                    f"{base}/authorize-retry",
+                    json={
+                        "expected_resume_generation": unknown.resume_generation,
+                        "acknowledgment_id": "acknowledgment-1",
+                        "acknowledge_possible_prior_execution": invalid_acknowledgement,
+                    },
+                    headers=headers,
+                )
+                assert rejected.status_code == 422
+            authorized = client.post(
+                f"{base}/authorize-retry",
+                json={
+                    "expected_resume_generation": unknown.resume_generation,
+                    "acknowledgment_id": "acknowledgment-1",
+                    "acknowledge_possible_prior_execution": True,
+                },
+                headers=headers,
+            )
+            assert authorized.status_code == 202
+            assert authorized.json()["scheduled"] is True
+            _wait_until(lambda: not harness.app.state.active_coroutines)
+        retried = runtime.store.authenticated_intervention("unknown-intervention")
+        assert retried is not None
+        assert retried.status is InterventionStatus.READY
+        assert retried.resume_generation == unknown.resume_generation + 1
+        assert retried.resume_attempt_id is None
+        assert retried.resume_run_id is None
+    finally:
+        harness.close()
+
+
+def test_intervention_routes_select_only_the_named_project_and_conflicts_do_not_schedule(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hub-wide ID lookup would let one project observe or alter another's intent."""
+    runner = _InterventionRunner()
+    harness = _real_hub_harness(tmp_path, runner=runner)
+    runtime_a, owner_a = _seed_live_fable_intervention_source(
+        harness,
+        runtime_key="a",
+        brief=valid_brief,
+        runner=runner,
+        run_id="project-a-source",
+    )
+    try:
+        record_a = harness.workflows.prepare_intervention(
+            project_id=runtime_a.project_id,
+            session_id="shared-chat",
+            task_id=valid_brief.task_id,
+            intent=InterventionIntent(
+                intervention_id="shared-intervention",
+                message="Project A guidance.",
+                addressed_to=ConversationTarget.FABLE,
+                revision=valid_brief.revision,
+                continuation_generation=owner_a.generation,
+            ),
+        ).record
+        harness.lease.release(owner_a)
+        restarted_lease = ActiveAgentLease()
+        restarted_workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            lease=restarted_lease,
+            usage_credits_acknowledged=harness.hub_store.usage_credits_acknowledged,
+        )
+        restarted_app = create_hub_app(
+            registry=ProjectRegistry(tuple(harness.runtimes.values())),
+            hub_store=harness.hub_store,
+            workflows=restarted_workflows,
+            static_dir=tmp_path / "real-static",
+            session_key=SESSION_KEY,
+            csrf_token=CSRF_TOKEN,
+        )
+        runtime_b, owner_b = _seed_live_fable_intervention_source(
+            harness,
+            runtime_key="b",
+            brief=valid_brief,
+            runner=runner,
+            run_id="project-b-source",
+            lease=restarted_lease,
+        )
+
+        def reject_scheduler(coroutine: object, **kwargs: object) -> object:
+            raise RuntimeError("scheduler unavailable")
+
+        with monkeypatch.context() as scoped:
+            def foreign_query(*args: object, **kwargs: object) -> object:
+                raise AssertionError("the project A Store must not be queried")
+
+            scoped.setattr(runtime_a.store, "authenticated_intervention", foreign_query)
+            scoped.setattr("agent_bridge.app.asyncio.create_task", reject_scheduler)
+            with TestClient(restarted_app) as client:
+                client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+                created_b = client.post(
+                    f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                    f"tasks/{valid_brief.task_id}/intervene",
+                    json={
+                        "intervention_id": "shared-intervention",
+                        "message": "Project B guidance.",
+                        "addressed_to": "fable",
+                        "revision": valid_brief.revision,
+                        "continuation_generation": owner_b.generation,
+                    },
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+                repeated_b = client.post(
+                    f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                    f"tasks/{valid_brief.task_id}/intervene",
+                    json={
+                        "intervention_id": "shared-intervention",
+                        "message": "Project B guidance.",
+                        "addressed_to": "fable",
+                        "revision": valid_brief.revision,
+                        "continuation_generation": owner_b.generation,
+                    },
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+            assert created_b.status_code == 202
+            assert created_b.json()["scheduled"] is False
+            assert repeated_b.status_code == 202
+            assert repeated_b.json() == created_b.json()
+        record_b = runtime_b.store.intervention("shared-intervention")
+        assert record_b is not None
+        assert record_b.message == "Project B guidance."
+        assert runtime_a.store.intervention("shared-intervention") == record_a
+        assert runner.stops == []
+
+        with TestClient(restarted_app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            conflict = client.post(
+                f"/api/projects/{runtime_b.project_id}/chats/shared-chat/"
+                f"tasks/{valid_brief.task_id}/intervene",
+                json={
+                    "intervention_id": "shared-intervention",
+                    "message": "Conflicting B guidance.",
+                    "addressed_to": "fable",
+                    "revision": valid_brief.revision,
+                    "continuation_generation": owner_b.generation,
+                },
+                headers={"X-CSRF-Token": CSRF_TOKEN},
+            )
+        assert conflict.status_code == 409
+        assert runtime_b.store.intervention("shared-intervention") == record_b
+        assert runner.stops == []
+        assert restarted_app.state.active_coroutines == set()
+
+        with monkeypatch.context() as scoped:
+            def foreign_resume_query(*args: object, **kwargs: object) -> object:
+                raise AssertionError("the project B Store must not be queried")
+
+            scoped.setattr(runtime_b.store, "intervention", foreign_resume_query)
+            with TestClient(restarted_app) as client:
+                client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+                foreign_resume = client.post(
+                    f"/api/projects/{runtime_a.project_id}/chats/shared-chat/"
+                    "interventions/shared-intervention/resume",
+                    json={"expected_resume_generation": record_a.resume_generation},
+                    headers={"X-CSRF-Token": CSRF_TOKEN},
+                )
+        assert foreign_resume.status_code == 409
+        assert runtime_a.store.intervention("shared-intervention") == record_a
+        assert runtime_b.store.intervention("shared-intervention") == record_b
+        assert restarted_app.state.active_coroutines == set()
+    finally:
+        harness.close()
+
+
+def test_hub_bootstrap_intervention_projection_is_allowlisted_and_warns_unknown(
+    tmp_path: Path,
+    valid_brief: TaskBrief,
+) -> None:
+    """The bootstrap must not turn a durable control record into process disclosure."""
+    harness = _real_hub_harness(tmp_path)
+    runtime = harness.runtimes["a"]
+    unknown = _seed_unknown_intervention(runtime, brief=valid_brief)
+    try:
+        with TestClient(harness.app) as client:
+            client.get(f"/?key={SESSION_KEY}", follow_redirects=False)
+            task = client.get(
+                f"/api/projects/{runtime.project_id}/chats/shared-chat/bootstrap"
+            ).json()["tasks"][0]
+        intervention = task["intervention"]
+        assert set(intervention) == {
+            "intervention_id", "message", "addressed_to", "routed_to", "status",
+            "task_id", "revision", "source_generation", "resume_generation",
+            "eligible", "visible_discontinuity", "warning",
+        }
+        assert intervention == {
+            "intervention_id": "unknown-intervention",
+            "message": "Keep the approved boundary exact.",
+            "addressed_to": "fable",
+            "routed_to": "fable",
+            "status": "resume_outcome_unknown",
+            "task_id": valid_brief.task_id,
+            "revision": valid_brief.revision,
+            "source_generation": 1,
+            "resume_generation": unknown.resume_generation,
+            "eligible": False,
+            "visible_discontinuity": False,
+            "warning": "prior resume outcome is unknown and may have executed",
+        }
+        serialized = str(intervention)
+        for forbidden in (
+            "run_id", "resume_attempt_id", "fable_session_id", "sol_thread_id",
+            "pending", "baseline", "raw_result", "command", "process_group",
+        ):
+            assert forbidden not in serialized
+    finally:
+        harness.close()

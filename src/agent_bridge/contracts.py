@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
+import re
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 
 JsonPrimitive: TypeAlias = None | bool | int | float | str
@@ -59,12 +61,52 @@ def _require_fields(data: Mapping[str, object], name: str, fields: tuple[str, ..
         raise ValueError(f"{name} has unexpected fields: {', '.join(sorted(unexpected))}")
 
 
+def _require_fields_with_optional(
+    data: Mapping[str, object],
+    name: str,
+    required_fields: tuple[str, ...],
+    optional_fields: tuple[str, ...],
+) -> None:
+    expected = set(required_fields) | set(optional_fields)
+    actual = set(data)
+    missing = set(required_fields) - actual
+    unexpected = actual - expected
+    if missing:
+        raise ValueError(f"{name} missing required fields: {', '.join(sorted(missing))}")
+    if unexpected:
+        raise ValueError(f"{name} has unexpected fields: {', '.join(sorted(unexpected))}")
+
+
 def _string(value: object, name: str, *, non_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     if non_empty and not value.strip():
         raise ValueError(f"{name} must be non-empty")
     return value
+
+
+_MAX_CONVERSATION_TEXT_LENGTH = 16 * 1024
+_SAFE_CONVERSATION_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def _bounded_conversation_text(value: object, name: str) -> str:
+    text = _string(value, name, non_empty=True)
+    try:
+        encoded_length = len(text.encode("utf-8"))
+    except UnicodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8") from error
+    if encoded_length > _MAX_CONVERSATION_TEXT_LENGTH:
+        raise ValueError(f"{name} is too long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise ValueError(f"{name} must not contain control characters")
+    return text
+
+
+def _conversation_identifier(value: object, name: str) -> str:
+    identifier = _string(value, name, non_empty=True)
+    if _SAFE_CONVERSATION_IDENTIFIER.fullmatch(identifier) is None:
+        raise ValueError(f"{name} must be a safe identifier")
+    return identifier
 
 
 def _string_tuple(value: object, name: str) -> tuple[str, ...]:
@@ -198,6 +240,7 @@ class SolQuestion:
     options: tuple[str, ...]
     recommendation: str
     can_continue_safely: bool
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ambiguity", _string(self.ambiguity, "ambiguity"))
@@ -209,22 +252,41 @@ class SolQuestion:
             "can_continue_safely",
             _boolean(self.can_continue_safely, "can_continue_safely"),
         )
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "SolQuestion":
         payload = _mapping(data, "SolQuestion")
         fields = ("ambiguity", "why_it_matters", "options", "recommendation", "can_continue_safely")
-        _require_fields(payload, "SolQuestion", fields)
-        return cls(**{field: payload[field] for field in fields})  # type: ignore[arg-type]
+        _require_fields_with_optional(payload, "SolQuestion", fields, ("directed_question",))
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
+        return cls(
+            ambiguity=payload["ambiguity"],
+            why_it_matters=payload["why_it_matters"],
+            options=payload["options"],
+            recommendation=payload["recommendation"],
+            can_continue_safely=payload["can_continue_safely"],
+            directed_question=directed_question,
+        )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "ambiguity": self.ambiguity,
             "why_it_matters": self.why_it_matters,
             "options": list(self.options),
             "recommendation": self.recommendation,
             "can_continue_safely": self.can_continue_safely,
         }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
 
 
 _SOL_OUTCOME_FIELDS = (
@@ -314,6 +376,7 @@ class FableClarification:
     scope_changed: bool
     revised_brief: TaskBrief | None
     question_for_user: str | None
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _string(self.status, "status"))
@@ -326,6 +389,10 @@ class FableClarification:
             raise ValueError("revised_brief must be a TaskBrief or null")
         if self.question_for_user is not None:
             object.__setattr__(self, "question_for_user", _string(self.question_for_user, "question_for_user"))
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
         if self.status not in _FABLE_CLARIFICATION_STATUSES:
             raise ValueError("status must be answered or escalate_to_user")
         if self.status == "answered" and (self.answer is None or not self.answer.strip()):
@@ -340,8 +407,18 @@ class FableClarification:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "FableClarification":
         payload = _mapping(data, "FableClarification")
-        _require_fields(payload, "FableClarification", _FABLE_CLARIFICATION_FIELDS)
+        _require_fields_with_optional(
+            payload,
+            "FableClarification",
+            _FABLE_CLARIFICATION_FIELDS,
+            ("directed_question",),
+        )
         revised_data = payload["revised_brief"]
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
         return cls(
             status=payload["status"],
             answer=payload["answer"],
@@ -352,10 +429,11 @@ class FableClarification:
                 None if revised_data is None else TaskBrief.from_dict(_mapping(revised_data, "revised_brief"))
             ),
             question_for_user=payload["question_for_user"],
+            directed_question=directed_question,
         )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "status": self.status,
             "answer": self.answer,
             "reasoning": self.reasoning,
@@ -364,6 +442,9 @@ class FableClarification:
             "revised_brief": None if self.revised_brief is None else self.revised_brief.to_dict(),
             "question_for_user": self.question_for_user,
         }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -405,6 +486,7 @@ class ReviewVerdict:
     remaining_risks: tuple[str, ...]
     corrections: tuple[str, ...]
     question_for_user: str | None
+    directed_question: DirectedAgentQuestion | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _string(self.status, "status"))
@@ -421,6 +503,10 @@ class ReviewVerdict:
         object.__setattr__(self, "corrections", _string_tuple(self.corrections, "corrections"))
         if self.question_for_user is not None:
             object.__setattr__(self, "question_for_user", _string(self.question_for_user, "question_for_user"))
+        if self.directed_question is not None and not isinstance(
+            self.directed_question, DirectedAgentQuestion,
+        ):
+            raise ValueError("directed_question must be a DirectedAgentQuestion or null")
         if self.status not in _REVIEW_VERDICT_STATUSES:
             raise ValueError("status must be approved, corrections_required, or escalate_to_user")
         if self.status == "corrections_required" and not self.corrections:
@@ -435,10 +521,20 @@ class ReviewVerdict:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "ReviewVerdict":
         payload = _mapping(data, "ReviewVerdict")
-        _require_fields(payload, "ReviewVerdict", _REVIEW_VERDICT_FIELDS)
+        _require_fields_with_optional(
+            payload,
+            "ReviewVerdict",
+            _REVIEW_VERDICT_FIELDS,
+            ("directed_question",),
+        )
         criteria_data = payload["criteria"]
         if not isinstance(criteria_data, Sequence) or isinstance(criteria_data, str):
             raise ValueError("criteria must be an array")
+        directed_question = None
+        if payload.get("directed_question") is not None:
+            directed_question = DirectedAgentQuestion.from_dict(
+                _mapping(payload["directed_question"], "directed_question")
+            )
         return cls(
             status=payload["status"],
             summary=payload["summary"],
@@ -448,10 +544,11 @@ class ReviewVerdict:
             remaining_risks=payload["remaining_risks"],
             corrections=payload["corrections"],
             question_for_user=payload["question_for_user"],
+            directed_question=directed_question,
         )  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "status": self.status,
             "summary": self.summary,
             "criteria": [criterion.to_dict() for criterion in self.criteria],
@@ -460,6 +557,254 @@ class ReviewVerdict:
             "remaining_risks": list(self.remaining_risks),
             "corrections": list(self.corrections),
             "question_for_user": self.question_for_user,
+        }
+        if self.directed_question is not None:
+            payload["directed_question"] = self.directed_question.to_dict()
+        return payload
+
+
+class ConversationActor(str, Enum):
+    USER = "user"
+    FABLE = "fable"
+    SOL = "sol"
+    SYSTEM = "system"
+
+
+class ConversationTarget(str, Enum):
+    USER = "user"
+    FABLE = "fable"
+    SOL = "sol"
+    TEAM = "team"
+
+
+class ConversationMessageType(str, Enum):
+    STATEMENT = "statement"
+    QUESTION = "question"
+    ANSWER = "answer"
+    APPROVAL = "approval"
+    INTERVENTION = "intervention"
+    STATUS = "status"
+
+
+_CONVERSATION_ENVELOPE_FIELDS = (
+    "sender",
+    "addressed_to",
+    "routed_to",
+    "message_type",
+    "text",
+    "task_id",
+    "revision",
+    "continuation_generation",
+    "question_id",
+    "reply_to_question_id",
+)
+
+
+def _conversation_binding(
+    message_type: ConversationMessageType,
+    task_id: str | None,
+    revision: int | None,
+    continuation_generation: int | None,
+) -> tuple[str | None, int | None, int | None]:
+    if message_type is ConversationMessageType.APPROVAL:
+        if task_id is None or revision is None or continuation_generation is not None:
+            raise ValueError("approvals require exactly task_id and revision")
+        task_id = _conversation_identifier(task_id, "task_id")
+        revision = _integer(revision, "revision")
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        return task_id, revision, None
+    if (task_id is None, revision is None, continuation_generation is None).count(True) not in (0, 3):
+        raise ValueError("task_id, revision, and continuation_generation binding must be all-or-none")
+    if task_id is not None:
+        task_id = _conversation_identifier(task_id, "task_id")
+        revision = _integer(revision, "revision")
+        continuation_generation = _integer(continuation_generation, "continuation_generation")
+        if revision < 1:
+            raise ValueError("revision must be >= 1")
+        if continuation_generation < 1:
+            raise ValueError("continuation_generation must be >= 1")
+    return task_id, revision, continuation_generation
+
+
+def _conversation_question_pair(
+    message_type: ConversationMessageType,
+    task_id: str | None,
+    revision: int | None,
+    continuation_generation: int | None,
+    question_id: str | None,
+    reply_to_question_id: str | None,
+) -> tuple[str | None, str | None]:
+    if question_id is not None:
+        question_id = _conversation_identifier(question_id, "question_id")
+    if reply_to_question_id is not None:
+        reply_to_question_id = _conversation_identifier(reply_to_question_id, "reply_to_question_id")
+    if message_type is ConversationMessageType.QUESTION:
+        if question_id is None or reply_to_question_id is not None:
+            raise ValueError("questions require question_id and no reply_to_question_id")
+        if task_id is None or revision is None or continuation_generation is None:
+            raise ValueError("questions require task_id, revision, and continuation_generation")
+    elif message_type is ConversationMessageType.ANSWER:
+        if question_id is not None or reply_to_question_id is None:
+            raise ValueError("answers require reply_to_question_id and no question_id")
+        if task_id is None or revision is None or continuation_generation is None:
+            raise ValueError("answers require task_id, revision, and continuation_generation")
+    elif question_id is not None or reply_to_question_id is not None:
+        raise ValueError("only questions and answers may bind question identifiers")
+    return question_id, reply_to_question_id
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationEnvelope:
+    sender: ConversationActor
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    message_type: ConversationMessageType
+    text: str
+    task_id: str | None = None
+    revision: int | None = None
+    continuation_generation: int | None = None
+    question_id: str | None = None
+    reply_to_question_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sender, ConversationActor):
+            raise ValueError("sender must be a ConversationActor")
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.routed_to, ConversationTarget):
+            raise ValueError("routed_to must be a ConversationTarget")
+        if not isinstance(self.message_type, ConversationMessageType):
+            raise ValueError("message_type must be a ConversationMessageType")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        task_id, revision, continuation_generation = _conversation_binding(
+            self.message_type, self.task_id, self.revision, self.continuation_generation
+        )
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "continuation_generation", continuation_generation)
+        question_id, reply_to_question_id = _conversation_question_pair(
+            self.message_type,
+            task_id,
+            revision,
+            continuation_generation,
+            self.question_id,
+            self.reply_to_question_id,
+        )
+        object.__setattr__(self, "question_id", question_id)
+        object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
+        if self.message_type is ConversationMessageType.STATUS and self.sender is not ConversationActor.SYSTEM:
+            raise ValueError("status messages require sender=system")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ConversationEnvelope":
+        payload = _mapping(data, "ConversationEnvelope")
+        _require_fields(payload, "ConversationEnvelope", _CONVERSATION_ENVELOPE_FIELDS)
+        try:
+            sender = ConversationActor(payload["sender"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("sender must be a known conversation actor") from error
+        try:
+            addressed_to = ConversationTarget(payload["addressed_to"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("addressed_to must be a known conversation target") from error
+        try:
+            routed_to = ConversationTarget(payload["routed_to"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("routed_to must be a known conversation target") from error
+        try:
+            message_type = ConversationMessageType(payload["message_type"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("message_type must be a known conversation message type") from error
+        return cls(
+            sender=sender,
+            addressed_to=addressed_to,
+            routed_to=routed_to,
+            message_type=message_type,
+            text=payload["text"],
+            task_id=payload["task_id"],
+            revision=payload["revision"],
+            continuation_generation=payload["continuation_generation"],
+            question_id=payload["question_id"],
+            reply_to_question_id=payload["reply_to_question_id"],
+        )  # type: ignore[arg-type]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "sender": self.sender.value,
+            "addressed_to": self.addressed_to.value,
+            "routed_to": self.routed_to.value,
+            "message_type": self.message_type.value,
+            "text": self.text,
+            "task_id": self.task_id,
+            "revision": self.revision,
+            "continuation_generation": self.continuation_generation,
+            "question_id": self.question_id,
+            "reply_to_question_id": self.reply_to_question_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UserConversationInput:
+    addressed_to: ConversationTarget
+    message_type: ConversationMessageType
+    text: str
+    task_id: str | None = None
+    revision: int | None = None
+    question_id: str | None = None
+    reply_to_question_id: str | None = None
+    continuation_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
+        if not isinstance(self.message_type, ConversationMessageType):
+            raise ValueError("message_type must be a ConversationMessageType")
+        if self.message_type is ConversationMessageType.STATUS:
+            raise ValueError("status messages are system-only")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        task_id, revision, continuation_generation = _conversation_binding(
+            self.message_type, self.task_id, self.revision, self.continuation_generation
+        )
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "continuation_generation", continuation_generation)
+        question_id, reply_to_question_id = _conversation_question_pair(
+            self.message_type,
+            task_id,
+            revision,
+            continuation_generation,
+            self.question_id,
+            self.reply_to_question_id,
+        )
+        object.__setattr__(self, "question_id", question_id)
+        object.__setattr__(self, "reply_to_question_id", reply_to_question_id)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectedAgentQuestion:
+    addressed_to: Literal["user", "fable", "sol"]
+    text: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.addressed_to not in {"user", "fable", "sol"}:
+            raise ValueError("addressed_to must be user, fable, or sol")
+        object.__setattr__(self, "text", _bounded_conversation_text(self.text, "text"))
+        object.__setattr__(self, "reason", _bounded_conversation_text(self.reason, "reason"))
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "DirectedAgentQuestion":
+        payload = _mapping(data, "DirectedAgentQuestion")
+        fields = ("addressed_to", "text", "reason")
+        _require_fields(payload, "DirectedAgentQuestion", fields)
+        return cls(**{field: payload[field] for field in fields})  # type: ignore[arg-type]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "addressed_to": self.addressed_to,
+            "text": self.text,
+            "reason": self.reason,
         }
 
 
@@ -502,11 +847,15 @@ def _array_schema(items: dict[str, object]) -> dict[str, object]:
     return {"type": "array", "items": items}
 
 
-def _object_schema(properties: dict[str, object]) -> dict[str, object]:
+def _object_schema(
+    properties: dict[str, object],
+    *,
+    required: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     return {
         "type": "object",
         "properties": properties,
-        "required": list(properties),
+        "required": list(properties) if required is None else list(required),
         "additionalProperties": False,
     }
 
@@ -518,13 +867,29 @@ _COMMAND_REPORT_SCHEMA = _object_schema({
     "exit_code": {"type": "integer"},
     "result": _STRING_SCHEMA,
 })
+_DIRECTED_AGENT_QUESTION_SCHEMA = _object_schema({
+    "addressed_to": {"type": "string", "enum": ["user", "fable", "sol"]},
+    "text": _STRING_SCHEMA,
+    "reason": _STRING_SCHEMA,
+})
+_DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA = {
+    "anyOf": [_DIRECTED_AGENT_QUESTION_SCHEMA, {"type": "null"}],
+}
 _SOL_QUESTION_SCHEMA = _object_schema({
     "ambiguity": _STRING_SCHEMA,
     "why_it_matters": _STRING_SCHEMA,
     "options": _STRING_ARRAY_SCHEMA,
     "recommendation": _STRING_SCHEMA,
     "can_continue_safely": {"type": "boolean"},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(
+    "ambiguity",
+    "why_it_matters",
+    "options",
+    "recommendation",
+    "can_continue_safely",
+    "directed_question",
+))
 _CRITERION_EVIDENCE_SCHEMA = _object_schema({
     "criterion": _STRING_SCHEMA,
     "evidence": _STRING_ARRAY_SCHEMA,
@@ -567,7 +932,8 @@ FABLE_CLARIFICATION_SCHEMA = _object_schema({
     "scope_changed": {"type": "boolean"},
     "revised_brief": {"anyOf": [TASK_BRIEF_SCHEMA, {"type": "null"}]},
     "question_for_user": {"type": ["string", "null"]},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(*_FABLE_CLARIFICATION_FIELDS, "directed_question"))
 
 REVIEW_VERDICT_SCHEMA = _object_schema({
     "status": {"type": "string", "enum": sorted(_REVIEW_VERDICT_STATUSES)},
@@ -578,4 +944,5 @@ REVIEW_VERDICT_SCHEMA = _object_schema({
     "remaining_risks": _STRING_ARRAY_SCHEMA,
     "corrections": _STRING_ARRAY_SCHEMA,
     "question_for_user": {"type": ["string", "null"]},
-})
+    "directed_question": _DIRECTED_AGENT_QUESTION_OR_NULL_SCHEMA,
+}, required=(*_REVIEW_VERDICT_FIELDS, "directed_question"))

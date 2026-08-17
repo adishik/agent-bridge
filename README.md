@@ -7,18 +7,27 @@ control surface for that handoff, not a public service.
 
 ## Install
 
-With `pipx`:
+For direct local use and the SSH workflow, install the published package-index
+release with `pipx`:
 
 ```bash
-pipx install .
+pipx install agent-bridge
 ```
 
-For a development checkout:
+The SSH launcher sends only an exact published release to the remote host.
+Install that release rather than a local directory, editable checkout, or
+direct URL when you intend to use `agent-bridge ssh`.
+
+For direct local development from a source checkout:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 ```
+
+This checkout installation is for direct local launches only: SSH rejects
+source-checkout, editable, direct-URL, and otherwise unpublished provenance
+instead of substituting unverified remote bytes.
 
 ## Prerequisites
 
@@ -28,6 +37,11 @@ API-key fallback: Fable must use the installed Claude Code subscription
 authentication, and Sol must use the local Codex CLI. Make sure both CLIs are
 available on `PATH`, or provide absolute executable overrides when starting
 the bridge.
+
+For the SSH workflow, the local computer also needs OpenSSH and an SSH alias
+configured in `~/.ssh/config`. The remote host must already provide Python
+3.11 or newer with `venv`, Git, and authenticated Claude and Codex CLIs. Agent
+Bridge does not install or authenticate either remote provider CLI.
 
 ## Subscription and usage safety
 
@@ -86,17 +100,64 @@ executable overrides:
 
 ## SSH access
 
-When the bridge runs on a remote machine, run this command on your local
-computer:
+Run the primary SSH workflow on your local computer:
 
 ```bash
-ssh -N -L 56590:127.0.0.1:56590 YOUR_SSH_ALIAS
+agent-bridge ssh YOUR_SSH_ALIAS --repo /absolute/remote/repository
 ```
 
-Keep that SSH forwarding command open. Then open the keyed loopback URL in a
-browser on your local computer, using the same port and key printed by the
-foreground bridge. The forwarding binds the local loopback interface to the
-remote loopback listener; it does not make Agent Bridge public.
+`YOUR_SSH_ALIAS` is resolved through your existing `~/.ssh/config`, so use
+that configuration for host keys, identity files, ports, or ProxyJump. The
+command bootstraps and starts Agent Bridge on the remote host, creates a
+loopback-only local tunnel, auto-opens the local keyed URL, and remains
+attached until you stop it with Ctrl+C. Pass `--no-open` to print the keyed URL
+without opening a browser.
+
+On first use of a released version, the remote host downloads that exact Agent
+Bridge version from its configured package index into
+`~/.cache/agent-bridge/runtime/<version>`. This is an unprivileged cache: it
+does not require root access or a global installation. The first bootstrap
+therefore needs remote package-index access. Only a published exact Agent
+Bridge version is accepted; a source-checkout-only or unpublished build fails
+clearly instead of substituting a different package or version.
+
+For more than one remote repository, repeat `--project` just as with a direct
+launch:
+
+```bash
+agent-bridge ssh YOUR_SSH_ALIAS \
+  --project app=/absolute/remote/app \
+  --project docs=/absolute/remote/docs \
+  --no-open
+```
+
+`--claude-executable`, `--codex-executable`, `--git-executable`,
+`--bash-executable`, and `--sh-executable` are absolute paths on the remote
+host, not paths on the local computer. `--local-port` selects the local
+loopback forward; `--remote-port` selects the remote loopback listener. Both
+default to an automatically selected port. To force a clean bootstrap after
+the bridge has stopped, remove only the affected remote version directory:
+`rm -rf ~/.cache/agent-bridge/runtime/<version>`. Replace `<version>` with the
+exact release being retried; do not remove normal Agent Bridge state while
+troubleshooting the runtime cache.
+
+### Advanced fallback: manual launch and tunnel
+
+If you intentionally manage the remote bridge yourself, start it in a
+foreground remote terminal, then create a separate local tunnel:
+
+```bash
+# On the remote host
+agent-bridge --repo /absolute/remote/repository
+
+# On the local computer, after noting the remote port
+ssh -N -L 127.0.0.1:56590:127.0.0.1:56590 YOUR_SSH_ALIAS
+```
+
+Keep both foreground processes open. Then open the keyed loopback URL in a
+browser on the local computer, using the same port and key printed by the
+remote bridge. The forwarding binds `127.0.0.1` locally to `127.0.0.1` on the
+remote host; it does not make Agent Bridge public.
 
 ## Workflow
 
@@ -117,11 +178,20 @@ remote loopback listener; it does not make Agent Bridge public.
 7. A bounded correction stays tied to the same task and revision lineage. If
    the requested change widens scope or cannot be resolved safely, the bridge
    escalates to the user instead of guessing.
-8. Use **Stop** to interrupt an active run. An interruption is recorded and
-   does not silently continue.
-9. Use **Resume** only after explicitly choosing to resume the interrupted
-   task. Reconnect first if the browser was closed; a historical process ID is
-   not evidence that work is still running.
+8. Use **Stop** to interrupt an active run. Stop wins over a pending
+   intervention, records the cancellation, and never silently continues the
+   interrupted process.
+9. Use **Intervene** to add a durable, visible instruction to the active
+   Fable or Sol run. The bridge persists that instruction before signaling the
+   exact owned process. Once a safe stop is confirmed, normal intervention
+   continuation is automatic; it is not a second browser-side agent launch.
+10. A planning interruption before Fable has issued its first session starts a
+    new Fable session and visibly says that continuity could not be preserved.
+    After either agent has a published session/thread, continuation uses that
+    exact identity instead of creating a substitute.
+11. Use **Resume** only for a safe, explicitly eligible interrupted task.
+    Reconnect first if the browser was closed; a historical process ID is not
+    evidence that work is still running.
 
 There is one hub-wide active workflow, not one per project. While a model
 workflow owns that lease, model-starting actions and opening another
@@ -129,10 +199,45 @@ project/chat's live workflow are rejected until it reaches a terminal state or
 is stopped. This is deliberate: finish or stop the active workflow before
 changing the selected project.
 
-Phase 1 does not implement directed agent-to-agent questions, agent-directed
-intervention, or cross-project handoffs. Fable and Sol communicate only through
-the persisted task workflow; the user remains the control point for approval,
-answers, Stop, and Resume.
+The composer always records the selected recipient. An ordinary request to
+Fable begins planning. An ordinary request addressed to Sol is still visibly
+routed through Fable until the exact displayed task revision has been approved;
+it does not start Sol early. Fable is the planner and reviewer with authority
+over intent and scope. Sol is the executor only for an exact approved,
+non-terminal revision.
+
+During an approved task, either agent may ask the other a structured question.
+The question and its exact reply are shown in the main conversation before the
+next agent runs, and each reply is bound to its project, chat, task, revision,
+continuation generation, and question identifier. A reply that does not match
+that exact question is rejected; it cannot be applied to another task. Agent
+messages are limited to the task discussion: directed messaging never supplies
+file paths, shell commands, executable names, environment values, or other
+execution instructions.
+
+Automatic agent-to-agent exchanges are deliberately bounded. Each approved
+revision starts with three exchanges. At the limit the bridge pauses visibly and
+asks the user to allow exactly three more; it never grants an open-ended agent
+conversation. A scope-changing answer creates the next revision and requires
+approval of that exact revision before Sol can continue. The user remains the
+control point for approvals, question answers, Stop, and Resume. Directed
+questions, interventions, and cross-project routing are bound to the selected
+project, chat, task, revision, and continuation generation; an identity mismatch
+fails closed.
+
+## Workspace controls and accessibility
+
+The project and task drawers support keyboard opening, focus containment, and
+Escape to return focus to the controlling button. Activity is an expandable,
+sanitized audit summary rather than raw provider output. Labels such as Fable,
+Sol, task state, and connection status remain visible alongside the warm-copper
+color treatment; color alone is not the state signal.
+
+The browser cannot grant itself authority. It submits only the selected
+project/chat/task identity and server-issued generations. Questions are answered
+through their exact visible cards; the +3 exchange control grants only that
+bounded increment for its exact permission. Intervene, Stop, Resume, and an
+unknown-outcome acknowledgement all remain server-authorized actions.
 
 ## Repository safety
 
@@ -190,14 +295,64 @@ being assumed safe to continue. Historical process IDs and process-group IDs
 are inert records for audit and recovery; they are never treated as permission
 to signal or resume a process. Resume is always an explicit user action.
 
+An intervention claim that is interrupted by a bridge crash is deliberately
+more conservative: its outcome becomes **unknown** and the bridge performs no
+automatic replay, including after repeated restarts. The workspace warns that
+the prior attempt may have executed. A new attempt requires an authenticated,
+unique acknowledgement of that risk; ordinary Resume is unavailable for that
+state. This produces one newly identified retry only after the acknowledgement.
+
+The provider CLIs do not offer a transactional idempotency key. Accordingly,
+Agent Bridge does not claim exactly-once provider execution across a crash.
+The UNKNOWN path is a safety boundary, not proof that a provider call did or
+did not happen.
+
+## Verification limits
+
+The automated end-to-end coverage uses only temporary Git repositories and
+absolute fake Claude/Codex executables behind the real registry, hub, FastAPI,
+coordinator, SQLite, and browser-controller boundaries. It makes no live
+provider or network calls. It validates scoped baseline preservation, including
+an allowed partial Sol edit written and provenance-recorded by the fake Codex
+executable itself. It also hard-kills a separate fake-only bridge process both
+after a durable claim before provider spawn and while the exact fake provider
+is live, then reopens the SQLite state. These are bounded fake-process checks,
+not evidence about live provider behavior, real user deployments, clinical
+use, or clinical outcomes.
+
 ## Troubleshooting
 
+- **SSH authentication or host-key failure:** confirm that
+  `ssh YOUR_SSH_ALIAS` works using your normal OpenSSH configuration. Correct
+  the host key or authentication configuration there; do not disable host-key
+  checking or expose the bridge on a public interface.
+- **Remote Python or `venv` unavailable:** install or select a remote Python
+  3.11+ with `venv` support, then pass its absolute remote path with
+  `--python` if `python3` is not the correct command.
+- **Unpublished Agent Bridge version:** install a published release locally
+  and retry. SSH bootstrap accepts only the exact published version; editable,
+  direct-URL, and source-checkout-only builds cannot be bootstrapped remotely.
+- **Remote Claude or Codex unavailable:** install and authenticate both CLIs
+  on the remote host, make them available on its `PATH`, or provide their
+  absolute remote paths with `--claude-executable` and `--codex-executable`.
+- **Remote repository rejected:** use an absolute path to a Git top-level on
+  the remote host. The SSH command validates remote repository paths before
+  starting the bridge.
+- **Local or remote port exhausted:** retry with another `--local-port` or
+  `--remote-port`, or omit those options to let Agent Bridge choose ports. Do
+  not change the loopback-only binding.
+- **Keyed URL never becomes ready:** keep the SSH command attached, use the
+  exact keyed URL it prints, and inspect the bounded SSH diagnostics for the
+  remote startup failure. A rejected key or early SSH exit is not a signal to
+  use an unkeyed or public URL.
 - **Missing executable:** install the named tool, put it on `PATH`, or pass an
   absolute path with the matching `--*-executable` option. The launcher checks
   every configured executable before starting the server.
-- **Fable subscription unavailable:** sign in through Claude Code's supported
-  subscription flow, then restart the foreground bridge. API keys and
-  usage-based fallbacks are not accepted.
+- **Fable subscription unavailable:** on the host running Agent Bridge, run
+  `claude auth login` through Claude Code's supported subscription flow. Then
+  return to the exact task and choose **Resume**. Restart the foreground
+  bridge only if the UI itself is unavailable. API keys and usage-based
+  fallbacks are not accepted.
 - **Sol executable unavailable:** install or authenticate the Codex CLI, or
   pass its absolute executable path with `--codex-executable`; the startup
   version check must succeed.

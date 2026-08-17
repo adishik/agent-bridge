@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import inspect
 import io
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -17,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import agent_bridge.__main__ as launcher
+from agent_bridge import process as process_module
 from agent_bridge.adapters.claude_cli import SubscriptionAuthError
 from agent_bridge.adapters.codex_cli import CodexCLI
 from agent_bridge.process import ProcessRunner
@@ -234,6 +237,10 @@ def test_importing_main_keeps_optional_web_stack_unloaded() -> None:
     assert "loopback-only" in help_text
     assert "127.0.0.1" in help_result.stdout
     assert "56590" in help_result.stdout
+    assert (
+        "Remote: agent-bridge ssh SSH_DESTINATION --repo /absolute/remote/repository"
+        in help_result.stdout
+    )
     for option in (
         "--claude-executable",
         "--codex-executable",
@@ -244,6 +251,61 @@ def test_importing_main_keeps_optional_web_stack_unloaded() -> None:
         assert option in help_result.stdout
     normalized_help = " ".join(help_text.split())
     assert normalized_help.count("must be an absolute executable path") == 5
+
+
+def test_main_dispatches_only_leading_ssh_without_parsing_local_repo(monkeypatch) -> None:
+    # This catches local parsing consuming the remote-only command before SSH dispatch.
+    calls = []
+    monkeypatch.setattr(
+        "agent_bridge.ssh.main",
+        lambda argv, **kwargs: calls.append((tuple(argv), kwargs)) or 17,
+    )
+
+    assert launcher.main(["ssh", "workbox", "--repo", "/srv/demo"]) == 17
+    assert calls[0][0] == ("workbox", "--repo", "/srv/demo")
+
+
+def test_main_keeps_a_nonleading_ssh_token_on_the_direct_parse_path(monkeypatch) -> None:
+    # This catches treating a repository argument named ssh as a remote subcommand.
+    calls = []
+
+    def direct(arguments, *, environ):
+        calls.append(tuple(arguments))
+        raise ValueError("direct parser reached")
+
+    monkeypatch.setattr(launcher, "parse_settings", direct)
+
+    with pytest.raises(ValueError, match="direct parser reached"):
+        launcher.main(["--repo", "/srv/ssh", "ssh"])
+
+    assert calls == [("--repo", "/srv/ssh", "ssh")]
+
+
+@pytest.mark.parametrize(
+    ("basename", "expected_label"),
+    (
+        ("agent-bridge-demo.mgF8bo", "agent-bridge-demo-mgf8bo"),
+        ("123-demo", "repo-123-demo"),
+        ("a" * 80, "a" * 32),
+        ("demo_", "demo_"),
+        ("demo-", "demo"),
+        ("demo--", "demo"),
+        ("A-", "a"),
+    ),
+)
+def test_repo_shorthand_always_derives_a_valid_project_label(
+    tmp_path: Path,
+    basename: str,
+    expected_label: str,
+) -> None:
+    # This catches --repo paths that cannot be represented by the project label grammar.
+    repo = _named_repo(tmp_path, basename)
+    tools = _fake_tools(tmp_path)
+
+    settings = parse_settings(_args(repo, tools), environ=_environment(tmp_path, repo))
+
+    assert settings.projects[0].label == expected_label
+    assert settings.projects[0].repo_root == repo
 
 
 def test_parse_settings_rejects_public_bind_missing_repo_and_non_git(tmp_path: Path) -> None:
@@ -448,7 +510,7 @@ def test_ssh_forward_uses_current_server_and_rejects_unsafe_user() -> None:
     assert ssh_forward_command(
         port=56590, user="bridgeuser",
         ssh_connection="192.0.2.10 55481 198.51.100.20 22",
-    ) == "ssh -N -L 56590:127.0.0.1:56590 bridgeuser@198.51.100.20"
+    ) == "ssh -N -L 127.0.0.1:56590:127.0.0.1:56590 bridgeuser@198.51.100.20"
     with pytest.raises(ValueError, match="user"):
         ssh_forward_command(
             port=56590, user="bridgeuser; touch /tmp/unsafe",
@@ -498,6 +560,362 @@ def test_localhost_is_normalized_before_selection_output_and_uvicorn(tmp_path: P
     ) == 0
 
 
+@pytest.mark.parametrize("disconnect_signal", (signal.SIGHUP, signal.SIGTERM, signal.SIGINT))
+def test_ssh_context_disconnect_stops_and_reaps_the_exact_active_provider_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disconnect_signal: signal.Signals,
+) -> None:
+    # This catches SSH disconnect HUP bypassing launcher finalization and leaving a provider group.
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    handlers: dict[int, object] = {}
+    signals: list[tuple[int, signal.Signals | int]] = []
+    original_killpg = process_module.os.killpg
+    captured_runner: ProcessRunner | None = None
+
+    def record_handler(signum: int, handler: object) -> object:
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    def record_killpg(process_group_id: int, signum: signal.Signals | int) -> None:
+        signals.append((process_group_id, signum))
+        original_killpg(process_group_id, signum)
+
+    monkeypatch.setattr(launcher, "signal", signal, raising=False)
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+    monkeypatch.setattr(process_module.os, "killpg", record_killpg)
+
+    def run_uvicorn(app, *, host: str, port: int, reload: bool) -> None:
+        nonlocal captured_runner
+        runtime = app.state.project_registry.projects()[0]
+        captured_runner = runtime.runner
+
+        async def disconnect() -> None:
+            task = asyncio.create_task(runtime.runner.run(
+                run_id="ssh-disconnect-sleeper",
+                argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+                cwd=tmp_path,
+                env=dict(os.environ),
+                stdin=None,
+                on_line=lambda stream, line: None,
+            ))
+            await runtime.runner.wait_until_started("ssh-disconnect-sleeper")
+            handler = handlers.get(disconnect_signal)
+            if not callable(handler):
+                pytest.fail("SSH disconnect handler was not installed")
+            handler(disconnect_signal, None)
+            await task
+
+        asyncio.run(disconnect())
+
+    with pytest.raises(KeyboardInterrupt):
+        main(_args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=run_uvicorn)
+
+    assert captured_runner is not None
+    assert captured_runner.is_running("ssh-disconnect-sleeper") is False
+    assert len({group for group, signum in signals if signum != 0}) == 1
+    assert [signum for _, signum in signals if signum != 0] == [signal.SIGTERM]
+
+
+def test_ssh_disconnect_during_startup_preflight_stops_the_exact_fake_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSH HUP must unwind an in-progress provider preflight before it escapes."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    started = tmp_path / "startup-provider.pid"
+    delayed = tmp_path / "startup-provider-escaped"
+    tools["claude"] = _write_executable(
+        tools["claude"],
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
+        f"started = Path({str(started)!r})\n"
+        f"delayed = Path({str(delayed)!r})\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    started.write_text(str(os.getpid()))\n"
+        "    time.sleep(0.5)\n"
+        "    delayed.write_text('escaped')\n"
+        "    print('Claude Code 9.9.9')\n"
+        "elif sys.argv[1:] == ['auth', 'status', '--json']:\n"
+        "    print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', 'apiProvider': 'firstParty', 'subscriptionType': 'max'}))\n"
+        "else:\n"
+        "    raise SystemExit(91)\n",
+    )
+    handlers: dict[int, object] = {}
+    signals: list[tuple[int, signal.Signals | int]] = []
+    original_signal = launcher.signal.signal
+    original_killpg = process_module.os.killpg
+    original_preflights = launcher._run_preflights
+
+    def record_handler(signum: int, handler: object) -> object:
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    def record_killpg(process_group_id: int, signum: signal.Signals | int) -> None:
+        signals.append((process_group_id, signum))
+        original_killpg(process_group_id, signum)
+
+    async def deliver_hup_during_preflight(**kwargs: object) -> object:
+        task = asyncio.create_task(original_preflights(**kwargs))
+        for _ in range(100):
+            if started.exists():
+                break
+            await asyncio.sleep(0.005)
+        else:
+            pytest.fail("fake provider did not start during preflight")
+        handler = handlers.get(signal.SIGHUP)
+        if not callable(handler):
+            pytest.fail("SSH HUP handler was not installed before preflight")
+        handler(signal.SIGHUP, None)
+        return await task
+
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+    monkeypatch.setattr(process_module.os, "killpg", record_killpg)
+    monkeypatch.setattr(launcher, "_run_preflights", deliver_hup_during_preflight)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            main(_args(repo, tools), environ=environment, stdout=io.StringIO())
+
+        time.sleep(0.6)
+        provider_pid = int(started.read_text(encoding="utf-8"))
+        assert delayed.exists() is False
+        assert [(group, signum) for group, signum in signals if signum != 0] == [
+            (provider_pid, signal.SIGTERM)
+        ]
+        with pytest.raises(ChildProcessError):
+            os.waitpid(provider_pid, os.WNOHANG)
+    finally:
+        monkeypatch.setattr(launcher.signal, "signal", original_signal)
+
+
+def test_ssh_disconnect_during_project_sorting_restores_original_signal_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every post-install startup boundary must restore SSH signal handlers."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    parsed = parse_settings(_args(repo, tools), environ=environment)
+    original_handlers = {
+        signum: object()
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    }
+    active_handlers = dict(original_handlers)
+
+    def record_handler(signum: int, handler: object) -> object:
+        previous = active_handlers[signum]
+        active_handlers[signum] = handler
+        return previous
+
+    class InterruptingProjects:
+        def __iter__(self):
+            handler = active_handlers[signal.SIGHUP]
+            assert callable(handler)
+            handler(signal.SIGHUP, None)
+            return iter(())
+
+    settings = launcher.Settings(
+        projects=InterruptingProjects(),  # type: ignore[arg-type]
+        hub_state_dir=parsed.hub_state_dir,
+        host=parsed.host,
+        port=parsed.port,
+        claude_executable=parsed.claude_executable,
+        codex_executable=parsed.codex_executable,
+        git_executable=parsed.git_executable,
+        bash_executable=parsed.bash_executable,
+        sh_executable=parsed.sh_executable,
+    )
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher.signal, "getsignal", lambda signum: active_handlers[signum])
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+
+    with pytest.raises(KeyboardInterrupt):
+        main([], environ=environment, stdout=io.StringIO())
+
+    assert active_handlers == original_handlers
+
+
+@pytest.mark.parametrize("source_marker", ("ordered_specs = tuple", "from agent_bridge.app"))
+def test_ssh_disconnect_at_each_startup_phase_restores_original_signal_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_marker: str,
+) -> None:
+    """No statement after SSH handler installation may sit outside restoration."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    original_handlers = {
+        signum: object()
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    }
+    active_handlers = dict(original_handlers)
+    source_lines, source_start = inspect.getsourcelines(launcher._run_local_startup)
+    target_line = source_start + next(
+        index for index, line in enumerate(source_lines) if source_marker in line
+    )
+    delivered = False
+
+    def record_handler(signum: int, handler: object) -> object:
+        previous = active_handlers[signum]
+        active_handlers[signum] = handler
+        return previous
+
+    def deliver_hup_at_target(frame: object, event: str, argument: object):
+        nonlocal delivered
+        if (
+            event == "line"
+            and getattr(frame, "f_code", None) is launcher._run_local_startup.__code__
+            and getattr(frame, "f_lineno", None) == target_line
+            and not delivered
+        ):
+            delivered = True
+            handler = active_handlers[signal.SIGHUP]
+            assert callable(handler)
+            handler(signal.SIGHUP, None)
+        return deliver_hup_at_target
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher.signal, "getsignal", lambda signum: active_handlers[signum])
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+    previous_trace = sys.gettrace()
+    sys.settrace(deliver_hup_at_target)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            main([], environ=environment, stdout=io.StringIO())
+    finally:
+        sys.settrace(previous_trace)
+
+    assert delivered
+    assert active_handlers == original_handlers
+
+
+def test_ssh_disconnect_on_handler_install_to_body_transition_restores_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler lifetime must already own the transition into startup code."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    original_handlers = {
+        signum: object()
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    }
+    active_handlers = dict(original_handlers)
+    source_lines, source_start = inspect.getsourcelines(launcher.main)
+    lifetime_index = next(
+        index
+        for index, line in enumerate(source_lines)
+        if "with _ssh_disconnect_handler_lifetime" in line
+    )
+    target_line = source_start + next(
+        index
+        for index, line in enumerate(source_lines[lifetime_index + 1 :], lifetime_index + 1)
+        if "return _run_local_startup" in line
+    )
+    delivered = False
+
+    def record_handler(signum: int, handler: object) -> object:
+        previous = active_handlers[signum]
+        active_handlers[signum] = handler
+        return previous
+
+    def deliver_hup_on_transition(frame: object, event: str, argument: object):
+        nonlocal delivered
+        if (
+            event == "line"
+            and getattr(frame, "f_code", None) is launcher.main.__code__
+            and getattr(frame, "f_lineno", None) == target_line
+            and not delivered
+        ):
+            delivered = True
+            handler = active_handlers[signal.SIGHUP]
+            assert callable(handler)
+            handler(signal.SIGHUP, None)
+        return deliver_hup_on_transition
+
+    monkeypatch.setattr(launcher, "parse_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(launcher.signal, "getsignal", lambda signum: active_handlers[signum])
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+    previous_trace = sys.gettrace()
+    sys.settrace(deliver_hup_on_transition)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            main([], environ=environment, stdout=io.StringIO())
+    finally:
+        sys.settrace(previous_trace)
+
+    assert delivered
+    assert active_handlers == original_handlers
+
+
+@pytest.mark.parametrize("interrupt_after_install", (False, True))
+def test_ssh_handler_install_failures_restore_prior_handlers(
+    monkeypatch: pytest.MonkeyPatch, interrupt_after_install: bool,
+) -> None:
+    """A signal must not escape between installation and recording its prior value."""
+    original_handlers = {
+        signum: object()
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    }
+    active_handlers = dict(original_handlers)
+
+    def get_handler(signum: int) -> object:
+        return active_handlers[signum]
+
+    def install_handler(signum: int, handler: object) -> object:
+        if handler is original_handlers[signum]:
+            active_handlers[signum] = handler
+            return handler
+        if not interrupt_after_install:
+            raise RuntimeError("interrupted before handler installation")
+        active_handlers[signum] = handler
+        assert callable(handler)
+        handler(signum, None)
+        raise AssertionError("disconnect handler must not return")
+
+    monkeypatch.setattr(launcher.signal, "getsignal", get_handler)
+    monkeypatch.setattr(launcher.signal, "signal", install_handler)
+
+    expected = KeyboardInterrupt if interrupt_after_install else RuntimeError
+    with pytest.raises(expected):
+        with launcher._ssh_disconnect_handler_lifetime({"SSH_CONNECTION": "remote"}):
+            pytest.fail("interrupted handler installation must not enter the body")
+
+    assert active_handlers == original_handlers
+
+
+def test_non_ssh_launch_does_not_replace_the_process_signal_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This catches imposing SSH-disconnect lifetime semantics on direct launches.
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    environment.pop("SSH_CONNECTION")
+    calls: list[int] = []
+
+    def record_handler(signum: int, handler: object) -> object:
+        calls.append(signum)
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(launcher.signal, "signal", record_handler)
+
+    assert main(
+        _args(repo, tools),
+        environ=environment,
+        stdout=io.StringIO(),
+        uvicorn_run=lambda *args, **kwargs: None,
+    ) == 0
+    # asyncio.run temporarily manages SIGINT for startup preflights, but direct
+    # launch must not install the SSH-only HUP/TERM lifetime handlers.
+    assert signal.SIGHUP not in calls
+    assert signal.SIGTERM not in calls
+
+
 def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_credentials(
     tmp_path: Path,
 ) -> None:
@@ -537,7 +955,7 @@ def test_foreground_launch_injects_complete_status_reuses_session_and_leaks_no_c
         assert record["fable_status"] == "subscription_ready"
         assert record["sol_version"] == "codex-cli 9.9.9"
         assert record["ssh_command"] == (
-            "ssh -N -L 56590:127.0.0.1:56590 bridgeuser@198.51.100.20"
+            "ssh -N -L 127.0.0.1:56590:127.0.0.1:56590 bridgeuser@198.51.100.20"
         )
         serialized = json.dumps(record, sort_keys=True)
         for secret in (
@@ -1351,6 +1769,46 @@ def test_invalid_legacy_state_aborts_before_recovery(
     with pytest.raises(RuntimeError, match="legacy project ownership audit failed"):
         main(_args(repo, tools), environ=environment, stdout=io.StringIO(), uvicorn_run=lambda *args, **kwargs: None)
 
+    assert recoveries == []
+
+
+def test_digest_checkpoint_tamper_aborts_before_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Digest state is checkpoint-audited before recovery can mutate it."""
+    tools = _fake_tools(tmp_path)
+    repo = _repo(tmp_path)
+    environment = _environment(tmp_path, repo)
+    settings = parse_settings(_args(repo, tools), environ=environment)
+    database = settings.projects[0].state_dir / "bridge.sqlite3"
+    database.parent.mkdir(parents=True)
+    store = SQLiteStore(database)
+    store.create_session("session-1", str(repo))
+    store.close()
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        INSERT INTO directed_fable_answer_checkpoints (
+            preparation_id, project_id, session_id, task_id, revision, question_id,
+            continuation_generation, clarification_json, status
+        ) VALUES ('orphan-prep', 'foreign-project', 'session-1', 'task-1', 1,
+                  'question-1', 1, '{}', 'PENDING')
+        """
+    )
+    connection.commit()
+    connection.close()
+    recoveries: list[Path] = []
+    original_recover = SQLiteStore.recover_active_tasks
+
+    def recover(self: SQLiteStore):
+        recoveries.append(database)
+        return original_recover(self)
+
+    monkeypatch.setattr(SQLiteStore, "recover_active_tasks", recover)
+    with pytest.raises(RuntimeError, match="directed Fable answer checkpoint audit failed"):
+        main(_args(repo, tools), environ=environment, stdout=io.StringIO(),
+             uvicorn_run=lambda *args, **kwargs: None)
     assert recoveries == []
 
 

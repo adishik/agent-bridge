@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    SubscriptionAuthError,
+)
+from agent_bridge.contracts import ConversationTarget, DirectedAgentQuestion
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -17,16 +24,24 @@ from agent_bridge.hub import (
     RuntimeReadiness,
     RuntimeStatus,
     PreparedWorkflow,
+    PreparedIntervention,
     StopReservation,
 )
+from agent_bridge.coordinator import InterventionIntent
 from agent_bridge.projects import ProjectSpec
+from agent_bridge.process import ProcessRunner
 from agent_bridge.state_machine import TaskState
 from agent_bridge.store import (
     AnswerPayload,
     ApprovalPayload,
+    ContinuationMessagePayload,
+    ExchangeGrantPayload,
+    InterventionRecord,
+    InterventionStatus,
     NewRequestPayload,
     PreparedActionOutcome,
     PreparedActionRecord,
+    QuestionAnswerPayload,
     ResumeDriftProjection,
     ResumePayload,
     SolResumeContext,
@@ -53,6 +68,7 @@ class _RuntimeStore:
     removed_listener_tokens: list[int] | None = None
     closed: bool = False
     prepared_rows: dict[str, PreparedActionRecord] | None = None
+    intervention_rows: dict[str, InterventionRecord] | None = None
 
     def __post_init__(self) -> None:
         if self.task_rows is None:
@@ -63,6 +79,8 @@ class _RuntimeStore:
             self.removed_listener_tokens = []
         if self.prepared_rows is None:
             self.prepared_rows = {}
+        if self.intervention_rows is None:
+            self.intervention_rows = {}
 
     def session_exists(self, session_id: str) -> bool:
         return session_id in self.sessions
@@ -72,6 +90,12 @@ class _RuntimeStore:
 
     def prepared_action(self, preparation_id: str) -> PreparedActionRecord | None:
         return self.prepared_rows.get(preparation_id)
+
+    def intervention(self, intervention_id: str) -> InterventionRecord | None:
+        return self.intervention_rows.get(intervention_id)
+
+    def authenticated_intervention(self, intervention_id: str) -> InterventionRecord | None:
+        return self.intervention(intervention_id)
 
     def latest_prepared_action_for_task(
         self, *, project_id: str, session_id: str, task_id: str, revision: int,
@@ -115,6 +139,14 @@ class _RuntimeCoordinator:
     store: _RuntimeStore
     project_id: str
     prepared_actions: list[str] = field(default_factory=list)
+    conversation_runs: list[tuple[str, str]] = field(default_factory=list)
+    directed_preparations: list[tuple[str, tuple[object, ...]]] = field(
+        default_factory=list,
+    )
+    intervention_continues: list[str] = field(default_factory=list)
+    intervention_dispatches: list[str] = field(default_factory=list)
+    intervention_dispatch_started: asyncio.Event | None = None
+    intervention_dispatch_release: asyncio.Event | None = None
 
     def _record(
         self, *, session_id: str, task_id: str, revision: int, action: str,
@@ -140,6 +172,39 @@ class _RuntimeCoordinator:
             )
             source = TaskState.INTERRUPTED
             active = TaskState.SOL_RUNNING
+        elif action == "continuation_message":
+            payload = ContinuationMessagePayload(
+                text="Continue the exact persisted work.",
+                addressed_to=ConversationTarget.SOL,
+                routed_to=ConversationTarget.SOL,
+                continuation_generation=7,
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
+        elif action == "question_answer":
+            payload = QuestionAnswerPayload(
+                question_id="question-7",
+                answer="Use the existing seam.",
+                continuation_generation=7,
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
+        elif action == "exchange_grant":
+            payload = ExchangeGrantPayload(
+                request_id="grant-7",
+                continuation_generation=7,
+                attempted_question=DirectedAgentQuestion(
+                    addressed_to="fable",
+                    text="Which exact rule applies?",
+                    reason="The agent needs a bounded clarification.",
+                ),
+                parent_mode="top_level",
+                continuation=continuation,
+            )
+            source = TaskState.AWAITING_USER_INPUT
+            active = TaskState.SOL_RUNNING
         else:
             raise AssertionError("unexpected route")
         self.prepared_actions.append(action)
@@ -156,7 +221,9 @@ class _RuntimeCoordinator:
             payload=payload,
             source_state=source,
             active_state=active,
-            continuation_state=None,
+            continuation_state=(
+                None if action in {"new_request", "approval"} else active
+            ),
             pending_context=pending_context,
             previous_preparation_id=None,
             status="PREPARED",
@@ -170,8 +237,15 @@ class _RuntimeCoordinator:
         return record
 
     def prepare_new_request(
-        self, *, session_id: str, task_id: str, text: str, generation: int,
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        text: str,
+        generation: int,
+        addressed_to: ConversationTarget = ConversationTarget.FABLE,
     ) -> PreparedActionRecord:
+        assert isinstance(addressed_to, ConversationTarget)
         self.prepared.append((session_id, text, task_id))
         return self._record(
             session_id=session_id, task_id=task_id, revision=0,
@@ -207,6 +281,65 @@ class _RuntimeCoordinator:
             action="resume", generation=generation,
         )
 
+    def _prepare_continuation_message_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "continuation_message",
+            (session_id, task_id, revision, continuation_generation, text, addressed_to, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="continuation_message", generation=generation,
+        )
+
+    def _prepare_question_answer_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "question_answer",
+            (session_id, task_id, revision, continuation_generation, question_id, answer, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="question_answer", generation=generation,
+        )
+
+    def _prepare_exchange_grant_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        self.directed_preparations.append((
+            "exchange_grant",
+            (session_id, task_id, revision, continuation_generation, request_id, generation),
+        ))
+        return self._record(
+            session_id=session_id, task_id=task_id, revision=revision,
+            action="exchange_grant", generation=generation,
+        )
+
     async def run_prepared_request(self, task_id: str) -> None:
         self.run_task_ids.append(task_id)
 
@@ -216,6 +349,16 @@ class _RuntimeCoordinator:
         self.run_task_ids.append(record.task_id)
         self.store.prepared_rows[preparation_id] = replace(record, status="COMPLETED")
         return PreparedActionOutcome("completed")
+
+    async def run_prepared_conversation_action(self, task_id: str, action: str) -> None:
+        self.conversation_runs.append((task_id, action))
+        record = next(
+            record for record in self.store.prepared_rows.values()
+            if record.task_id == task_id and record.action == action
+        )
+        self.store.prepared_rows[record.preparation_id] = replace(
+            record, status="COMPLETED",
+        )
 
     def abort_prepared_action(
         self, preparation_id: str, *, generation: int, reason: str,
@@ -243,6 +386,51 @@ class _RuntimeCoordinator:
         for key, task in self.store.task_rows.items():
             if key[0] == task_id:
                 task.state = TaskState.INTERRUPTED
+
+    def prepare_intervention(
+        self, task_id: str, intent: InterventionIntent,
+    ) -> InterventionRecord:
+        task = next(task for (candidate, _), task in self.store.task_rows.items() if candidate == task_id)
+        task.state = TaskState.INTERRUPTED
+        record = InterventionRecord(
+            intervention_id=intent.intervention_id,
+            session_id=task.session_id,
+            task_id=task_id,
+            revision=intent.revision,
+            addressed_to=intent.addressed_to,
+            routed_to=intent.addressed_to,
+            message=intent.message,
+            run_id="source-run-1",
+            continuation_state=TaskState.FABLE_PLANNING,
+            source_generation=intent.continuation_generation,
+            resume_generation=intent.continuation_generation + 1,
+            fable_session_id=None,
+            sol_thread_id=None,
+            resume_attempt_id=None,
+            resume_run_id=None,
+            status=InterventionStatus.PENDING_STOP,
+            created_at="2026-08-10T12:00:00Z",
+        )
+        self.store.intervention_rows[intent.intervention_id] = record
+        return record
+
+    async def continue_intervention(self, intervention_id: str) -> None:
+        self.intervention_continues.append(intervention_id)
+        record = self.store.intervention_rows[intervention_id]
+        self.store.intervention_rows[intervention_id] = replace(
+            record, status=InterventionStatus.READY,
+        )
+
+    async def dispatch_ready_intervention(self, intervention_id: str) -> None:
+        self.intervention_dispatches.append(intervention_id)
+        if self.intervention_dispatch_started is not None:
+            self.intervention_dispatch_started.set()
+        if self.intervention_dispatch_release is not None:
+            await self.intervention_dispatch_release.wait()
+        record = self.store.intervention_rows[intervention_id]
+        self.store.intervention_rows[intervention_id] = replace(
+            record, status=InterventionStatus.RESUMED,
+        )
 
 
 @dataclass
@@ -559,6 +747,68 @@ def test_registry_close_releases_owned_runtimes_in_reverse_order_after_close_fai
     ]
 
 
+def test_owned_runtime_close_stops_its_runner_before_closing_other_resources() -> None:
+    calls: list[str] = []
+    runtime = _owned_runtime("project-a", calls)
+    runtime.runner = _CloseResource("runner", calls)  # type: ignore[assignment]
+
+    runtime.close()
+
+    assert calls == ["runner", "coordinator", "tracker", "store", "lock-project-a"]
+
+
+def test_owned_runtime_aclose_reaps_provider_group_before_every_resource_close(
+    tmp_path: Path,
+) -> None:
+    """No listener, store, coordinator, or lock may close around a live group."""
+    async def scenario() -> None:
+        events: list[str] = []
+        runtime = _owned_runtime("project-a", events)
+        runner = ProcessRunner(stop_grace_seconds=0.02)
+        ready = asyncio.Event()
+        runtime.runner = runner
+        task = asyncio.create_task(runner.run(
+            run_id="shutdown-provider",
+            argv=(
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)",
+            ),
+            cwd=tmp_path,
+            env=dict(os.environ),
+            stdin=None,
+            on_line=lambda stream, line: ready.set() if line == "ready" else None,
+        ))
+        try:
+            await runner.wait_until_started("shutdown-provider")
+            await ready.wait()
+            group = runner._active_runs["shutdown-provider"].process_group_id
+            assert group is not None
+
+            def assert_reaped(name: str) -> None:
+                assert runner._process_group_exists(group) is False
+                events.append(name)
+
+            runtime.store.remove_event_listener = lambda token: assert_reaped("listener")
+            runtime.store.close = lambda: assert_reaped("store")
+            runtime.coordinator = SimpleNamespace(close=lambda: assert_reaped("coordinator"))  # type: ignore[assignment]
+            runtime.tracker = SimpleNamespace(close=lambda: assert_reaped("tracker"))  # type: ignore[assignment]
+            runtime.state_authority_close = lambda: assert_reaped("authority")
+            runtime.lock = SimpleNamespace(release=lambda: assert_reaped("lock"))  # type: ignore[assignment]
+
+            await runtime.aclose()
+
+            assert (await task).interrupted is True
+            assert events == ["listener", "coordinator", "tracker", "store", "authority", "lock"]
+            await runtime.aclose()
+            assert events == ["listener", "coordinator", "tracker", "store", "authority", "lock"]
+        finally:
+            await runner.aclose()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_registry_close_does_not_close_a_non_owning_runtime() -> None:
     runtime = _runtime("project-a")
     registry = ProjectRegistry((runtime,))
@@ -704,6 +954,36 @@ def test_workflow_preparation_holds_one_lease_for_fresh_readiness_and_releases_o
     asyncio.run(exercise())
 
 
+def test_hub_prepare_answer_releases_its_lease_when_the_directed_answer_guard_rejects(
+) -> None:
+    """The hub must not retain authority after Store rejects an unbound legacy answer."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        runtime.store.task_rows[("task-existing", 1)] = SimpleNamespace(
+            session_id="chat-1", revision=1, state=TaskState.AWAITING_USER_INPUT,
+        )
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        def reject_legacy_answer(**_: object) -> PreparedActionRecord:
+            raise RuntimeError("exact directed question answer is required")
+
+        runtime.coordinator.prepare_answer = reject_legacy_answer  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="exact directed question"):
+            await workflows.prepare_answer(
+                project_id="project-a", session_id="chat-1",
+                task_id="task-existing", revision=1, answer="Do not bypass the question.",
+            )
+
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("action", ("approval", "resume", "answer"))
 def test_held_lease_rejects_other_model_starting_routes_without_new_probes(
     action: str,
@@ -807,6 +1087,44 @@ def test_hub_run_retains_the_exact_lease_when_terminal_persistence_fails() -> No
     asyncio.run(exercise())
 
 
+def test_hub_invalidates_only_the_selected_fable_readiness_after_login_expiry() -> None:
+    async def exercise() -> None:
+        selected = _runtime("project-a")
+        untouched = _runtime("project-b")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((selected, untouched)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        prepared = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        async def login_expired(preparation_id: str) -> PreparedActionOutcome:
+            record = selected.store.prepared_action(preparation_id)
+            assert record is not None
+            selected.store.prepared_rows[preparation_id] = replace(
+                record, status="INTERRUPTED", reason="adapter_interrupted",
+            )
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
+
+        selected.coordinator.run_prepared_action = login_expired  # type: ignore[method-assign]
+        with pytest.raises(SubscriptionAuthError) as raised:
+            await workflows.run(prepared)
+
+        assert raised.value.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+        assert selected.readiness.snapshot() == RuntimeStatus(
+            False, "subscription_unavailable", "ready",
+        )
+        assert untouched.readiness.snapshot() == RuntimeStatus(
+            False, "checking", "checking",
+        )
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 def test_hub_terminal_retry_keeps_the_lease_and_never_restarts_the_child() -> None:
     async def exercise() -> None:
         runtime = _runtime("project-a")
@@ -901,6 +1219,92 @@ def test_hub_route_specific_preparations_run_the_matching_durable_action(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    "route",
+    ("continuation_message", "question_answer", "exchange_grant"),
+)
+def test_hub_directed_preparations_keep_one_lease_and_run_only_the_durable_kind(
+    route: str,
+) -> None:
+    """The hub must pass exact values into one typed Store preparation."""
+    async def exercise() -> None:
+        fable_calls: list[None] = []
+        sol_calls: list[None] = []
+        runtime = _runtime("project-a")
+        runtime.readiness = _readiness(
+            fable_calls=fable_calls,
+            sol_calls=sol_calls,
+        )
+        runtime.store.task_rows[("task-existing", 1)] = SimpleNamespace(
+            session_id="chat-1", revision=1, state=TaskState.AWAITING_USER_INPUT,
+        )
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)),
+            lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+
+        if route == "continuation_message":
+            prepared = await workflows.prepare_continuation_message(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                text="Continue the exact persisted work.",
+                addressed_to=ConversationTarget.SOL,
+            )
+        elif route == "question_answer":
+            prepared = await workflows.prepare_question_answer(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                question_id="question-7",
+                answer="Use the existing seam.",
+            )
+        else:
+            prepared = await workflows.prepare_exchange_grant(
+                project_id="project-a",
+                session_id="chat-1",
+                task_id="task-existing",
+                revision=1,
+                continuation_generation=7,
+                request_id="grant-7",
+            )
+
+        assert lease.snapshot() == prepared.token
+        assert fable_calls == [None]
+        assert sol_calls == [None]
+        expected_values = {
+            "continuation_message": (
+                "chat-1", "task-existing", 1, 7,
+                "Continue the exact persisted work.", ConversationTarget.SOL, 1,
+            ),
+            "question_answer": (
+                "chat-1", "task-existing", 1, 7, "question-7",
+                "Use the existing seam.", 1,
+            ),
+            "exchange_grant": (
+                "chat-1", "task-existing", 1, 7, "grant-7", 1,
+            ),
+        }
+        assert runtime.coordinator.directed_preparations == [
+            (route, expected_values[route]),
+        ]
+        await workflows.run(prepared)
+
+        assert runtime.coordinator.prepared_actions == [route]
+        assert runtime.coordinator.conversation_runs == [("task-existing", route)]
+        assert runtime.coordinator.run_task_ids == []
+        assert runtime.store.prepared_action(prepared.preparation_id).status == "COMPLETED"  # type: ignore[union-attr]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("claimed", (False, True))
 def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
     claimed: bool,
@@ -936,6 +1340,160 @@ def test_hub_stop_interrupts_the_exact_prepared_action_before_or_after_claim(
         assert lease.snapshot() is None
 
     asyncio.run(exercise())
+
+
+def test_hub_prepare_intervention_borrows_the_exact_live_source_lease() -> None:
+    """Preparation must commit guidance without releasing or signaling its source lease."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="intervention-1", message="Pause here.",
+                addressed_to=ConversationTarget.FABLE, revision=0,
+                continuation_generation=source.token.generation,
+            ),
+        )
+
+        assert isinstance(prepared, PreparedIntervention)
+        assert prepared.lease_token == source.token
+        assert prepared.lease_origin.value == "borrowed_source"
+        assert lease.snapshot() == source.token
+        assert runtime.coordinator.stops == []
+
+    asyncio.run(exercise())
+
+
+def test_duplicate_hub_intervention_continuations_do_not_release_the_running_owner_lease() -> None:
+    """Removing Hub lifecycle ownership lets a duplicate schedule dispatch and release early."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        readiness_calls: list[None] = []
+        runtime.readiness = _readiness(fable_calls=readiness_calls, sol_calls=readiness_calls)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        runtime.coordinator.intervention_dispatch_started = started
+        runtime.coordinator.intervention_dispatch_release = release
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1",
+            intent=InterventionIntent(
+                intervention_id="intervention-1", message="Pause here.",
+                addressed_to=ConversationTarget.FABLE, revision=0,
+                continuation_generation=source.token.generation,
+            ),
+        )
+        readiness_calls.clear()
+
+        owner = asyncio.create_task(workflows.continue_intervention(prepared))
+        await started.wait()
+        follower = asyncio.create_task(workflows.continue_intervention(prepared))
+        await asyncio.sleep(0)
+
+        assert runtime.coordinator.intervention_continues == ["intervention-1"]
+        assert readiness_calls == [None, None]
+        assert runtime.coordinator.intervention_dispatches == ["intervention-1"]
+        assert lease.snapshot() == prepared.lease_token
+
+        release.set()
+        await asyncio.gather(owner, follower)
+
+        assert runtime.store.intervention("intervention-1").status is InterventionStatus.RESUMED  # type: ignore[union-attr]
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+def test_hub_completed_intervention_retry_returns_canonical_record_without_a_lease() -> None:
+    """An exact endpoint retry after completion must not require the released source lease."""
+    async def exercise() -> None:
+        runtime = _runtime("project-a")
+        readiness_calls: list[None] = []
+        runtime.readiness = _readiness(fable_calls=readiness_calls, sol_calls=readiness_calls)
+        lease = ActiveAgentLease()
+        workflows = HubWorkflowOrchestrator(
+            registry=ProjectRegistry((runtime,)), lease=lease,
+            usage_credits_acknowledged=lambda: True,
+        )
+        source = await workflows.prepare_new_request(
+            project_id="project-a", session_id="chat-1", text="Build it", ids=_Ids(),
+        )
+        intent = InterventionIntent(
+            intervention_id="completed-retry", message="Keep it bounded.",
+            addressed_to=ConversationTarget.FABLE, revision=0,
+            continuation_generation=source.token.generation,
+        )
+        prepared = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1", intent=intent,
+        )
+        readiness_calls.clear()
+        await workflows.continue_intervention(prepared)
+        assert lease.snapshot() is None
+        continued = list(runtime.coordinator.intervention_continues)
+        dispatched = list(runtime.coordinator.intervention_dispatches)
+        readiness = list(readiness_calls)
+
+        retried = workflows.prepare_intervention(
+            project_id="project-a", session_id="chat-1", task_id="task-1", intent=intent,
+        )
+        await workflows.continue_intervention(retried)
+
+        assert retried.record == runtime.store.intervention("completed-retry")
+        assert runtime.coordinator.intervention_continues == continued
+        assert runtime.coordinator.intervention_dispatches == dispatched
+        assert readiness_calls == readiness
+        assert lease.snapshot() is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("status", (InterventionStatus.PENDING_STOP, InterventionStatus.READY))
+def test_recovery_preparation_acquires_and_abort_releases_only_its_new_lease(
+    status: InterventionStatus,
+) -> None:
+    """A rejected recovery installation must leave its durable record untouched."""
+    runtime = _runtime("project-a")
+    runtime.store.intervention_rows["intervention-1"] = InterventionRecord(
+        intervention_id="intervention-1", session_id="chat-1", task_id="task-1",
+        revision=0, addressed_to=ConversationTarget.FABLE,
+        routed_to=ConversationTarget.FABLE, message="Pause here.", run_id="source-run-1",
+        continuation_state=TaskState.FABLE_PLANNING, source_generation=1,
+        resume_generation=1, fable_session_id=None, sol_thread_id=None,
+        resume_attempt_id=None, resume_run_id=None, status=status,
+        created_at="2026-08-10T12:00:00Z",
+    )
+    lease = ActiveAgentLease()
+    workflows = HubWorkflowOrchestrator(
+        registry=ProjectRegistry((runtime,)), lease=lease,
+        usage_credits_acknowledged=lambda: True,
+    )
+
+    prepared = workflows.prepare_recovery_resume(
+        project_id="project-a", session_id="chat-1", intervention_id="intervention-1",
+        expected_resume_generation=1,
+    )
+    aborted = workflows.abort_prepared_intervention(prepared, reason="scheduler_unavailable")
+
+    assert prepared.lease_origin.value == "recovery_acquired"
+    assert aborted.status is status
+    assert runtime.store.intervention("intervention-1") == aborted
+    assert lease.snapshot() is None
 
 
 def test_abort_prepared_is_idempotent_and_stop_requires_the_exact_lease_owner() -> None:
@@ -1123,8 +1681,8 @@ def test_stop_rejects_a_reconstructed_reservation_claim() -> None:
     asyncio.run(exercise())
 
 
-def test_owner_release_during_stop_reservation_is_applied_after_stop_cancellation() -> None:
-    """Dropping an ordinary release during a reservation would strand the lease."""
+def test_owner_release_during_failed_stop_stays_pinned_for_exact_retry() -> None:
+    """A failed Stop cannot release authority while its exact child may remain live."""
     async def exercise() -> None:
         runtime = _runtime("project-a")
         lease = ActiveAgentLease()
@@ -1155,6 +1713,8 @@ def test_owner_release_during_stop_reservation_is_applied_after_stop_cancellatio
         with pytest.raises(RuntimeError, match="injected Stop failure"):
             await stopping
         assert runtime.coordinator.stops == []
+        assert lease.snapshot() == prepared.token
+        lease.release(prepared.token)
         assert lease.snapshot() is None
 
     asyncio.run(exercise())

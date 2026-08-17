@@ -1,25 +1,36 @@
 :root {
   color-scheme: light;
-  --ink: #17211d;
-  --muted: #5d6a64;
-  --surface: #f7f7f2;
-  --panel: #ffffff;
-  --line: #d9ded9;
-  --line-strong: #98a59e;
-  --brand: #185b45;
-  --brand-strong: #104331;
-  --brand-soft: #e7f2ed;
-  --fable: #6a4d91;
-  --fable-soft: #f2edf8;
-  --sol: #2a5f9e;
-  --sol-soft: #eaf2fb;
-  --user: #996113;
-  --user-soft: #fff4de;
-  --coordinator: #52605a;
-  --coordinator-soft: #eef1ef;
-  --danger: #a52c34;
-  --danger-soft: #fbecee;
-  --shadow: 0 18px 50px rgb(20 40 30 / 12%);
+  --ink-950: #211a17;
+  --ink-800: #3b302b;
+  --cream-50: #fffaf3;
+  --cream-100: #f6ecdf;
+  --copper-700: #9a4524;
+  --copper-600: #b65a31;
+  --copper-100: #f4d8c7;
+  --green-700: #49634e;
+  --green-100: #dce8da;
+  --danger-700: #8b2f2f;
+  --focus-ring: #176b87;
+  --ink: var(--ink-950);
+  --muted: var(--ink-800);
+  --surface: var(--cream-50);
+  --panel: var(--cream-50);
+  --line: #9b8273;
+  --line-strong: #755b4c;
+  --brand: var(--copper-700);
+  --brand-strong: var(--copper-700);
+  --brand-soft: var(--copper-100);
+  --fable: var(--copper-700);
+  --fable-soft: var(--copper-100);
+  --sol: var(--green-700);
+  --sol-soft: var(--green-100);
+  --user: var(--ink-800);
+  --user-soft: var(--cream-100);
+  --coordinator: var(--ink-800);
+  --coordinator-soft: var(--cream-100);
+  --danger: var(--danger-700);
+  --danger-soft: #f5dddd;
+  --shadow: 0 18px 50px rgb(59 48 43 / 14%);
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
@@ -60,8 +71,11 @@ input[type="checkbox"] {
 button:focus-visible,
 textarea:focus-visible,
 input:focus-visible,
+select:focus-visible,
+a:focus-visible,
+summary:focus-visible,
 [tabindex]:focus-visible {
-  outline: 3px solid #e2a842;
+  outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -74,6 +88,7 @@ input:focus-visible,
   color: #fff;
   background: var(--brand-strong);
   border-radius: 0.45rem;
+  min-height: 44px;
   transform: translateY(-150%);
 }
 
@@ -179,7 +194,7 @@ input:focus-visible,
 
 .project-navigation-button {
   max-width: 11rem;
-  min-height: 1.8rem;
+  min-height: 44px;
   padding: 0.26rem 0.5rem;
   overflow: hidden;
   color: var(--muted);
@@ -201,12 +216,12 @@ input:focus-visible,
 }
 
 .project-navigation-button:disabled {
-  color: #7a847f;
+  color: var(--ink-800);
   cursor: not-allowed;
 }
 
 #new-chat {
-  min-height: 1.8rem;
+  min-height: 44px;
   padding: 0.26rem 0.5rem;
   font-size: 0.7rem;
 }
@@ -255,8 +270,8 @@ input:focus-visible,
 .state-fable_planning::before,
 .state-fable_clarifying::before,
 .state-fable_reviewing::before {
-  background: #b56a00;
-  box-shadow: 0 0 0 3px #ffe2ae;
+  background: #ffe2ae;
+  box-shadow: 0 0 0 3px #b56a00;
 }
 
 .status-error::before,
@@ -277,6 +292,40 @@ input:focus-visible,
   overflow: hidden;
 }
 
+#project-navigation {
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  padding: 1rem;
+  overflow-y: auto;
+  background: rgb(255 250 243 / 86%);
+  border-right: 1px solid var(--line);
+}
+
+#conversation-shell {
+  grid-column: 2;
+  grid-row: 1;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#task-inspector-panel {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  padding: 1rem;
+  overflow-y: auto;
+  background: rgb(255 250 243 / 86%);
+  border-left: 1px solid var(--line);
+}
+
 #task-list,
 #task-inspector,
 #conversation {
@@ -294,11 +343,11 @@ input:focus-visible,
 }
 
 #task-list {
-  border-right: 1px solid var(--line);
+  border-right: 0;
 }
 
 #task-inspector {
-  border-left: 1px solid var(--line);
+  border-left: 0;
 }
 
 .panel-heading {
@@ -422,6 +471,50 @@ dialog h2 {
   letter-spacing: 0.03em;
 }
 
+.message-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-right: 0.45rem;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  background: var(--coordinator);
+  border-radius: 50%;
+}
+
+.message-user .message-avatar { background: var(--user); }
+.message-fable .message-avatar { background: var(--fable); }
+.message-sol .message-avatar { background: var(--sol); }
+
+.message-route {
+  display: inline;
+}
+
+.conversation-action-card {
+  max-width: min(46rem, 92%);
+  margin: 0 0 0.85rem;
+  padding: 0.8rem 0.95rem;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-left: 5px solid var(--brand);
+  border-radius: 0.75rem;
+  box-shadow: 0 5px 18px rgb(20 40 30 / 5%);
+}
+
+.conversation-action-card p {
+  margin: 0.35rem 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.conversation-action-card .button + .button {
+  margin-left: 0.45rem;
+}
+
 .message p {
   margin: 0;
   line-height: 1.55;
@@ -527,7 +620,7 @@ dialog h2 {
 }
 
 .button {
-  min-height: 2.45rem;
+  min-height: 44px;
   padding: 0.58rem 0.85rem;
   color: var(--ink);
   font-weight: 740;
@@ -543,8 +636,8 @@ dialog h2 {
 }
 
 .button:disabled {
-  color: #7a847f;
-  background: #ecefec;
+  color: var(--ink-800);
+  background: var(--cream-100);
   cursor: not-allowed;
 }
 
@@ -579,7 +672,8 @@ dialog h2 {
 
 .field-group textarea,
 .field-group input,
-#message-input {
+#message-input,
+#composer-recipient {
   width: 100%;
   padding: 0.7rem;
   color: var(--ink);
@@ -589,6 +683,11 @@ dialog h2 {
   resize: vertical;
 }
 
+.field-group input,
+.field-group textarea {
+  min-height: 44px;
+}
+
 #composer {
   z-index: 8;
   display: grid;
@@ -596,6 +695,30 @@ dialog h2 {
   padding: 0.75rem clamp(1rem, 3vw, 2rem);
   background: rgb(255 255 255 / 95%);
   border-top: 1px solid var(--line);
+}
+
+#conversation-context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.65rem clamp(1rem, 3vw, 2rem);
+  color: var(--muted);
+  background: var(--cream-100);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+#conversation-context p {
+  flex: 1 1 18rem;
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+#intervene-control[hidden],
+#stop-control[hidden] {
+  display: none;
 }
 
 #composer > label {
@@ -610,8 +733,36 @@ dialog h2 {
   gap: 0.65rem;
 }
 
+.composer-recipient {
+  display: grid;
+  gap: 0.2rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 740;
+}
+
+#composer-recipient {
+  min-height: 44px;
+  padding: 0.45rem;
+}
+
+.composer-binding {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.composer-binding .button {
+  min-height: 44px;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.72rem;
+}
+
 #message-input {
-  min-height: 3rem;
+  min-height: 44px;
   max-height: 10rem;
 }
 
@@ -628,6 +779,11 @@ dialog {
 dialog::backdrop {
   background: rgb(20 32 27 / 58%);
   backdrop-filter: blur(3px);
+}
+
+summary {
+  min-height: 44px;
+  padding: 0.55rem 0;
 }
 
 #usage-credits-form {
@@ -648,7 +804,7 @@ dialog::backdrop {
   align-items: start;
   padding: 0.85rem;
   background: var(--brand-soft);
-  border: 1px solid #bfd5cb;
+  border: 1px solid var(--line-strong);
   border-radius: 0.6rem;
   line-height: 1.45;
 }
@@ -725,13 +881,13 @@ dialog::backdrop {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  #conversation {
+  #conversation-shell {
     grid-column: 1;
     grid-row: 1;
   }
 
-  #task-list,
-  #task-inspector {
+  #project-navigation,
+  #task-inspector-panel {
     position: absolute;
     z-index: 20;
     top: 0;
@@ -742,18 +898,19 @@ dialog::backdrop {
     box-shadow: var(--shadow);
   }
 
-  #task-list {
+  #project-navigation {
     left: 0;
+    flex: none;
     border-right: 1px solid var(--line-strong);
   }
 
-  #task-inspector {
+  #task-inspector-panel {
     right: 0;
     border-left: 1px solid var(--line-strong);
   }
 
-  #task-list.drawer-open,
-  #task-inspector.drawer-open {
+  #project-navigation.drawer-open,
+  #task-inspector-panel.drawer-open {
     display: flex;
   }
 }
@@ -791,5 +948,21 @@ dialog::backdrop {
   *::after {
     scroll-behavior: auto !important;
     transition: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .button,
+  .task-list-button,
+  .project-navigation-button,
+  .message,
+  .task-section,
+  dialog {
+    border: 2px solid CanvasText;
+  }
+
+  .status-pill::before,
+  .state-badge::before {
+    border: 1px solid CanvasText;
   }
 }

@@ -42,6 +42,17 @@ class FableAdapter(Protocol):
     ) -> AgentRunResult:
         raise NotImplementedError
 
+    async def answer_sol_question(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        task_id: str,
+        prompt: str,
+        context: str,
+    ) -> AgentRunResult:
+        raise NotImplementedError
+
     async def review(
         self, *, run_id: str, session_id: str, prompt: str,
     ) -> AgentRunResult:
@@ -56,5 +67,15 @@ class SolAdapter(Protocol):
 
     async def resume(
         self, *, run_id: str, thread_id: str, prompt: str,
+    ) -> AgentRunResult:
+        raise NotImplementedError
+
+    async def answer_fable_question(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        brief: TaskBrief,
+        prompt: str,
     ) -> AgentRunResult:
         raise NotImplementedError

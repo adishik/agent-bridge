@@ -10,12 +10,15 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -36,7 +39,7 @@ from agent_bridge.app import (
     create_hub_app,
 )
 from agent_bridge.coordinator import Coordinator
-from agent_bridge.contracts import TaskBrief
+from agent_bridge.contracts import ConversationTarget, TaskBrief
 from agent_bridge.hub import (
     ActiveAgentLease,
     HubWorkflowOrchestrator,
@@ -50,7 +53,7 @@ from agent_bridge.process import LineCallback, ProcessResult, ProcessRunner
 from agent_bridge.projects import ProjectSpec, build_project_specs
 from agent_bridge.repository import RepositoryTracker
 from agent_bridge.state_machine import TaskState
-from agent_bridge.store import SQLiteStore
+from agent_bridge.store import InterventionStatus, SQLiteStore
 import agent_bridge.__main__ as launcher
 
 
@@ -115,12 +118,13 @@ class RecordingProcessRunner(ProcessRunner):
 def _brief(
     *,
     task_id: str = "task-1",
+    revision: int = 1,
     title: str = "Add the bounded bridge fixture",
     allowed_path: str = "bridge_work",
 ) -> dict[str, object]:
     return {
         "task_id": task_id,
-        "revision": 1,
+        "revision": revision,
         "title": title,
         "objective": "Create one file inside the approved bridge work directory.",
         "context": ["This is a controlled fake-agent integration run."],
@@ -177,6 +181,42 @@ def _question() -> dict[str, object]:
             "can_continue_safely": False,
         },
     }
+
+
+def _directed_question(
+    text: str,
+    *,
+    addressed_to: str = "fable",
+) -> dict[str, object]:
+    payload = _question()
+    question = payload["question"]
+    assert isinstance(question, dict)
+    question["directed_question"] = {
+        "addressed_to": addressed_to,
+        "text": text,
+        "reason": "The approved fake workflow needs one exact answer.",
+    }
+    return payload
+
+
+def _fable_answer(
+    text: str,
+    *,
+    directed_to_sol: str | None = None,
+    revised_brief: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = _clarification()
+    payload["answer"] = text
+    if revised_brief is not None:
+        payload["scope_changed"] = True
+        payload["revised_brief"] = revised_brief
+    if directed_to_sol is not None:
+        payload["directed_question"] = {
+            "addressed_to": "sol",
+            "text": directed_to_sol,
+            "reason": "Fable needs exact fake execution evidence.",
+        }
+    return payload
 
 
 def _clarification(*, escalate: bool = False) -> dict[str, object]:
@@ -1022,14 +1062,15 @@ def test_fake_agent_model_invocation_refuses_missing_sentinel(
 
 
 def test_stop_interrupts_only_the_active_fake_child(fake_bridge: FakeBridge) -> None:
-    fake_bridge.configure(codex_modes=["slow_after_thread"])
+    fake_bridge.configure(codex_modes=["slow_before_thread"])
 
-    async def wait_for_marker(path: Path) -> None:
+    async def wait_for_active_run(task_id: str):
         for _ in range(250):
-            if path.exists():
-                return
+            active = fake_bridge.store.active_run_for_task(task_id, 1)
+            if active is not None and fake_bridge.runner.is_running(active.run_id):
+                return active
             await asyncio.sleep(0.02)
-        raise AssertionError("fake Codex did not reach its controlled stop marker")
+        raise AssertionError("fake Codex did not start its controlled child")
 
     async def scenario() -> None:
         task_id = await fake_bridge.coordinator.handle_user_request(
@@ -1038,9 +1079,7 @@ def test_stop_interrupts_only_the_active_fake_child(fake_bridge: FakeBridge) -> 
         approval = asyncio.create_task(
             fake_bridge.coordinator.approve_task(task_id, revision=1)
         )
-        await wait_for_marker(fake_bridge.captures / "fake-codex-partials-ready.json")
-        active = fake_bridge.store.active_run_for_task(task_id, 1)
-        assert active is not None
+        active = await wait_for_active_run(task_id)
         await fake_bridge.coordinator.stop_task(task_id)
         await approval
 
@@ -1376,6 +1415,1763 @@ def _project_path(hub: FakeHub, label: str) -> str:
 
 def _event_documents(bridge: FakeBridge, session_id: str) -> list[dict[str, object]]:
     return [event.to_dict() for event in bridge.store.events_after(session_id, 0)]
+
+
+def _conversation_documents(
+    bridge: FakeBridge, session_id: str,
+) -> list[dict[str, object]]:
+    return [
+        document["payload"]
+        for document in _event_documents(bridge, session_id)
+        if document["kind"] == "conversation"
+    ]
+
+
+def _model_invocations(bridge: FakeBridge) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        item
+        for item in bridge.invocations
+        if item.get("kind") in {"claude", "codex"}
+        and item.get("argv") != ["auth", "status", "--json"]
+    )
+
+
+def _crash_recovery_bridge_layout(
+    root: Path,
+    *,
+    fake_claude: Path,
+    fake_codex: Path,
+) -> Any:
+    """Describe the immutable alpha fixture layout left by a killed worker."""
+    bridge_root = root / "first-parent"
+    state = bridge_root / "external-state"
+    captures = bridge_root / "external-captures"
+    binaries = bridge_root / "fake-bin"
+    repo = bridge_root / "same-name"
+    return SimpleNamespace(
+        root=bridge_root,
+        repo=repo,
+        database=state / "bridge.sqlite3",
+        artifacts=bridge_root / "external-artifacts",
+        schemas=bridge_root / "external-schemas",
+        captures=captures,
+        scenario_path=captures / "scenario.json",
+        invocation_log=captures / "resolved-executables.jsonl",
+        fake_claude=fake_claude.resolve(strict=True),
+        fake_codex=fake_codex.resolve(strict=True),
+        fake_git=binaries / "git",
+        fake_bash=binaries / "bash",
+        fake_sh=binaries / "sh",
+        environment={
+            "AGENT_BRIDGE_TEST_FAKE": "1",
+            "AGENT_BRIDGE_INVOCATION_LOG": str(captures / "resolved-executables.jsonl"),
+            "FAKE_AGENT_CAPTURE_DIR": str(captures),
+            "FAKE_AGENT_SCENARIO": str(captures / "scenario.json"),
+            "FAKE_BRIDGE_REPO_ROOT": str(repo),
+            "FAKE_BRIDGE_TEST_COMMAND": TEST_COMMAND,
+            "FAKE_CLAUDE_TASK_ID": "task-1",
+            "FAKE_CLAUDE_SESSION_ID": "fable-alpha-session",
+            "FAKE_CODEX_THREAD_ID": "0199a213-81c0-7800-8aa1-bbab2a035a51",
+            "HOME": str(state),
+            "PATH": "/path-resolution-is-forbidden",
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        fable_session_id="fable-alpha-session",
+        sol_thread_id="0199a213-81c0-7800-8aa1-bbab2a035a51",
+        session_id=SESSION_ID,
+    )
+
+
+def _subprocess_intervention_crash_worker_source() -> str:
+    """Run the actual fake hub until a durable crash boundary, then wait forever."""
+    return r'''
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+import runpy
+import threading
+import time
+
+from fastapi.testclient import TestClient
+
+module = runpy.run_path(os.environ["TASK8_E2E_MODULE"])
+FakeHub = module["FakeHub"]
+InterventionStatus = module["InterventionStatus"]
+TaskState = module["TaskState"]
+_authenticate_hub = module["_authenticate_hub"]
+_brief = module["_brief"]
+_clarification = module["_clarification"]
+_completed = module["_completed"]
+_project_path = module["_project_path"]
+_question = module["_question"]
+_review = module["_review"]
+_wait_for = module["_wait_for"]
+
+root = Path(os.environ["TASK8_CRASH_ROOT"])
+control = Path(os.environ["TASK8_CRASH_CONTROL"])
+phase = os.environ["TASK8_CRASH_PHASE"]
+hub = FakeHub.create(
+    root=root,
+    fake_claude=Path(os.environ["TASK8_FAKE_CLAUDE"]),
+    fake_codex=Path(os.environ["TASK8_FAKE_CODEX"]),
+)
+bridge = hub.bridges["alpha"]
+bridge.configure(
+    plans=[_brief(task_id="$TASK_ID")],
+    outcomes=[
+        _question(),
+        _completed(content="source allowed partial\n"),
+        _completed(content="possibly executed continuation\n"),
+        _completed(content="acknowledged exact retry\n"),
+    ],
+    clarifications=[_clarification()],
+    reviews=[_review()],
+    codex_modes=[
+        None,
+        "slow_after_thread",
+        "slow_after_thread" if phase == "provider_spawned" else None,
+    ],
+)
+
+async def wait_for_ready(**kwargs):
+    raise RuntimeError("controlled durable ready boundary")
+
+def publish(*, provider_pid=None):
+    record = bridge.store.intervention("intervention-subprocess-crash")
+    if record is None or record.status is not InterventionStatus.RESUMING:
+        raise RuntimeError("resume claim was not durable at the crash boundary")
+    control.write_text(json.dumps({
+        "worker_pid": os.getpid(),
+        "task_id": record.task_id,
+        "revision": record.revision,
+        "intervention_id": record.intervention_id,
+        "resume_generation": record.resume_generation,
+        "resume_run_id": record.resume_run_id,
+        "provider_pid": provider_pid,
+    }, sort_keys=True), encoding="utf-8")
+
+async def post_claim_pre_spawn(intervention_id, *, resume_attempt_id, resume_run_id):
+    publish()
+    await asyncio.Event().wait()
+
+with TestClient(hub.app) as client:
+    headers = _authenticate_hub(client)
+    project = _project_path(hub, "alpha")
+    session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+    response = client.post(
+        f"{project}/chats/{session_id}/messages",
+        json={"text": "Reach a durable Sol crash boundary."},
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"message was not accepted: {response.status_code}")
+    _wait_for(
+        lambda: bool(bridge.store.latest_task_overviews(session_id))
+        and bridge.store.latest_task_overviews(session_id)[0].task.state
+        is TaskState.AWAITING_USER_APPROVAL,
+    )
+    task = bridge.store.latest_task_overviews(session_id)[0].task
+    response = client.post(
+        f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+        json={"revision": task.revision},
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"approval was not accepted: {response.status_code}")
+    state_path = bridge.captures / "scenario-state-codex.json"
+    _wait_for(
+        lambda: state_path.exists()
+        and json.loads(state_path.read_text(encoding="utf-8")) == {"outcome": 2},
+    )
+    source_marker = bridge.captures / "fake-codex-partials-ready.json"
+    _wait_for(source_marker.exists)
+    task = bridge.store.latest_task(task.task_id)
+    if task is None or task.state is not TaskState.SOL_RUNNING:
+        raise RuntimeError("live Sol source was not installed")
+    source = bridge.store.active_run_for_task(task.task_id, task.revision)
+    if source is None or source.agent != "sol":
+        raise RuntimeError("live Sol source run was not installed")
+    _wait_for(lambda: bridge.runner.is_running(source.run_id))
+    original_readiness = hub.runtime("alpha").readiness.require_model_start_ready
+    hub.runtime("alpha").readiness.require_model_start_ready = wait_for_ready
+    response = client.post(
+        f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+        json={
+            "intervention_id": "intervention-subprocess-crash",
+            "message": "Keep this exact continuation bounded.",
+            "addressed_to": "sol",
+            "revision": task.revision,
+            "continuation_generation": task.continuation_generation,
+        },
+        headers=headers,
+    )
+    if response.status_code != 202:
+        raise RuntimeError(f"intervention was not accepted: {response.status_code}")
+    _wait_for(
+        lambda: (
+            (record := bridge.store.intervention("intervention-subprocess-crash"))
+            is not None and record.status is InterventionStatus.READY
+        ),
+    )
+    hub.runtime("alpha").readiness.require_model_start_ready = original_readiness
+    for path in (
+        bridge.captures / "fake-codex-partials-ready.json",
+        bridge.captures / "fake-codex-mutations.json",
+    ):
+        path.unlink()
+    if phase == "post_claim_pre_spawn":
+        bridge.coordinator.run_intervention_resume = post_claim_pre_spawn
+    record = bridge.store.intervention("intervention-subprocess-crash")
+    if record is None:
+        raise RuntimeError("ready intervention disappeared")
+    def dispatch() -> None:
+        asyncio.run(bridge.coordinator.dispatch_ready_intervention(record.intervention_id))
+    threading.Thread(target=dispatch, daemon=True).start()
+    if phase == "provider_spawned":
+        mutation_path = bridge.captures / "fake-codex-mutations.json"
+        _wait_for(mutation_path.exists)
+        provenance = json.loads(mutation_path.read_text(encoding="utf-8"))
+        provider_pid = provenance.get("pid")
+        if not isinstance(provider_pid, int) or provider_pid <= 0:
+            raise RuntimeError("fake Codex did not record its provider PID")
+        publish(provider_pid=provider_pid)
+    else:
+        _wait_for(control.exists)
+    while True:
+        time.sleep(0.1)
+'''
+
+
+def test_intervention_early_fable_is_visible_before_its_exact_owned_stop(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An early Fable intervention commits before signaling only its source run."""
+    hub = FakeHub.create(
+        root=tmp_path / "early-fable-intervention",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    beta_chats_before = hub.bridges["beta"].store.list_chats()
+    beta_events_before = _event_documents(hub.bridges["beta"], SESSION_ID)
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID"), _brief(task_id="$TASK_ID")],
+        claude_modes={"plan": ["slow_before_init"]},
+    )
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    ready_before_claim = threading.Event()
+    source_intervention_completed = threading.Event()
+    resume_dispatch_started = threading.Event()
+    stopped_run_ids: list[str] = []
+    continued_intervention_ids: list[str] = []
+    original_stop = bridge.runner.stop
+    original_readiness = hub.runtime("alpha").readiness.require_model_start_ready
+    original_dispatch = bridge.coordinator.dispatch_ready_intervention
+    original_continue = hub.workflows.continue_intervention
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        stopped_run_ids.append(run_id)
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    async def defer_ready_claim(**kwargs: Any) -> None:
+        ready_before_claim.set()
+        raise RuntimeError("controlled recovery-resume boundary")
+
+    async def observe_source_intervention(prepared: Any) -> None:
+        continued_intervention_ids.append(prepared.record.intervention_id)
+        try:
+            await original_continue(prepared)
+        finally:
+            source_intervention_completed.set()
+
+    async def observe_resume_dispatch(intervention_id: str) -> None:
+        resume_dispatch_started.set()
+        await original_dispatch(intervention_id)
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    monkeypatch.setattr(hub.workflows, "continue_intervention", observe_source_intervention)
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Plan an early Fable intervention."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bool(bridge.store.latest_task_overviews(session_id))
+                and bridge.store.active_run_for_task(
+                    bridge.store.latest_task_overviews(session_id)[0].task.task_id,
+                    bridge.store.latest_task_overviews(session_id)[0].task.revision,
+                ) is not None,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            source_run = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source_run is not None
+            _wait_for(lambda: bridge.runner.is_running(source_run.run_id))
+            scenario_state = bridge.captures / "scenario-state-claude.json"
+            _wait_for(
+                lambda: scenario_state.exists()
+                and json.loads(scenario_state.read_text(encoding="utf-8")) == {"plan": 1},
+            )
+            assert task.fable_session_id is None
+            monkeypatch.setattr(
+                hub.runtime("alpha").readiness,
+                "require_model_start_ready",
+                defer_ready_claim,
+            )
+            monkeypatch.setattr(
+                bridge.coordinator,
+                "dispatch_ready_intervention",
+                observe_resume_dispatch,
+            )
+
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": "intervention-early-fable",
+                    "message": "Keep the original bounded plan, then continue.",
+                    "addressed_to": "fable",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert response.status_code == 202
+            assert source_stop_started.wait(timeout=1)
+            persisted = bridge.store.intervention("intervention-early-fable")
+            assert persisted is not None
+            assert persisted.status is InterventionStatus.PENDING_STOP
+            assert persisted.run_id == source_run.run_id
+            assert bridge.store.agent_run(source_run.run_id).status == "running"
+            assert hub.workflows.active_lease_snapshot() is not None
+            visible = _conversation_documents(bridge, session_id)
+            assert any(
+                entry["text"] == "Keep the original bounded plan, then continue."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "fable"
+                for entry in visible
+            )
+
+            release_source_stop.set()
+            assert ready_before_claim.wait(timeout=3), (
+                bridge.store.intervention("intervention-early-fable").status,
+                bridge.store.latest_task(task.task_id).state,
+                bridge.store.agent_run(source_run.run_id).status,
+                hub.app.state.coroutine_observation_failures,
+            )
+            assert source_intervention_completed.wait(timeout=1)
+            ready = bridge.store.intervention("intervention-early-fable")
+            assert ready is not None
+            assert ready.status is InterventionStatus.READY
+            assert stopped_run_ids == [source_run.run_id]
+            assert bridge.store.agent_run(source_run.run_id).status == "interrupted"
+
+            monkeypatch.setattr(
+                hub.runtime("alpha").readiness,
+                "require_model_start_ready",
+                original_readiness,
+            )
+            resumed = client.post(
+                f"{project}/chats/{session_id}/interventions/{ready.intervention_id}/resume",
+                json={"expected_resume_generation": ready.resume_generation},
+                headers=headers,
+            )
+            assert resumed.status_code == 202
+            assert resumed.json()["scheduled"] is True
+            assert resume_dispatch_started.wait(timeout=1)
+            _wait_for(
+                lambda: bridge.store.intervention("intervention-early-fable").status
+                is InterventionStatus.RESUMED,
+            )
+
+        completed = bridge.store.intervention("intervention-early-fable")
+        task = bridge.store.latest_task(task.task_id)
+        assert completed is not None and task is not None
+        assert completed.status is InterventionStatus.RESUMED
+        assert task.fable_session_id == bridge.fable_session_id
+        system_messages = [
+            event["payload"]["text"]
+            for event in _event_documents(bridge, session_id)
+            if event["kind"] == "conversation" and event["payload"]["sender"] == "system"
+        ]
+        assert system_messages == [
+            "Fable continuity could not be preserved; a new Fable session was started.",
+        ]
+        assert continued_intervention_ids == [
+            "intervention-early-fable", "intervention-early-fable",
+        ]
+        assert hub.bridges["beta"].store.list_chats() == beta_chats_before
+        assert _event_documents(hub.bridges["beta"], SESSION_ID) == beta_events_before
+        assert bridge.live_call_count == 0
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+def test_intervention_sol_preserves_allowed_partial_work_and_exact_thread(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live Sol continuation retains its approved baseline and exact thread."""
+    hub = FakeHub.create(
+        root=tmp_path / "sol-partial-intervention",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    beta_events_before = _event_documents(hub.bridges["beta"], SESSION_ID)
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[
+            _question(),
+            _completed(content="allowed partial Sol edit\n"),
+            _completed(content="resumed exact Sol output\n"),
+        ],
+        clarifications=[_clarification()],
+        reviews=[_review()],
+        codex_modes=[None, "slow_after_thread"],
+    )
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    stopped_run_ids: list[str] = []
+    original_stop = bridge.runner.stop
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        stopped_run_ids.append(run_id)
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Preserve the approved partial Sol work."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task_overviews(session_id)[0].task.state
+                is TaskState.AWAITING_USER_APPROVAL,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+                json={"revision": task.revision}, headers=headers,
+            ).status_code == 202
+            codex_state = bridge.captures / "scenario-state-codex.json"
+            _wait_for(
+                lambda: codex_state.exists()
+                and json.loads(codex_state.read_text(encoding="utf-8")) == {"outcome": 2},
+            )
+            _wait_for(lambda: (bridge.captures / "fake-codex-partials-ready.json").exists())
+            task = bridge.store.latest_task(task.task_id)
+            assert task is not None
+            assert task.state is TaskState.SOL_RUNNING
+            assert task.sol_thread_id == bridge.sol_thread_id
+            source = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source is not None
+            assert source.agent == "sol"
+            _wait_for(lambda: bridge.runner.is_running(source.run_id))
+            baseline = bridge.coordinator._load_baseline(task)  # noqa: SLF001 - E2E invariant
+            partial_path = bridge.repo / "bridge_work" / "output.txt"
+            assert partial_path.read_text(encoding="utf-8") == "allowed partial Sol edit\n"
+            provenance = json.loads(
+                (bridge.captures / "fake-codex-mutations.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+            assert isinstance(provenance["pid"], int) and provenance["pid"] > 0
+            assert provenance["executable"] == str(bridge.fake_codex)
+            assert provenance["mutations"] == [{
+                "path": "bridge_work/output.txt",
+                "sha256": hashlib.sha256(b"allowed partial Sol edit\n").hexdigest(),
+            }]
+            assert bridge.tracker.compare(baseline).changed_paths == ("bridge_work/output.txt",)
+            active_lease = hub.workflows.active_lease_snapshot()
+            assert active_lease is not None
+            assert (
+                active_lease.project_id,
+                active_lease.session_id,
+                active_lease.task_id,
+            ) == (hub.specs["alpha"].project_id, session_id, task.task_id)
+
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": "intervention-sol-partial",
+                    "message": "Keep the approved partial edit and finish the bounded task.",
+                    "addressed_to": "sol",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                    },
+                    headers=headers,
+                )
+            assert response.status_code == 202
+            assert source_stop_started.wait(timeout=1)
+            persisted = bridge.store.intervention("intervention-sol-partial")
+            assert persisted is not None
+            assert persisted.status is InterventionStatus.PENDING_STOP
+            assert persisted.run_id == source.run_id
+            assert persisted.sol_thread_id == bridge.sol_thread_id
+            assert bridge.store.agent_run(source.run_id).status == "running"
+            visible = _conversation_documents(bridge, session_id)
+            assert any(
+                entry["text"] == "Keep the approved partial edit and finish the bounded task."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "sol"
+                for entry in visible
+            )
+
+            release_source_stop.set()
+            _wait_for(
+                lambda: bridge.store.intervention("intervention-sol-partial").status
+                is InterventionStatus.RESUMED,
+            )
+
+        completed = bridge.store.intervention("intervention-sol-partial")
+        task = bridge.store.latest_task(task.task_id)
+        assert completed is not None and task is not None
+        assert completed.status is InterventionStatus.RESUMED
+        assert task.state is TaskState.COMPLETED
+        assert (task.fable_session_id, task.sol_thread_id) == (
+            bridge.fable_session_id, bridge.sol_thread_id,
+        )
+        assert stopped_run_ids == [source.run_id]
+        delta = bridge.tracker.compare(baseline)
+        assert delta.changed_paths == ("bridge_work/output.txt",)
+        assert delta.unexpected_paths == ()
+        assert delta.protected_changed_paths == ()
+        assert partial_path.read_text(encoding="utf-8") == "resumed exact Sol output\n"
+        codex_calls = [call for call in _model_invocations(bridge) if call["kind"] == "codex"]
+        assert [call["argv"][:2] for call in codex_calls] == [
+            ["exec", "--json"], ["exec", "resume"], ["exec", "resume"],
+        ]
+        assert all(bridge.sol_thread_id in call["argv"] for call in codex_calls[1:])
+        assert _event_documents(hub.bridges["beta"], SESSION_ID) == beta_events_before
+        assert bridge.live_call_count == 0
+        assert all(launch["sentinel"] is True for launch in bridge.runner.launches)
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+def test_post_session_fable_clarification_intervention_reuses_its_exact_session(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clarification interruption must retain the published Fable session."""
+    hub = FakeHub.create(
+        root=tmp_path / "fable-clarification-intervention",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    beta_events_before = _event_documents(hub.bridges["beta"], SESSION_ID)
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[_question(), _completed(content="clarified exact Sol output\n")],
+        clarifications=[_clarification(), _clarification()],
+        reviews=[_review()],
+        claude_modes={"clarification": ["slow_after_init"]},
+    )
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    continuation_completed = threading.Event()
+    stopped_run_ids: list[str] = []
+    original_stop = bridge.runner.stop
+    original_continue = hub.workflows.continue_intervention
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        stopped_run_ids.append(run_id)
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    async def observe_continuation(prepared: Any) -> None:
+        try:
+            await original_continue(prepared)
+        finally:
+            continuation_completed.set()
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    monkeypatch.setattr(hub.workflows, "continue_intervention", observe_continuation)
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Clarify the exact approved constraint."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task_overviews(session_id)[0].task.state
+                is TaskState.AWAITING_USER_APPROVAL,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+                json={"revision": task.revision}, headers=headers,
+            ).status_code == 202
+            claude_state = bridge.captures / "scenario-state-claude.json"
+            _wait_for(
+                lambda: claude_state.exists()
+                and json.loads(claude_state.read_text(encoding="utf-8")) == {
+                    "clarification": 1, "plan": 1,
+                },
+            )
+            task = bridge.store.latest_task(task.task_id)
+            assert task is not None
+            assert task.state is TaskState.FABLE_CLARIFYING
+            assert task.fable_session_id == bridge.fable_session_id
+            source = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source is not None
+            assert (source.agent, source.cli_session_id) == ("fable", bridge.fable_session_id)
+            _wait_for(lambda: bridge.runner.is_running(source.run_id))
+            baseline = bridge.coordinator._load_baseline(task)  # noqa: SLF001 - E2E invariant
+
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": "intervention-fable-clarification",
+                    "message": "Clarify only the published approved constraint.",
+                    "addressed_to": "fable",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert response.status_code == 202
+            assert source_stop_started.wait(timeout=1)
+            persisted = bridge.store.intervention("intervention-fable-clarification")
+            assert persisted is not None
+            assert persisted.status is InterventionStatus.PENDING_STOP
+            assert (persisted.run_id, persisted.fable_session_id) == (
+                source.run_id, bridge.fable_session_id,
+            )
+            assert bridge.store.agent_run(source.run_id).status == "running"
+            assert any(
+                entry["text"] == "Clarify only the published approved constraint."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "fable"
+                for entry in _conversation_documents(bridge, session_id)
+            )
+
+            release_source_stop.set()
+            assert continuation_completed.wait(timeout=3)
+
+        completed = bridge.store.intervention("intervention-fable-clarification")
+        task = bridge.store.latest_task(task.task_id)
+        assert completed is not None and task is not None
+        assert completed.status is InterventionStatus.RESUMED
+        assert task.state is TaskState.COMPLETED
+        assert stopped_run_ids == [source.run_id]
+        delta = bridge.tracker.compare(baseline)
+        assert delta.changed_paths == ("bridge_work/output.txt",)
+        assert delta.unexpected_paths == ()
+        assert delta.protected_changed_paths == ()
+        clarification_calls = [
+            call for call in _model_invocations(bridge)
+            if call["kind"] == "claude" and _claude_contract_kind(call) == "clarification"
+        ]
+        assert len(clarification_calls) == 2
+        assert all(
+            call["argv"][call["argv"].index("--resume") + 1]
+            == bridge.fable_session_id
+            for call in clarification_calls
+        )
+        assert not [
+            event for event in _conversation_documents(bridge, session_id)
+            if event["sender"] == "system"
+            and event["text"] == "Fable continuity could not be preserved; a new Fable session was started."
+        ]
+        assert _event_documents(hub.bridges["beta"], SESSION_ID) == beta_events_before
+        assert bridge.live_call_count == 0
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+def test_post_session_fable_review_intervention_reuses_its_exact_session(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review interruption must retain the published Fable session."""
+    hub = FakeHub.create(
+        root=tmp_path / "fable-review-intervention",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[_completed(content="reviewed exact Sol output\n")],
+        reviews=[_review(), _review()],
+        claude_modes={"review": ["slow_after_init"]},
+    )
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    continuation_completed = threading.Event()
+    stopped_run_ids: list[str] = []
+    original_stop = bridge.runner.stop
+    original_continue = hub.workflows.continue_intervention
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        stopped_run_ids.append(run_id)
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    async def observe_continuation(prepared: Any) -> None:
+        try:
+            await original_continue(prepared)
+        finally:
+            continuation_completed.set()
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    monkeypatch.setattr(hub.workflows, "continue_intervention", observe_continuation)
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Review the exact bounded output."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task_overviews(session_id)[0].task.state
+                is TaskState.AWAITING_USER_APPROVAL,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+                json={"revision": task.revision}, headers=headers,
+            ).status_code == 202
+            claude_state = bridge.captures / "scenario-state-claude.json"
+            _wait_for(
+                lambda: claude_state.exists()
+                and json.loads(claude_state.read_text(encoding="utf-8")) == {
+                    "plan": 1, "review": 1,
+                },
+            )
+            task = bridge.store.latest_task(task.task_id)
+            assert task is not None
+            assert task.state is TaskState.FABLE_REVIEWING
+            assert task.fable_session_id == bridge.fable_session_id
+            source = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source is not None
+            assert source.agent == "fable"
+            _wait_for(lambda: bridge.runner.is_running(source.run_id))
+            baseline = bridge.coordinator._load_baseline(task)  # noqa: SLF001 - E2E invariant
+
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": "intervention-fable-review",
+                    "message": "Review only the existing bounded evidence.",
+                    "addressed_to": "fable",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert response.status_code == 202, response.text
+            assert source_stop_started.wait(timeout=1)
+            persisted = bridge.store.intervention("intervention-fable-review")
+            assert persisted is not None
+            assert persisted.status is InterventionStatus.PENDING_STOP
+            assert (persisted.run_id, persisted.fable_session_id) == (
+                source.run_id, bridge.fable_session_id,
+            )
+            assert bridge.store.agent_run(source.run_id).status == "running"
+            assert any(
+                entry["text"] == "Review only the existing bounded evidence."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "fable"
+                for entry in _conversation_documents(bridge, session_id)
+            )
+
+            release_source_stop.set()
+            assert continuation_completed.wait(timeout=3)
+
+        completed = bridge.store.intervention("intervention-fable-review")
+        task = bridge.store.latest_task(task.task_id)
+        assert completed is not None and task is not None
+        assert completed.status is InterventionStatus.RESUMED
+        assert task.state is TaskState.COMPLETED
+        assert stopped_run_ids == [source.run_id]
+        delta = bridge.tracker.compare(baseline)
+        assert delta.changed_paths == ("bridge_work/output.txt",)
+        assert delta.unexpected_paths == ()
+        assert delta.protected_changed_paths == ()
+        review_calls = [
+            call for call in _model_invocations(bridge)
+            if call["kind"] == "claude" and _claude_contract_kind(call) == "review"
+        ]
+        assert len(review_calls) == 2
+        assert all(
+            call["argv"][call["argv"].index("--resume") + 1]
+            == bridge.fable_session_id
+            for call in review_calls
+        )
+        assert bridge.live_call_count == 0
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+def test_intervention_sol_correction_reuses_its_exact_thread(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Sol correction interruption resumes the published correction thread only."""
+    hub = FakeHub.create(
+        root=tmp_path / "sol-correction-intervention",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[
+            _completed(content="first exact implementation\n"),
+            _completed(content="interrupted correction must not apply\n"),
+            _completed(content="corrected exact implementation\n"),
+        ],
+        reviews=[_review("corrections_required"), _review("approved")],
+        codex_modes=[None, "slow_after_thread"],
+    )
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    continuation_completed = threading.Event()
+    stopped_run_ids: list[str] = []
+    original_stop = bridge.runner.stop
+    original_continue = hub.workflows.continue_intervention
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        stopped_run_ids.append(run_id)
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    async def observe_continuation(prepared: Any) -> None:
+        try:
+            await original_continue(prepared)
+        finally:
+            continuation_completed.set()
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    monkeypatch.setattr(hub.workflows, "continue_intervention", observe_continuation)
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Correct only the approved bounded output."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task_overviews(session_id)[0].task.state
+                is TaskState.AWAITING_USER_APPROVAL,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/approve",
+                json={"revision": task.revision}, headers=headers,
+            ).status_code == 202
+            codex_state = bridge.captures / "scenario-state-codex.json"
+            _wait_for(
+                lambda: codex_state.exists()
+                and json.loads(codex_state.read_text(encoding="utf-8")) == {"outcome": 2},
+            )
+            task = bridge.store.latest_task(task.task_id)
+            assert task is not None
+            assert task.state is TaskState.SOL_CORRECTING
+            assert task.sol_thread_id == bridge.sol_thread_id
+            source = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source is not None
+            assert (source.agent, source.cli_session_id) == ("sol", bridge.sol_thread_id)
+            _wait_for(lambda: bridge.runner.is_running(source.run_id))
+            baseline = bridge.coordinator._load_baseline(task)  # noqa: SLF001 - E2E invariant
+
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": "intervention-sol-correction",
+                    "message": "Apply the one bounded correction without widening scope.",
+                    "addressed_to": "sol",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert response.status_code == 202
+            assert source_stop_started.wait(timeout=1)
+            persisted = bridge.store.intervention("intervention-sol-correction")
+            assert persisted is not None
+            assert persisted.status is InterventionStatus.PENDING_STOP
+            assert (persisted.run_id, persisted.sol_thread_id) == (
+                source.run_id, bridge.sol_thread_id,
+            )
+            assert bridge.store.agent_run(source.run_id).status == "running"
+            assert any(
+                entry["text"] == "Apply the one bounded correction without widening scope."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "sol"
+                for entry in _conversation_documents(bridge, session_id)
+            )
+
+            release_source_stop.set()
+            assert continuation_completed.wait(timeout=3)
+
+        completed = bridge.store.intervention("intervention-sol-correction")
+        task = bridge.store.latest_task(task.task_id)
+        assert completed is not None and task is not None
+        assert completed.status is InterventionStatus.RESUMED
+        assert task.state is TaskState.COMPLETED
+        assert task.correction_count == 1
+        assert stopped_run_ids == [source.run_id]
+        delta = bridge.tracker.compare(baseline)
+        assert delta.changed_paths == ("bridge_work/output.txt",)
+        assert delta.unexpected_paths == ()
+        assert delta.protected_changed_paths == ()
+        assert (bridge.repo / "bridge_work" / "output.txt").read_text() == (
+            "corrected exact implementation\n"
+        )
+        codex_calls = [call for call in _model_invocations(bridge) if call["kind"] == "codex"]
+        assert [call["argv"][:2] for call in codex_calls] == [
+            ["exec", "--json"], ["exec", "resume"], ["exec", "resume"],
+        ]
+        assert all(bridge.sol_thread_id in call["argv"] for call in codex_calls[1:])
+        assert bridge.live_call_count == 0
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+@pytest.mark.parametrize("crash_phase", ("before_spawn", "during_provider"))
+def test_intervention_claim_crash_stays_unknown_until_one_acknowledged_retry(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_phase: str,
+) -> None:
+    """A claimed continuation is never replayed after a process-level crash."""
+    hub = FakeHub.create(
+        root=tmp_path / f"unknown-after-{crash_phase}",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    plan_modes = ["slow_before_init"]
+    plan_count = 2
+    if crash_phase == "during_provider":
+        plan_modes.append("slow_after_init")
+        plan_count = 3
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID") for _ in range(plan_count)],
+        claude_modes={"plan": plan_modes},
+    )
+    beta_events_before = _event_documents(hub.bridges["beta"], SESSION_ID)
+    source_stop_started = threading.Event()
+    release_source_stop = threading.Event()
+    ready_before_claim = threading.Event()
+    source_intervention_completed = threading.Event()
+    claim_committed = threading.Event()
+    original_stop = bridge.runner.stop
+    original_readiness = hub.runtime("alpha").readiness.require_model_start_ready
+    original_continue = hub.workflows.continue_intervention
+
+    async def stop_after_persistence(run_id: str, *, timeout_seconds: float):
+        source_stop_started.set()
+        await asyncio.to_thread(release_source_stop.wait)
+        return await original_stop(run_id, timeout_seconds=timeout_seconds)
+
+    async def defer_ready_claim(**kwargs: Any) -> None:
+        ready_before_claim.set()
+        raise RuntimeError("controlled crash-resume boundary")
+
+    async def observe_source_intervention(prepared: Any) -> None:
+        try:
+            await original_continue(prepared)
+        finally:
+            source_intervention_completed.set()
+
+    async def crash_after_claim(
+        intervention_id: str,
+        *,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        claim_committed.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bridge.runner, "stop", stop_after_persistence)
+    monkeypatch.setattr(hub.workflows, "continue_intervention", observe_source_intervention)
+    if crash_phase == "before_spawn":
+        monkeypatch.setattr(
+            bridge.coordinator, "run_intervention_resume", crash_after_claim,
+        )
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Create a safe crash boundary."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bool(bridge.store.latest_task_overviews(session_id))
+                and bridge.store.active_run_for_task(
+                    bridge.store.latest_task_overviews(session_id)[0].task.task_id,
+                    bridge.store.latest_task_overviews(session_id)[0].task.revision,
+                ) is not None,
+            )
+            task = bridge.store.latest_task_overviews(session_id)[0].task
+            source_run = bridge.store.active_run_for_task(task.task_id, task.revision)
+            assert source_run is not None
+            _wait_for(lambda: bridge.runner.is_running(source_run.run_id))
+            plan_state = bridge.captures / "scenario-state-claude.json"
+            _wait_for(
+                lambda: plan_state.exists()
+                and json.loads(plan_state.read_text(encoding="utf-8")) == {"plan": 1},
+            )
+            monkeypatch.setattr(
+                hub.runtime("alpha").readiness,
+                "require_model_start_ready",
+                defer_ready_claim,
+            )
+            response = client.post(
+                f"{project}/chats/{session_id}/tasks/{task.task_id}/intervene",
+                json={
+                    "intervention_id": f"intervention-unknown-{crash_phase}",
+                    "message": "Keep this bounded continuation exact.",
+                    "addressed_to": "fable",
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert response.status_code == 202
+            assert source_stop_started.wait(timeout=1)
+            record = bridge.store.intervention(f"intervention-unknown-{crash_phase}")
+            assert record is not None
+            assert record.status is InterventionStatus.PENDING_STOP
+            assert record.run_id == source_run.run_id
+            assert any(
+                entry["text"] == "Keep this bounded continuation exact."
+                and entry["sender"] == "user"
+                and entry["addressed_to"] == "fable"
+                for entry in _conversation_documents(bridge, session_id)
+            )
+
+            release_source_stop.set()
+            assert ready_before_claim.wait(timeout=3)
+            assert source_intervention_completed.wait(timeout=1)
+            ready = bridge.store.intervention(f"intervention-unknown-{crash_phase}")
+            assert ready is not None
+            assert ready.status is InterventionStatus.READY
+            monkeypatch.setattr(
+                hub.runtime("alpha").readiness,
+                "require_model_start_ready",
+                original_readiness,
+            )
+            resumed = client.post(
+                f"{project}/chats/{session_id}/interventions/{ready.intervention_id}/resume",
+                json={"expected_resume_generation": ready.resume_generation},
+                headers=headers,
+            )
+            assert resumed.status_code == 202
+            if crash_phase == "before_spawn":
+                assert claim_committed.wait(timeout=1)
+            else:
+                partials_ready = bridge.captures / "fake-claude-partials-ready.json"
+                _wait_for(lambda: partials_ready.exists())
+            claimed = bridge.store.intervention(ready.intervention_id)
+            assert claimed is not None
+            assert claimed.status is InterventionStatus.RESUMING
+            claimed_run_id = claimed.resume_run_id
+            assert claimed_run_id is not None
+            calls_at_crash = _model_invocations(bridge)
+
+        recovered = hub.restart()
+        bridge = hub.bridges["alpha"]
+        unknown = bridge.store.intervention(f"intervention-unknown-{crash_phase}")
+        assert unknown is not None
+        assert unknown.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert unknown.resume_run_id == claimed_run_id
+        assert _model_invocations(bridge) == calls_at_crash
+        assert recovered["alpha"].prepared_actions_recovered == 0
+        assert recovered["alpha"].agent_runs_interrupted == 0
+
+        hub.restart()
+        bridge = hub.bridges["alpha"]
+        repeated_unknown = bridge.store.intervention(f"intervention-unknown-{crash_phase}")
+        assert repeated_unknown is not None
+        assert repeated_unknown.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert _model_invocations(bridge) == calls_at_crash
+        assert _event_documents(hub.bridges["beta"], SESSION_ID) == beta_events_before
+
+        project = _project_path(hub, "alpha")
+        base = (
+            f"{project}/chats/{session_id}/interventions/"
+            f"intervention-unknown-{crash_phase}"
+        )
+        retry_completed = threading.Event()
+        retry_errors: list[tuple[str, str]] = []
+        original_retry_continue = hub.workflows.continue_intervention
+
+        async def observe_acknowledged_retry(prepared: Any) -> None:
+            try:
+                await original_retry_continue(prepared)
+            except BaseException as error:
+                retry_errors.append((type(error).__name__, str(error)))
+                raise
+            finally:
+                retry_completed.set()
+
+        monkeypatch.setattr(
+            hub.workflows, "continue_intervention", observe_acknowledged_retry,
+        )
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            normal = client.post(
+                f"{base}/resume",
+                json={"expected_resume_generation": repeated_unknown.resume_generation},
+                headers=headers,
+            )
+            assert normal.status_code == 409
+            unauthenticated = client.post(
+                f"{base}/authorize-retry",
+                json={
+                    "expected_resume_generation": repeated_unknown.resume_generation,
+                    "acknowledgment_id": "unknown-retry-1",
+                    "acknowledge_possible_prior_execution": True,
+                },
+            )
+            assert unauthenticated.status_code == 403
+            bootstrap = client.get(f"{project}/chats/{session_id}/bootstrap")
+            assert bootstrap.status_code == 200
+            assert bootstrap.json()["tasks"][0]["intervention"]["warning"] == (
+                "prior resume outcome is unknown and may have executed"
+            )
+            retry = client.post(
+                f"{base}/authorize-retry",
+                json={
+                    "expected_resume_generation": repeated_unknown.resume_generation,
+                    "acknowledgment_id": "unknown-retry-1",
+                    "acknowledge_possible_prior_execution": True,
+                },
+                headers=headers,
+            )
+            assert retry.status_code == 202
+            assert retry_completed.wait(timeout=3)
+            duplicate = client.post(
+                f"{base}/authorize-retry",
+                json={
+                    "expected_resume_generation": repeated_unknown.resume_generation,
+                    "acknowledgment_id": "unknown-retry-1",
+                    "acknowledge_possible_prior_execution": True,
+                },
+                headers=headers,
+            )
+            assert duplicate.status_code in {404, 409}
+
+        completed = bridge.store.intervention(f"intervention-unknown-{crash_phase}")
+        assert completed is not None
+        assert completed.status is InterventionStatus.RESUMED, (
+            completed,
+            bridge.store.latest_task(completed.task_id),
+            bridge.store.agent_run(completed.resume_run_id),
+            hub.app.state.coroutine_observation_failures,
+            retry_errors,
+        )
+        calls_after_retry = _model_invocations(bridge)
+        assert len(calls_after_retry) == len(calls_at_crash) + 1
+        assert all(launch["sentinel"] is True for launch in bridge.runner.launches)
+        assert bridge.live_call_count == 0
+    finally:
+        release_source_stop.set()
+        hub.close()
+
+
+@pytest.mark.parametrize("phase", ("post_claim_pre_spawn", "provider_spawned"))
+def test_abrupt_subprocess_intervention_crash_is_unknown_until_one_retry(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    phase: str,
+) -> None:
+    """A SIGKILL loses no durable claim and never triggers automatic replay.
+
+    This deliberately kills the separate hub process without letting FastAPI's
+    lifespan or the coordinator's ``finally`` handlers convert the interrupted
+    invocation into a normal outcome.  The provider-spawned boundary is the
+    fake Codex process itself, identified only by its durable fixture capture.
+    """
+    root = tmp_path / f"subprocess-{phase}"
+    control = root / "crash-boundary.json"
+    package_root = Path(__file__).parents[2]
+    python_path = os.environ.get("PYTHONPATH")
+    worker_environment = {
+        **os.environ,
+        "PYTHONPATH": str(package_root / "src") + (
+            "" if not python_path else os.pathsep + python_path
+        ),
+        "TASK8_E2E_MODULE": str(Path(__file__).resolve(strict=True)),
+        "TASK8_CRASH_ROOT": str(root),
+        "TASK8_CRASH_CONTROL": str(control),
+        "TASK8_CRASH_PHASE": phase,
+        "TASK8_FAKE_CLAUDE": str(fake_claude.resolve(strict=True)),
+        "TASK8_FAKE_CODEX": str(fake_codex.resolve(strict=True)),
+    }
+    worker = subprocess.Popen(
+        [str(Path(sys.executable).absolute()), "-c", _subprocess_intervention_crash_worker_source()],
+        cwd=package_root,
+        env=worker_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    provider_pid: int | None = None
+    worker_output = ""
+    worker_errors = ""
+    try:
+        deadline = time.monotonic() + 5
+        checkpoint: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            if control.exists():
+                candidate = json.loads(control.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    checkpoint = candidate
+                    break
+            if worker.poll() is not None:
+                worker_output, worker_errors = worker.communicate(timeout=1)
+                raise AssertionError(
+                    "subprocess fake hub exited before its durable boundary:\n"
+                    f"stdout={worker_output}\nstderr={worker_errors}"
+                )
+            time.sleep(0.01)
+        assert checkpoint is not None, "subprocess fake hub missed the crash boundary"
+        assert checkpoint["worker_pid"] == worker.pid
+        assert checkpoint["intervention_id"] == "intervention-subprocess-crash"
+        assert isinstance(checkpoint["resume_generation"], int)
+        assert isinstance(checkpoint["resume_run_id"], str)
+        if phase == "post_claim_pre_spawn":
+            assert checkpoint["provider_pid"] is None
+        else:
+            provider_pid = checkpoint["provider_pid"]
+            assert isinstance(provider_pid, int) and provider_pid > 0
+            provider_cmdline = Path(f"/proc/{provider_pid}/cmdline").read_bytes()
+            assert str(fake_codex.resolve(strict=True)).encode() in provider_cmdline
+
+        # SIGKILL is intentionally the only worker shutdown: no TestClient,
+        # Hub, Coordinator, or ProcessRunner cleanup is invoked in that process.
+        worker.kill()
+        worker_output, worker_errors = worker.communicate(timeout=3)
+        assert worker.returncode == -signal.SIGKILL
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        if worker.returncode is None:
+            worker_output, worker_errors = worker.communicate(timeout=3)
+        if provider_pid is not None:
+            try:
+                os.kill(provider_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    layout = _crash_recovery_bridge_layout(
+        root, fake_claude=fake_claude, fake_codex=fake_codex,
+    )
+    reopened, recovered = _reopen_fake_bridge(layout)
+    try:
+        record = reopened.store.intervention("intervention-subprocess-crash")
+        assert record is not None
+        assert record.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert record.resume_run_id == checkpoint["resume_run_id"]
+        assert reopened.store.get_task(record.task_id, record.revision).state is TaskState.INTERRUPTED
+        assert recovered.tasks_interrupted == 1
+        if phase == "post_claim_pre_spawn":
+            # Claiming reserves the exact identifier but no child exists until
+            # the adapter crosses its spawn boundary.
+            with pytest.raises(RuntimeError, match="agent run not found"):
+                reopened.store.agent_run(record.resume_run_id)
+            assert recovered.agent_runs_interrupted == 0
+        else:
+            assert reopened.store.agent_run(record.resume_run_id).status == "interrupted"
+            assert recovered.agent_runs_interrupted == 1
+        calls_at_crash = _model_invocations(reopened)
+    finally:
+        reopened.close()
+
+    repeated, repeated_recovery = _reopen_fake_bridge(layout)
+    try:
+        unknown = repeated.store.intervention("intervention-subprocess-crash")
+        assert unknown is not None
+        assert unknown.status is InterventionStatus.RESUME_OUTCOME_UNKNOWN
+        assert repeated_recovery == store_module.RecoverySummary(0, 0, 0)
+        assert _model_invocations(repeated) == calls_at_crash
+
+        authorized = repeated.store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id=f"subprocess-ack-{phase}",
+        )
+        assert authorized.status is InterventionStatus.READY
+        duplicate = repeated.store.authorize_retry_after_unknown(
+            unknown.intervention_id,
+            expected_resume_generation=unknown.resume_generation,
+            acknowledgment_id=f"subprocess-ack-{phase}",
+        )
+        assert duplicate == authorized
+        codex_calls_before_retry = [
+            call for call in _model_invocations(repeated) if call["kind"] == "codex"
+        ]
+        asyncio.run(repeated.coordinator.dispatch_ready_intervention(authorized.intervention_id))
+        completed = repeated.store.intervention(authorized.intervention_id)
+        assert completed is not None
+        assert completed.status is InterventionStatus.RESUMED
+        codex_calls_after_retry = [
+            call for call in _model_invocations(repeated) if call["kind"] == "codex"
+        ]
+        assert len(codex_calls_after_retry) == len(codex_calls_before_retry) + 1
+        assert repeated.live_call_count == 0
+    finally:
+        repeated.close()
+
+
+def test_directed_conversation_uses_exact_visible_fake_workflow_boundaries(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routing or authority regression must fail in the real hub/app stack."""
+    hub = FakeHub.create(
+        root=tmp_path / "directed-workflow",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    revised = _brief(
+        task_id="task-directed-one",
+        revision=2,
+        title="Expand the bounded fake scope",
+        allowed_path="expanded_work",
+    )
+    bridge.configure(
+        plans=[
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+            _brief(task_id="$TASK_ID"),
+        ],
+        outcomes=[
+            _directed_question("Which exact approved interpretation applies?"),
+            _completed(summary="The exact fake evidence is available."),
+            _directed_question("Which invariant still applies?"),
+            _directed_question("May the approved scope now expand?"),
+            _directed_question(
+                "Which exact user preference controls this task?",
+                addressed_to="user",
+            ),
+            _directed_question(
+                "Which exact user preference controls the next task?",
+                addressed_to="user",
+            ),
+            _completed(),
+        ],
+        clarifications=[
+            _fable_answer(
+                "Use the existing approved interpretation.",
+                directed_to_sol="Which fake check proves the interpretation?",
+            ),
+            _fable_answer("The fake evidence confirms the approved scope."),
+            _fable_answer("Keep the existing approved invariant."),
+            _fable_answer(
+                "The new path requires revision two approval.",
+                revised_brief=revised,
+            ),
+        ],
+        reviews=[_review()],
+    )
+    token_values = iter((
+        "chat-directed",
+        "directed-one",
+        "directed-two",
+        "directed-three",
+        "directed-four",
+    ))
+    preparation_number = 0
+
+    def deterministic_browser_ids(nbytes: int) -> str:
+        nonlocal preparation_number
+        if nbytes == 16:
+            return next(token_values)
+        if nbytes == 24:
+            preparation_number += 1
+            return f"prepared-{preparation_number:040x}"
+        raise AssertionError(f"unexpected test identifier width: {nbytes}")
+
+    try:
+        monkeypatch.setattr("agent_bridge.app.secrets.token_hex", deterministic_browser_ids)
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            chat = client.post(f"{project}/chats", headers=headers)
+            assert chat.status_code == 201
+            session_id = "chat-directed"
+            assert chat.json()["session_id"] == session_id
+
+            # A visible Sol address before approval still invokes only Fable.
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={
+                    "text": "Plan the bounded directed fake workflow.",
+                    "addressed_to": "sol",
+                },
+                headers=headers,
+            ).status_code == 202
+            first_task_id = "task-directed-one"
+            _wait_for(
+                lambda: bridge.store.latest_task(first_task_id).state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            initial_agents = _model_invocations(bridge)
+            assert [item["kind"] for item in initial_agents] == ["claude"]
+            initial_conversation = _conversation_documents(bridge, session_id)
+            assert initial_conversation[0] == {
+                "sender": "user",
+                "addressed_to": "sol",
+                "routed_to": "fable",
+                "message_type": "statement",
+                "text": "Plan the bounded directed fake workflow.",
+                "task_id": None,
+                "revision": None,
+                "continuation_generation": None,
+                "question_id": None,
+                "reply_to_question_id": None,
+            }
+
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{first_task_id}/approve",
+                json={"revision": 1}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_prepared_action_for_task(
+                    project_id=hub.specs["alpha"].project_id,
+                    session_id=session_id,
+                    task_id=first_task_id,
+                    revision=1,
+                ).status in {"COMPLETED", "FAILED", "INTERRUPTED"},  # type: ignore[union-attr]
+            )
+            assert bridge.store.latest_task(first_task_id).state is TaskState.AWAITING_USER_INPUT, (  # type: ignore[union-attr]
+                bridge.store.latest_task(first_task_id),
+                bridge.store.latest_prepared_action_for_task(
+                    project_id=hub.specs["alpha"].project_id,
+                    session_id=session_id,
+                    task_id=first_task_id,
+                    revision=1,
+                ),
+                hub.app.state.coroutine_observation_failures,
+            )
+            first_task = bridge.store.latest_task(first_task_id)
+            assert first_task is not None
+            assert (
+                first_task.continuation_state,
+                first_task.exchange_consumed,
+                first_task.exchange_allowance,
+            ) == (TaskState.SOL_RUNNING, 3, 0)
+            assert bridge.store._connection.execute(  # noqa: SLF001 - E2E durable count
+                "SELECT COUNT(*) FROM exchange_reservations WHERE task_id = ?",
+                (first_task_id,),
+            ).fetchone()[0] == 3
+            permission = bridge.store.current_exchange_permission(
+                session_id=session_id, task_id=first_task_id, revision=1,
+            )
+            assert permission is not None
+            first_conversation = _conversation_documents(bridge, session_id)
+            assert [
+                (entry["sender"], entry["addressed_to"], entry["routed_to"], entry["message_type"])
+                for entry in first_conversation[1:]
+            ] == [
+                ("sol", "fable", "fable", "question"),
+                ("fable", "sol", "sol", "question"),
+                ("sol", "fable", "fable", "answer"),
+                ("fable", "sol", "sol", "answer"),
+                ("sol", "fable", "fable", "question"),
+                ("fable", "sol", "sol", "answer"),
+                ("system", "user", "user", "status"),
+            ]
+            assert first_conversation[3]["reply_to_question_id"] == first_conversation[2]["question_id"]
+            assert first_conversation[4]["reply_to_question_id"] == first_conversation[1]["question_id"]
+            assert first_conversation[6]["reply_to_question_id"] == first_conversation[5]["question_id"]
+
+            # Permission is exactly +3; the saved fourth question resumes as N+1.
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{first_task_id}/exchanges/grant",
+                json=permission,
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task(first_task_id).revision == 2  # type: ignore[union-attr]
+                and bridge.store.latest_task(first_task_id).state
+                is TaskState.AWAITING_SCOPE_APPROVAL,  # type: ignore[union-attr]
+            )
+            revised_task = bridge.store.get_task(first_task_id, 2)
+            assert (revised_task.exchange_allowance, revised_task.exchange_consumed) == (3, 0)
+            assert revised_task.fable_session_id == bridge.fable_session_id
+            assert revised_task.sol_thread_id == bridge.sol_thread_id
+
+            # Two concurrent user questions must retain their exact question binding.
+            for task_id, text in (
+                ("task-directed-two", "Ask the user one bounded question."),
+                ("task-directed-three", "Ask the user another bounded question."),
+            ):
+                assert client.post(
+                    f"{project}/chats/{session_id}/messages",
+                    json={"text": text}, headers=headers,
+                ).status_code == 202
+                _wait_for(
+                    lambda task_id=task_id: bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+                )
+                assert client.post(
+                    f"{project}/chats/{session_id}/tasks/{task_id}/approve",
+                    json={"revision": 1}, headers=headers,
+                ).status_code == 202
+                _wait_for(
+                    lambda task_id=task_id: bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_INPUT,  # type: ignore[union-attr]
+                )
+
+            second_question = bridge.store.unanswered_question_for_task(
+                "task-directed-two", 1,
+            )
+            third_question = bridge.store.unanswered_question_for_task(
+                "task-directed-three", 1,
+            )
+            assert second_question is not None and third_question is not None
+            assert (
+                second_question.routed_to,
+                third_question.routed_to,
+            ) == (ConversationTarget.USER, ConversationTarget.USER)
+            model_invocations_before_rejected_answer = _model_invocations(bridge)
+            rejected = client.post(
+                f"{project}/chats/{session_id}/tasks/task-directed-three/answer",
+                json={
+                    "text": "This answer names the wrong pending question.",
+                    "revision": 1,
+                    "question_id": second_question.question_id,
+                    "continuation_generation": third_question.continuation_generation,
+                },
+                headers=headers,
+            )
+            assert rejected.status_code == 409
+            assert bridge.store.question(second_question.question_id) == second_question
+            assert bridge.store.question(third_question.question_id) == third_question
+            assert _model_invocations(bridge) == model_invocations_before_rejected_answer
+
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/task-directed-three/answer",
+                json={
+                    "text": "Use the exact approved preference.",
+                    "revision": 1,
+                    "question_id": third_question.question_id,
+                    "continuation_generation": third_question.continuation_generation,
+                },
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task("task-directed-three").state
+                is TaskState.COMPLETED,  # type: ignore[union-attr]
+            )
+
+            # A terminal Sol address cannot reuse old approval and starts a Fable task.
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={
+                    "text": "Start a separate terminal follow-up.",
+                    "addressed_to": "sol",
+                },
+                headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task("task-directed-four").state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            terminal_route = [
+                event for event in _event_documents(bridge, session_id)
+                if event["kind"] == "conversation"
+            ][-1]
+            assert (
+                terminal_route["payload"]["sender"],
+                terminal_route["payload"]["addressed_to"],
+                terminal_route["payload"]["routed_to"],
+                terminal_route["payload"]["task_id"],
+                terminal_route["task_id"],
+            ) == ("user", "sol", "fable", None, "task-directed-four")
+
+        assert bridge.live_call_count == 0
+        assert all(launch["sentinel"] is True for launch in bridge.runner.launches)
+        assert all(
+            entry["executable"] in {str(bridge.fake_claude), str(bridge.fake_codex)}
+            for entry in bridge.invocations
+            if entry.get("kind") in {"claude", "codex"}
+        )
+    finally:
+        hub.close()
+
+
+def test_directed_exchange_limit_restart_reuses_exact_durable_pause(
+    tmp_path: Path,
+    fake_claude: Path,
+    fake_codex: Path,
+) -> None:
+    """Restarting at the +3 boundary must not duplicate an exchange or provider call."""
+    hub = FakeHub.create(
+        root=tmp_path / "directed-restart",
+        fake_claude=fake_claude,
+        fake_codex=fake_codex,
+    )
+    bridge = hub.bridges["alpha"]
+    bridge.configure(
+        plans=[_brief(task_id="$TASK_ID")],
+        outcomes=[
+            _directed_question(f"Which exact fake constraint is #{ordinal}?")
+            for ordinal in range(1, 5)
+        ] + [_completed()],
+        clarifications=[
+            _fable_answer(f"Use exact fake constraint #{ordinal}.")
+            for ordinal in range(1, 5)
+        ],
+        reviews=[_review()],
+    )
+    try:
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            session_id = client.post(f"{project}/chats", headers=headers).json()["session_id"]
+            assert client.post(
+                f"{project}/chats/{session_id}/messages",
+                json={"text": "Reach the durable exchange limit."}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: len(bridge.store.latest_task_overviews(session_id)) == 1,
+            )
+            task_id = bridge.store.latest_task_overviews(session_id)[0].task.task_id
+            _wait_for(
+                lambda: bridge.store.latest_task(task_id).state
+                is TaskState.AWAITING_USER_APPROVAL,  # type: ignore[union-attr]
+            )
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task_id}/approve",
+                json={"revision": 1}, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: (
+                    bridge.store.latest_task(task_id).state
+                    is TaskState.AWAITING_USER_INPUT  # type: ignore[union-attr]
+                    and bridge.store.latest_task(task_id).exchange_allowance == 0  # type: ignore[union-attr]
+                    and bridge.store.current_exchange_permission(
+                        session_id=session_id, task_id=task_id, revision=1,
+                    ) is not None
+                ),
+            )
+            paused = bridge.store.latest_task(task_id)
+            assert paused is not None
+            permission = bridge.store.current_exchange_permission(
+                session_id=session_id, task_id=task_id, revision=1,
+            )
+            assert permission is not None
+            before_events = _event_documents(bridge, session_id)
+            before_questions = bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+                "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+                (task_id,),
+            ).fetchall()
+            assert len(before_questions) == 3
+            assert (paused.continuation_generation, paused.exchange_consumed) == (1, 3)
+
+        recovered = hub.restart()
+        assert recovered["alpha"] == store_module.RecoverySummary(0, 0, 0)
+        bridge = hub.bridges["alpha"]
+        resumed = bridge.store.latest_task(task_id)
+        assert resumed is not None
+        assert (
+            resumed.state,
+            resumed.continuation_state,
+            resumed.continuation_generation,
+            resumed.exchange_allowance,
+            resumed.exchange_consumed,
+            resumed.fable_session_id,
+            resumed.sol_thread_id,
+        ) == (
+            TaskState.AWAITING_USER_INPUT,
+            TaskState.SOL_RUNNING,
+            1,
+            0,
+            3,
+            bridge.fable_session_id,
+            bridge.sol_thread_id,
+        )
+        assert _event_documents(bridge, session_id) == before_events
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT question_id, exchange_id FROM questions WHERE task_id = ? ORDER BY rowid",
+            (task_id,),
+        ).fetchall() == before_questions
+        assert bridge.store.current_exchange_permission(
+            session_id=session_id, task_id=task_id, revision=1,
+        ) == permission
+
+        with TestClient(hub.app) as client:
+            headers = _authenticate_hub(client)
+            project = _project_path(hub, "alpha")
+            assert client.post(
+                f"{project}/chats/{session_id}/tasks/{task_id}/exchanges/grant",
+                json=permission, headers=headers,
+            ).status_code == 202
+            _wait_for(
+                lambda: bridge.store.latest_task(task_id).state
+                is TaskState.COMPLETED,  # type: ignore[union-attr]
+            )
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT COUNT(*) FROM exchange_reservations WHERE task_id = ?", (task_id,),
+        ).fetchone()[0] == 4
+        assert bridge.store._connection.execute(  # noqa: SLF001 - durable E2E evidence
+            "SELECT COUNT(*) FROM exchange_grants WHERE task_id = ?", (task_id,),
+        ).fetchone()[0] == 1
+        assert bridge.live_call_count == 0
+    finally:
+        hub.close()
 
 
 @dataclass(frozen=True)
@@ -1890,13 +3686,22 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     "session_id": common_chat,
                     "task_id": common_task,
                     "actor": "user",
-                    "kind": "message",
+                    "kind": "conversation",
                     "payload": {
+                        "sender": "user",
+                        "addressed_to": "fable",
+                        "routed_to": "fable",
+                        "message_type": "statement",
                         "text": (
                             "Plan the first equal-ID project."
                             if label == "alpha"
                             else "Plan the second equal-ID project."
-                        )
+                        ),
+                        "task_id": None,
+                        "revision": None,
+                        "continuation_generation": None,
+                        "question_id": None,
+                        "reply_to_question_id": None,
                     },
                     "created_at": "2026-08-10T14:00:00Z",
                 }
@@ -2155,7 +3960,7 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     **({"json": body} if body is not None else {}),
                 )
                 assert _response_signature(foreign) == _response_signature(missing)
-                assert foreign.status_code in {404, 409}
+                assert foreign.status_code in {404, 409, 422}
             for session_id in ("beta-only-chat", "not-a-real-chat"):
                 with pytest.raises(WebSocketDisconnect) as rejected:
                     with client.websocket_connect(
@@ -2227,7 +4032,7 @@ def test_two_project_http_websocket_workflow_isolated_by_hub_lease(
                     **({"json": body} if body is not None else {}),
                 )
                 assert _response_signature(removed) == _response_signature(missing)
-                assert removed.status_code == 404
+                assert removed.status_code in {404, 422}
             for project_id in (beta_project_id, missing_project_id):
                 with pytest.raises(WebSocketDisconnect) as rejected:
                     with client.websocket_connect(

@@ -5,6 +5,29 @@ const ACTOR_LABELS = Object.freeze({
   coordinator: "Coordinator",
 });
 
+const DIRECTED_ACTORS = Object.freeze({
+  user: Object.freeze({label: "User", avatar: "U", className: "user"}),
+  fable: Object.freeze({label: "Fable", avatar: "F", className: "fable"}),
+  sol: Object.freeze({label: "Sol", avatar: "S", className: "sol"}),
+  system: Object.freeze({label: "System", avatar: "•", className: "coordinator"}),
+});
+
+const DIRECTED_TARGETS = Object.freeze({
+  user: Object.freeze({label: "You", className: "user"}),
+  fable: Object.freeze({label: "Fable", className: "fable"}),
+  sol: Object.freeze({label: "Sol", className: "sol"}),
+  team: Object.freeze({label: "Team", className: "coordinator"}),
+});
+
+const DIRECTED_MESSAGE_TYPES = new Set([
+  "statement",
+  "question",
+  "answer",
+  "approval",
+  "intervention",
+  "status",
+]);
+
 const ACTIVE_STATES = new Set([
   "fable_planning",
   "sol_running",
@@ -58,6 +81,7 @@ const TASK_ACTIONS = new Set([
   "answer",
   "stop",
   "resume",
+  "intervene",
 ]);
 
 const LIST_FIELDS = Object.freeze([
@@ -210,10 +234,139 @@ function appendConversationNode(documentRoot, conversation, node) {
 }
 
 
+function safeConversationText(value) {
+  if (typeof value !== "string" || /^\p{White_Space}*$/u.test(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  const TextEncoderCtor = globalThis.TextEncoder;
+  if (typeof TextEncoderCtor !== "function") {
+    return false;
+  }
+  try {
+    const encoded = new TextEncoderCtor().encode(value);
+    return encoded instanceof Uint8Array && encoded.length <= 16 * 1024;
+  } catch (_error) {
+    return false;
+  }
+}
+
+
 export function conversationPresentation(event) {
+  if (event?.kind === "conversation") {
+    const envelope = directedEnvelope(event);
+    return envelope === null ? "hidden" : (envelope.messageType === "status" ? "status" : "message");
+  }
   if (event?.kind === "task_state") return "status";
   if (MESSAGE_EVENT_KINDS.has(event?.kind)) return "message";
   return "hidden";
+}
+
+
+function directedEnvelope(event) {
+  const payload = asObject(event?.payload);
+  const envelopeFields = [
+    "sender", "addressed_to", "routed_to", "message_type", "text", "task_id",
+    "revision", "continuation_generation", "question_id", "reply_to_question_id",
+  ];
+  const sender = typeof payload.sender === "string" ? DIRECTED_ACTORS[payload.sender] : null;
+  const addressedTo = typeof payload.addressed_to === "string"
+    ? DIRECTED_TARGETS[payload.addressed_to]
+    : null;
+  const routedTo = typeof payload.routed_to === "string"
+    ? DIRECTED_TARGETS[payload.routed_to]
+    : null;
+  if (
+    event?.kind !== "conversation"
+    || Object.keys(payload).length !== envelopeFields.length
+    || !envelopeFields.every((field) => Object.hasOwn(payload, field))
+    || sender === undefined || sender === null
+    || addressedTo === undefined || addressedTo === null
+    || routedTo === undefined || routedTo === null
+    || !DIRECTED_MESSAGE_TYPES.has(payload.message_type)
+    || typeof payload.text !== "string"
+    || typeof event?.actor !== "string"
+    || event.actor !== payload.sender
+  ) {
+    return null;
+  }
+  const taskId = typeof payload.task_id === "string" && SAFE_ID.test(payload.task_id)
+    ? payload.task_id
+    : null;
+  const outerTaskId = event?.task_id === null
+    ? null
+    : (typeof event?.task_id === "string" && SAFE_ID.test(event.task_id)
+      ? event.task_id
+      : undefined);
+  if (outerTaskId === undefined) {
+    return null;
+  }
+  const revision = Number.isInteger(payload.revision) && payload.revision >= 1
+    ? payload.revision
+    : null;
+  const generation = Number.isInteger(payload.continuation_generation)
+    && payload.continuation_generation >= 1
+    ? payload.continuation_generation
+    : null;
+  const questionId = typeof payload.question_id === "string" && SAFE_ID.test(payload.question_id)
+    ? payload.question_id
+    : null;
+  const replyToQuestionId = typeof payload.reply_to_question_id === "string"
+    && SAFE_ID.test(payload.reply_to_question_id)
+    ? payload.reply_to_question_id
+    : null;
+  const textIsSafe = safeConversationText(payload.text);
+  const hasUnboundFields = payload.task_id === null
+    && payload.revision === null
+    && payload.continuation_generation === null;
+  const hasBoundFields = taskId !== null && revision !== null && generation !== null;
+  const hasApprovalBinding = taskId !== null && revision !== null
+    && payload.continuation_generation === null;
+  const hasBoundBinding = payload.message_type === "approval"
+    ? hasApprovalBinding
+    : hasBoundFields;
+  if (
+    (payload.question_id !== undefined && payload.question_id !== null && questionId === null)
+    || (payload.reply_to_question_id !== undefined && payload.reply_to_question_id !== null && replyToQuestionId === null)
+    || !textIsSafe
+    || (payload.message_type === "question" && (questionId === null || replyToQuestionId !== null))
+    || (payload.message_type === "answer" && (questionId !== null || replyToQuestionId === null))
+    || (!["question", "answer"].includes(payload.message_type)
+      && (questionId !== null || replyToQuestionId !== null))
+    || (payload.message_type === "approval" && !hasApprovalBinding)
+    || (payload.message_type !== "approval" && !hasUnboundFields && !hasBoundFields)
+    || ((payload.message_type === "question" || payload.message_type === "answer") && !hasBoundFields)
+    || (hasBoundBinding && outerTaskId !== taskId)
+    || (payload.message_type === "status" && payload.sender !== "system")
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    sender,
+    addressedTo,
+    routedTo,
+    messageType: payload.message_type,
+    text: payload.text,
+    taskId,
+    revision,
+    generation,
+    questionId,
+    replyToQuestionId,
+  });
 }
 
 
@@ -244,22 +397,6 @@ export function renderMessage(documentRoot, event, associatedRevision = null) {
     "message-metadata",
   );
   article.append(actor, messageNode, metadata);
-  const projection = {
-    sequence: Number.isSafeInteger(event?.sequence) ? event.sequence : null,
-    session_id: typeof event?.session_id === "string" ? event.session_id : null,
-    task_id: typeof event?.task_id === "string" ? event.task_id : null,
-    revision,
-    actor: typeof event?.actor === "string" ? event.actor : null,
-    kind: typeof event?.kind === "string" ? event.kind : null,
-    payload,
-    created_at: typeof event?.created_at === "string" ? event.created_at : null,
-  };
-  const details = element(documentRoot, "details");
-  details.append(
-    element(documentRoot, "summary", "Inspect structured event"),
-    element(documentRoot, "pre", JSON.stringify(projection, null, 2)),
-  );
-  article.append(details);
   if (
     typeof event?.created_at === "string"
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(event.created_at)
@@ -269,6 +406,57 @@ export function renderMessage(documentRoot, event, associatedRevision = null) {
     time.setAttribute("datetime", event.created_at);
     article.append(time);
   }
+  return appendConversationNode(documentRoot, conversation, article);
+}
+
+
+function renderDirectedMessage(documentRoot, event, envelope) {
+  const conversation = documentRoot.querySelector("#conversation");
+  if (!conversation) {
+    throw new Error("conversation region is missing");
+  }
+  const article = element(
+    documentRoot,
+    "article",
+    undefined,
+    `message message-${envelope.sender.className} target-${envelope.routedTo.className}`,
+  );
+  article.setAttribute("aria-label", `${envelope.sender.label} to ${envelope.routedTo.label}`);
+  const avatar = element(documentRoot, "span", envelope.sender.avatar, "message-avatar");
+  avatar.setAttribute("aria-hidden", "true");
+  const heading = element(
+    documentRoot,
+    "strong",
+    `${envelope.sender.label} → ${envelope.routedTo.label}`,
+    "message-route",
+  );
+  const text = element(documentRoot, "p", envelope.text);
+  const context = [];
+  if (envelope.taskId !== null) {
+    context.push(`Task ${envelope.taskId}`);
+  }
+  if (envelope.revision !== null) {
+    context.push(`r${envelope.revision}`);
+  }
+  if (envelope.questionId !== null) {
+    context.push(`Question ${envelope.questionId}`);
+  }
+  if (envelope.replyToQuestionId !== null) {
+    context.push(`Reply to question ${envelope.replyToQuestionId}`);
+  }
+  if (envelope.generation !== null) {
+    context.push(`generation ${envelope.generation}`);
+  }
+  if (envelope.addressedTo !== envelope.routedTo) {
+    context.push(`Addressed to ${envelope.addressedTo.label} · routed to ${envelope.routedTo.label} before approval`);
+  }
+  const metadata = element(
+    documentRoot,
+    "p",
+    context.length > 0 ? context.join(" · ") : "Conversation message",
+    "message-metadata",
+  );
+  article.append(avatar, heading, text, metadata);
   return appendConversationNode(documentRoot, conversation, article);
 }
 
@@ -296,6 +484,14 @@ function renderConversationStatus(documentRoot, event, associatedRevision) {
 
 
 export function renderConversationEvent(documentRoot, event, associatedRevision = null) {
+  if (event?.kind === "conversation") {
+    const envelope = directedEnvelope(event);
+    if (envelope === null) return null;
+    if (envelope.messageType === "status") {
+      return renderConversationStatus(documentRoot, event, associatedRevision);
+    }
+    return renderDirectedMessage(documentRoot, event, envelope);
+  }
   const presentation = conversationPresentation(event);
   if (presentation === "hidden") return null;
   if (presentation === "status") {
@@ -466,6 +662,154 @@ function appendListSection(documentRoot, parent, headingText, values) {
   }
   section.append(list);
   parent.append(section);
+}
+
+
+const ACTIVITY_KINDS = new Set(["action_error", "stop_error", "agent_event", "resume_drift"]);
+const AGENT_ACTIVITY_STATUSES = new Set([
+  "completed", "declined", "failed", "in_progress", "interrupted",
+]);
+const SHA256_DIGEST = /^[a-f0-9]{64}$/;
+
+export function sanitizeActivity(kind, candidate) {
+  if (typeof kind !== "string" || !ACTIVITY_KINDS.has(kind)) {
+    return null;
+  }
+  if (kind !== "agent_event") {
+    return {};
+  }
+  const activity = asObject(candidate);
+  const safe = {};
+  if (typeof activity.status === "string" && AGENT_ACTIVITY_STATUSES.has(activity.status)) {
+    safe.status = activity.status;
+  }
+  if (typeof activity.command_sha256 === "string" && SHA256_DIGEST.test(activity.command_sha256)) {
+    safe.command_sha256 = activity.command_sha256;
+  }
+  return safe;
+}
+
+function activitySummary(task) {
+  const activity = sanitizeActivity(task?.activity_kind, task?.activity);
+  if (activity === null) {
+    return "No structured activity recorded";
+  }
+  return [
+    stateLabel(task.activity_kind),
+    typeof activity.status === "string" ? stateLabel(activity.status) : null,
+    typeof activity.command_sha256 === "string" ? activity.command_sha256 : null,
+  ].filter(Boolean).join(" · ");
+}
+
+
+function activityRows(task) {
+  const activity = sanitizeActivity(task?.activity_kind, task?.activity);
+  if (activity === null) {
+    return [["Type", "No structured activity recorded"]];
+  }
+  const type = stateLabel(task.activity_kind);
+  const rows = [["Type", type]];
+  if (typeof activity.status === "string") {
+    rows.push(["Status", stateLabel(activity.status)]);
+  }
+  if (typeof activity.command_sha256 === "string") {
+    rows.push(["Command digest", activity.command_sha256]);
+  }
+  return rows;
+}
+
+
+function renderActivityAudit(documentRoot, task) {
+  const audit = documentRoot.querySelector("#activity-audit");
+  if (!audit || audit.open !== true) {
+    return;
+  }
+  const rows = element(documentRoot, "dl", undefined, "activity-audit-rows");
+  rows.append(...activityRows(task).flatMap(([label, value]) => [
+    element(documentRoot, "dt", label), element(documentRoot, "dd", value),
+  ]));
+  audit.replaceChildren(
+    element(documentRoot, "summary", "Activity and audit"),
+    element(documentRoot, "p", activitySummary(task)),
+    rows,
+  );
+}
+
+
+function boundedInspectorList(value) {
+  if (!Array.isArray(value)) {
+    return "None recorded";
+  }
+  const values = value
+    .filter((entry) => typeof entry === "string" && entry.trim())
+    .slice(0, 20);
+  if (values.length === 0) {
+    return "None recorded";
+  }
+  return values.join(" · ");
+}
+
+
+function renderPersistentInspector(documentRoot, task, options) {
+  const summary = documentRoot.querySelector("#task-inspector-summary");
+  const controls = documentRoot.querySelector("#task-controls");
+  const empty = documentRoot.querySelector("#task-inspector-empty");
+  if (!task) {
+    if (empty) {
+      empty.hidden = false;
+    }
+    if (summary) {
+      const rows = [
+        ["Task revision", "Awaiting task selection"],
+        ["State", "Awaiting task selection"],
+        ["Scope", "Awaiting task selection"],
+        ["Allowed paths", "Awaiting task selection"],
+        ["Required tests", "Awaiting task selection"],
+        ["Question budget", "Awaiting task selection"],
+      ];
+      summary.replaceChildren(...rows.flatMap(([label, value]) => [
+        element(documentRoot, "dt", label),
+        element(documentRoot, "dd", value),
+      ]));
+    }
+    if (controls) {
+      controls.hidden = false;
+      const heading = element(documentRoot, "h3", "Task controls");
+      heading.id = "task-controls-heading";
+      controls.replaceChildren(
+        heading,
+        element(documentRoot, "p", "Task-specific controls appear after task selection."),
+      );
+    }
+    return;
+  }
+  if (empty) {
+    empty.hidden = true;
+  }
+  const brief = taskBrief(task);
+  const identity = taskIdentity(task);
+  const questionBudget = Number.isInteger(task?.exchange_allowance)
+    && task.exchange_allowance >= 0
+    ? `${task.exchange_allowance} remaining${Number.isInteger(task.exchange_consumed) && task.exchange_consumed >= 0 ? ` · ${task.exchange_consumed} consumed` : ""}`
+    : "Not recorded";
+  if (summary) {
+    const rows = [
+      ["Task revision", `${identity} · r${taskRevision(task)}`],
+      ["State", stateLabel(String(task?.state ?? "unknown"))],
+      ["Scope", brief?.objective ?? "None recorded"],
+      ["Allowed paths", boundedInspectorList(brief?.allowed_paths)],
+      ["Required tests", boundedInspectorList(brief?.required_tests)],
+      ["Question budget", questionBudget],
+    ];
+    summary.replaceChildren(...rows.flatMap(([label, value]) => [
+      element(documentRoot, "dt", label),
+      element(documentRoot, "dd", value),
+    ]));
+  }
+  if (!controls) {
+    return;
+  }
+  controls.hidden = true;
 }
 
 
@@ -660,14 +1004,6 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
       : [];
     appendListSection(documentRoot, card, "Acceptance evidence", criteria);
   }
-  if (task?.activity) {
-    const activity = element(documentRoot, "details", undefined, "task-section");
-    activity.append(
-      element(documentRoot, "summary", "Latest agent activity"),
-      element(documentRoot, "pre", JSON.stringify(asObject(task.activity), null, 2)),
-    );
-    card.append(activity);
-  }
   appendTextSection(documentRoot, card, "Last activity", taskRecency(task));
   appendTextSection(
     documentRoot,
@@ -743,26 +1079,6 @@ export function renderTaskInspector(documentRoot, task, options = {}) {
     if (button) {
       actions.append(button);
     }
-  }
-
-  if (controls.answer.visible) {
-    const answerForm = element(documentRoot, "form", undefined, "task-section");
-    const answerLabel = element(documentRoot, "label", "Answer the agents");
-    const answer = element(documentRoot, "textarea");
-    answer.id = `task-answer-${taskIdentity(task)}`;
-    answerLabel.setAttribute("for", answer.id);
-    answer.name = "answer";
-    answer.required = true;
-    answer.disabled = !controls.answer.enabled;
-    const send = element(documentRoot, "button", "Send answer", "button button-primary");
-    send.type = "submit";
-    send.disabled = !controls.answer.enabled;
-    answerForm.append(answerLabel, answer, send);
-    answerForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      onAction("answer", task, {answer: String(answer.value ?? "")});
-    });
-    card.append(answerForm);
   }
 
   card.append(actions);
@@ -981,6 +1297,14 @@ export function projectChatMessagePath(projectId, sessionId) {
 }
 
 
+export function projectTaskMessagePath(projectId, sessionId, taskId) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  requireSafeId(taskId, "task_id");
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/messages`;
+}
+
+
 export function projectTaskActionPath(projectId, sessionId, taskId, action) {
   requireSafeId(projectId, "project_id");
   requireSafeId(sessionId, "session_id");
@@ -989,6 +1313,445 @@ export function projectTaskActionPath(projectId, sessionId, taskId, action) {
     throw new Error("unsupported task action");
   }
   return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/${action}`;
+}
+
+
+export function projectInterventionPath(projectId, sessionId, interventionId, action) {
+  requireSafeId(projectId, "project_id");
+  requireSafeId(sessionId, "session_id");
+  requireSafeId(interventionId, "intervention_id");
+  if (action !== "resume" && action !== "authorize-retry") {
+    throw new Error("intervention action is unavailable");
+  }
+  return `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(sessionId)}/interventions/${encodeURIComponent(interventionId)}/${action}`;
+}
+
+
+function composerIdentity(state) {
+  const current = asObject(state);
+  return {
+    projectId: requireSafeId(current.projectId, "project_id"),
+    sessionId: requireSafeId(current.sessionId, "session_id"),
+  };
+}
+
+
+function userRecipient(value, allowTeam = true) {
+  if (value !== "fable" && value !== "sol" && (value !== "team" || !allowTeam)) {
+    throw new Error("recipient is unavailable");
+  }
+  return value;
+}
+
+
+function exactBinding(state, binding) {
+  const current = composerIdentity(state);
+  const candidate = asObject(binding);
+  if (
+    candidate.projectId !== current.projectId
+    || candidate.sessionId !== current.sessionId
+    || typeof candidate.taskId !== "string"
+    || !SAFE_ID.test(candidate.taskId)
+    || !Number.isInteger(candidate.revision)
+    || candidate.revision < 1
+    || !Number.isInteger(candidate.continuationGeneration)
+    || candidate.continuationGeneration < 1
+  ) {
+    throw new Error("bound reply is stale");
+  }
+  return {current, candidate};
+}
+
+
+export function composerRequest(state, binding, text, recipient = "fable") {
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw new Error("message text is required");
+  }
+  if (binding === null || binding === undefined) {
+    const current = composerIdentity(state);
+    return {
+      path: projectChatMessagePath(current.projectId, current.sessionId),
+      payload: {text, addressed_to: userRecipient(recipient)},
+    };
+  }
+  const {current, candidate} = exactBinding(state, binding);
+  if (candidate.kind === "question") {
+    requireSafeId(candidate.questionId, "question_id");
+    return {
+      path: projectTaskActionPath(current.projectId, current.sessionId, candidate.taskId, "answer"),
+      payload: {
+        text,
+        revision: candidate.revision,
+        question_id: candidate.questionId,
+        continuation_generation: candidate.continuationGeneration,
+      },
+    };
+  }
+  if (candidate.kind === "continuation") {
+    return {
+      path: projectTaskMessagePath(current.projectId, current.sessionId, candidate.taskId),
+      payload: {
+        text,
+        addressed_to: userRecipient(recipient, false),
+        revision: candidate.revision,
+        continuation_generation: candidate.continuationGeneration,
+      },
+    };
+  }
+  throw new Error("bound reply is unavailable");
+}
+
+
+export function exchangeGrantRequest(state, binding) {
+  const {current, candidate} = exactBinding(state, binding);
+  if (candidate.kind !== "exchange_permission") {
+    throw new Error("exchange permission is unavailable");
+  }
+  requireSafeId(candidate.requestId, "request_id");
+  return {
+    path: `/api/projects/${encodeURIComponent(current.projectId)}/chats/${encodeURIComponent(current.sessionId)}/tasks/${encodeURIComponent(candidate.taskId)}/exchanges/grant`,
+    payload: {
+      revision: candidate.revision,
+      continuation_generation: candidate.continuationGeneration,
+      request_id: candidate.requestId,
+    },
+  };
+}
+
+
+export function composerGuidance(state, binding, recipient = "fable") {
+  const current = asObject(state);
+  const gate = asObject(current.gate);
+  const readiness = typeof gate.guidance === "string" ? gate.guidance : "Actions are unavailable.";
+  if (binding !== null && binding !== undefined) {
+    return `${readiness} This reply remains bound to its exact task and continuation.`;
+  }
+  const route = recipient === "sol"
+    ? "Before approval, messages addressed to Sol are visibly routed through Fable."
+    : (recipient === "team"
+      ? "Before approval, messages addressed to Team are visibly routed through Fable."
+      : "Fable is the direct planner for new tasks.");
+  if (current.activeLease !== null && current.activeLease !== undefined) {
+    return `An agent is active. Select an exact Reply card to answer its bound question. ${route}`;
+  }
+  return `${readiness} ${route}`;
+}
+
+
+export function composerPresentation(state, binding, recipient = "fable") {
+  const current = asObject(state);
+  const gate = asObject(current.gate);
+  const boundReply = binding !== null && binding !== undefined;
+  const ordinaryLeaseLocked = current.activeLease !== null
+    && current.activeLease !== undefined
+    && !boundReply;
+  const selectedRecipient = recipient === "sol"
+    ? "Sol"
+    : (recipient === "team" ? "Team" : "Fable");
+  const disabled = gate.canCompose !== true
+    || current.sessionId === null
+    || current.sessionId === undefined
+    || ordinaryLeaseLocked;
+  return Object.freeze({
+    disabled,
+    recipientDisabled: disabled || binding?.kind === "question",
+    label: boundReply ? "Bound reply" : `Message ${selectedRecipient}`,
+    submit: boundReply ? "Send reply" : "Send",
+    guidance: composerGuidance(current, binding, recipient),
+  });
+}
+
+
+function interventionIdentity(task) {
+  const candidate = asObject(task);
+  if (
+    typeof candidate.task_id !== "string"
+    || !SAFE_ID.test(candidate.task_id)
+    || !Number.isInteger(candidate.revision)
+    || candidate.revision < 1
+    || !Number.isInteger(candidate.continuation_generation)
+    || candidate.continuation_generation < 1
+  ) {
+    throw new Error("active task identity is unavailable");
+  }
+  return candidate;
+}
+
+
+export function interventionRecipients(task) {
+  const active = interventionIdentity(task);
+  return Object.freeze(["sol_running", "sol_correcting"].includes(active.state)
+    ? ["fable", "sol"]
+    : ["fable"]);
+}
+
+
+export function interventionDraft(task, interventionId, addressedTo, message) {
+  const active = interventionIdentity(task);
+  requireSafeId(interventionId, "intervention_id");
+  if (!interventionRecipients(active).includes(addressedTo)) {
+    throw new Error("intervention recipient is unavailable");
+  }
+  if (typeof message !== "string" || !message.trim() || message.length > 16 * 1024) {
+    throw new Error("intervention message is required");
+  }
+  return Object.freeze({
+    taskId: active.task_id,
+    revision: active.revision,
+    sourceGeneration: active.continuation_generation,
+    interventionId,
+    addressedTo,
+    message,
+    submitted: false,
+  });
+}
+
+
+export function interventionWarningKey(intervention) {
+  const record = asObject(intervention);
+  if (
+    typeof record.intervention_id !== "string"
+    || !SAFE_ID.test(record.intervention_id)
+    || !Number.isInteger(record.resume_generation)
+    || record.resume_generation < 1
+  ) {
+    throw new Error("intervention warning identity is unavailable");
+  }
+  return `${record.intervention_id}:${record.resume_generation}`;
+}
+
+
+export function interventionRequest(state, task, message, interventionId, recipient = "fable") {
+  const current = composerIdentity(state);
+  const active = interventionIdentity(task);
+  requireSafeId(interventionId, "intervention_id");
+  if (!interventionRecipients(active).includes(recipient)) {
+    throw new Error("intervention recipient is unavailable");
+  }
+  if (typeof message !== "string" || !message.trim() || message.length > 16 * 1024) {
+    throw new Error("intervention message is required");
+  }
+  return Object.freeze({
+    path: projectTaskActionPath(current.projectId, current.sessionId, active.task_id, "intervene"),
+    payload: Object.freeze({
+      intervention_id: interventionId,
+      message,
+      addressed_to: recipient,
+      revision: active.revision,
+      continuation_generation: active.continuation_generation,
+    }),
+  });
+}
+
+
+export function interventionPresentation(state, task) {
+  const current = composerIdentity(state);
+  const active = interventionIdentity(task);
+  const record = asObject(active.intervention);
+  if (Object.keys(record).length === 0) {
+    return Object.freeze({kind: "new", submit: "Intervene", warning: null});
+  }
+  if (
+    typeof record.intervention_id !== "string"
+    || !SAFE_ID.test(record.intervention_id)
+    || !Number.isInteger(record.resume_generation)
+    || record.resume_generation < 1
+  ) {
+    return Object.freeze({kind: "unavailable", submit: "Intervention unavailable", warning: null});
+  }
+  if (record.status === "pending_stop" || record.status === "resuming") {
+    return Object.freeze({kind: "pending", submit: "Intervention pending", warning: null});
+  }
+  if (record.status === "canceled_by_stop") {
+    return Object.freeze({kind: "canceled", submit: "Intervention canceled by Stop", warning: null});
+  }
+  if (record.status === "ready" && record.eligible === true) {
+    return Object.freeze({
+      kind: "resume",
+      submit: "Resume intervention",
+      warning: null,
+      interventionId: record.intervention_id,
+      resumeGeneration: record.resume_generation,
+      path: projectInterventionPath(current.projectId, current.sessionId, record.intervention_id, "resume"),
+      payload: Object.freeze({expected_resume_generation: record.resume_generation}),
+    });
+  }
+  if (record.status === "resume_outcome_unknown") {
+    const warning = typeof record.warning === "string" && record.warning
+      ? record.warning
+      : "The prior resume outcome is unknown and may have executed.";
+    return Object.freeze({
+      kind: "unknown",
+      submit: "Acknowledge possible prior execution",
+      warning,
+      interventionId: record.intervention_id,
+      resumeGeneration: record.resume_generation,
+    });
+  }
+  return Object.freeze({kind: "unavailable", submit: "Intervention unavailable", warning: null});
+}
+
+
+export function interventionRetryRequest(state, presentation, acknowledgmentId) {
+  const current = composerIdentity(state);
+  const unknown = asObject(presentation);
+  if (
+    unknown.kind !== "unknown"
+    || typeof unknown.interventionId !== "string"
+    || !SAFE_ID.test(unknown.interventionId)
+    || !Number.isInteger(unknown.resumeGeneration)
+    || unknown.resumeGeneration < 1
+  ) {
+    throw new Error("unknown intervention acknowledgement is unavailable");
+  }
+  requireSafeId(acknowledgmentId, "acknowledgment_id");
+  return Object.freeze({
+    path: projectInterventionPath(current.projectId, current.sessionId, unknown.interventionId, "authorize-retry"),
+    payload: Object.freeze({
+      expected_resume_generation: unknown.resumeGeneration,
+      acknowledgment_id: acknowledgmentId,
+      acknowledge_possible_prior_execution: true,
+    }),
+  });
+}
+
+
+function pendingQuestionBinding(state, task) {
+  const snapshot = asObject(task);
+  const question = asObject(snapshot.pending_question);
+  const identity = composerIdentity(state);
+  if (
+    typeof snapshot.task_id !== "string"
+    || !SAFE_ID.test(snapshot.task_id)
+    || !Number.isInteger(snapshot.revision)
+    || snapshot.revision < 1
+    || !Number.isInteger(snapshot.continuation_generation)
+    || snapshot.continuation_generation < 1
+    || typeof question.question_id !== "string"
+    || !SAFE_ID.test(question.question_id)
+    || question.addressed_to !== "user"
+    || question.routed_to !== "user"
+    || !["fable", "sol"].includes(question.asked_by)
+    || typeof question.text !== "string"
+    || question.revision !== snapshot.revision
+    || question.continuation_generation !== snapshot.continuation_generation
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    kind: "question",
+    ...identity,
+    taskId: snapshot.task_id,
+    revision: snapshot.revision,
+    questionId: question.question_id,
+    continuationGeneration: snapshot.continuation_generation,
+    askedBy: question.asked_by,
+    text: question.text,
+  });
+}
+
+
+function exchangePermissionBinding(state, task) {
+  const snapshot = asObject(task);
+  const permission = asObject(snapshot.exchange_permission);
+  const identity = composerIdentity(state);
+  if (
+    typeof snapshot.task_id !== "string"
+    || !SAFE_ID.test(snapshot.task_id)
+    || !Number.isInteger(snapshot.revision)
+    || snapshot.revision < 1
+    || !Number.isInteger(snapshot.continuation_generation)
+    || snapshot.continuation_generation < 1
+    || typeof permission.request_id !== "string"
+    || !SAFE_ID.test(permission.request_id)
+    || permission.revision !== snapshot.revision
+    || permission.continuation_generation !== snapshot.continuation_generation
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    kind: "exchange_permission",
+    ...identity,
+    taskId: snapshot.task_id,
+    revision: snapshot.revision,
+    continuationGeneration: snapshot.continuation_generation,
+    requestId: permission.request_id,
+  });
+}
+
+
+function clearConversationActionCards(conversation) {
+  for (const node of Array.from(conversation?.children ?? [])) {
+    if (node.className !== "conversation-action-card") {
+      continue;
+    }
+    if (typeof node.remove === "function") {
+      node.remove();
+    } else if (typeof conversation.removeChild === "function") {
+      conversation.removeChild(node);
+    }
+  }
+}
+
+
+export function renderPendingConversationCards(documentRoot, tasks, handlers = {}, state = {}) {
+  const conversation = documentRoot.querySelector("#conversation");
+  if (!conversation) {
+    throw new Error("conversation region is missing");
+  }
+  clearConversationActionCards(conversation);
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const question = pendingQuestionBinding(state, task);
+    if (question !== null) {
+      const card = element(documentRoot, "article", undefined, "conversation-action-card");
+      card.setAttribute("aria-label", `${actorLabel(question.askedBy)} question for you`);
+      card.append(
+        element(documentRoot, "strong", `${actorLabel(question.askedBy)} → You`, "message-route"),
+        element(documentRoot, "p", question.text),
+        element(documentRoot, "p", `Task ${question.taskId} · r${question.revision} · question ${question.questionId} · generation ${question.continuationGeneration}`, "message-metadata"),
+      );
+      const reply = element(documentRoot, "button", "Reply", "button button-primary");
+      reply.type = "button";
+      reply.addEventListener("click", () => handlers.onReply?.(question));
+      card.append(reply);
+      appendConversationNode(documentRoot, conversation, card);
+    }
+    const permission = exchangePermissionBinding(state, task);
+    if (permission !== null) {
+      const card = element(documentRoot, "article", undefined, "conversation-action-card");
+      card.setAttribute("aria-label", "Exchange permission for you");
+      card.append(
+        element(documentRoot, "strong", "System → You", "message-route"),
+        element(documentRoot, "p", "Automatic exchange limit reached. Your direction is needed."),
+        element(documentRoot, "p", `Task ${permission.taskId} · r${permission.revision} · generation ${permission.continuationGeneration}`, "message-metadata"),
+      );
+      const reply = element(documentRoot, "button", "Reply", "button");
+      reply.type = "button";
+      reply.addEventListener("click", () => handlers.onReply?.(Object.freeze({
+        kind: "continuation",
+        projectId: permission.projectId,
+        sessionId: permission.sessionId,
+        taskId: permission.taskId,
+        revision: permission.revision,
+        continuationGeneration: permission.continuationGeneration,
+      })));
+      const grant = element(documentRoot, "button", "Allow 3 more exchanges", "button button-primary");
+      grant.type = "button";
+      grant.addEventListener("click", () => handlers.onGrant?.(permission));
+      card.append(reply, grant);
+      appendConversationNode(documentRoot, conversation, card);
+    }
+  }
+  return conversation;
+}
+
+
+export class HttpError extends Error {
+  constructor(status, detail) {
+    super(detail);
+    this.name = "HttpError";
+    this.status = status;
+  }
 }
 
 
@@ -1013,7 +1776,7 @@ export async function postJson(fetchFunction, path, payload, csrfToken) {
     } catch (_error) {
       // The status is sufficient when an error response has no JSON body.
     }
-    throw new Error(detail);
+    throw new HttpError(response.status, detail);
   }
   return response;
 }
@@ -1545,6 +2308,10 @@ export function createProjectChatController({
   let projectRefreshPending = false;
   let selectionPending = false;
   let projectRefreshBlocksNavigation = false;
+  let selectedBootstrapRefreshTimer = null;
+  let selectedBootstrapRefreshInFlight = null;
+  let selectedBootstrapRefreshPending = false;
+  let selectedBootstrapRefreshGeneration = 0;
 
   function publish(nextState) {
     state = nextState;
@@ -1571,6 +2338,7 @@ export function createProjectChatController({
   function stopStream() {
     stream?.stop();
     stream = null;
+    invalidateSelectedBootstrapRefresh();
   }
 
   function navigationPending() {
@@ -1582,6 +2350,113 @@ export function createProjectChatController({
     if (projectRefreshInFlight !== null) {
       projectRefreshPending = true;
       projectRefreshBlocksNavigation = true;
+    }
+  }
+
+  function invalidateSelectedBootstrapRefresh() {
+    selectedBootstrapRefreshGeneration += 1;
+    if (selectedBootstrapRefreshTimer !== null) {
+      cancelSchedule(selectedBootstrapRefreshTimer);
+      selectedBootstrapRefreshTimer = null;
+    }
+    selectedBootstrapRefreshInFlight = null;
+    selectedBootstrapRefreshPending = false;
+  }
+
+  function scheduleSelectedBootstrapRefresh(projectId, sessionId, generation) {
+    if (selectedBootstrapRefreshInFlight !== null) {
+      selectedBootstrapRefreshPending = true;
+      return;
+    }
+    if (selectedBootstrapRefreshTimer !== null) {
+      return;
+    }
+    const refreshGeneration = selectedBootstrapRefreshGeneration;
+    selectedBootstrapRefreshTimer = schedule(() => {
+      selectedBootstrapRefreshTimer = null;
+      if (
+        refreshGeneration !== selectedBootstrapRefreshGeneration
+        || !selected(projectId, sessionId, generation)
+      ) {
+        return;
+      }
+      void requestSelectedBootstrapRefresh(
+        projectId,
+        sessionId,
+        generation,
+        false,
+      ).catch(() => {});
+    }, BOOTSTRAP_REFRESH_DELAY);
+  }
+
+  function requestSelectedBootstrapRefresh(projectId, sessionId, generation, explicit) {
+    if (!selected(projectId, sessionId, generation)) {
+      return Promise.resolve(false);
+    }
+    if (selectedBootstrapRefreshInFlight !== null || selectedBootstrapRefreshTimer !== null) {
+      if (explicit || selectedBootstrapRefreshInFlight !== null) {
+        selectedBootstrapRefreshPending = true;
+      }
+      return Promise.resolve(false);
+    }
+    return refreshSelectedBootstrapSingleFlight(
+      projectId,
+      sessionId,
+      generation,
+      selectedBootstrapRefreshGeneration,
+    );
+  }
+
+  async function refreshSelectedBootstrapSingleFlight(
+    projectId, sessionId, generation, refreshGeneration,
+  ) {
+    if (
+      refreshGeneration !== selectedBootstrapRefreshGeneration
+      || !selected(projectId, sessionId, generation)
+      || selectedBootstrapRefreshInFlight !== null
+    ) {
+      return false;
+    }
+    const cursor = state.lastSequence;
+    const flight = Object.freeze({projectId, sessionId, generation, refreshGeneration, cursor});
+    selectedBootstrapRefreshInFlight = flight;
+    let shouldFollowUp = false;
+    try {
+      const bootstrapData = await getJson(projectChatBootstrapPath(projectId, sessionId));
+      const stillSelected = refreshGeneration === selectedBootstrapRefreshGeneration
+        && selected(projectId, sessionId, generation);
+      if (!stillSelected) {
+        return false;
+      }
+      if (state.lastSequence !== cursor) {
+        shouldFollowUp = true;
+        return false;
+      }
+      const applied = applyBootstrap(state, bootstrapData);
+      if (applied.projectId !== projectId || applied.sessionId !== sessionId) {
+        throw new Error("bootstrap selection did not match the requested project chat");
+      }
+      publish({
+        ...applied,
+        projectLabel: projectLabelFor(applied, projectId),
+        navigationPending: navigationPending(),
+      });
+      startStream(projectId, sessionId);
+      return true;
+    } finally {
+      if (selectedBootstrapRefreshInFlight !== flight) {
+        return;
+      }
+      selectedBootstrapRefreshInFlight = null;
+      if (shouldFollowUp || selectedBootstrapRefreshPending) {
+        selectedBootstrapRefreshPending = false;
+        if (
+          refreshGeneration === selectedBootstrapRefreshGeneration
+          && selected(projectId, sessionId, generation)
+        ) {
+          scheduleSelectedBootstrapRefresh(projectId, sessionId, generation);
+        }
+      }
     }
   }
 
@@ -1612,6 +2487,7 @@ export function createProjectChatController({
     if (stream || !selected(projectId, sessionId, selectionGeneration)) {
       return;
     }
+    const streamSelectionGeneration = selectionGeneration;
     stream = createEventStream({
       sessionId,
       initialSequence: state.lastSequence,
@@ -1625,7 +2501,7 @@ export function createProjectChatController({
       bootstrap: (isCurrent) => bootstrapSelected(
         projectId,
         sessionId,
-        selectionGeneration,
+        streamSelectionGeneration,
         isCurrent,
       ),
       onEvent: (event) => {
@@ -1638,6 +2514,17 @@ export function createProjectChatController({
         publish({...state, tasks, selectedTaskId, lastSequence: sequence});
         const associatedTask = tasks.find((task) => taskIdentity(task) === event?.task_id);
         onEvent(event, associatedTask);
+        if (selectedBootstrapRefreshInFlight !== null) {
+          selectedBootstrapRefreshPending = true;
+        }
+        const taskState = asObject(event?.payload).state;
+        if (
+          event?.kind === "conversation"
+          || (event?.kind === "task_state"
+            && ["awaiting_user_input", "awaiting_scope_approval"].includes(taskState))
+        ) {
+          scheduleSelectedBootstrapRefresh(projectId, sessionId, streamSelectionGeneration);
+        }
         void refreshProjects().catch(() => {});
       },
       onStatus: (status) => {
@@ -1797,7 +2684,12 @@ export function createProjectChatController({
     if (typeof state.projectId !== "string" || typeof state.sessionId !== "string") {
       return false;
     }
-    return bootstrapSelected(state.projectId, state.sessionId, selectionGeneration);
+    return requestSelectedBootstrapRefresh(
+      state.projectId,
+      state.sessionId,
+      selectionGeneration,
+      true,
+    );
   }
 
   async function createChat() {
@@ -2086,7 +2978,7 @@ export function reduceTaskEvent(tasks, event) {
   } else if (event.kind === "review") {
     updated = {...updated, review: payload};
   } else if (["agent_event", "resume_drift", "stop_error", "action_error"].includes(event.kind)) {
-    updated = {...updated, activity: payload};
+    updated = {...updated, activity_kind: event.kind, activity: payload};
   }
   return upsertTask(tasks, updated);
 }
@@ -2095,6 +2987,31 @@ export function reduceTaskEvent(tasks, event) {
 function setStatus(node, text, variant) {
   node.textContent = text;
   node.className = `status-pill status-${variant}`;
+}
+
+
+function activeTaskForControls(state) {
+  const leaseTaskId = typeof state?.activeLease?.taskId === "string"
+    ? state.activeLease.taskId
+    : null;
+  const tasks = Array.isArray(state?.tasks) ? state.tasks : [];
+  return tasks.find((task) => taskIdentity(task) === leaseTaskId)
+    ?? tasks.find((task) => ACTIVE_STATES.has(task?.state))
+    ?? tasks.find((task) => Object.keys(asObject(task?.intervention)).length > 0)
+    ?? null;
+}
+
+
+let generatedControlId = 0;
+
+
+function newControlId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.();
+  if (typeof random === "string" && SAFE_ID.test(random)) {
+    return `${prefix}-${random}`;
+  }
+  generatedControlId += 1;
+  return `${prefix}-${Date.now().toString(36)}-${generatedControlId}`;
 }
 
 
@@ -2114,13 +3031,31 @@ function showToast(documentRoot, text, isError = false) {
 }
 
 
-function closeDrawer(documentRoot, id, button, isMobileDrawer) {
+function closeDrawer(documentRoot, id, button, isMobileDrawer, restoreFocus = false) {
   const panel = documentRoot.querySelector(id);
   if (panel) {
     panel.classList.remove("drawer-open");
     panel.inert = isMobileDrawer();
+    panel.removeAttribute?.("role");
+    panel.removeAttribute?.("aria-modal");
   }
   button.setAttribute("aria-expanded", "false");
+  if (restoreFocus) {
+    button.focus?.();
+  }
+}
+
+
+function drawerFocusables(panel) {
+  const selector = "button, textarea, input, select, a, summary, [tabindex]";
+  const candidates = typeof panel?.querySelectorAll === "function"
+    ? Array.from(panel.querySelectorAll(selector))
+    : [panel?.querySelector?.(selector)].filter(Boolean);
+  return candidates.filter((node) => (
+    node.disabled !== true
+    && node.hidden !== true
+    && node.getAttribute?.("tabindex") !== "-1"
+  ));
 }
 
 
@@ -2131,6 +3066,7 @@ function wireDrawer(
   otherButtonId,
   otherPanelId,
   isMobileDrawer,
+  syncInert,
 ) {
   const button = documentRoot.querySelector(buttonId);
   const panel = documentRoot.querySelector(panelId);
@@ -2143,10 +3079,20 @@ function wireDrawer(
     closeDrawer(documentRoot, otherPanelId, otherButton, isMobileDrawer);
     panel.classList.toggle("drawer-open", opening);
     panel.inert = isMobileDrawer() && !opening;
+    if (opening && isMobileDrawer()) {
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+    } else {
+      panel.removeAttribute?.("role");
+      panel.removeAttribute?.("aria-modal");
+    }
     button.setAttribute("aria-expanded", opening ? "true" : "false");
+    syncInert?.();
     if (opening) {
-      const focusTarget = panel.querySelector("button, textarea, input, select, [tabindex]");
+      const focusTarget = drawerFocusables(panel)[0];
       focusTarget?.focus();
+    } else {
+      button.focus?.();
     }
   });
 }
@@ -2169,11 +3115,25 @@ export function startBrowserApp(documentRoot, windowRoot) {
   };
   let controller = null;
   let ready = Promise.resolve(false);
+  let composerBinding = null;
+  let activeInterventionDraft = null;
+  let acknowledgementDraft = null;
+  let unknownWarningId = null;
 
   const composer = documentRoot.querySelector("#composer");
   const messageInput = documentRoot.querySelector("#message-input");
   const composerSubmit = documentRoot.querySelector("#composer-submit");
+  const composerLabel = documentRoot.querySelector("#composer-label");
+  const composerRecipient = documentRoot.querySelector("#composer-recipient");
+  const composerBindingNode = documentRoot.querySelector("#composer-binding");
+  const composerBindingText = documentRoot.querySelector("#composer-binding-text");
+  const composerClearBinding = documentRoot.querySelector("#composer-clear-binding");
   const guidance = documentRoot.querySelector("#composer-guidance");
+  const interventionContext = documentRoot.querySelector("#intervention-context");
+  const interveneControl = documentRoot.querySelector("#intervene-control");
+  const stopControl = documentRoot.querySelector("#stop-control");
+  const conversationStatus = documentRoot.querySelector("#conversation-status");
+  const conversationContext = documentRoot.querySelector("#conversation-context");
   const usageModal = documentRoot.querySelector("#usage-modal");
   const usageForm = documentRoot.querySelector("#usage-credits-form");
   const usageCheckbox = documentRoot.querySelector("#usage-credits-confirm");
@@ -2193,6 +3153,24 @@ export function startBrowserApp(documentRoot, windowRoot) {
 
   function selectedTask() {
     return state.tasks.find((task) => taskIdentity(task) === state.selectedTaskId) ?? null;
+  }
+
+  function bindingText(binding) {
+    if (binding?.kind === "question") {
+      return `Replying to ${actorLabel(binding.askedBy)} · task ${binding.taskId} · r${binding.revision} · question ${binding.questionId} · generation ${binding.continuationGeneration}`;
+    }
+    if (binding?.kind === "continuation") {
+      return `Replying on task ${binding.taskId} · r${binding.revision} · generation ${binding.continuationGeneration}`;
+    }
+    return "";
+  }
+
+  function setComposerBinding(binding) {
+    composerBinding = binding;
+    renderStatus();
+    if (binding !== null) {
+      messageInput.focus();
+    }
   }
 
   function renderStatus() {
@@ -2221,11 +3199,162 @@ export function startBrowserApp(documentRoot, windowRoot) {
       const branch = typeof state.branch === "string" ? state.branch : "checking";
       repoNode.textContent = `Project: ${project} · Branch: ${branch}`;
     }
-    messageInput.disabled = !state.gate.canCompose || state.sessionId === null;
-    composerSubmit.disabled = messageInput.disabled;
+    let activeTask = activeTaskForControls(state);
+    let activePresentation = null;
+    if (activeTask !== null) {
+      try {
+        activePresentation = interventionPresentation(state, activeTask);
+      } catch (_error) {
+        // A websocket state update can arrive before its bounded bootstrap
+        // projection contains the exact continuation identity.
+        activeTask = null;
+      }
+    }
+    if (activeInterventionDraft !== null && (
+      activeTask === null
+      || activeInterventionDraft.taskId !== taskIdentity(activeTask)
+      || activeInterventionDraft.revision !== activeTask.revision
+      || activeInterventionDraft.sourceGeneration !== activeTask.continuation_generation
+    )) {
+      activeInterventionDraft = null;
+    }
+    if (activeInterventionDraft !== null && activePresentation?.kind !== "new") {
+      activeInterventionDraft = null;
+    }
+    const interventionMode = activeInterventionDraft !== null;
+    const boundReply = composerBinding !== null;
+    const selectedRecipient = composerRecipient?.value ?? "fable";
+    const presentation = composerPresentation(state, composerBinding, selectedRecipient);
+    messageInput.disabled = interventionMode ? activeInterventionDraft.submitted : presentation.disabled;
+    composerSubmit.disabled = interventionMode
+      ? activeInterventionDraft.submitted || !String(messageInput.value ?? "").trim()
+      : presentation.disabled;
+    if (composerRecipient) {
+      composerRecipient.disabled = interventionMode ? activeInterventionDraft.submitted : presentation.recipientDisabled;
+      const eligibleRecipients = interventionMode ? interventionRecipients(activeTask) : null;
+      for (const option of Array.from(composerRecipient.options ?? [])) {
+        option.disabled = interventionMode && !eligibleRecipients.includes(option.value);
+      }
+      if (interventionMode && !eligibleRecipients.includes(composerRecipient.value)) {
+        composerRecipient.value = "fable";
+      }
+    }
+    if (composerLabel) {
+      composerLabel.textContent = interventionMode ? "Intervention guidance" : presentation.label;
+    }
+    composerSubmit.textContent = interventionMode ? "Intervene" : presentation.submit;
+    if (composerBindingNode) {
+      composerBindingNode.hidden = !boundReply;
+    }
+    if (composerBindingText) {
+      composerBindingText.textContent = boundReply ? bindingText(composerBinding) : "";
+    }
+    if (composerClearBinding) {
+      composerClearBinding.disabled = !boundReply;
+    }
     guidance.textContent = state.sessionId === null
-      ? `${state.gate.guidance} Waiting for the server session identifier.`
-      : state.gate.guidance;
+      ? `${presentation.guidance} Waiting for the server session identifier.`
+      : presentation.guidance;
+    if (interventionMode) {
+      guidance.textContent = "Guidance will interrupt the exact active run. Choose Fable or Sol; the server verifies eligibility.";
+    }
+    renderInterventionControls(activeTask, activePresentation);
+  }
+
+  function removeUnknownAcknowledgement() {
+    const existing = conversationContext?.querySelector?.("#intervention-acknowledge-control");
+    existing?.remove?.();
+  }
+
+  function renderInterventionControls(activeTask, presentation) {
+    if (!interveneControl || !stopControl) {
+      return;
+    }
+    const activeRun = activeTask !== null && ACTIVE_STATES.has(activeTask.state);
+    const interventionStatus = asObject(activeTask?.intervention).status;
+    const stoppableIntervention = [
+      "pending_stop", "ready", "resuming", "resume_outcome_unknown",
+    ].includes(interventionStatus);
+    interveneControl.hidden = activeTask === null;
+    stopControl.hidden = !(activeRun || stoppableIntervention);
+    stopControl.disabled = !(activeRun || stoppableIntervention);
+    removeUnknownAcknowledgement();
+    if (activeTask === null || presentation === null) {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention controls appear for an active run.");
+      return;
+    }
+    interveneControl.textContent = presentation.submit;
+    interveneControl.disabled = presentation.kind === "pending"
+      || presentation.kind === "canceled"
+      || presentation.kind === "unavailable";
+    if (presentation.kind === "new") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = activeInterventionDraft === null
+        ? "An agent is running. Intervene with exact guidance for Fable or Sol, or Stop the run separately."
+        : "Intervention guidance is bound to this exact active run.");
+      return;
+    }
+    if (presentation.kind === "pending") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention accepted; waiting for the exact source run to stop.");
+      return;
+    }
+    if (presentation.kind === "resume") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "The interruption is ready to resume from its stored continuation.");
+      return;
+    }
+    if (presentation.kind === "canceled") {
+      interventionContext?.removeAttribute?.("role");
+      interventionContext?.removeAttribute?.("tabindex");
+      interventionContext && (interventionContext.textContent = "Intervention canceled by Stop.");
+      return;
+    }
+    if (presentation.kind === "unknown") {
+      if (
+        acknowledgementDraft !== null
+        && (acknowledgementDraft.interventionId !== presentation.interventionId
+          || acknowledgementDraft.resumeGeneration !== presentation.resumeGeneration)
+      ) {
+        acknowledgementDraft = null;
+      }
+      if (interventionContext) {
+        interventionContext.textContent = `Warning: ${presentation.warning}`;
+        interventionContext.setAttribute("role", "alert");
+        interventionContext.setAttribute("tabindex", "-1");
+        const warningKey = interventionWarningKey({
+          intervention_id: presentation.interventionId,
+          resume_generation: presentation.resumeGeneration,
+        });
+        if (unknownWarningId !== warningKey) {
+          unknownWarningId = warningKey;
+          interventionContext.focus?.();
+        }
+      }
+      interveneControl.hidden = true;
+      const acknowledge = element(
+        documentRoot,
+        "button",
+        "Acknowledge possible prior execution",
+        "button button-danger",
+      );
+      acknowledge.id = "intervention-acknowledge-control";
+      acknowledge.type = "button";
+      acknowledge.addEventListener("click", () => {
+        acknowledgementDraft ??= {
+          interventionId: presentation.interventionId,
+          resumeGeneration: presentation.resumeGeneration,
+          acknowledgmentId: newControlId("acknowledgment"),
+        };
+        void submitUnknownAcknowledgement(presentation);
+      });
+      conversationContext?.append?.(acknowledge);
+    }
   }
 
   function renderWorkspace() {
@@ -2254,13 +3383,33 @@ export function startBrowserApp(documentRoot, windowRoot) {
       renderWorkspace();
       const toggle = documentRoot.querySelector("#task-drawer-toggle");
       if (toggle) {
-        closeDrawer(documentRoot, "#task-list", toggle, isMobileDrawer);
+        closeDrawer(documentRoot, projectDrawerId, toggle, isMobileDrawer);
+        syncDrawerMode();
       }
     });
     renderTaskInspector(documentRoot, selectedTask(), {
       gate: state.gate,
       onAction: handleTaskAction,
     });
+    renderPersistentInspector(documentRoot, selectedTask(), {
+      gate: state.gate,
+      onAction: handleTaskAction,
+    });
+    renderActivityAudit(documentRoot, selectedTask());
+    renderPendingConversationCards(documentRoot, state.tasks, {
+      onReply: (binding) => setComposerBinding(binding),
+      onGrant: (binding) => {
+        void (async () => {
+          try {
+            const request = exchangeGrantRequest(state, binding);
+            await postJson(windowRoot.fetch.bind(windowRoot), request.path, request.payload, state.csrfToken);
+            await controller?.refreshSelectedBootstrap();
+          } catch (error) {
+            showToast(documentRoot, String(error.message ?? error), true);
+          }
+        })();
+      },
+    }, state);
   }
 
   function syncUsageModal() {
@@ -2363,10 +3512,134 @@ export function startBrowserApp(documentRoot, windowRoot) {
     setStatus(connection, label, variant);
   }
 
+  async function submitInterventionResume(presentation) {
+    try {
+      await postJson(
+        windowRoot.fetch.bind(windowRoot),
+        presentation.path,
+        presentation.payload,
+        state.csrfToken,
+      );
+      conversationStatus && (conversationStatus.textContent = "Intervention resume accepted.");
+      await controller?.refreshSelectedBootstrap();
+    } catch (error) {
+      showToast(documentRoot, String(error.message ?? error), true);
+    }
+  }
+
+  async function submitUnknownAcknowledgement(presentation) {
+    if (
+      acknowledgementDraft?.interventionId !== presentation.interventionId
+      || acknowledgementDraft?.resumeGeneration !== presentation.resumeGeneration
+    ) {
+      acknowledgementDraft = null;
+      return;
+    }
+    try {
+      const request = interventionRetryRequest(
+        state,
+        presentation,
+        acknowledgementDraft.acknowledgmentId,
+      );
+      await postJson(
+        windowRoot.fetch.bind(windowRoot), request.path, request.payload, state.csrfToken,
+      );
+      conversationStatus && (conversationStatus.textContent = "Possible prior execution acknowledged; retry accepted.");
+      acknowledgementDraft = null;
+      unknownWarningId = null;
+      await controller?.refreshSelectedBootstrap();
+    } catch (error) {
+      if (error?.status === 409) {
+        acknowledgementDraft = null;
+      }
+      showToast(documentRoot, String(error.message ?? error), true);
+    }
+  }
+
+  interveneControl?.addEventListener("click", () => {
+    const activeTask = activeTaskForControls(state);
+    if (activeTask === null) {
+      return;
+    }
+    const presentation = interventionPresentation(state, activeTask);
+    if (presentation.kind === "new") {
+      activeInterventionDraft ??= Object.freeze({
+        taskId: taskIdentity(activeTask),
+        revision: activeTask.revision,
+        sourceGeneration: activeTask.continuation_generation,
+        interventionId: newControlId("intervention"),
+        addressedTo: "fable",
+        message: null,
+        submitted: false,
+      });
+      renderStatus();
+      messageInput.focus?.();
+      return;
+    }
+    if (presentation.kind === "resume") {
+      void submitInterventionResume(presentation);
+    }
+  });
+
+  stopControl?.addEventListener("click", () => {
+    const activeTask = activeTaskForControls(state);
+    if (activeTask === null) {
+      return;
+    }
+    void (async () => {
+      try {
+        await sendTaskAction("stop", activeTask, null);
+        activeInterventionDraft = null;
+        acknowledgementDraft = null;
+        conversationStatus && (conversationStatus.textContent = "Stop accepted; any pending intervention is canceled by the server.");
+        await controller?.refreshSelectedBootstrap();
+      } catch (error) {
+        showToast(documentRoot, String(error.message ?? error), true);
+      }
+    })();
+  });
+
   composer.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = String(messageInput.value ?? "");
-    if (!state.gate.canCompose || !state.projectId || !state.sessionId || !text.trim()) {
+    if (
+      (!state.gate.canCompose && activeInterventionDraft === null)
+      || !state.projectId
+      || !state.sessionId
+      || !text.trim()
+      || (composerBinding === null && state.activeLease !== null && activeInterventionDraft === null)
+    ) {
+      return;
+    }
+    let request;
+    try {
+      if (activeInterventionDraft !== null) {
+        const activeTask = activeTaskForControls(state);
+        if (
+          activeTask === null
+          || activeInterventionDraft.taskId !== taskIdentity(activeTask)
+          || activeInterventionDraft.revision !== activeTask.revision
+          || activeInterventionDraft.sourceGeneration !== activeTask.continuation_generation
+        ) {
+          throw new Error("intervention source is no longer active");
+        }
+        const recipient = composerRecipient?.value ?? activeInterventionDraft.addressedTo;
+        const candidate = activeInterventionDraft.message === null
+          ? interventionDraft(activeTask, activeInterventionDraft.interventionId, recipient, text)
+          : activeInterventionDraft;
+        request = interventionRequest(
+          state,
+          activeTask,
+          candidate.message,
+          candidate.interventionId,
+          candidate.addressedTo,
+        );
+        activeInterventionDraft = Object.freeze({...candidate, submitted: true});
+      } else {
+        request = composerRequest(state, composerBinding, text, composerRecipient?.value ?? "fable");
+      }
+    } catch (error) {
+      showToast(documentRoot, String(error.message ?? error), true);
       return;
     }
     messageInput.disabled = true;
@@ -2374,22 +3647,41 @@ export function startBrowserApp(documentRoot, windowRoot) {
     try {
       await postJson(
         windowRoot.fetch.bind(windowRoot),
-        projectChatMessagePath(state.projectId, state.sessionId),
-        {text},
+        request.path,
+        request.payload,
         state.csrfToken,
       );
       messageInput.value = "";
+      if (activeInterventionDraft !== null) {
+        conversationStatus && (conversationStatus.textContent = "Intervention accepted; waiting for server status.");
+        void controller?.refreshSelectedBootstrap().catch(() => {});
+      } else if (composerBinding !== null) {
+        composerBinding = null;
+        void controller?.refreshSelectedBootstrap().catch(() => {});
+      }
     } catch (error) {
+      if (activeInterventionDraft?.submitted) {
+        activeInterventionDraft = Object.freeze({...activeInterventionDraft, submitted: false});
+      }
+      if (error?.status === 409) {
+        activeInterventionDraft = null;
+        messageInput.value = "";
+      }
       showToast(documentRoot, String(error.message ?? error), true);
     } finally {
       renderStatus();
     }
   });
 
+  composerRecipient?.addEventListener("change", renderStatus);
+  messageInput.addEventListener("input", renderStatus);
+  composerClearBinding?.addEventListener("click", () => setComposerBinding(null));
+
   usageCheckbox.addEventListener("change", () => {
     usageSubmit.disabled = !usageCheckbox.checked;
   });
   usageModal.addEventListener("cancel", (event) => event.preventDefault());
+  documentRoot.querySelector("#activity-audit")?.addEventListener("toggle", renderWorkspace);
   usageForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!usageCheckbox.checked || !state.csrfToken) {
@@ -2414,28 +3706,24 @@ export function startBrowserApp(documentRoot, windowRoot) {
     }
   });
 
-  wireDrawer(
-    documentRoot,
-    "#task-drawer-toggle",
-    "#task-list",
-    "#inspector-drawer-toggle",
-    "#task-inspector",
-    isMobileDrawer,
-  );
-  wireDrawer(
-    documentRoot,
-    "#inspector-drawer-toggle",
-    "#task-inspector",
-    "#task-drawer-toggle",
-    "#task-list",
-    isMobileDrawer,
-  );
+  const projectDrawerId = documentRoot.querySelector("#project-navigation")
+    ? "#project-navigation"
+    : "#task-list";
+  const inspectorDrawerId = documentRoot.querySelector("#task-inspector-panel")
+    ? "#task-inspector-panel"
+    : "#task-inspector";
 
   function syncDrawerMode() {
-    for (const [panelId, buttonId] of [
-      ["#task-list", "#task-drawer-toggle"],
-      ["#task-inspector", "#inspector-drawer-toggle"],
-    ]) {
+    const conversationShell = documentRoot.querySelector("#conversation-shell")
+      ?? documentRoot.querySelector("#conversation");
+    const drawers = [
+      [projectDrawerId, "#task-drawer-toggle"],
+      [inspectorDrawerId, "#inspector-drawer-toggle"],
+    ];
+    const openPanel = drawers.find(([panelId]) => (
+      documentRoot.querySelector(panelId)?.classList.contains("drawer-open")
+    ))?.[0] ?? null;
+    for (const [panelId, buttonId] of drawers) {
       const panel = documentRoot.querySelector(panelId);
       const button = documentRoot.querySelector(buttonId);
       if (!panel || !button) {
@@ -2443,11 +3731,38 @@ export function startBrowserApp(documentRoot, windowRoot) {
       }
       if (!isMobileDrawer()) {
         panel.classList.remove("drawer-open");
+        panel.inert = false;
+        panel.removeAttribute?.("role");
+        panel.removeAttribute?.("aria-modal");
         button.setAttribute("aria-expanded", "false");
+      } else {
+        panel.inert = panelId !== openPanel;
       }
-      panel.inert = isMobileDrawer() && !panel.classList.contains("drawer-open");
+    }
+    if (conversationShell) {
+      conversationShell.inert = isMobileDrawer() && openPanel !== null;
     }
   }
+
+  wireDrawer(
+    documentRoot,
+    "#task-drawer-toggle",
+    projectDrawerId,
+    "#inspector-drawer-toggle",
+    inspectorDrawerId,
+    isMobileDrawer,
+    syncDrawerMode,
+  );
+  wireDrawer(
+    documentRoot,
+    "#inspector-drawer-toggle",
+    inspectorDrawerId,
+    "#task-drawer-toggle",
+    projectDrawerId,
+    isMobileDrawer,
+    syncDrawerMode,
+  );
+
   syncDrawerMode();
   if (typeof drawerMedia.addEventListener === "function") {
     drawerMedia.addEventListener("change", syncDrawerMode);
@@ -2456,19 +3771,40 @@ export function startBrowserApp(documentRoot, windowRoot) {
   }
 
   documentRoot.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && isMobileDrawer()) {
+      const openPanel = [projectDrawerId, inspectorDrawerId]
+        .map((panelId) => documentRoot.querySelector(panelId))
+        .find((panel) => panel?.classList.contains("drawer-open"));
+      const focusable = drawerFocusables(openPanel);
+      if (focusable.length > 0) {
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (documentRoot.activeElement !== first && documentRoot.activeElement !== last) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus?.();
+          return;
+        }
+        if ((!event.shiftKey && documentRoot.activeElement === last)
+          || (event.shiftKey && documentRoot.activeElement === first)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus?.();
+          return;
+        }
+      }
+    }
     if (event.key !== "Escape") {
       return;
     }
     for (const [panelId, buttonId] of [
-      ["#task-list", "#task-drawer-toggle"],
-      ["#task-inspector", "#inspector-drawer-toggle"],
+      [projectDrawerId, "#task-drawer-toggle"],
+      [inspectorDrawerId, "#inspector-drawer-toggle"],
     ]) {
       const panel = documentRoot.querySelector(panelId);
       const button = documentRoot.querySelector(buttonId);
       if (panel?.classList.contains("drawer-open") && button) {
         event.preventDefault();
-        closeDrawer(documentRoot, panelId, button, isMobileDrawer);
-        button.focus();
+        closeDrawer(documentRoot, panelId, button, isMobileDrawer, true);
+        syncDrawerMode();
       }
     }
   });

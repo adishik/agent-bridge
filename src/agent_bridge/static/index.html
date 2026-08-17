@@ -22,110 +22,201 @@
           Selected at server startup. Messages cannot change repository authority.
         </span>
       </div>
-      <nav id="project-navigation" class="project-navigation" aria-label="Projects and chats">
-        <div class="project-navigation-group">
-          <p class="project-navigation-label">
-            Project <strong id="selected-project-name">No project selected</strong>
-          </p>
-          <ul id="project-list" class="project-navigation-list" aria-label="Projects"></ul>
-        </div>
-        <div class="project-navigation-group">
-          <div class="project-navigation-chat-heading">
-            <p class="project-navigation-label">
-              Chat <strong id="selected-chat-name">No chat selected</strong>
-            </p>
-            <button id="new-chat" class="button button-quiet" type="button" disabled>
-              New Chat
-            </button>
-          </div>
-          <ul id="chat-list" class="project-navigation-list" aria-label="Chats"></ul>
-        </div>
-      </nav>
-      <div class="header-statuses" aria-label="Bridge status">
-        <span id="connection-status" class="status-pill status-checking">
-          Connection · checking
-        </span>
-        <span id="fable-status" class="status-pill status-checking">
-          Fable · Subscription · checking
-        </span>
-        <span id="sol-status" class="status-pill status-checking">
-          Sol · checking
-        </span>
-      </div>
       <div class="drawer-toggles" aria-label="Workspace panels">
         <button
           id="task-drawer-toggle"
           class="button button-quiet"
           type="button"
-          aria-controls="task-list"
+          aria-controls="project-navigation"
           aria-expanded="false"
+          aria-haspopup="dialog"
         >
-          Tasks
+          Projects and chats
         </button>
         <button
           id="inspector-drawer-toggle"
           class="button button-quiet"
           type="button"
-          aria-controls="task-inspector"
+          aria-controls="task-inspector-panel"
           aria-expanded="false"
+          aria-haspopup="dialog"
         >
-          Inspector
+          Task inspector
         </button>
       </div>
     </header>
 
-    <main id="workspace">
-      <aside id="task-list" aria-label="Tasks">
-        <div class="panel-heading">
-          <p class="eyebrow">Work queue</p>
-          <h2>Tasks</h2>
-        </div>
-        <p class="empty-state" id="task-list-empty">
-          Tasks will appear after Fable prepares a brief.
-        </p>
-      </aside>
-
-      <section id="conversation" aria-label="Shared conversation" aria-live="polite">
-        <div class="conversation-intro" id="conversation-empty">
-          <p class="eyebrow">Shared chronological chat</p>
-          <h1>Plan with Fable. Execute with Sol.</h1>
+    <div id="workspace" role="application" aria-label="Team workspace">
+      <main id="conversation-shell" aria-labelledby="conversation-heading">
+        <header class="conversation-intro">
+          <p class="eyebrow">Chronological team chat</p>
+          <h1 id="conversation-heading">Conversation</h1>
+          <p>
+            <strong id="selected-project-name">No project selected</strong>
+            · <strong id="selected-chat-name">No chat selected</strong>
+          </p>
           <p>
             Fable reads and plans. You approve each exact task revision. Sol is
             the only participant allowed to change the repository.
           </p>
-        </div>
-      </section>
+        </header>
+        <section id="conversation" aria-label="Conversation history">
+          <p class="empty-state" id="conversation-empty">
+            Conversation messages will appear here.
+          </p>
+        </section>
+        <p id="conversation-status" role="status" aria-live="polite">
+          Conversation status will appear here.
+        </p>
+        <section id="conversation-context" aria-labelledby="conversation-context-heading">
+          <h2 id="conversation-context-heading">Conversation context</h2>
+          <p id="bound-question-context">No question is currently bound to the composer.</p>
+          <p id="intervention-context">Intervention controls appear for an active run.</p>
+          <button id="intervene-control" class="button button-quiet" type="button" disabled>
+            Intervene
+          </button>
+          <button id="stop-control" class="button button-danger" type="button" disabled>
+            Stop
+          </button>
+        </section>
+        <form id="composer" aria-label="Message Fable">
+          <label for="message-input" id="composer-label">Message Fable</label>
+          <div class="composer-row">
+            <label class="composer-recipient" for="composer-recipient">
+              To
+              <select id="composer-recipient" name="addressed_to" disabled>
+                <option value="fable" selected>Fable</option>
+                <option value="sol">Sol</option>
+                <option value="team">Team</option>
+              </select>
+            </label>
+            <textarea
+              id="message-input"
+              name="message"
+              rows="2"
+              required
+              disabled
+              placeholder="Waiting for subscription readiness and usage-credit acknowledgement…"
+            ></textarea>
+            <button id="composer-submit" class="button button-primary" type="submit" disabled>
+              Send to Fable
+            </button>
+          </div>
+          <div id="composer-binding" class="composer-binding" hidden>
+            <span id="composer-binding-text"></span>
+            <button id="composer-clear-binding" class="button button-quiet" type="button">
+              Send a new task instead
+            </button>
+          </div>
+          <p id="composer-guidance" class="form-guidance" role="status">
+            Fable receives planning messages. Before approval, messages addressed to Sol are visibly routed through Fable.
+          </p>
+        </form>
+      </main>
 
-      <aside id="task-inspector" aria-label="Task inspector">
+      <nav
+        id="project-navigation"
+        class="project-navigation"
+        aria-label="Projects and chats"
+        aria-labelledby="project-navigation-heading"
+        data-drawer="mobile"
+        tabindex="-1"
+      >
+        <div class="project-navigation-group">
+          <h2 id="project-navigation-heading">Projects</h2>
+          <ul id="project-list" class="project-navigation-list" aria-label="Projects">
+            <li>
+              <button class="project-navigation-button" type="button" aria-current="true" disabled>
+                No project selected
+              </button>
+            </li>
+          </ul>
+        </div>
+        <div class="project-navigation-group">
+          <div class="project-navigation-chat-heading">
+            <h2>Chats</h2>
+            <button id="new-chat" class="button button-quiet" type="button" disabled>
+              New Chat
+            </button>
+          </div>
+          <ul id="chat-list" class="project-navigation-list" aria-label="Chats">
+            <li>
+              <button class="project-navigation-button" type="button" aria-current="true" disabled>
+                No chat selected
+              </button>
+            </li>
+          </ul>
+        </div>
+        <div class="header-statuses" aria-label="Team presence">
+          <span id="connection-status" class="status-pill status-checking">
+            Connection · checking
+          </span>
+          <span class="team-presence">
+            <span id="fable-avatar" role="img" aria-label="Fable">F</span>
+            <span id="fable-status" class="status-pill status-checking">
+              Fable · Subscription · checking
+            </span>
+          </span>
+          <span class="team-presence">
+            <span id="sol-avatar" role="img" aria-label="Sol">S</span>
+            <span id="sol-status" class="status-pill status-checking">
+              Sol · checking
+            </span>
+          </span>
+        </div>
+        <section id="task-list" aria-labelledby="task-list-heading">
+          <div class="panel-heading">
+            <p class="eyebrow">Work queue</p>
+            <h2 id="task-list-heading">Tasks</h2>
+          </div>
+          <p class="empty-state" id="task-list-empty">
+            Tasks will appear after Fable prepares a brief.
+          </p>
+        </section>
+      </nav>
+
+      <aside
+        id="task-inspector-panel"
+        aria-label="Task inspector"
+        aria-labelledby="task-inspector-heading"
+        data-drawer="mobile"
+        tabindex="-1"
+      >
         <div class="panel-heading">
           <p class="eyebrow">Selected work</p>
-          <h2>Task inspector</h2>
+          <h2 id="task-inspector-heading">Task inspector</h2>
         </div>
+        <div
+          id="task-inspector"
+          aria-labelledby="task-inspector-heading"
+        ></div>
+        <dl id="task-inspector-summary">
+          <dt>Task revision</dt>
+          <dd>Awaiting task selection</dd>
+          <dt>State</dt>
+          <dd>Awaiting task selection</dd>
+          <dt>Scope</dt>
+          <dd>Awaiting task selection</dd>
+          <dt>Allowed paths</dt>
+          <dd>Awaiting task selection</dd>
+          <dt>Required tests</dt>
+          <dd>Awaiting task selection</dd>
+          <dt>Question budget</dt>
+          <dd>Awaiting task selection</dd>
+        </dl>
+        <section id="task-controls" aria-labelledby="task-controls-heading">
+          <h3 id="task-controls-heading">Task controls</h3>
+          <p>Task-specific controls appear after task selection.</p>
+        </section>
+        <details id="activity-audit">
+          <summary>Activity and audit</summary>
+          <p>Structured activity and audit evidence appear for the selected task.</p>
+        </details>
         <p class="empty-state" id="task-inspector-empty">
           Select a task to review its contract, scope, evidence, and controls.
         </p>
       </aside>
-    </main>
-
-    <form id="composer" aria-label="Message Fable">
-      <label for="message-input">Message Fable</label>
-      <div class="composer-row">
-        <textarea
-          id="message-input"
-          name="message"
-          rows="2"
-          required
-          disabled
-          placeholder="Waiting for subscription readiness and usage-credit acknowledgement…"
-        ></textarea>
-        <button id="composer-submit" class="button button-primary" type="submit" disabled>
-          Send to Fable
-        </button>
-      </div>
-      <p id="composer-guidance" class="form-guidance" role="status">
-        Checking Fable subscription authentication…
-      </p>
-    </form>
+    </div>
 
     <dialog
       id="usage-modal"
@@ -159,7 +250,7 @@
       </form>
     </dialog>
 
-    <div id="toast-region" class="toast-region" aria-live="assertive"></div>
+    <div id="toast-region" class="toast-region" role="status" aria-live="assertive"></div>
     <script id="bridge-module" type="module" src="/static/app.js"></script>
   </body>
 </html>

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict, fields
 from math import inf, nan
 
 import pytest
 
 from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    DirectedAgentQuestion,
     FableClarification,
     ReviewVerdict,
     SolOutcome,
     StreamEvent,
     TaskBrief,
+    UserConversationInput,
 )
 
 
@@ -29,6 +37,313 @@ VALID_BRIEF = {
     "confidence": 0.95,
     "confidence_rationale": "All fields are explicit.",
 }
+
+
+VALID_CONVERSATION_ENVELOPE = {
+    "sender": "user",
+    "addressed_to": "fable",
+    "routed_to": "fable",
+    "message_type": "question",
+    "text": "Should the coordinator continue?",
+    "task_id": "task-1",
+    "revision": 1,
+    "continuation_generation": 2,
+    "question_id": "question-1",
+    "reply_to_question_id": None,
+}
+
+
+def test_conversation_envelope_has_an_exact_canonical_json_round_trip() -> None:
+    envelope = ConversationEnvelope.from_dict(VALID_CONVERSATION_ENVELOPE)
+
+    assert envelope.to_dict() == VALID_CONVERSATION_ENVELOPE
+    assert json.loads(json.dumps(envelope.to_dict(), sort_keys=True)) == VALID_CONVERSATION_ENVELOPE
+    assert envelope.sender is ConversationActor.USER
+    assert envelope.addressed_to is ConversationTarget.FABLE
+    assert envelope.message_type is ConversationMessageType.QUESTION
+
+
+def test_conversation_contracts_have_exact_fields_and_canonical_json_values() -> None:
+    input_message = UserConversationInput(
+        addressed_to=ConversationTarget.TEAM,
+        message_type=ConversationMessageType.STATEMENT,
+        text="The team can inspect this.",
+    )
+    directed_question = DirectedAgentQuestion(
+        addressed_to="user",
+        text="Continue?",
+        reason="The coordinator needs a decision.",
+    )
+
+    assert tuple(field.name for field in fields(ConversationEnvelope)) == tuple(VALID_CONVERSATION_ENVELOPE)
+    assert tuple(field.name for field in fields(UserConversationInput)) == (
+        "addressed_to", "message_type", "text", "task_id", "revision", "question_id",
+        "reply_to_question_id", "continuation_generation",
+    )
+    assert tuple(field.name for field in fields(DirectedAgentQuestion)) == (
+        "addressed_to", "text", "reason",
+    )
+    assert json.loads(json.dumps(asdict(input_message), sort_keys=True)) == {
+        "addressed_to": "team",
+        "message_type": "statement",
+        "text": "The team can inspect this.",
+        "task_id": None,
+        "revision": None,
+        "question_id": None,
+        "reply_to_question_id": None,
+        "continuation_generation": None,
+    }
+    assert json.loads(json.dumps(asdict(directed_question), sort_keys=True)) == {
+        "addressed_to": "user",
+        "text": "Continue?",
+        "reason": "The coordinator needs a decision.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sender", "unknown"),
+        ("addressed_to", "unknown"),
+        ("routed_to", "unknown"),
+        ("message_type", "unknown"),
+        ("revision", True),
+        ("continuation_generation", True),
+        ("revision", 0),
+        ("continuation_generation", 0),
+        ("task_id", "task\n1"),
+        ("task_id", "x" * 129),
+        ("question_id", "question\x00"),
+        ("text", ""),
+        ("text", "contains\ncontrol"),
+        ("text", "x" * (16 * 1024 + 1)),
+    ],
+)
+def test_conversation_envelope_rejects_invalid_serialized_values(field: str, value: object) -> None:
+    payload = dict(VALID_CONVERSATION_ENVELOPE)
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        ConversationEnvelope.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {key: value for key, value in VALID_CONVERSATION_ENVELOPE.items() if key != "routed_to"},
+        {**VALID_CONVERSATION_ENVELOPE, "project_id": "outside-contract"},
+        {**VALID_CONVERSATION_ENVELOPE, "message_type": "statement"},
+        {**VALID_CONVERSATION_ENVELOPE, "message_type": "answer", "question_id": None},
+        {**VALID_CONVERSATION_ENVELOPE, "question_id": "same", "reply_to_question_id": "same"},
+        {
+            **VALID_CONVERSATION_ENVELOPE,
+            "message_type": "answer",
+            "question_id": None,
+            "reply_to_question_id": None,
+        },
+        {
+            **VALID_CONVERSATION_ENVELOPE,
+            "task_id": None,
+            "revision": None,
+            "continuation_generation": None,
+        },
+    ],
+)
+def test_conversation_envelope_rejects_invalid_field_sets_and_question_pairs(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        ConversationEnvelope.from_dict(payload)
+
+
+def test_conversation_envelope_requires_approval_binding_and_system_status_sender() -> None:
+    with pytest.raises(ValueError, match="task_id"):
+        ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.TEAM,
+            routed_to=ConversationTarget.TEAM,
+            message_type=ConversationMessageType.APPROVAL,
+            text="Approved.",
+        )
+    with pytest.raises(ValueError, match="sender"):
+        ConversationEnvelope(
+            sender=ConversationActor.USER,
+            addressed_to=ConversationTarget.TEAM,
+            routed_to=ConversationTarget.TEAM,
+            message_type=ConversationMessageType.STATUS,
+            text="Waiting.",
+        )
+
+
+@pytest.mark.parametrize(
+    ("character", "count", "is_valid"),
+    [
+        ("x", 16 * 1024, True),
+        ("x", 16 * 1024 + 1, False),
+        ("é", 8192, True),
+        ("é", 8193, False),
+        ("é", 9000, False),
+    ],
+)
+def test_conversation_envelope_enforces_a_utf8_byte_limit(
+    character: str, count: int, is_valid: bool,
+) -> None:
+    text = character * count
+    kwargs = {
+        "sender": ConversationActor.USER,
+        "addressed_to": ConversationTarget.TEAM,
+        "routed_to": ConversationTarget.TEAM,
+        "message_type": ConversationMessageType.STATEMENT,
+        "text": text,
+    }
+
+    if is_valid:
+        assert ConversationEnvelope(**kwargs).text == text
+    else:
+        with pytest.raises(ValueError, match="text is too long"):
+            ConversationEnvelope(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("character", "count", "is_valid"),
+    [
+        ("x", 16 * 1024, True),
+        ("x", 16 * 1024 + 1, False),
+        ("é", 8192, True),
+        ("é", 8193, False),
+        ("é", 9000, False),
+    ],
+)
+def test_directed_agent_question_enforces_a_utf8_byte_limit(
+    character: str, count: int, is_valid: bool,
+) -> None:
+    reason = character * count
+    kwargs = {"addressed_to": "fable", "text": "Question?", "reason": reason}
+
+    if is_valid:
+        assert DirectedAgentQuestion(**kwargs).reason == reason
+    else:
+        with pytest.raises(ValueError, match="reason is too long"):
+            DirectedAgentQuestion(**kwargs)
+
+
+def test_conversation_envelope_approval_binds_exactly_task_and_revision() -> None:
+    approval = ConversationEnvelope(
+        sender=ConversationActor.USER,
+        addressed_to=ConversationTarget.TEAM,
+        routed_to=ConversationTarget.TEAM,
+        message_type=ConversationMessageType.APPROVAL,
+        text="Approved.",
+        task_id="task-1",
+        revision=1,
+    )
+
+    assert approval.continuation_generation is None
+    for binding in (
+        {"task_id": "task-1"},
+        {"revision": 1},
+        {"continuation_generation": 1},
+        {"task_id": "task-1", "continuation_generation": 1},
+        {"revision": 1, "continuation_generation": 1},
+        {"task_id": "task-1", "revision": 1, "continuation_generation": 1},
+    ):
+        with pytest.raises(ValueError, match="approval"):
+            ConversationEnvelope(
+                sender=ConversationActor.USER,
+                addressed_to=ConversationTarget.TEAM,
+                routed_to=ConversationTarget.TEAM,
+                message_type=ConversationMessageType.APPROVAL,
+                text="Approved.",
+                **binding,
+            )
+
+
+def test_user_conversation_input_validates_exact_optional_binding_before_routing() -> None:
+    input_message = UserConversationInput(
+        addressed_to=ConversationTarget.FABLE,
+        message_type=ConversationMessageType.QUESTION,
+        text="What remains?",
+        task_id="task-1",
+        revision=1,
+        continuation_generation=2,
+        question_id="question-1",
+    )
+
+    assert input_message.addressed_to is ConversationTarget.FABLE
+    assert UserConversationInput(
+        addressed_to=ConversationTarget.TEAM,
+        message_type=ConversationMessageType.APPROVAL,
+        text="Approved.",
+        task_id="task-1",
+        revision=1,
+    ).continuation_generation is None
+    with pytest.raises(ValueError, match="binding"):
+        UserConversationInput(
+            addressed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Unbound partial context.",
+            task_id="task-1",
+        )
+    with pytest.raises(ValueError, match="question_id"):
+        UserConversationInput(
+            addressed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which revision?",
+            task_id="task-1",
+            revision=1,
+            continuation_generation=2,
+        )
+    with pytest.raises(ValueError, match="reply_to_question_id"):
+        UserConversationInput(
+            addressed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.ANSWER,
+            text="Revision one.",
+            task_id="task-1",
+            revision=1,
+            continuation_generation=2,
+        )
+    with pytest.raises(TypeError, match="sender"):
+        UserConversationInput(  # type: ignore[call-arg]
+            addressed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Coordinator must set this.",
+            sender=ConversationActor.USER,
+        )
+    with pytest.raises(TypeError, match="routed_to"):
+        UserConversationInput(  # type: ignore[call-arg]
+            addressed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.STATEMENT,
+            text="Coordinator must route this.",
+            routed_to=ConversationTarget.FABLE,
+        )
+    with pytest.raises(ValueError, match="status"):
+        UserConversationInput(
+            addressed_to=ConversationTarget.TEAM,
+            message_type=ConversationMessageType.STATUS,
+            text="The user cannot emit this.",
+        )
+
+
+def test_directed_agent_question_has_limited_targets_and_bounded_nonempty_text() -> None:
+    question = DirectedAgentQuestion(
+        addressed_to="sol",
+        text="Which contract is ready?",
+        reason="The review is blocked on the persisted envelope.",
+    )
+
+    assert question.addressed_to == "sol"
+    with pytest.raises(ValueError, match="addressed_to"):
+        DirectedAgentQuestion(
+            addressed_to="team",  # type: ignore[arg-type]
+            text="Invalid target.",
+            reason="A direct question cannot target the whole team.",
+        )
+    with pytest.raises(ValueError, match="reason"):
+        DirectedAgentQuestion(addressed_to="user", text="Question?", reason="x" * (16 * 1024 + 1))
+    with pytest.raises(ValueError, match="reason"):
+        DirectedAgentQuestion(addressed_to="user", text="Question?", reason="Contains\x7fcontrol")
+    with pytest.raises(ValueError, match="text"):
+        DirectedAgentQuestion(addressed_to="fable", text="", reason="Reason.")
 
 
 def test_task_brief_is_immutable_and_round_trips() -> None:

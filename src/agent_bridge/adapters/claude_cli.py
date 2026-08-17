@@ -8,6 +8,8 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
+from enum import Enum
 
 from agent_bridge.adapters.base import AgentRunResult
 from agent_bridge.contracts import (
@@ -29,10 +31,28 @@ METERED_ENV_KEYS = frozenset({
     "GOOGLE_APPLICATION_CREDENTIALS",
 })
 MAX_CLAUDE_AUDIT_EVENTS = 1_024
+_SAFE_CLAUDE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_LOGIN_REQUIRED_SUBSCRIPTION_TYPES = frozenset({"max"})
+
+
+class ClaudeAuthFailureCategory(str, Enum):
+    """Allowlisted structural auth failures safe for coordinator handling."""
+
+    LOGIN_REQUIRED = "login_required"
 
 
 class SubscriptionAuthError(RuntimeError):
     """Claude CLI is not unambiguously using a saved paid subscription."""
+
+    def __init__(self, category: ClaudeAuthFailureCategory | None = None) -> None:
+        if category is not None and not isinstance(category, ClaudeAuthFailureCategory):
+            raise ValueError("subscription auth failure category is invalid")
+        self.category = category
+        super().__init__(
+            "Claude subscription login is required"
+            if category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+            else "Claude subscription authentication could not be verified"
+        )
 
 
 class ClaudeRunError(RuntimeError):
@@ -102,7 +122,7 @@ class ClaudeCLI:
         run_id = f"claude-subscription-preflight-{next(self._preflight_ids)}"
         result = await self._run_preflight(run_id)
         if result.interrupted:
-            raise SubscriptionAuthError("Claude subscription authentication was interrupted")
+            raise SubscriptionAuthError()
         return self._parse_auth_status(result)
 
     async def plan(
@@ -159,6 +179,30 @@ class ClaudeCLI:
             expected_task_id=None,
         )
 
+    async def answer_sol_question(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        task_id: str,
+        prompt: str,
+        context: str,
+    ) -> AgentRunResult:
+        session_id = self._validated_session_id(session_id)
+        return await self._run_contract(
+            run_id=run_id,
+            schema=FABLE_CLARIFICATION_SCHEMA,
+            contract_name="FableClarification",
+            prompt=self._answer_sol_question_prompt(
+                task_id=task_id,
+                prompt=prompt,
+                context=context,
+            ),
+            session_id=session_id,
+            expected_task_id=None,
+            strict_session_id=True,
+        )
+
     async def review(
         self, *, run_id: str, session_id: str, prompt: str,
     ) -> AgentRunResult:
@@ -183,17 +227,23 @@ class ClaudeCLI:
 
     def _parse_auth_status(self, result: ProcessResult) -> ClaudeAuthStatus:
         if result.exit_code != 0 or not result.stdout:
-            raise SubscriptionAuthError("Claude subscription authentication could not be verified")
+            raise SubscriptionAuthError()
         auth_document = "\n".join(result.stdout)
         try:
             status = json.loads(auth_document)
         except (json.JSONDecodeError, TypeError):
-            raise SubscriptionAuthError(
-                "Claude subscription authentication could not be verified"
-            ) from None
+            raise SubscriptionAuthError() from None
         if not isinstance(status, Mapping):
-            raise SubscriptionAuthError("Claude subscription authentication could not be verified")
+            raise SubscriptionAuthError()
         subscription_type = status.get("subscriptionType")
+        if (
+            status.get("loggedIn") is False
+            and status.get("authMethod") == "claude.ai"
+            and status.get("apiProvider") == "firstParty"
+            and isinstance(subscription_type, str)
+            and subscription_type in _LOGIN_REQUIRED_SUBSCRIPTION_TYPES
+        ):
+            raise SubscriptionAuthError(ClaudeAuthFailureCategory.LOGIN_REQUIRED)
         if (
             status.get("loggedIn") is not True
             or status.get("authMethod") != "claude.ai"
@@ -201,7 +251,7 @@ class ClaudeCLI:
             or not isinstance(subscription_type, str)
             or not subscription_type.strip()
         ):
-            raise SubscriptionAuthError("Claude subscription authentication is required")
+            raise SubscriptionAuthError()
         return ClaudeAuthStatus(
             logged_in=True,
             auth_method="claude.ai",
@@ -218,8 +268,11 @@ class ClaudeCLI:
         prompt: str,
         session_id: str | None,
         expected_task_id: str | None,
+        strict_session_id: bool = False,
     ) -> AgentRunResult:
-        auth_result = await self._run_preflight(run_id)
+        auth_result = await self._run_preflight(
+            f"claude-subscription-preflight-{next(self._preflight_ids)}"
+        )
         if auth_result.interrupted:
             return AgentRunResult(
                 run_id=run_id,
@@ -259,14 +312,39 @@ class ClaudeCLI:
             on_line=lambda stream, line: None,
         )
         try:
-            parsed = self._parse_events(process.stdout, interrupted=process.interrupted)
+            parsed = self._parse_events(
+                process.stdout,
+                interrupted=process.interrupted,
+                strict_session_id=session_id if strict_session_id else None,
+            )
         except _EventParseError as error:
+            events = (
+                self._without_session_ids(error.events)
+                if strict_session_id
+                else error.events
+            )
             raise ClaudeRunError(
                 str(error),
-                result=self._failed_result(run_id, process, error.events),
+                result=self._failed_result(run_id, process, events),
             ) from None
         events = parsed.audit_events
         cli_session_id = parsed.session_id
+        if strict_session_id and cli_session_id != session_id:
+            message = (
+                "Claude resumed a different session than requested"
+                if cli_session_id is not None
+                else "Claude output is missing the required resumed session ID"
+            )
+            raise ClaudeRunError(
+                message,
+                result=self._failed_result(
+                    run_id,
+                    process,
+                    self._without_session_ids(events),
+                    None,
+                    interrupted=process.interrupted,
+                ),
+            )
         if (
             session_id is not None
             and cli_session_id is not None
@@ -331,7 +409,7 @@ class ClaudeCLI:
 
     @staticmethod
     def _parse_events(
-        lines: tuple[str, ...], *, interrupted: bool,
+        lines: tuple[str, ...], *, interrupted: bool, strict_session_id: str | None = None,
     ) -> _ParsedEvents:
         events: list[Mapping[str, object]] = []
         dropped_audit_events = 0
@@ -359,6 +437,15 @@ class ClaudeCLI:
                 audit_event = {"type": "system", "subtype": "init"}
                 candidate_session_id = event.get("session_id")
                 if isinstance(candidate_session_id, str) and candidate_session_id:
+                    if (
+                        strict_session_id is not None
+                        and session_id is not None
+                        and candidate_session_id != session_id
+                    ):
+                        raise _EventParseError(
+                            "Claude emitted conflicting system/init session IDs",
+                            tuple(events),
+                        )
                     audit_event["session_id"] = candidate_session_id
                     if session_id is None:
                         session_id = candidate_session_id
@@ -436,6 +523,29 @@ class ClaudeCLI:
         return None
 
     @staticmethod
+    def _without_session_ids(
+        events: tuple[Mapping[str, object], ...],
+    ) -> tuple[Mapping[str, object], ...]:
+        redacted_events: list[Mapping[str, object]] = []
+        for event in events:
+            redacted = freeze_json({
+                key: value for key, value in event.items() if key != "session_id"
+            })
+            if not isinstance(redacted, Mapping):
+                raise RuntimeError("audit event normalization did not produce an object")
+            redacted_events.append(redacted)
+        return tuple(redacted_events)
+
+    @staticmethod
+    def _validated_session_id(session_id: object) -> str:
+        if (
+            not isinstance(session_id, str)
+            or _SAFE_CLAUDE_SESSION_ID.fullmatch(session_id) is None
+        ):
+            raise ValueError("session_id must be a safe provider session ID")
+        return session_id
+
+    @staticmethod
     def _validate_payload(
         contract_name: str, payload: Mapping[str, object],
     ) -> Mapping[str, object]:
@@ -470,3 +580,18 @@ class ClaudeCLI:
             "Only JSON matching the supplied schema may be final output.",
         ))
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _answer_sol_question_prompt(*, task_id: str, prompt: str, context: str) -> str:
+        return "\n\n".join((
+            "Fable owns intent and scope for this exact task revision.",
+            (
+                "Answer Sol only from the approved task context. Fable may give "
+                "same-scope guidance, ask Sol for approved evidence, or produce "
+                "revision N+1 when the requested answer changes scope."
+            ),
+            f"Coordinator task ID: {task_id}.",
+            f"Applicable AGENTS.md and repository context:\n{context}",
+            f"Sol's directed question:\n{prompt}",
+            "Only JSON matching the supplied FableClarification schema may be final output.",
+        ))

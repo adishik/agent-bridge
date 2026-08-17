@@ -6,6 +6,14 @@ import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
+from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+)
+from agent_bridge.store import NewRequestPayload, SQLiteStore
+
 
 STATIC = Path("src/agent_bridge/static")
 
@@ -15,7 +23,10 @@ class _RenderedLayout(HTMLParser):
         super().__init__()
         self.elements: list[tuple[str, dict[str, str | None]]] = []
         self.ids: set[str] = set()
+        self.id_counts: dict[str, int] = {}
         self.text: list[str] = []
+        self.ancestors: dict[str, tuple[str, ...]] = {}
+        self._open_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
@@ -23,7 +34,36 @@ class _RenderedLayout(HTMLParser):
         values = dict(attrs)
         self.elements.append((tag, values))
         if values.get("id") is not None:
-            self.ids.add(str(values["id"]))
+            element_id = str(values["id"])
+            self.ids.add(element_id)
+            self.id_counts[element_id] = self.id_counts.get(element_id, 0) + 1
+            self.ancestors[element_id] = tuple(
+                str(open_attrs["id"])
+                for _open_tag, open_attrs in self._open_elements
+                if open_attrs.get("id") is not None
+            )
+        if tag not in {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "source",
+            "track",
+            "wbr",
+        }:
+            self._open_elements.append((tag, values))
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._open_elements) - 1, -1, -1):
+            if self._open_elements[index][0] == tag:
+                del self._open_elements[index:]
+                return
 
     def handle_data(self, data: str) -> None:
         self.text.append(data)
@@ -52,17 +92,34 @@ def _run_module_harness(source: str) -> None:
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() -> None:
+def test_index_uses_one_semantic_three_pane_application_workspace() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     rendered = _RenderedLayout()
     rendered.feed(html)
 
+    application_landmarks = [
+        attrs
+        for _tag, attrs in rendered.elements
+        if attrs.get("role") == "application"
+    ]
+    assert application_landmarks == [
+        {"id": "workspace", "role": "application", "aria-label": "Team workspace"}
+    ]
     assert {
         "app-header",
         "workspace",
+        "project-navigation",
+        "project-list",
+        "chat-list",
+        "new-chat",
         "task-list",
         "conversation",
+        "conversation-heading",
+        "conversation-status",
+        "conversation-context",
         "task-inspector",
+        "task-inspector-heading",
+        "activity-audit",
         "composer",
         "message-input",
         "usage-modal",
@@ -73,22 +130,27 @@ def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() 
         "inspector-drawer-toggle",
         "repository-authority-note",
     } <= rendered.ids
-    assert rendered.element("aside", "task-list")["aria-label"] == "Tasks"
-    assert rendered.element("section", "conversation")["aria-live"] == "polite"
+    assert rendered.element("nav", "project-navigation")["aria-label"] == "Projects and chats"
+    assert rendered.element("ul", "project-list")["aria-label"] == "Projects"
+    assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
+    assert rendered.element("button", "new-chat")["type"] == "button"
+    assert rendered.element("main", "conversation-shell")["aria-labelledby"] == "conversation-heading"
+    assert rendered.element("p", "conversation-status")["aria-live"] == "polite"
     assert (
-        rendered.element("aside", "task-inspector")["aria-label"]
-        == "Task inspector"
+        rendered.element("aside", "task-inspector-panel")["aria-labelledby"]
+        == "task-inspector-heading"
     )
+    assert "open" not in rendered.element("details", "activity-audit")
     assert rendered.element("button", "task-drawer-toggle")["aria-controls"] == (
-        "task-list"
+        "project-navigation"
     )
     assert rendered.element("button", "inspector-drawer-toggle")[
         "aria-controls"
-    ] == "task-inspector"
+    ] == "task-inspector-panel"
     assert "open" not in rendered.element("dialog", "usage-modal")
     modal_markup = html[html.index('<dialog\n      id="usage-modal"'):html.index("</dialog>")]
     assert 'id="bootstrap-retry"' in modal_markup
-    assert "disabled" in rendered.element("button", "composer-submit")
+    assert rendered.element("button", "composer-submit")["type"] == "submit"
     assert rendered.element("script", "bridge-module")["type"] == "module"
     assert rendered.element("script", "bridge-module")["src"] == "/static/app.js"
     assert any(
@@ -105,6 +167,151 @@ def test_index_renders_semantic_option_a_layout_and_accessible_mobile_drawers() 
     )
     assert "Claude account usage credits are disabled" in page_text
     assert "cannot verify or change this account setting" in page_text
+
+
+def test_index_accessibility_contract_has_explicit_labels_and_safe_hooks() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert [tag for tag, _attrs in rendered.elements].count("h1") == 1
+    page_text = " ".join(" ".join(rendered.text).split())
+    assert all(label in page_text for label in ("Projects", "Chats", "Conversation", "Task inspector"))
+    assert all(
+        attrs.get("type") is not None
+        for tag, attrs in rendered.elements
+        if tag == "button"
+    )
+    assert rendered.element("span", "fable-avatar")["aria-label"] == "Fable"
+    assert rendered.element("span", "sol-avatar")["aria-label"] == "Sol"
+    assert "Fable · Subscription · checking" in page_text
+    assert "Sol · checking" in page_text
+    assert any(
+        attrs.get("aria-current") == "true"
+        for _tag, attrs in rendered.elements
+    )
+
+    live_regions = [
+        attrs
+        for _tag, attrs in rendered.elements
+        if attrs.get("aria-live") is not None
+    ]
+    assert all(attrs.get("role") in {"status", "alert"} for attrs in live_regions)
+    assert re.search(r"<[^>]+\s(?:on[a-z]+|style)=", html, flags=re.IGNORECASE) is None
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert all(
+        sink not in script
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
+    )
+
+
+def test_index_keeps_conversation_first_with_single_mobile_drawer_controls() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    element_ids = [attrs.get("id") for _tag, attrs in rendered.elements]
+    assert element_ids.index("conversation") < element_ids.index("project-navigation")
+    assert element_ids.index("conversation") < element_ids.index("task-inspector")
+    for panel_id, heading_id in (
+        ("project-navigation", "project-navigation-heading"),
+        ("task-inspector-panel", "task-inspector-heading"),
+    ):
+        panel = next(
+            attrs
+            for _tag, attrs in rendered.elements
+            if attrs.get("id") == panel_id
+        )
+        assert panel["data-drawer"] == "mobile"
+        assert panel["aria-labelledby"] == heading_id
+        assert panel["tabindex"] == "-1"
+    assert element_ids.count("task-drawer-toggle") == 1
+    assert element_ids.count("inspector-drawer-toggle") == 1
+
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+    styles = (STATIC / "styles.css").read_text(encoding="utf-8")
+    assert 'event.key !== "Escape"' in script
+    assert "panel.inert" in script
+    assert "focusTarget?.focus()" in script
+    assert "@media (prefers-reduced-motion: reduce)" in styles
+
+
+def test_drawer_controls_target_complete_unique_panels_and_resolvable_idrefs() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    drawer_contracts = (
+        (
+            "task-drawer-toggle",
+            "project-navigation",
+            ("project-list", "chat-list", "new-chat", "fable-status", "sol-status"),
+        ),
+        (
+            "inspector-drawer-toggle",
+            "task-inspector-panel",
+            ("task-inspector", "task-inspector-summary", "task-controls", "activity-audit"),
+        ),
+    )
+    for toggle_id, panel_id, required_children in drawer_contracts:
+        toggle = rendered.element("button", toggle_id)
+        assert toggle["aria-controls"] == panel_id
+        assert rendered.id_counts[panel_id] == 1
+        for child_id in required_children:
+            assert panel_id in rendered.ancestors[child_id]
+
+    for _tag, attrs in rendered.elements:
+        for attribute in ("aria-controls", "aria-describedby", "aria-labelledby", "for"):
+            value = attrs.get(attribute)
+            if value is None:
+                continue
+            for reference in value.split():
+                assert rendered.id_counts[reference] == 1
+        href = attrs.get("href")
+        if href is not None and href.startswith("#"):
+            assert rendered.id_counts[href[1:]] == 1
+
+
+def test_static_shells_survive_controller_replacement_roots() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    rendered = _RenderedLayout()
+    rendered.feed(html)
+
+    assert rendered.element("main", "conversation-shell")["aria-labelledby"] == (
+        "conversation-heading"
+    )
+    assert rendered.element("section", "conversation")["aria-label"] == (
+        "Conversation history"
+    )
+    assert "conversation-shell" in rendered.ancestors["conversation"]
+    for persistent_id in (
+        "conversation-heading",
+        "selected-project-name",
+        "selected-chat-name",
+        "conversation-status",
+        "conversation-context",
+        "composer",
+    ):
+        assert "conversation" not in rendered.ancestors[persistent_id]
+
+    assert rendered.element("aside", "task-inspector-panel")["aria-labelledby"] == (
+        "task-inspector-heading"
+    )
+    assert rendered.element("div", "task-inspector")["aria-labelledby"] == (
+        "task-inspector-heading"
+    )
+    assert "task-inspector-panel" in rendered.ancestors["task-inspector"]
+    for persistent_id in (
+        "task-inspector-heading",
+        "task-inspector-summary",
+        "task-controls",
+        "activity-audit",
+    ):
+        assert "task-inspector" not in rendered.ancestors[persistent_id]
+
+    assert "fable-status" not in rendered.ancestors["fable-avatar"]
+    assert "sol-status" not in rendered.ancestors["sol-avatar"]
+    assert "slack" not in html.lower()
 
 
 def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
@@ -208,7 +415,6 @@ def test_safe_rendering_preserves_untrusted_task_and_message_text() -> None:
         "scope issue", "Fable risk", "fix it", "criterion proof",
         "Architecture impact", "Ambiguous scope", "Could widen changes", "Option B",
             "Clarification reasoning", "Clarification question", "Review question",
-            "activity-hash",
             "Approved at 2026-08-10T01:00:00Z", "Correction count", "2",
             "Sol Correcting", "2026-08-10T01:02:03Z", "Sol · started 2026-08-10T01:01:00Z",
       ]) {{
@@ -568,7 +774,7 @@ def test_injected_bootstrap_and_events_build_latest_task_state_without_live_call
     _run_module_harness(harness)
 
 
-def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> None:
+def test_every_persisted_event_kind_reduces_without_raw_conversation_details() -> None:
     harness = r"""
       class Node {
         constructor(tag) {
@@ -630,12 +836,13 @@ def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> N
       if (task.state !== "failed") process.exit(2);
       if (task.history.length !== events.length - 1 || task.history[0].sequence !== 2) process.exit(3);
       if (task.activity.command_sha256 !== "hash-only") process.exit(23);
+      if (task.activity_kind !== "agent_event" || task.activity.type !== "command_execution") process.exit(29);
       if (task.outcome.architecture_docs !== "unchanged") process.exit(4);
       if (task.clarification.question_for_user !== "Choose one") process.exit(5);
       if (task.review.question_for_user !== "Review question") process.exit(6);
       const fullText = created.map((node) => node.textContent).join("\n");
-      for (const expected of ["why_it_matters", "changed.py", "RuntimeError", "Review question"]) {
-        if (!fullText.includes(expected)) process.exit(7);
+      for (const rawDetail of ["why_it_matters", "command_sha256", "exit_code"]) {
+        if (fullText.includes(rawDetail)) process.exit(7);
       }
       if (created.some((node) => node.textContent === "Command Execution")) process.exit(24);
       const statusRows = conversation.children.filter(
@@ -644,13 +851,10 @@ def test_every_persisted_event_kind_reduces_and_renders_full_safe_details() -> N
       if (statusRows.length !== 1 || !statusRows[0].textContent.includes("Sol Running")) {
         process.exit(25);
       }
-      if (created.filter((node) => node.tag === "details").length !== events.length - 2) process.exit(8);
       if (!fullText.includes("#1") || !fullText.includes("task-1") || !fullText.includes("message")) process.exit(9);
-      if (!fullText.includes('"sequence": 1') || !fullText.includes('"kind": "message"')) process.exit(10);
-      if (!fullText.includes("r1") || !fullText.includes('"revision": 1')) process.exit(11);
+      if (!fullText.includes("r1")) process.exit(11);
       const outcomeArticle = conversation.children[3];
       if (!outcomeArticle.children[2].textContent.includes("r1")) process.exit(12);
-      if (!outcomeArticle.children[3].children[1].textContent.includes('"revision": 1')) process.exit(13);
 
       conversation.children = [];
       for (const event of [
@@ -741,6 +945,393 @@ def test_conversation_is_bounded_and_metadata_classes_fail_closed() -> None:
     _run_module_harness(harness)
 
 
+def test_directed_conversation_cards_use_safe_envelopes_and_exact_bindings() -> None:
+    harness = r"""
+      class Node {
+        constructor(tag) {
+          this.tag = tag; this.children = []; this.attributes = {}; this.dataset = {};
+          this.className = ""; this._text = ""; this.listeners = {}; this.disabled = false;
+        }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        replaceChildren(...children) { this.children = [...children]; this._text = ""; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener(name, listener) { this.listeners[name] = listener; }
+        remove() { this.removed = true; }
+      }
+      const conversation = new Node("section");
+      const roots = {"#conversation": conversation, "#conversation-empty": null};
+      const documentRoot = {
+        createElement(tag) { return new Node(tag); },
+        querySelector(selector) { return roots[selector] ?? null; },
+      };
+      const solQuestion = {
+        kind: "conversation", actor: "sol", task_id: "task-a", sequence: 8,
+        payload: {
+              sender: "sol", addressed_to: "fable", routed_to: "fable", message_type: "question",
+              text: "Need the exact test evidence.", task_id: "task-a", revision: 2,
+              continuation_generation: 3, question_id: "question-a", reply_to_question_id: null,
+        },
+      };
+      const card = bridge.renderConversationEvent(documentRoot, solQuestion);
+      if (!card || !card.className.includes("message-sol") || !card.className.includes("target-fable")) process.exit(2);
+      const cardText = card.children.map((node) => node.textContent).join("\n");
+      if (!cardText.includes("Sol → Fable") || !cardText.includes("Task task-a · r2") || !cardText.includes("Question question-a")) process.exit(3);
+      if (!cardText.includes("S")) process.exit(4);
+      const routed = bridge.renderConversationEvent(documentRoot, {
+        kind: "conversation", actor: "user", task_id: null, payload: {
+              sender: "user", addressed_to: "sol", routed_to: "fable", message_type: "statement",
+              text: "Please plan this.", task_id: null, revision: null,
+              continuation_generation: null, question_id: null, reply_to_question_id: null,
+        },
+      });
+      if (!routed || !routed.children.map((node) => node.textContent).join("\n").includes("User → Fable")) process.exit(14);
+      if (!routed.children.map((node) => node.textContent).join("\n").includes("Addressed to Sol · routed to Fable before approval")) process.exit(15);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "conversation", payload: {sender: "<img>", text: "unsafe"}}) !== null) process.exit(5);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "conversation", actor: "sol", payload: {sender: "fable", addressed_to: "user", routed_to: "user", message_type: "statement", text: "ambiguous"}}) !== null) process.exit(16);
+      if (bridge.renderConversationEvent(documentRoot, {kind: "agent_event", payload: {type: "command"}}) !== null) process.exit(6);
+
+      const bindings = [];
+      bridge.renderPendingConversationCards(documentRoot, [
+        {task_id: "task-a", revision: 2, continuation_generation: 3, pending_question: {
+          question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user",
+          text: "Which test?", revision: 2, continuation_generation: 3,
+        }},
+        {task_id: "task-b", revision: 5, continuation_generation: 7, pending_question: {
+          question_id: "question-b", asked_by: "fable", addressed_to: "user", routed_to: "user",
+          text: "Which scope?", revision: 5, continuation_generation: 7,
+        }},
+        {task_id: "task-c", revision: 1, continuation_generation: 4, exchange_permission: {
+          request_id: "permission-c", revision: 1, continuation_generation: 4,
+        }},
+      ], {
+        onReply(binding) { bindings.push(binding); },
+        onGrant(binding) { bindings.push(binding); },
+      }, {projectId: "project-a", sessionId: "chat-a"});
+      const actionCards = conversation.children.filter((node) => node.className === "conversation-action-card");
+      if (actionCards.length !== 3) process.exit(7);
+      const buttons = actionCards.flatMap((card) => card.children).filter((node) => node.tag === "button");
+      buttons.find((button) => button.textContent === "Reply").listeners.click();
+      buttons.find((button) => button.textContent === "Allow 3 more exchanges").listeners.click();
+      if (bindings.length !== 2 || bindings[0].taskId !== "task-a" || bindings[0].questionId !== "question-a") process.exit(8);
+      if (bindings[1].requestId !== "permission-c" || bindings[1].continuationGeneration !== 4) process.exit(9);
+
+      const state = {projectId: "project-a", sessionId: "chat-a"};
+      const ordinary = bridge.composerRequest(state, null, "Plan this", "sol");
+      if (ordinary.path !== "/api/projects/project-a/chats/chat-a/messages" || JSON.stringify(ordinary.payload) !== '{"text":"Plan this","addressed_to":"sol"}') process.exit(10);
+      const answer = bridge.composerRequest(state, bindings[0], "Use the focused lane.", "fable");
+      if (answer.path !== "/api/projects/project-a/chats/chat-a/tasks/task-a/answer" || JSON.stringify(answer.payload) !== '{"text":"Use the focused lane.","revision":2,"question_id":"question-a","continuation_generation":3}') process.exit(11);
+      const grant = bridge.exchangeGrantRequest(state, bindings[1]);
+      if (grant.path !== "/api/projects/project-a/chats/chat-a/tasks/task-c/exchanges/grant" || JSON.stringify(grant.payload) !== '{"revision":1,"continuation_generation":4,"request_id":"permission-c"}') process.exit(12);
+      let staleFailedClosed = false;
+      try { bridge.composerRequest({...state, sessionId: "other-chat"}, bindings[0], "wrong", "fable"); }
+      catch { staleFailedClosed = true; }
+      if (!staleFailedClosed) process.exit(13);
+    """
+    _run_module_harness(harness)
+
+
+def test_directed_envelope_schema_matrix_matches_all_six_contract_types() -> None:
+    harness = r"""
+      class Node {
+        constructor(tag) { this.tag = tag; this.children = []; this.attributes = {}; this.dataset = {}; this.className = ""; this._text = ""; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text; }
+        append(...children) { this.children.push(...children); }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        addEventListener() {}
+      }
+      const conversation = new Node("section");
+      const documentRoot = {createElement(tag) { return new Node(tag); }, querySelector(selector) { return selector === "#conversation" ? conversation : null; }};
+      const base = {sender: "user", addressed_to: "team", routed_to: "fable", text: "safe", task_id: null, revision: null, continuation_generation: null, question_id: null, reply_to_question_id: null};
+      const valid = [
+        {...base, message_type: "statement"},
+        {...base, message_type: "intervention", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "approval", text: "Allowed 3 more exchanges.", task_id: "task-1", revision: 1},
+        {...base, sender: "system", addressed_to: "user", routed_to: "user", message_type: "status", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, sender: "sol", addressed_to: "fable", routed_to: "fable", message_type: "question", task_id: "task-1", revision: 1, continuation_generation: 2, question_id: "question-1"},
+        {...base, sender: "fable", addressed_to: "sol", routed_to: "sol", message_type: "answer", task_id: "task-1", revision: 1, continuation_generation: 2, reply_to_question_id: "question-1"},
+      ];
+      for (const payload of valid) {
+        const event = {kind: "conversation", actor: payload.sender, task_id: payload.task_id, payload};
+        const card = bridge.renderConversationEvent(documentRoot, event);
+        if (bridge.conversationPresentation(event) === "hidden" || card === null) process.exit(2);
+        if (payload.message_type === "approval" && !card.children.map((node) => node.textContent).join("\n").includes("Allowed 3 more exchanges.")) process.exit(4);
+      }
+      const invalid = [
+        {...base, message_type: "approval", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "question", task_id: "task-1", revision: 1, continuation_generation: 2},
+        {...base, message_type: "answer", task_id: "task-1", revision: 1, continuation_generation: 2, question_id: "question-1"},
+        {...base, message_type: "approval", task_id: "task-1", revision: 1, question_id: "question-1"},
+        {...base, sender: "fable", message_type: "status"},
+        {...base, message_type: "statement", task_id: "task-1", revision: null, continuation_generation: null},
+        {...base, message_type: "statement", text: "unsafe\ncontrol"},
+        {...base, message_type: "statement", unexpected: "audit only"},
+      ];
+      for (const payload of invalid) {
+        const event = {kind: "conversation", actor: payload.sender, task_id: payload.task_id, payload};
+        if (bridge.conversationPresentation(event) !== "hidden" || bridge.renderConversationEvent(documentRoot, event) !== null) process.exit(3);
+      }
+    """
+    _run_module_harness(harness)
+
+
+def test_directed_envelopes_match_real_store_outer_associations_and_text_contract(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "directed-events.sqlite3", clock=lambda: "2026-08-12T00:00:00Z")
+    store.create_session("chat-real", "/not-a-real-repository")
+    store.prepare_new_request_action(
+        project_id="project-real",
+        session_id="chat-real",
+        task_id="new-task",
+        generation=1,
+        payload=NewRequestPayload("Route this through the team.", ConversationTarget.TEAM),
+    )
+    store.append_event(
+        "chat-real", "bound-task", "sol", "conversation", ConversationEnvelope(
+            sender=ConversationActor.SOL,
+            addressed_to=ConversationTarget.FABLE,
+            routed_to=ConversationTarget.FABLE,
+            message_type=ConversationMessageType.QUESTION,
+            text="Which exact task contract applies?",
+            task_id="bound-task",
+            revision=2,
+            continuation_generation=3,
+            question_id="question-real",
+        ).to_dict(),
+    )
+    store.append_event(
+        "chat-real", "bound-task", "fable", "conversation", ConversationEnvelope(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.ANSWER,
+            text="Use the persisted task contract.",
+            task_id="bound-task",
+            revision=2,
+            continuation_generation=3,
+            reply_to_question_id="question-real",
+        ).to_dict(),
+    )
+    produced = [event.to_dict() for event in store.events_after("chat-real", 0)]
+    store.close()
+    harness = f"""
+      const produced = {json.dumps(produced)};
+      for (const event of produced) {{
+        if (bridge.conversationPresentation(event) === "hidden") process.exit(2);
+      }}
+      const unbound = produced[0];
+      if (unbound.task_id !== "new-task" || unbound.payload.task_id !== null) process.exit(3);
+      const mismatchedOuter = {{...produced[1], task_id: "other-task"}};
+      if (bridge.conversationPresentation(mismatchedOuter) !== "hidden") process.exit(4);
+      const unsafeOuter = {{...produced[1], task_id: "bad/task"}};
+      if (bridge.conversationPresentation(unsafeOuter) !== "hidden") process.exit(5);
+      const base = {{...unbound.payload, message_type: "statement"}};
+      const valid = [
+        "x".repeat(16384),
+        "é".repeat(8192),
+        "😀".repeat(4096),
+      ];
+      for (const text of valid) {{
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text}}}}) === "hidden") process.exit(6);
+      }}
+      const originalTextEncoder = globalThis.TextEncoder;
+      try {{
+        delete globalThis.TextEncoder;
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(8);
+        globalThis.TextEncoder = {{}};
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(9);
+        globalThis.TextEncoder = class {{ encode() {{ throw new Error("encoder failed"); }} }};
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text: "safe"}}}}) !== "hidden") process.exit(10);
+      }} finally {{
+        globalThis.TextEncoder = originalTextEncoder;
+      }}
+      const invalid = [
+        "   ", "\\u0085", "\\u2003", "x".repeat(16385), "é".repeat(8193), "😀".repeat(4097),
+        "line\\nfeed", "bad\\u007fdelete", "high\\ud800", "low\\udc00",
+      ];
+      for (const text of invalid) {{
+        if (bridge.conversationPresentation({{...unbound, payload: {{...base, text}}}}) !== "hidden") process.exit(7);
+      }}
+    """
+    _run_module_harness(harness)
+
+
+def test_composer_guidance_preserves_recipient_routing_through_lease_and_binding() -> None:
+    harness = r"""
+      const ready = {sessionId: "chat-a", gate: {canCompose: true, guidance: "Ready for a new Fable plan."}, activeLease: null};
+      if (!bridge.composerGuidance(ready, null, "fable").includes("Fable is the direct planner")) process.exit(2);
+      if (!bridge.composerGuidance(ready, null, "sol").includes("addressed to Sol are visibly routed through Fable")) process.exit(3);
+      if (!bridge.composerGuidance(ready, null, "team").includes("addressed to Team are visibly routed through Fable")) process.exit(4);
+      const leased = {...ready, activeLease: {projectId: "project-a"}};
+      const leasedGuidance = bridge.composerGuidance(leased, null, "sol");
+      if (!leasedGuidance.includes("An agent is active") || !leasedGuidance.includes("routed through Fable")) process.exit(5);
+      const boundGuidance = bridge.composerGuidance(leased, {kind: "question"}, "sol");
+      if (!boundGuidance.includes("exact task and continuation") || boundGuidance.includes("An agent is active")) process.exit(6);
+      const sol = bridge.composerPresentation(ready, null, "sol");
+      if (sol.disabled || sol.recipientDisabled || sol.label !== "Message Sol" || sol.submit !== "Send" || !sol.guidance.includes("routed through Fable")) process.exit(7);
+      const lease = bridge.composerPresentation(leased, null, "team");
+      if (!lease.disabled || !lease.recipientDisabled || !lease.guidance.includes("routed through Fable")) process.exit(8);
+      const bound = bridge.composerPresentation(leased, {kind: "question"}, "sol");
+      if (bound.disabled || !bound.recipientDisabled || bound.label !== "Bound reply" || bound.submit !== "Send reply") process.exit(9);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_events_coalesce_selected_bootstrap_refresh_and_drop_stale_switch() -> None:
+    harness = r"""
+      const scheduled = [];
+      const sockets = [];
+      class Socket {
+        constructor() { this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const pendingTask = {
+        task_id: "task-a", revision: 1, state: "awaiting_user_input", continuation_generation: 2,
+        exchange_allowance: 0, exchange_consumed: 3, pending_question: {
+          question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user",
+          text: "Which exact option?", revision: 1, continuation_generation: 2,
+        }, exchange_permission: {request_id: "permission-a", revision: 1, continuation_generation: 2},
+      };
+      let alphaBootstraps = 0;
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, projects: [
+          {project_id: "alpha", label: "Alpha", branch: "main", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "beta", label: "Beta", branch: "next", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ], active_lease: null})});
+        if (url === "/api/projects/alpha/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "A", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "B", latest_sequence: 0}]})});
+        if (url === "/api/projects/alpha/chats/chat-a/bootstrap") {
+          alphaBootstraps += 1;
+          return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "alpha", session_id: "chat-a", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "main", replay_after: 0, tasks: alphaBootstraps === 1 ? [{task_id: "task-a", revision: 1, state: "sol_running"}] : [pendingTask]})});
+        }
+        if (url === "/api/projects/beta/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, project_id: "beta", session_id: "chat-b", fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", branch: "next", replay_after: 0, tasks: []})});
+        throw new Error(`unexpected ${url}`);
+      };
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket,
+        schedule(callback) { scheduled.push(callback); return scheduled.length; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 1, kind: "conversation", actor: "sol", task_id: "task-a", payload: {}})});
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 2, kind: "task_state", actor: "coordinator", task_id: "task-a", payload: {state: "awaiting_user_input", revision: 1}})});
+      if (scheduled.length !== 1) process.exit(2);
+      scheduled.shift()();
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+      if (alphaBootstraps !== 2 || controller.state.tasks[0].pending_question?.question_id !== "question-a" || controller.state.tasks[0].exchange_permission?.request_id !== "permission-a") process.exit(3);
+      sockets[0].listeners.message({data: JSON.stringify({sequence: 3, kind: "task_state", actor: "coordinator", task_id: "task-a", payload: {state: "awaiting_user_input", revision: 1}})});
+      if (scheduled.length !== 1) process.exit(4);
+      await controller.selectProject("beta");
+      scheduled.shift()();
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+      if (controller.state.projectId !== "beta" || controller.state.sessionId !== "chat-b" || alphaBootstraps !== 2) process.exit(5);
+    """
+    _run_module_harness(harness)
+
+
+def test_project_chat_refresh_is_single_flight_cursor_guarded_and_cancellable() -> None:
+    harness = r"""
+      const scheduled = [];
+      const sockets = [];
+      const deferred = [];
+      class Socket {
+        constructor() { this.listeners = {}; sockets.push(this); }
+        addEventListener(kind, listener) { this.listeners[kind] = listener; }
+        close() { this.closed = true; }
+      }
+      const bootstrap = (projectId, sessionId, tasks = []) => ({
+        csrf_token: "csrf", usage_credits_acknowledged: true, project_id: projectId, session_id: sessionId,
+        fable_ready: true, fable_status: "subscription_ready", sol_status: "ready", replay_after: 0, tasks,
+      });
+      const baseTask = {task_id: "task-a", revision: 1, state: "sol_running"};
+      const freshTask = {task_id: "task-a", revision: 1, state: "awaiting_user_input", continuation_generation: 2,
+        pending_question: {question_id: "question-a", asked_by: "sol", addressed_to: "user", routed_to: "user", text: "Which option?", revision: 1, continuation_generation: 2},
+        exchange_permission: {request_id: "permission-a", revision: 1, continuation_generation: 2}};
+      let alphaCalls = 0;
+      const fetchFunction = (url) => {
+        if (url === "/api/projects") return Promise.resolve({ok: true, status: 200, json: async () => ({csrf_token: "csrf", usage_credits_acknowledged: true, projects: [
+          {project_id: "alpha", label: "Alpha", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+          {project_id: "beta", label: "Beta", readiness: {fable_ready: true, fable_status: "subscription_ready", sol_status: "ready"}},
+        ], active_lease: null})});
+        if (url === "/api/projects/alpha/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-a", title: "A", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats?limit=50") return Promise.resolve({ok: true, status: 200, json: async () => ({chats: [{session_id: "chat-b", title: "B", latest_sequence: 0}]})});
+        if (url === "/api/projects/beta/chats/chat-b/bootstrap") return Promise.resolve({ok: true, status: 200, json: async () => bootstrap("beta", "chat-b")});
+        if (url === "/api/projects/alpha/chats/chat-a/bootstrap") {
+          alphaCalls += 1;
+          if (alphaCalls === 1 || alphaCalls === 4 || alphaCalls === 6 || alphaCalls === 8) return Promise.resolve({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+          return new Promise((resolve) => deferred.push(resolve));
+        }
+        throw new Error(`unexpected ${url}`);
+      };
+      const flush = async () => { for (let tick = 0; tick < 12; tick += 1) await Promise.resolve(); };
+      const controller = bridge.createProjectChatController({
+        fetchFunction, WebSocketCtor: Socket,
+        schedule(callback) { scheduled.push(callback); return scheduled.length; }, cancelSchedule() {},
+        location: {protocol: "http:", host: "bridge.test"}, onState() {}, onEvent() {}, onStatus() {},
+      });
+      await controller.bootstrapInitial();
+      const emit = (socket, sequence) => socket.listeners.message({data: JSON.stringify({sequence, kind: "conversation", actor: "sol", task_id: "task-a", payload: {}})});
+      emit(sockets[0], 2);
+      emit(sockets[0], 1);
+      if (scheduled.length !== 1 || controller.state.lastSequence !== 2) process.exit(2);
+      void controller.refreshSelectedBootstrap();
+      if (alphaCalls !== 1 || scheduled.length !== 1) process.exit(14);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 2 || deferred.length !== 1) process.exit(3);
+      emit(sockets[0], 3);
+      emit(sockets[0], 4);
+      if (scheduled.length !== 0) process.exit(4);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (controller.state.lastSequence !== 4 || scheduled.length !== 1) process.exit(5);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 3 || deferred.length !== 1) process.exit(6);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [freshTask])});
+      await flush();
+      if (controller.state.tasks[0].pending_question?.question_id !== "question-a") process.exit(7);
+      emit(sockets[0], 5);
+      if (scheduled.length !== 1) process.exit(8);
+      controller.stop();
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 3) process.exit(9);
+      await controller.selectChat("alpha", "chat-a");
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 5 || deferred.length !== 1) process.exit(10);
+      emit(sockets[1], 1);
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (scheduled.length !== 1 || controller.state.lastSequence !== 1) process.exit(11);
+      scheduled.shift()();
+      await flush();
+      if (alphaCalls !== 6) process.exit(15);
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 7 || deferred.length !== 1) process.exit(16);
+      controller.stop();
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [baseTask])});
+      await flush();
+      if (scheduled.length !== 0 || controller.state.lastSequence !== 1) process.exit(17);
+      await controller.selectChat("alpha", "chat-a");
+      void controller.refreshSelectedBootstrap();
+      await flush();
+      if (alphaCalls !== 9 || deferred.length !== 1) process.exit(12);
+      const switchPromise = controller.selectProject("beta");
+      deferred.shift()({ok: true, status: 200, json: async () => bootstrap("alpha", "chat-a", [freshTask])});
+      await switchPromise;
+      await flush();
+      if (controller.state.projectId !== "beta" || controller.state.sessionId !== "chat-b" || scheduled.length !== 0) process.exit(13);
+    """
+    _run_module_harness(harness)
+
+
 def test_action_requests_send_csrf_json_without_agent_text_in_urls() -> None:
     unsafe = "agent says /?key=secret#fragment <script>"
     harness = f"""
@@ -793,6 +1384,15 @@ def test_action_requests_send_csrf_json_without_agent_text_in_urls() -> None:
       if (call.options.headers["Content-Type"] !== "application/json") process.exit(6);
       if (call.options.body !== '{{"revision":3}}') process.exit(7);
       if (JSON.parse(calls[1].options.body).text !== {json.dumps(unsafe)}) process.exit(9);
+      try {{
+        await bridge.postJson(
+          async () => ({{ok: false, status: 409, json: async () => ({{detail: "current revision differs"}})}}),
+          "/api/tasks/task-1/approve", {{revision: 3}}, "csrf-token",
+        );
+        process.exit(10);
+      }} catch (error) {{
+        if (!(error instanceof bridge.HttpError) || error.status !== 409 || error.message !== "current revision differs") process.exit(11);
+      }}
       if (JSON.parse(calls[2].options.body).answer !== {json.dumps(unsafe)}) process.exit(10);
       if (JSON.parse(calls[3].options.body).title !== {json.dumps(unsafe)}) process.exit(11);
       let rejected = false;
@@ -984,14 +1584,559 @@ def test_static_assets_avoid_executable_html_sinks_and_define_responsive_grid() 
 
     forbidden = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
     assert all(token not in script for token in forbidden)
+    assert "JSON.stringify(asObject(task.activity)" not in script
+    assert "JSON.stringify(projection, null, 2)" not in script
+    assert "const details = element(documentRoot, \"details\")" not in script
     assert re.search(r"grid-template-columns\s*:\s*18rem\s+minmax\(0,\s*1fr\)\s+22rem", styles)
     assert re.search(r"@media\s*\(max-width:\s*899px\)", styles)
-    assert "#task-list.drawer-open" in styles
-    assert "#task-inspector.drawer-open" in styles
+    assert "#project-navigation.drawer-open" in styles
+    assert "#task-inspector-panel.drawer-open" in styles
     assert ".message-user" in styles
     assert ".message-fable" in styles
     assert ".message-sol" in styles
     assert ".message-coordinator" in styles
+
+
+def test_activity_sanitizer_uses_the_exact_per_kind_producer_schema() -> None:
+    harness = r"""
+      const digest = "a".repeat(64);
+      for (const status of ["completed", "declined", "failed", "in_progress", "interrupted"]) {
+        const safe = bridge.sanitizeActivity("agent_event", {
+          status, command_sha256: digest, run_id: "never", output: "never",
+        });
+        if (JSON.stringify(safe) !== JSON.stringify({status, command_sha256: digest})) process.exit(2);
+      }
+      for (const status of ["running", "pending", "success", "error", "COMPLETED"]) {
+        const safe = bridge.sanitizeActivity("agent_event", {
+          status, command_sha256: "A".repeat(64), run_id: "never",
+        });
+        if (JSON.stringify(safe) !== "{}") process.exit(3);
+      }
+      for (const kind of ["action_error", "stop_error", "resume_drift"]) {
+        const safe = bridge.sanitizeActivity(kind, {
+          status: "completed", command_sha256: digest, raw_output: "never",
+        });
+        if (JSON.stringify(safe) !== "{}") process.exit(4);
+      }
+      if (bridge.sanitizeActivity("unrecognized", {status: "completed"}) !== null) process.exit(5);
+    """
+    _run_module_harness(harness)
+
+
+def test_activity_sanitizer_projects_valid_agent_fields_independently() -> None:
+    harness = r"""
+      const validDigest = "a".repeat(64);
+      const invalidDigest = "A".repeat(64);
+      const cases = [
+        [{status: "completed"}, {status: "completed"}],
+        [{command_sha256: validDigest}, {command_sha256: validDigest}],
+        [{status: "completed", command_sha256: invalidDigest}, {status: "completed"}],
+        [{status: "running", command_sha256: validDigest}, {command_sha256: validDigest}],
+        [{status: "completed", command_sha256: validDigest}, {status: "completed", command_sha256: validDigest}],
+        [{status: "running", command_sha256: invalidDigest}, {}],
+      ];
+      for (const [source, expected] of cases) {
+        if (JSON.stringify(bridge.sanitizeActivity("agent_event", source)) !== JSON.stringify(expected)) process.exit(2);
+      }
+      for (const kind of ["action_error", "stop_error", "resume_drift"]) {
+        if (JSON.stringify(bridge.sanitizeActivity(kind, {status: "completed", command_sha256: validDigest})) !== "{}") process.exit(3);
+      }
+    """
+    _run_module_harness(harness)
+
+
+def test_warm_copper_tokens_keep_controls_visible_and_accessible() -> None:
+    styles = (STATIC / "styles.css").read_text(encoding="utf-8")
+
+    required_tokens = {
+        "--ink-950": "#211a17",
+        "--ink-800": "#3b302b",
+        "--cream-50": "#fffaf3",
+        "--cream-100": "#f6ecdf",
+        "--copper-700": "#9a4524",
+        "--copper-600": "#b65a31",
+        "--copper-100": "#f4d8c7",
+        "--green-700": "#49634e",
+        "--green-100": "#dce8da",
+        "--danger-700": "#8b2f2f",
+        "--focus-ring": "#176b87",
+    }
+    for token, color in required_tokens.items():
+        assert re.search(rf"{re.escape(token)}\s*:\s*{color}\s*;", styles)
+    assert "slack" not in styles.lower()
+    assert "#6a4d91" not in styles.lower()
+    assert re.search(r"outline:\s*(?:2|3)px solid var\(--focus-ring\)", styles)
+    assert "min-height: 44px" in styles
+    assert re.search(r"\.skip-link\s*\{[^}]*min-height:\s*44px", styles, re.S)
+    assert re.search(r"\.field-group input\s*,\s*\.field-group textarea\s*\{[^}]*min-height:\s*44px", styles, re.S)
+    assert "select:focus-visible" in styles
+    assert "summary:focus-visible" in styles
+    assert "@media (max-width: 899px)" in styles
+    assert "@media (prefers-reduced-motion: reduce)" in styles
+    assert "@media (forced-colors: active)" in styles
+
+    root = re.search(r":root\s*\{(?P<body>.*?)\}", styles, re.S)
+    assert root is not None
+    tokens = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", root.group("body")))
+
+    declarations: dict[tuple[str, str], list[str]] = {}
+    for header, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles, re.S):
+        properties = re.findall(r"([\w-]+)\s*:\s*([^;{}]+);", body)
+        for selector in (item.strip() for item in header.split(",")):
+            for property_name, value in properties:
+                declarations.setdefault((selector, property_name), []).append(value.strip())
+
+    color_atom = re.compile(
+        r"var\(--[\w-]+\)|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{3}(?![0-9a-fA-F])|"
+        r"rgb\([^)]*\)|transparent"
+    )
+
+    def parsed_color(
+        selector: str,
+        property_name: str,
+        *,
+        occurrence: int = 0,
+        atom: int = -1,
+    ) -> str:
+        value = declarations[(selector, property_name)][occurrence]
+        colors = color_atom.findall(value)
+        assert colors, f"missing measurable color in {selector} {property_name}: {value}"
+        return colors[atom]
+
+    def resolve(value: str, backdrop: str) -> str:
+        value = value.strip()
+        match = re.fullmatch(r"var\((--[\w-]+)\)", value)
+        if match:
+            token_value = tokens[match.group(1)]
+            token_colors = color_atom.findall(token_value)
+            return resolve(token_colors[-1] if token_colors else token_value, backdrop)
+        if value == "transparent":
+            return resolve(backdrop, "#ffffff")
+        if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
+            return "#" + "".join(channel * 2 for channel in value[1:])
+        rgb = re.fullmatch(
+            r"rgb\(\s*(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})(?:\s*/\s*(\d{1,3})%)?\s*\)",
+            value,
+        )
+        if rgb:
+            red, green, blue = (int(channel) for channel in rgb.group(1, 2, 3))
+            assert all(0 <= channel <= 255 for channel in (red, green, blue))
+            opacity = int(rgb.group(4) or "100") / 100
+            if opacity < 1:
+                resolved_backdrop = resolve(backdrop, "#ffffff")
+                base = tuple(
+                    int(resolved_backdrop[index:index + 2], 16)
+                    for index in (1, 3, 5)
+                )
+                red, green, blue = (
+                    round(channel * opacity + under * (1 - opacity))
+                    for channel, under in zip((red, green, blue), base)
+                )
+            return f"#{red:02x}{green:02x}{blue:02x}"
+        assert re.fullmatch(r"#[0-9a-fA-F]{6}", value), value
+        return value.lower()
+
+    def luminance(hex_color: str) -> float:
+        channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(foreground: str, background: str) -> float:
+        lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+        return (lighter + 0.05) / (darker + 0.05)
+
+    def pairing(
+        foreground: str,
+        background: str,
+        backdrop: str,
+        threshold: float,
+        label: str,
+    ) -> tuple[str, str, str, float, str]:
+        return foreground, background, backdrop, threshold, label
+
+    surface = parsed_color("body", "background")
+    ink = parsed_color("body", "color")
+    panel = tokens["--panel"]
+    muted = tokens["--muted"]
+    coordinator_soft = tokens["--coordinator-soft"]
+    body_tint = resolve(parsed_color("body", "background", atom=0), surface)
+    nav_surface = resolve(parsed_color("#project-navigation", "background"), surface)
+    inspector_surface = resolve(parsed_color("#task-inspector-panel", "background"), surface)
+    composer_surface = resolve(parsed_color("#composer", "background"), surface)
+
+    adjacencies: dict[
+        tuple[str, str], list[tuple[str, str, str, float, str]]
+    ] = {}
+
+    def put(
+        selector: str,
+        property_name: str,
+        *cases: tuple[str, str, str, float, str],
+    ) -> None:
+        key = (selector, property_name)
+        assert key not in adjacencies, key
+        adjacencies[key] = list(cases)
+
+    def text_case(foreground: str, background: str, backdrop: str, label: str):
+        return pairing(foreground, background, backdrop, 4.5, label)
+
+    def indicator_case(foreground: str, background: str, backdrop: str, label: str):
+        return pairing(foreground, background, backdrop, 3, label)
+
+    # Explicit text declarations and the concrete surfaces reached through the
+    # cascade. Repeated cases are intentional where one declaration is inherited
+    # on multiple actor/state surfaces.
+    text_surfaces = {
+        "body": [(ink, surface, surface, "body text")],
+        ".skip-link": [(parsed_color(".skip-link", "color"), parsed_color(".skip-link", "background"), surface, "skip-link text")],
+        ".brand-block span": [(muted, parsed_color("#app-header", "background"), body_tint, "header metadata")],
+        ".project-navigation-label": [(muted, panel, surface, "navigation label")],
+        ".project-navigation-label strong": [(ink, panel, surface, "navigation label emphasis")],
+        ".project-navigation-button": [(muted, panel, surface, "navigation button")],
+        ".project-navigation-button:hover:not(:disabled)": [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation hover")],
+        '.project-navigation-button[aria-current="true"]': [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation current")],
+        ".project-navigation-button:disabled": [("var(--ink-800)", panel, surface, "navigation disabled")],
+        ".status-pill": [(muted, coordinator_soft, surface, "presence badge")],
+        ".state-badge": [(muted, coordinator_soft, panel, "task state badge")],
+        ".eyebrow": [("var(--brand)", panel, surface, "eyebrow")],
+        ".empty-state": [(muted, panel, surface, "empty state")],
+        ".form-guidance": [(muted, composer_surface, surface, "composer guidance")],
+        ".metadata": [(muted, panel, surface, "metadata")],
+        ".task-meta": [(muted, panel, surface, "task metadata")],
+        ".task-list-button": [(ink, panel, nav_surface, "task button inherited text")],
+        ".conversation-intro > p:last-child": [(muted, parsed_color(".conversation-intro", "background"), body_tint, "conversation intro")],
+        ".message-avatar": [(parsed_color(".message-avatar", "color"), parsed_color(".message-avatar", "background"), panel, "coordinator avatar")],
+        ".message time": [
+            (muted, parsed_color(selector, "background"), panel, f"{selector.removeprefix('.message-')} message time")
+            for selector in (".message-user", ".message-fable", ".message-sol", ".message-coordinator")
+        ],
+        ".conversation-status": [(muted, parsed_color(".conversation-status", "background"), surface, "conversation status")],
+        ".task-section-empty": [(muted, panel, inspector_surface, "empty task section")],
+        ".button": [(ink, panel, surface, "button text")],
+        ".button:disabled": [("var(--ink-800)", "var(--cream-100)", surface, "disabled button")],
+        ".button-primary": [(parsed_color(".button-primary", "color"), "var(--brand)", surface, "primary button")],
+        ".button-danger": [("var(--danger)", panel, surface, "danger button")],
+        ".field-group textarea": [(ink, panel, inspector_surface, "field textarea")],
+        ".field-group input": [(ink, panel, inspector_surface, "field input")],
+        "#message-input": [(ink, panel, composer_surface, "message textarea")],
+        "#composer-recipient": [(ink, panel, composer_surface, "recipient select")],
+        "#conversation-context": [(muted, "var(--cream-100)", surface, "conversation context")],
+        ".composer-recipient": [(muted, composer_surface, surface, "recipient label")],
+        ".composer-binding": [(muted, composer_surface, surface, "composer binding")],
+        "dialog": [(ink, panel, surface, "dialog text")],
+        ".form-error": [("var(--danger)", panel, surface, "form error")],
+        ".toast": [(parsed_color(".toast", "color"), "var(--brand-strong)", surface, "toast text")],
+    }
+    for selector, cases in text_surfaces.items():
+        declared_color = declarations[(selector, "color")][0]
+        actual_foreground = (
+            parsed_color(selector, "color")
+            if color_atom.findall(declared_color)
+            else ink
+        )
+        put(
+            selector,
+            "color",
+            *(
+                text_case(actual_foreground, background, backdrop, label)
+                for _foreground, background, backdrop, label in cases
+            ),
+        )
+
+    # Surfaces are keyed independently so changing only a background cannot
+    # evade the same rendered text contrast calculation.
+    background_surfaces = {
+        "body": [(ink, surface, surface, "body base surface"), (ink, parsed_color("body", "background", atom=0), surface, "body gradient tint")],
+        ".skip-link": [(parsed_color(".skip-link", "color"), parsed_color(".skip-link", "background"), surface, "skip-link surface")],
+        "#app-header": [(ink, parsed_color("#app-header", "background"), body_tint, "header surface")],
+        ".project-navigation-button": [(muted, panel, surface, "navigation button surface")],
+        ".project-navigation-button:hover:not(:disabled)": [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation hover surface")],
+        '.project-navigation-button[aria-current="true"]': [("var(--brand-strong)", "var(--brand-soft)", surface, "navigation current surface")],
+        ".status-pill": [(muted, coordinator_soft, surface, "presence badge surface")],
+        ".state-badge": [(muted, coordinator_soft, panel, "task state badge surface")],
+        "#project-navigation": [(ink, parsed_color("#project-navigation", "background"), surface, "desktop project pane"), (ink, parsed_color("#project-navigation", "background", occurrence=1), surface, "mobile project drawer")],
+        "#task-inspector-panel": [(ink, parsed_color("#task-inspector-panel", "background"), surface, "desktop inspector pane"), (ink, parsed_color("#task-inspector-panel", "background", occurrence=1), surface, "mobile inspector drawer")],
+        "#task-list": [(ink, parsed_color("#task-list", "background"), nav_surface, "task list surface")],
+        "#task-inspector": [(ink, parsed_color("#task-inspector", "background"), inspector_surface, "task inspector surface")],
+        ".task-list-button": [(ink, panel, nav_surface, "task button surface")],
+        ".conversation-intro": [(ink, parsed_color(".conversation-intro", "background"), body_tint, "conversation intro surface")],
+        ".message": [(ink, panel, surface, "base message surface")],
+        ".message-avatar": [(parsed_color(".message-avatar", "color"), "var(--coordinator)", panel, "coordinator avatar surface")],
+        ".message-user .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--user)", "var(--user-soft)", "user avatar surface")],
+        ".message-fable .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--fable)", "var(--fable-soft)", "Fable avatar surface")],
+        ".message-sol .message-avatar": [(parsed_color(".message-avatar", "color"), "var(--sol)", "var(--sol-soft)", "Sol avatar surface")],
+        ".conversation-action-card": [(ink, panel, surface, "action card surface")],
+        ".message-user": [(ink, "var(--user-soft)", surface, "user message text")],
+        ".message-fable": [(ink, "var(--fable-soft)", surface, "Fable message text")],
+        ".message-sol": [(ink, "var(--sol-soft)", surface, "Sol message text")],
+        ".message-coordinator": [(ink, coordinator_soft, surface, "coordinator message text")],
+        ".conversation-status": [(muted, parsed_color(".conversation-status", "background"), surface, "status surface")],
+        ".task-section": [(ink, panel, inspector_surface, "task section surface")],
+        ".button": [(ink, panel, surface, "button surface")],
+        ".button:disabled": [("var(--ink-800)", "var(--cream-100)", surface, "disabled surface")],
+        ".button-primary": [(parsed_color(".button-primary", "color"), "var(--brand)", surface, "primary surface")],
+        ".button-primary:hover:not(:disabled)": [(parsed_color(".button-primary", "color"), "var(--brand-strong)", surface, "primary hover surface")],
+        ".button-quiet": [(ink, "transparent", panel, "quiet button on panel"), (ink, "transparent", "var(--cream-100)", "quiet button on context")],
+        ".field-group textarea": [(ink, panel, inspector_surface, "field textarea surface")],
+        ".field-group input": [(ink, panel, inspector_surface, "field input surface")],
+        "#message-input": [(ink, panel, composer_surface, "message input surface")],
+        "#composer-recipient": [(ink, panel, composer_surface, "select surface")],
+        "#composer": [(muted, parsed_color("#composer", "background"), surface, "composer surface")],
+        "#conversation-context": [(muted, "var(--cream-100)", surface, "context surface")],
+        "dialog": [(ink, panel, surface, "dialog surface")],
+        ".acknowledgement-row": [(ink, "var(--brand-soft)", panel, "acknowledgement surface")],
+        ".toast": [(parsed_color(".toast", "color"), "var(--brand-strong)", surface, "toast surface")],
+        ".toast-error": [(parsed_color(".toast", "color"), "var(--danger)", surface, "error toast surface")],
+    }
+    for selector, cases in background_surfaces.items():
+        if selector == "body":
+            put(selector, "background", *(text_case(*case) for case in cases))
+            continue
+        actual_backgrounds = [
+            parsed_color(selector, "background", occurrence=occurrence)
+            for occurrence in range(len(declarations[(selector, "background")]))
+        ]
+        put(
+            selector,
+            "background",
+            *(
+                text_case(
+                    foreground,
+                    (
+                        actual_backgrounds[index]
+                        if len(actual_backgrounds) == len(cases)
+                        else actual_backgrounds[0]
+                    ),
+                    backdrop,
+                    label,
+                )
+                for index, (foreground, _background, backdrop, label) in enumerate(cases)
+            ),
+        )
+    put(
+        "dialog::backdrop",
+        "background",
+        indicator_case(
+            parsed_color("dialog::backdrop", "background"),
+            surface,
+            surface,
+            "modal backdrop",
+        ),
+    )
+
+    container = coordinator_soft
+    base_dots = (".status-pill::before", ".state-badge::before")
+    ready_dots = (".status-ready::before", ".state-completed::before")
+    error_dots = (".status-error::before", ".state-failed::before", ".state-interrupted::before")
+    running_dots = (
+        ".status-running::before", ".state-sol_running::before",
+        ".state-sol_correcting::before", ".state-fable_planning::before",
+        ".state-fable_clarifying::before", ".state-fable_reviewing::before",
+    )
+    for selector in base_dots + ready_dots + error_dots:
+        put(selector, "background", indicator_case(parsed_color(selector, "background"), container, panel, f"{selector} fill against container"))
+    for selector in running_dots:
+        halo = parsed_color(selector, "box-shadow")
+        put(selector, "background", indicator_case(parsed_color(selector, "background"), halo, container, f"{selector} fill against halo"))
+        put(selector, "box-shadow", indicator_case(halo, container, panel, f"{selector} halo against container"))
+
+    # Focus rings are outside their controls (2px offset), so their actual
+    # adjacency is the containing surface, not the control fill.
+    focus_surfaces = {
+        "button:focus-visible": (surface, panel, "var(--cream-100)", "var(--brand-soft)", composer_surface),
+        "textarea:focus-visible": (composer_surface, panel),
+        "input:focus-visible": (panel, "var(--brand-soft)"),
+        "select:focus-visible": (composer_surface,),
+        "a:focus-visible": (surface,),
+        "summary:focus-visible": (panel,),
+        "[tabindex]:focus-visible": (surface, panel),
+    }
+    for selector, surfaces in focus_surfaces.items():
+        ring = parsed_color(selector, "outline")
+        put(selector, "outline", *(indicator_case(ring, adjacent, surface, f"{selector} on {adjacent}") for adjacent in surfaces))
+
+    border_surfaces = {
+        ("#app-header", "border-bottom"): (body_tint, "header bottom line"),
+        (".project-navigation-button", "border"): (panel, "navigation button line"),
+        (".project-navigation-button:hover:not(:disabled)", "border-color"): (panel, "navigation hover indicator"),
+        ('.project-navigation-button[aria-current="true"]', "border-color"): (panel, "navigation current indicator"),
+        (".status-pill", "border"): (coordinator_soft, "presence badge line"),
+        (".state-badge", "border"): (coordinator_soft, "state badge line"),
+        ("#project-navigation", "border-right"): (surface, "project pane line"),
+        ("#task-inspector-panel", "border-left"): (surface, "inspector pane line"),
+        (".panel-heading", "border-bottom"): (panel, "panel heading line"),
+        (".task-list-button", "border"): (panel, "task button line"),
+        (".task-list-button:hover", "border-color"): (panel, "task hover indicator"),
+        ('.task-list-button[aria-current="true"]', "border-color"): (panel, "task current indicator"),
+        (".conversation-intro", "border"): (surface, "conversation card line"),
+        (".message", "border"): (surface, "message card outer line"),
+        (".conversation-action-card", "border"): (panel, "action card strong line"),
+        (".conversation-action-card", "border-left"): (panel, "action card state indicator"),
+        (".message-user", "border-left-color"): ("var(--user-soft)", "user message indicator"),
+        (".message-fable", "border-left-color"): ("var(--fable-soft)", "Fable message indicator"),
+        (".message-sol", "border-left-color"): ("var(--sol-soft)", "Sol message indicator"),
+        (".message-coordinator", "border-left-color"): (coordinator_soft, "coordinator message indicator"),
+        (".conversation-status", "border-left"): (parsed_color(".conversation-status", "background"), "status line"),
+        (".task-section", "border"): (panel, "task section line"),
+        (".button", "border"): (panel, "button strong line"),
+        (".button:hover:not(:disabled)", "border-color"): (panel, "button hover indicator"),
+        (".button-primary", "border-color"): (panel, "primary button boundary"),
+        (".button-danger", "border-color"): (panel, "danger button boundary"),
+        (".field-group textarea", "border"): (panel, "textarea strong line"),
+        (".field-group input", "border"): (panel, "input strong line"),
+        ("#message-input", "border"): (panel, "message input strong line"),
+        ("#composer-recipient", "border"): (panel, "select strong line"),
+        ("#composer", "border-top"): (surface, "composer line"),
+        ("#conversation-context", "border-top"): (surface, "context top line"),
+        ("#conversation-context", "border-bottom"): (surface, "context bottom line"),
+        ("dialog", "border"): (panel, "dialog strong line"),
+        (".acknowledgement-row", "border"): ("var(--brand-soft)", "acknowledgement strong line"),
+        (".toast", "border"): ("var(--brand-strong)", "toast line"),
+    }
+    for (selector, property_name), (adjacent, label) in border_surfaces.items():
+        values = declarations[(selector, property_name)]
+        measurable = [value for value in values if color_atom.findall(value) and "CanvasText" not in value]
+        cases = [
+            indicator_case(color_atom.findall(value)[-1], adjacent, surface, label)
+            for value in measurable
+        ]
+        put(selector, property_name, *cases)
+
+    for selector in (".task-list-button:hover", '.task-list-button[aria-current="true"]'):
+        put(selector, "box-shadow", indicator_case(parsed_color(selector, "box-shadow"), panel, nav_surface, f"{selector} inset selection indicator"))
+
+    def is_relevant(key: tuple[str, str], values: list[str]) -> bool:
+        selector, property_name = key
+        if property_name in {"color", "background", "outline"}:
+            return True
+        if property_name.startswith("border"):
+            return any(color_atom.findall(value) and "CanvasText" not in value for value in values)
+        return property_name == "box-shadow" and (
+            selector in running_dots
+            or selector in {".task-list-button:hover", '.task-list-button[aria-current="true"]'}
+        )
+
+    shipped_relevant_inventory = {
+        key for key, values in declarations.items() if is_relevant(key, values)
+    }
+
+    def require_exhaustive(mapping: dict[tuple[str, str], list[tuple[str, str, str, float, str]]]) -> None:
+        assert mapping.keys() == shipped_relevant_inventory
+        assert all(mapping.values())
+
+    require_exhaustive(adjacencies)
+
+    def assert_pair(case: tuple[str, str, str, float, str]) -> None:
+        foreground, background, backdrop, threshold, label = case
+        rendered_background = resolve(background, backdrop)
+        rendered_foreground = resolve(foreground, rendered_background)
+        ratio = contrast(rendered_foreground, rendered_background)
+        assert ratio >= threshold, f"{label}: {ratio:.3f}:1 < {threshold}:1"
+
+    for cases in adjacencies.values():
+        for case in cases:
+            assert_pair(case)
+
+    # Meta/mutation checks prove both halves of the contract can turn red.
+    missing_case = {key: list(cases) for key, cases in adjacencies.items()}
+    missing_case.pop(("body", "color"))
+    try:
+        require_exhaustive(missing_case)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a missing adjacency key escaped exhaustive coverage")
+
+    empty_case = {key: list(cases) for key, cases in adjacencies.items()}
+    empty_case[("body", "color")] = []
+    try:
+        require_exhaustive(empty_case)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("an empty adjacency list escaped exhaustive coverage")
+
+    low_contrast_mutations = {
+        "badge": pairing("var(--brand-soft)", coordinator_soft, panel, 4.5, "mutated badge"),
+        "message": pairing("var(--line)", "var(--fable-soft)", surface, 4.5, "mutated message"),
+        "input": pairing("var(--line)", panel, surface, 4.5, "mutated input"),
+        "border": pairing("var(--line)", "var(--fable-soft)", surface, 3, "mutated border"),
+        "dot": pairing("#ffe2ae", coordinator_soft, panel, 3, "mutated dot halo"),
+    }
+    for mutation, case in low_contrast_mutations.items():
+        try:
+            assert_pair(case)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"low-contrast {mutation} mutation was accepted")
+
+
+def test_intervention_requests_are_exact_idempotent_and_unknown_requires_acknowledgement() -> None:
+    harness = r"""
+      const state = {
+        projectId: "project-a", sessionId: "chat-a", csrfToken: "csrf",
+        gate: {canCompose: true}, activeLease: {task_id: "task-a"},
+      };
+      const task = {
+        task_id: "task-a", revision: 4, continuation_generation: 7,
+        state: "sol_running",
+      };
+      const first = bridge.interventionRequest(state, task, "Hold this boundary.", "intervention-a", "sol");
+      if (first.path !== "/api/projects/project-a/chats/chat-a/tasks/task-a/intervene") process.exit(2);
+      if (JSON.stringify(first.payload) !== JSON.stringify({
+        intervention_id: "intervention-a", message: "Hold this boundary.", addressed_to: "sol",
+        revision: 4, continuation_generation: 7,
+      })) process.exit(3);
+      const pending = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "pending_stop", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: true,
+      }});
+      if (pending.kind !== "pending" || pending.submit !== "Intervention pending") process.exit(4);
+      const ready = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "ready", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: true,
+      }});
+      if (ready.kind !== "resume" || ready.path !== "/api/projects/project-a/chats/chat-a/interventions/intervention-a/resume" || ready.payload.expected_resume_generation !== 8) process.exit(5);
+      const unknown = bridge.interventionPresentation(state, {...task, intervention: {
+        intervention_id: "intervention-a", status: "resume_outcome_unknown", revision: 4,
+        source_generation: 7, resume_generation: 8, eligible: false,
+        warning: "prior resume outcome is unknown and may have executed",
+      }});
+      if (unknown.kind !== "unknown" || !unknown.warning.includes("may have executed")) process.exit(6);
+      const retry = bridge.interventionRetryRequest(state, unknown, "acknowledgment-a");
+      if (retry.path !== "/api/projects/project-a/chats/chat-a/interventions/intervention-a/authorize-retry") process.exit(7);
+      if (JSON.stringify(retry.payload) !== JSON.stringify({
+        expected_resume_generation: 8, acknowledgment_id: "acknowledgment-a",
+        acknowledge_possible_prior_execution: true,
+      })) process.exit(8);
+      if (bridge.composerPresentation({...state, activeLease: null}, null, "fable").submit !== "Send") process.exit(9);
+      if (!bridge.composerPresentation(state, null, "fable").disabled) process.exit(10);
+    """
+    _run_module_harness(harness)
+
+
+def test_intervention_draft_policy_is_server_safe_and_preserves_one_exact_payload() -> None:
+    harness = r"""
+      const task = {task_id: "task-a", revision: 2, continuation_generation: 5, state: "fable_planning"};
+      if (JSON.stringify(bridge.interventionRecipients(task)) !== JSON.stringify(["fable"])) process.exit(2);
+      if (JSON.stringify(bridge.interventionRecipients({...task, state: "sol_running"})) !== JSON.stringify(["fable", "sol"])) process.exit(3);
+      for (const state of ["idle", "fable_planning", "fable_clarifying", "fable_reviewing", "awaiting_user_approval", "awaiting_user_input"]) {
+        if (JSON.stringify(bridge.interventionRecipients({...task, state})) !== JSON.stringify(["fable"])) process.exit(6);
+      }
+      for (const state of ["sol_running", "sol_correcting"]) {
+        if (JSON.stringify(bridge.interventionRecipients({...task, state})) !== JSON.stringify(["fable", "sol"])) process.exit(7);
+      }
+      const draft = bridge.interventionDraft(task, "intervention-a", "fable", "Keep the scope exact.");
+      if (JSON.stringify(draft) !== JSON.stringify({taskId: "task-a", revision: 2, sourceGeneration: 5, interventionId: "intervention-a", addressedTo: "fable", message: "Keep the scope exact.", submitted: false})) process.exit(4);
+      const unknownOne = bridge.interventionWarningKey({intervention_id: "i", resume_generation: 4});
+      const unknownTwo = bridge.interventionWarningKey({intervention_id: "i", resume_generation: 5});
+      if (unknownOne === unknownTwo || unknownOne !== "i:4") process.exit(5);
+    """
+    _run_module_harness(harness)
 
 
 def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() -> None:
@@ -1012,8 +2157,8 @@ def test_project_chat_navigation_markup_is_semantic_and_never_exposes_paths() ->
     assert rendered.element("ul", "chat-list")["aria-label"] == "Chats"
     assert rendered.element("button", "new-chat")["type"] == "button"
     assert rendered.element("button", "new-chat")["disabled"] is None
-    assert rendered.element("section", "conversation")["id"] == "conversation"
-    assert rendered.element("aside", "task-inspector")["id"] == "task-inspector"
+    assert rendered.element("main", "conversation-shell")["id"] == "conversation-shell"
+    assert rendered.element("aside", "task-inspector-panel")["id"] == "task-inspector-panel"
     assert "Fable" in " ".join(rendered.text)
     assert "Sol" in " ".join(rendered.text)
     assert not any(

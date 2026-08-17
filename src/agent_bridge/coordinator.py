@@ -10,17 +10,30 @@ from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Protocol
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Literal, Protocol
 from uuid import UUID
 
 from agent_bridge.adapters.base import AgentRunResult, FableAdapter, SolAdapter
-from agent_bridge.adapters.claude_cli import ClaudeCLI, ClaudeRunError, SubscriptionAuthError
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    ClaudeCLI,
+    ClaudeRunError,
+    SubscriptionAuthError,
+)
 from agent_bridge.adapters.codex_cli import CodexCLI, CodexRunError
 from agent_bridge.contracts import (
+    ConversationActor,
+    ConversationEnvelope,
+    ConversationMessageType,
+    ConversationTarget,
+    DirectedAgentQuestion,
     FableClarification,
     ReviewVerdict,
     SolOutcome,
     TaskBrief,
+    UserConversationInput,
 )
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import project_id_for_root
@@ -37,16 +50,22 @@ from agent_bridge.store import (
     BaselineSetting,
     ClarificationContext,
     COMPATIBILITY_PREPARATION_GENERATION,
+    ContinuationMessagePayload,
+    ExchangeGrantPayload,
     NewRequestPayload,
     PreparedActionInterruptionReason,
     PreparedActionOutcome,
     PreparedActionRecord,
+    QuestionAnswerPayload,
+    QuestionRecord,
     ReviewContext,
     ResumeDriftProjection,
     ResumePayload,
     RecoverySummary,
     ScopeApprovalContext,
     SolResumeContext,
+    InterventionRecord,
+    InterventionStatus,
     SQLiteStore,
     TaskRecord,
     ApprovalPayload,
@@ -87,6 +106,170 @@ _MAX_AUDIT_COUNT = 2**63 - 1
 MAX_AGENT_STRUCTURAL_EVENTS = 1_024
 _MIN_EXIT_CODE = -(2**31)
 _MAX_EXIT_CODE = 2**31 - 1
+_TERMINAL_ROUTING_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED})
+_CONVERSATION_PREPARED_ACTIONS = frozenset({
+    "continuation_message", "question_answer", "exchange_grant",
+})
+_EXCHANGE_PERMISSION_TEXT = (
+    "Automatic exchange limit reached. Allow three more internal exchanges to continue."
+)
+_FABLE_LOGIN_EXPIRED_TEXT = (
+    "Fable login expired. Run claude auth login on the host, then Resume."
+)
+_FABLE_CONTINUITY_RESTARTED_TEXT = (
+    "Fable continuity could not be preserved; a new Fable session was started."
+)
+_STOP_TIMEOUT_SECONDS = 10.0
+_MAX_INTERVENTION_PARTIAL_EVENTS = 16
+
+
+class RoutingMode(str, Enum):
+    """The only two user-message routing outcomes."""
+
+    NEW_FABLE_TASK = "new_fable_task"
+    BOUND_CONTINUATION = "bound_continuation"
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingDecision:
+    """A deterministic route derived solely from authenticated task state."""
+
+    addressed_to: ConversationTarget
+    routed_to: ConversationTarget
+    mode: RoutingMode
+    task_id: str | None
+    revision: int | None
+    continuation_generation: int | None
+
+
+class RoutingError(RuntimeError):
+    """One bounded failure category for invalid or stale conversation routes."""
+
+    def __init__(self) -> None:
+        super().__init__("conversation routing is unavailable")
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionIntent:
+    """One authenticated request to interrupt an exact active agent run."""
+
+    intervention_id: str
+    message: str
+    addressed_to: ConversationTarget
+    revision: int
+    continuation_generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intervention_id, str) or not self.intervention_id:
+            raise ValueError("intervention_id must be non-empty")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("message must be non-empty")
+        if self.addressed_to not in {ConversationTarget.FABLE, ConversationTarget.SOL}:
+            raise ValueError("addressed_to must be Fable or Sol")
+        for value, name, minimum in (
+            (self.revision, "revision", 0),
+            (self.continuation_generation, "continuation_generation", 1),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"{name} is invalid")
+
+
+class InterventionOperation(str, Enum):
+    """One explicit provider operation allowed for a durable intervention."""
+
+    FABLE_PLAN = "fable_plan"
+    FABLE_RESUME_PLAN = "fable_resume_plan"
+    FABLE_CLARIFY = "fable_clarify"
+    FABLE_REVIEW = "fable_review"
+    SOL_RESUME = "sol_resume"
+    FABLE_ANSWER_SOL_QUESTION = "fable_answer_sol_question"
+    SOL_ANSWER_FABLE_QUESTION = "sol_answer_fable_question"
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionInvocation:
+    """A coordinator-owned operation and the contract required before routing."""
+
+    operation: InterventionOperation
+    run_id: str
+    expected_contract: Literal[
+        "TaskBrief", "FableClarification", "ReviewVerdict", "SolOutcome",
+    ]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, InterventionOperation):
+            raise ValueError("operation must be an InterventionOperation")
+        if not isinstance(self.run_id, str) or _SAFE_ID.fullmatch(self.run_id) is None:
+            raise ValueError("run_id must be a safe coordinator run ID")
+        expected_contracts = {
+            InterventionOperation.FABLE_PLAN: "TaskBrief",
+            InterventionOperation.FABLE_RESUME_PLAN: "TaskBrief",
+            InterventionOperation.FABLE_CLARIFY: "FableClarification",
+            InterventionOperation.FABLE_REVIEW: "ReviewVerdict",
+            InterventionOperation.SOL_RESUME: "SolOutcome",
+            InterventionOperation.FABLE_ANSWER_SOL_QUESTION: "FableClarification",
+            InterventionOperation.SOL_ANSWER_FABLE_QUESTION: "SolOutcome",
+        }
+        if self.expected_contract != expected_contracts[self.operation]:
+            raise ValueError("operation has the wrong expected contract")
+
+
+class _InterventionValidationError(RuntimeError):
+    """A durable intervention cannot safely continue with this provider result."""
+
+
+def route_user_intent(
+    authenticated_task: TaskRecord | None,
+    intent: UserConversationInput,
+) -> RoutingDecision:
+    """Route an authenticated user intent without touching a lease or adapter.
+
+    An unbound message is always a new Fable-planned task.  A bound message
+    must match every persisted identity coordinate; stale or unknown bindings
+    fail closed rather than selecting another task.  Before exact approval,
+    an apparent Sol address remains visible but is routed to Fable.
+    """
+    if not isinstance(intent, UserConversationInput):
+        raise RoutingError()
+    if intent.task_id is None:
+        return RoutingDecision(
+            addressed_to=intent.addressed_to,
+            routed_to=ConversationTarget.FABLE,
+            mode=RoutingMode.NEW_FABLE_TASK,
+            task_id=None,
+            revision=None,
+            continuation_generation=None,
+        )
+    if not isinstance(authenticated_task, TaskRecord):
+        raise RoutingError()
+    if (
+        intent.task_id != authenticated_task.task_id
+        or intent.revision != authenticated_task.revision
+        or intent.continuation_generation != authenticated_task.continuation_generation
+    ):
+        raise RoutingError()
+    if authenticated_task.state in _TERMINAL_ROUTING_STATES:
+        return RoutingDecision(
+            addressed_to=intent.addressed_to,
+            routed_to=ConversationTarget.FABLE,
+            mode=RoutingMode.NEW_FABLE_TASK,
+            task_id=None,
+            revision=None,
+            continuation_generation=None,
+        )
+    routed_to = intent.addressed_to
+    if routed_to in {ConversationTarget.TEAM, ConversationTarget.USER}:
+        routed_to = ConversationTarget.FABLE
+    if routed_to is ConversationTarget.SOL and authenticated_task.approved_at is None:
+        routed_to = ConversationTarget.FABLE
+    return RoutingDecision(
+        addressed_to=intent.addressed_to,
+        routed_to=routed_to,
+        mode=RoutingMode.BOUND_CONTINUATION,
+        task_id=authenticated_task.task_id,
+        revision=authenticated_task.revision,
+        continuation_generation=authenticated_task.continuation_generation,
+    )
 
 
 class ResumeDriftBlocked(RuntimeError):
@@ -148,6 +331,9 @@ class Coordinator:
         self._run_completions: dict[str, asyncio.Event] = {}
         self._terminal_retries: dict[str, PreparedActionOutcome] = {}
         self._compatibility_errors: dict[str, RuntimeError] = {}
+        self._intervention_completions: dict[str, asyncio.Event] = {}
+        self._retryable_stop_run_id: str | None = None
+        self._claimed_preparation_id: str | None = None
         # A prepared row is never proof that a child is still alive after a
         # process restart.  Recover before this coordinator can be admitted to
         # a runtime registry or start another workflow.
@@ -158,6 +344,9 @@ class Coordinator:
         self._run_completions.clear()
         self._terminal_retries.clear()
         self._compatibility_errors.clear()
+        self._intervention_completions.clear()
+        self._retryable_stop_run_id = None
+        self._claimed_preparation_id = None
 
     @property
     def project_id(self) -> str:
@@ -177,14 +366,24 @@ class Coordinator:
         return task_id
 
     def prepare_new_request(
-        self, *, session_id: str, task_id: str, text: str, generation: int,
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        text: str,
+        generation: int,
+        addressed_to: ConversationTarget | None = None,
     ) -> PreparedActionRecord:
+        if addressed_to is not None and not isinstance(
+            addressed_to, ConversationTarget,
+        ):
+            raise ValueError("addressed_to must be a ConversationTarget")
         return self._store.prepare_new_request_action(
             project_id=self.project_id,
             session_id=session_id,
             task_id=task_id,
             generation=generation,
-            payload=NewRequestPayload(text=text),
+            payload=NewRequestPayload(text=text, addressed_to=addressed_to),
         )
 
     def prepare_user_request(
@@ -281,20 +480,235 @@ class Coordinator:
             payload=AnswerPayload(answer=answer, continuation=self._context_from_task(task)),
         )
 
+    def prepare_continuation_message(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+    ) -> TaskRecord:
+        """Prepare one bound user statement through its distinct durable kind."""
+        record = self._prepare_continuation_message_action(
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            continuation_generation=continuation_generation,
+            text=text,
+            addressed_to=addressed_to,
+            generation=COMPATIBILITY_PREPARATION_GENERATION,
+        )
+        return self._store.get_task(record.task_id, record.revision)
+
+    def _prepare_continuation_message_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+        generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise RuntimeError("task record not found")
+        intent = UserConversationInput(
+            addressed_to=addressed_to,
+            message_type=ConversationMessageType.STATEMENT,
+            text=text,
+            task_id=task_id,
+            revision=revision,
+            continuation_generation=continuation_generation,
+        )
+        decision = route_user_intent(task, intent)
+        if decision.mode is not RoutingMode.BOUND_CONTINUATION:
+            raise RoutingError()
+        context = self._context_from_task(task)
+        return self._store.prepare_continuation_message_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            generation=generation,
+            payload=ContinuationMessagePayload(
+                text=text,
+                addressed_to=decision.addressed_to,
+                routed_to=decision.routed_to,
+                continuation_generation=continuation_generation,
+                continuation=context,
+            ),
+        )
+
+    def prepare_question_answer(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+    ) -> TaskRecord:
+        """Prepare an answer only for the exact user-routed question."""
+        record = self._prepare_question_answer_action(
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            continuation_generation=continuation_generation,
+            question_id=question_id,
+            answer=answer,
+            generation=COMPATIBILITY_PREPARATION_GENERATION,
+        )
+        return self._store.get_task(record.task_id, record.revision)
+
+    def _prepare_question_answer_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise RuntimeError("task record not found")
+        return self._store.prepare_question_answer_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            generation=generation,
+            payload=QuestionAnswerPayload(
+                question_id=question_id,
+                answer=answer,
+                continuation_generation=continuation_generation,
+                continuation=self._context_from_task(task),
+            ),
+        )
+
+    def prepare_exchange_grant(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+    ) -> TaskRecord:
+        """Prepare one fixed grant through its distinct durable kind."""
+        record = self._prepare_exchange_grant_action(
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            continuation_generation=continuation_generation,
+            request_id=request_id,
+            generation=COMPATIBILITY_PREPARATION_GENERATION,
+        )
+        return self._store.get_task(record.task_id, record.revision)
+
+    def _prepare_exchange_grant_action(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+        generation: int,
+    ) -> PreparedActionRecord:
+        task = self._store.get_task(task_id, revision)
+        if task.session_id != session_id:
+            raise RuntimeError("task record not found")
+        attempted = (task.pending or {}).get("attempted_question")
+        if not isinstance(attempted, Mapping):
+            raise RuntimeError("exchange permission is missing its attempted question")
+        try:
+            directed = DirectedAgentQuestion.from_dict(attempted)
+        except ValueError as error:
+            raise RuntimeError("exchange permission is missing its attempted question") from error
+        outer = self._store.unanswered_question_for_task(task_id, revision)
+        outer_question_id = (
+            outer.question_id
+            if task.continuation_state is TaskState.FABLE_CLARIFYING and outer is not None
+            else None
+        )
+        continuation = (
+            self._stored_sol_context(task) if outer_question_id is not None
+            else self._context_from_task(task)
+        )
+        return self._store.prepare_exchange_grant_action(
+            project_id=self.project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            generation=generation,
+            payload=ExchangeGrantPayload(
+                request_id=request_id,
+                continuation_generation=continuation_generation,
+                attempted_question=directed,
+                continuation=continuation,
+                parent_mode=(
+                    "question" if outer_question_id is not None
+                    else "clarification" if isinstance(continuation, ClarificationContext)
+                    else "top_level"
+                ),
+                outer_question_id=outer_question_id,
+            ),
+        )
+
     def prepare_resume(
         self, *, session_id: str, task_id: str, revision: int, generation: int,
     ) -> PreparedActionRecord:
         task = self._store.get_task(task_id, revision)
-        if task.session_id != session_id or task.state is not TaskState.INTERRUPTED:
+        if task.session_id != session_id:
             raise ValueError("only an interrupted task may be resumed")
-        if task.continuation_state is None:
-            raise RuntimeError("interrupted task has no persisted continuation")
         predecessor = self._store.latest_prepared_action_for_task(
             project_id=self.project_id,
             session_id=session_id,
             task_id=task_id,
             revision=revision,
         )
+        if (
+            predecessor is not None
+            and predecessor.action == "exchange_grant"
+            and predecessor.status == "RECOVERED"
+            and isinstance(predecessor.payload, ExchangeGrantPayload)
+            and predecessor.payload.parent_mode in {"clarification", "question"}
+            and task.state is TaskState.AWAITING_USER_INPUT
+        ):
+            return self._store.rebind_recovered_exchange_grant_checkpoint(
+                predecessor.preparation_id,
+                old_generation=predecessor.generation,
+                generation=generation,
+                project_id=self.project_id,
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+            )
+        unanswered_scope_checkpoint = (
+            predecessor is not None
+            and task.state is TaskState.AWAITING_USER_INPUT
+            and self._store.directed_fable_answer_checkpoint(predecessor) is not None
+        )
+        if task.state is not TaskState.INTERRUPTED and not unanswered_scope_checkpoint:
+            raise ValueError("only an interrupted task may be resumed")
+        if task.continuation_state is None:
+            raise RuntimeError("interrupted task has no persisted continuation")
+        if (
+            predecessor is not None
+            and predecessor.action == "exchange_grant"
+            and predecessor.status == "RECOVERED"
+        ):
+            return self._store.resume_recovered_exchange_grant(
+                predecessor.preparation_id, generation=predecessor.generation,
+            )
         context = self._initial_approval_resume_context(task, predecessor)
         if context is None:
             context = self._context_from_task(task)
@@ -339,6 +753,14 @@ class Coordinator:
             raise RuntimeError("prepared action belongs to a different project")
         if record.status == "CLAIMED":
             outcome = self._terminal_retries.get(record.preparation_id)
+            if outcome is None and isinstance(record.payload, ExchangeGrantPayload):
+                child = self._store.resume_claimed_exchange_grant_checkpoint(
+                    record.preparation_id, generation=record.generation,
+                )
+                await self.answer_directed_question(child)
+                return self._persist_terminal_prepared_outcome(
+                    record, self._terminal_outcome_after_child(record),
+                )
             if outcome is None:
                 raise PreparedActionFailed()
             return self._persist_terminal_prepared_outcome(record, outcome)
@@ -347,6 +769,7 @@ class Coordinator:
         claimed = self._store.claim_prepared_action(
             record.preparation_id, generation=record.generation,
         )
+        self._claimed_preparation_id = claimed.preparation_id
         task = self._store.get_task(claimed.task_id, claimed.revision)
         try:
             if isinstance(claimed.payload, NewRequestPayload):
@@ -362,24 +785,299 @@ class Coordinator:
             elif isinstance(claimed.payload, AnswerPayload):
                 await self._run_context(task, claimed.payload.continuation, claimed.payload.answer)
             elif isinstance(claimed.payload, ResumePayload):
+                predecessor = (
+                    None if claimed.previous_preparation_id is None
+                    else self._store.prepared_action(claimed.previous_preparation_id)
+                )
+                if claimed.previous_preparation_id is not None and predecessor is None:
+                    raise RuntimeError("Fable answer checkpoint predecessor is missing")
+                checkpoint = (
+                    None if predecessor is None
+                    else self._store.directed_fable_answer_checkpoint(predecessor)
+                )
+                if checkpoint is not None:
+                    question = self._store.question(checkpoint.question_id)
+                    if (
+                        question is None
+                        or question.task_id != claimed.task_id
+                        or question.revision != claimed.revision
+                        or question.continuation_generation
+                        != checkpoint.continuation_generation
+                    ):
+                        raise RuntimeError("Fable answer checkpoint changed")
+                    unanswered_scope_parent = (
+                        checkpoint.clarification.scope_changed
+                        and question.answer_text is None
+                        and question.answered_by is None
+                        and task.state is TaskState.AWAITING_USER_INPUT
+                        and task.continuation_state is not None
+                        and task.pending is not None
+                    )
+                    if not unanswered_scope_parent and (
+                        question.answer_text != checkpoint.clarification.answer
+                        or question.answered_by is not ConversationActor.FABLE
+                    ):
+                        raise RuntimeError("Fable answer checkpoint changed")
+                    if checkpoint.clarification.scope_changed:
+                        answer_event = None
+                        answered_pending = None
+                        recovered_stage = None
+                        if unanswered_scope_parent:
+                            recovered_stage = self._store.recoverable_next_fable_scope_stage(
+                                predecessor,
+                            )
+                            answer_event = ConversationEnvelope(
+                                sender=ConversationActor.FABLE,
+                                addressed_to=ConversationTarget.SOL,
+                                routed_to=ConversationTarget.SOL,
+                                message_type=ConversationMessageType.ANSWER,
+                                text=checkpoint.clarification.answer,
+                                task_id=claimed.task_id,
+                                revision=claimed.revision,
+                                continuation_generation=checkpoint.continuation_generation,
+                                reply_to_question_id=question.question_id,
+                            )
+                            answered_pending = dict(task.pending)
+                        await self._route_directed_fable_answer(
+                            task,
+                            checkpoint.clarification,
+                            checkpoint_record=predecessor,
+                            answered_question=(question if unanswered_scope_parent else None),
+                            answered_pending=answered_pending,
+                            answer_event=answer_event,
+                            completed_next_fable_intervention_id=(
+                                None if recovered_stage is None else recovered_stage[0]
+                            ),
+                            completed_next_fable_run_id=(
+                                None if recovered_stage is None else recovered_stage[1]
+                            ),
+                        )
+                    else:
+                        handed_off = self._store.handoff_directed_fable_answer_same_scope(
+                            predecessor,
+                        )
+                        await self._resume_sol(handed_off, checkpoint.clarification.answer or "")
+                    return self._persist_terminal_prepared_outcome(
+                        claimed, self._terminal_outcome_after_child(claimed),
+                    )
                 await self._run_context(task, claimed.payload.continuation, None)
+            elif isinstance(claimed.payload, ContinuationMessagePayload):
+                self._validate_claimed_conversation_action(task, claimed)
+                await self._run_context(
+                    task, claimed.payload.continuation, claimed.payload.text,
+                )
+            elif isinstance(claimed.payload, QuestionAnswerPayload):
+                self._validate_claimed_conversation_action(task, claimed)
+                question = self._store.question(claimed.payload.question_id)
+                if (
+                    question is None
+                    or question.session_id != claimed.session_id
+                    or question.task_id != claimed.task_id
+                    or question.revision != claimed.revision
+                    or question.continuation_generation
+                    != claimed.payload.continuation_generation
+                    or question.routed_to is not ConversationTarget.USER
+                    or question.answer_text != claimed.payload.answer
+                    or question.answered_by is not ConversationActor.USER
+                    or task.continuation_generation
+                    != claimed.payload.continuation_generation + 1
+                ):
+                    raise RuntimeError("prepared question answer changed")
+                await self._run_context(
+                    task, claimed.payload.continuation, claimed.payload.answer,
+                )
+            elif isinstance(claimed.payload, ExchangeGrantPayload):
+                self._validate_claimed_conversation_action(task, claimed)
+                if task.continuation_generation != claimed.payload.continuation_generation:
+                    raise RuntimeError("prepared exchange grant changed")
+                if claimed.payload.outer_question_id is not None:
+                    outer = self._store.restore_fable_answer_parent_for_retry(
+                        session_id=task.session_id, task_id=task.task_id,
+                        revision=task.revision,
+                        expected_generation=claimed.payload.continuation_generation,
+                        outer_question_id=claimed.payload.outer_question_id,
+                    )
+                    restored = self._store.get_task(task.task_id, task.revision)
+                    await self._answer_sol_question_with_fable(
+                        restored, outer, claimed.payload.continuation,
+                    )
+                    return self._persist_terminal_prepared_outcome(
+                        claimed, self._terminal_outcome_after_child(claimed),
+                    )
+                if claimed.payload.parent_mode == "clarification":
+                    question_id, request_key = self._directed_question_identifiers(
+                        task, ConversationActor.FABLE, claimed.payload.attempted_question,
+                    )
+                    intervention_id, child_run_id = self._nested_intervention_preparation(
+                        task,
+                    )
+                    _, question = self._store.reserve_fable_clarification_evidence_question(
+                        session_id=task.session_id, task_id=task.task_id,
+                        revision=task.revision,
+                        expected_generation=claimed.payload.continuation_generation,
+                        question_id=question_id, request_key=request_key,
+                        text=claimed.payload.attempted_question.text,
+                        event=ConversationEnvelope(
+                            sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                            routed_to=ConversationTarget.SOL,
+                            message_type=ConversationMessageType.QUESTION,
+                            text=claimed.payload.attempted_question.text,
+                            task_id=task.task_id, revision=task.revision,
+                            continuation_generation=claimed.payload.continuation_generation,
+                            question_id=question_id,
+                        ),
+                        intervention_id=intervention_id,
+                        child_run_id=child_run_id,
+                    )
+                    current = self._store.get_task(task.task_id, task.revision)
+                    intervention_prompt, intervention_invocation = (
+                        self._nested_sol_intervention_payload(
+                            current,
+                            question,
+                            intervention_id=intervention_id,
+                            child_run_id=child_run_id,
+                        )
+                    )
+                    await self.answer_directed_question(
+                        question,
+                        run_id=child_run_id,
+                        intervention_prompt=intervention_prompt,
+                        intervention_invocation=intervention_invocation,
+                    )
+                    return self._persist_terminal_prepared_outcome(
+                        claimed, self._terminal_outcome_after_child(claimed),
+                    )
+                await self._route_directed_question(
+                    task,
+                    self._actor_for_context(claimed.payload.continuation),
+                    claimed.payload.attempted_question,
+                    continuation=claimed.payload.continuation,
+                )
             else:
                 raise RuntimeError("prepared action payload is invalid")
         except asyncio.CancelledError:
             outcome = self._terminal_outcome_after_error(claimed)
             self._persist_terminal_prepared_outcome(claimed, outcome)
             raise asyncio.CancelledError() from None
-        except BaseException:
+        except BaseException as error:
             outcome = self._terminal_outcome_after_error(claimed)
             self._persist_terminal_prepared_outcome(claimed, outcome)
             if claimed.generation == COMPATIBILITY_PREPARATION_GENERATION:
                 self._compatibility_errors[claimed.preparation_id] = (
                     self._bounded_compatibility_error(sys.exception())
                 )
+            if (
+                isinstance(error, SubscriptionAuthError)
+                and error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED
+            ):
+                raise error from None
             raise PreparedActionFailed() from None
+        finally:
+            self._claimed_preparation_id = None
         return self._persist_terminal_prepared_outcome(
             claimed, self._terminal_outcome_after_child(claimed),
         )
+
+    async def run_prepared_conversation_action(self, task_id: str, action: str) -> None:
+        """Reload and run the latest exact typed conversation preparation only."""
+        if action not in _CONVERSATION_PREPARED_ACTIONS:
+            raise ValueError("conversation prepared action is invalid")
+        task = self._latest_required(task_id)
+        record = self._store.latest_prepared_action_for_task(
+            project_id=self.project_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+        )
+        if record is None or record.action != action:
+            raise RuntimeError("prepared conversation action not found")
+        await self.run_prepared_action(record.preparation_id)
+
+    def _validate_claimed_conversation_action(
+        self, task: TaskRecord, record: PreparedActionRecord,
+    ) -> None:
+        """Recheck persisted state after claim before another agent may start."""
+        if (
+            record.action not in _CONVERSATION_PREPARED_ACTIONS
+            or task.task_id != record.task_id
+            or task.revision != record.revision
+            or task.session_id != record.session_id
+            or task.state is not record.active_state
+            or self._latest_required(task.task_id).revision != task.revision
+        ):
+            raise RuntimeError("prepared conversation action changed")
+        payload = record.payload
+        context = (
+            payload.continuation
+            if isinstance(
+                payload,
+                (ContinuationMessagePayload, QuestionAnswerPayload, ExchangeGrantPayload),
+            )
+            else None
+        )
+        if not self._context_matches_active_task(task, context):
+            if not (
+                isinstance(payload, ExchangeGrantPayload)
+                and payload.outer_question_id is not None
+                and task.state is TaskState.FABLE_CLARIFYING
+                and isinstance(context, SolResumeContext)
+            ):
+                raise RuntimeError("prepared conversation continuation changed")
+        if isinstance(payload, ContinuationMessagePayload):
+            if (
+                task.continuation_generation != payload.continuation_generation
+                or self._target_for_context(payload.continuation) is not payload.routed_to
+            ):
+                raise RuntimeError("prepared continuation message changed")
+
+    @staticmethod
+    def _target_for_context(context: object) -> ConversationTarget:
+        while isinstance(context, AnswerContext):
+            context = context.underlying_continuation
+        if isinstance(context, (ScopeApprovalContext, SolResumeContext)):
+            return ConversationTarget.SOL
+        if isinstance(context, (ReviewContext, ClarificationContext)):
+            return ConversationTarget.FABLE
+        raise RuntimeError("prepared continuation has no exact route")
+
+    @classmethod
+    def _actor_for_context(cls, context: object) -> ConversationActor:
+        target = cls._target_for_context(context)
+        if target is ConversationTarget.FABLE:
+            return ConversationActor.FABLE
+        if target is ConversationTarget.SOL:
+            return ConversationActor.SOL
+        raise RuntimeError("prepared continuation has no answering agent")
+
+    @staticmethod
+    def _context_matches_active_task(task: TaskRecord, context: object) -> bool:
+        while isinstance(context, AnswerContext):
+            context = context.underlying_continuation
+        if isinstance(context, SolResumeContext):
+            return (
+                task.state in _SOL_STATES
+                and task.sol_thread_id == context.sol_thread_id
+            )
+        if isinstance(context, ScopeApprovalContext):
+            if task.state not in _SOL_STATES:
+                return False
+            if task.baseline_id != context.baseline_id or task.revision != context.approved_revision:
+                return False
+            return (
+                context.underlying_continuation is None
+                or task.sol_thread_id == context.underlying_continuation.sol_thread_id
+            )
+        if isinstance(context, ClarificationContext):
+            return (
+                task.state is TaskState.FABLE_CLARIFYING
+                and task.fable_session_id == context.fable_session_id
+            )
+        if isinstance(context, ReviewContext):
+            return (
+                task.state is TaskState.FABLE_REVIEWING
+                and task.fable_session_id == context.fable_session_id
+            )
+        return False
 
     def _terminal_outcome_after_child(
         self, claimed: PreparedActionRecord,
@@ -397,6 +1095,11 @@ class Coordinator:
     def _terminal_outcome_after_error(
         self, claimed: PreparedActionRecord,
     ) -> PreparedActionOutcome:
+        if self._store.directed_fable_answer_checkpoint(claimed) is not None:
+            self._store.interrupt_claimed_fable_answer_checkpoint(
+                claimed.preparation_id, generation=claimed.generation,
+            )
+            return PreparedActionOutcome("adapter_interrupted")
         current = self._store.get_task(claimed.task_id, claimed.revision)
         if current.state is TaskState.INTERRUPTED:
             terminal = self._store.prepared_action(claimed.preparation_id)
@@ -454,7 +1157,7 @@ class Coordinator:
     def _bounded_compatibility_error(self, error: BaseException) -> RuntimeError:
         """Keep old wrapper exception types without exposing provider text."""
         if isinstance(error, SubscriptionAuthError) and isinstance(self._fable, ClaudeCLI):
-            return SubscriptionAuthError("subscription authentication is unavailable")
+            return SubscriptionAuthError()
         if isinstance(error, ClaudeRunError) and isinstance(self._fable, ClaudeCLI):
             return ClaudeRunError("Fable did not return a valid contract")
         if isinstance(error, CodexRunError) and isinstance(self._sol, CodexCLI):
@@ -626,39 +1329,83 @@ class Coordinator:
             return self._scope_context(task)
         return self._sol_context(task, prompt)
 
-    async def _run_context(self, task: TaskRecord, context: object, answer: str | None) -> None:
+    async def _run_context(
+        self,
+        task: TaskRecord,
+        context: object,
+        answer: str | None,
+        *,
+        answer_source: Literal["user", "sol"] = "user",
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
+    ) -> None:
         if isinstance(context, AnswerContext):
-            await self._run_context(task, context.underlying_continuation, context.answer)
+            await self._run_context(
+                task, context.underlying_continuation, context.answer,
+                answer_source=answer_source,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
+            )
             return
         if isinstance(context, SolResumeContext):
-            await self._resume_sol(task, answer if answer is not None else context.prompt)
+            await self._resume_sol(
+                task,
+                answer if answer is not None else context.prompt,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
+            )
             return
         if isinstance(context, ScopeApprovalContext):
             if context.underlying_continuation is None:
-                await self._start_sol(task)
+                await self._start_sol(task, run_id=run_id)
             else:
                 await self._resume_sol(
                     task,
                     answer if answer is not None else context.underlying_continuation.prompt,
+                    run_id=run_id,
                 )
             return
         if isinstance(context, ReviewContext):
-            prompt = context.review_prompt
-            if answer is not None:
-                prompt = f"{prompt}\nUser answer: {answer}"
+            if intervention_invocation is not None:
+                if (
+                    intervention_invocation.operation is not InterventionOperation.FABLE_REVIEW
+                    or answer is None
+                ):
+                    raise RuntimeError("intervention review invocation changed")
+                prompt = answer
+            else:
+                prompt = context.review_prompt
+            if answer is not None and intervention_invocation is None:
+                prompt = f"{prompt}\n{'User answer' if answer_source == 'user' else 'Sol evidence'}: {answer}"
             await self._call_fable_review(
-                task, prompt, completion_allowed=context.completion_allowed,
+                task,
+                prompt,
+                completion_allowed=context.completion_allowed,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if isinstance(context, ClarificationContext):
-            prompt = context.clarification_prompt
-            if answer is not None:
-                prompt = f"{prompt}\nUser answer: {answer}"
+            if intervention_invocation is not None:
+                if (
+                    intervention_invocation.operation is not InterventionOperation.FABLE_CLARIFY
+                    or answer is None
+                ):
+                    raise RuntimeError("intervention clarification invocation changed")
+                prompt = answer
+            else:
+                prompt = context.clarification_prompt
+            if answer is not None and intervention_invocation is None:
+                prompt = f"{prompt}\n{'User answer' if answer_source == 'user' else 'Sol evidence'}: {answer}"
             underlying = context.underlying_continuation
             if not isinstance(underlying, SolResumeContext):
                 raise RuntimeError("clarification has no exact Sol continuation")
             await self._call_fable_clarification(
-                task, prompt, underlying_continuation=underlying,
+                task,
+                prompt,
+                underlying_continuation=underlying,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
             return
         if context is None:
@@ -666,6 +1413,7 @@ class Coordinator:
                 task,
                 self._original_user_message(task.session_id, task.task_id),
                 resume_session_id=task.fable_session_id,
+                run_id=run_id,
             )
             return
         raise RuntimeError("prepared continuation is invalid")
@@ -781,6 +1529,8 @@ class Coordinator:
         task = self._latest_required(task_id)
         if task.state is not TaskState.AWAITING_USER_INPUT:
             raise ValueError("task is not awaiting user input")
+        if self._store.unanswered_question_for_task(task.task_id, task.revision) is not None:
+            raise ValueError("exact directed question answer is required")
         prepared = self.prepare_answer(
             session_id=task.session_id,
             task_id=task.task_id,
@@ -790,8 +1540,532 @@ class Coordinator:
         )
         await self._run_compatibility_prepared(prepared.preparation_id)
 
+    def prepare_intervention(
+        self, task_id: str, intent: InterventionIntent,
+    ) -> InterventionRecord:
+        """Commit one exact stop intent without signaling its source process."""
+        if not isinstance(intent, InterventionIntent):
+            raise ValueError("intent must be an InterventionIntent")
+        existing = self._store.authenticated_intervention(intent.intervention_id)
+        if existing is not None:
+            if (
+                existing.task_id == task_id
+                and existing.revision == intent.revision
+                and existing.source_generation == intent.continuation_generation
+                and existing.message == intent.message
+                and existing.addressed_to is intent.addressed_to
+                and existing.routed_to is intent.addressed_to
+            ):
+                return existing
+            raise RuntimeError("intervention identifier is already bound differently")
+        task = self._latest_required(task_id)
+        if task.revision != intent.revision:
+            raise RuntimeError("intervention revision changed")
+        if task.continuation_generation != intent.continuation_generation:
+            raise RuntimeError("intervention source generation changed")
+        active = self._store.active_run_for_task(task.task_id, task.revision)
+        if active is None:
+            raise RuntimeError("intervention source run is not active")
+        effective_phase = (
+            task.continuation_state
+            if task.state is TaskState.AWAITING_USER_INPUT
+            else task.state
+        )
+        if intent.addressed_to is ConversationTarget.SOL and (
+            effective_phase not in _SOL_STATES
+            or task.approved_at is None
+            or task.baseline_id is None
+            or task.sol_thread_id is None
+        ):
+            raise RuntimeError("intervention Sol recipient is not eligible")
+        return self._store.create_intervention_and_request_stop(
+            intervention_id=intent.intervention_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_source_generation=intent.continuation_generation,
+            message=intent.message,
+            addressed_to=intent.addressed_to,
+            routed_to=intent.addressed_to,
+            run_id=active.run_id,
+        )
+
+    async def continue_intervention(self, intervention_id: str) -> None:
+        """Signal and finalize only the source run committed by an intervention."""
+        existing = self._intervention_completions.get(intervention_id)
+        if existing is not None:
+            await existing.wait()
+            return
+        intervention_completion = asyncio.Event()
+        self._intervention_completions[intervention_id] = intervention_completion
+        record = self._store.intervention(intervention_id)
+        try:
+            if record is None:
+                raise RuntimeError("intervention not found")
+            if record.status is not InterventionStatus.PENDING_STOP:
+                if record.status is InterventionStatus.READY:
+                    return
+                raise RuntimeError("intervention is not pending stop")
+            receipt = await self._runner.stop(
+                record.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+            )
+            if not receipt.process_exited:
+                raise TimeoutError("intervention source process did not exit")
+            run_completion = self._run_completions.get(record.run_id)
+            if run_completion is not None:
+                await run_completion.wait()
+            source = self._store.agent_run(record.run_id)
+            if source.status == "running":
+                raise RuntimeError("intervention source completion is not final")
+            current = self._store.intervention(record.intervention_id)
+            if current is not None and current.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            try:
+                self._store.mark_intervention_ready(record.intervention_id, run_id=record.run_id)
+            except RuntimeError:
+                current = self._store.intervention(record.intervention_id)
+                if current is None or current.status is not InterventionStatus.CANCELED_BY_STOP:
+                    raise
+        except BaseException:
+            if record is not None:
+                self._store.append_event(
+                    record.session_id, record.task_id, "coordinator", "stop_error",
+                    {"run_id": record.run_id},
+                )
+            raise
+        finally:
+            intervention_completion.set()
+            if self._intervention_completions.get(intervention_id) is intervention_completion:
+                del self._intervention_completions[intervention_id]
+
+    async def resume_intervention(
+        self,
+        intervention_id: str,
+        *,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        """Claim and restore one authenticated continuation before its invocation."""
+        record = self._store.intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        self._store.begin_intervention_resume(
+            intervention_id,
+            expected_resume_generation=record.resume_generation,
+            resume_attempt_id=resume_attempt_id,
+            resume_run_id=resume_run_id,
+        )
+
+    async def run_intervention_resume(
+        self,
+        intervention_id: str,
+        *,
+        resume_attempt_id: str,
+        resume_run_id: str,
+    ) -> None:
+        """Dispatch one claimed continuation through its existing routed adapter."""
+        record = self._store.intervention(intervention_id)
+        if (
+            record is None
+            or record.status is not InterventionStatus.RESUMING
+            or record.resume_attempt_id != resume_attempt_id
+            or record.resume_run_id != resume_run_id
+        ):
+            return
+        task = self._store.get_task(record.task_id, record.revision)
+        binding = record.directed_binding
+        if binding is not None and binding.stage == "next_fable":
+            self._store.start_next_fable_intervention_stage(
+                intervention_id, run_id=resume_run_id,
+            )
+            task = self._store.get_task(record.task_id, record.revision)
+            child = self._store.question(binding.question_id)
+            if child is None or child.answer_text is None:
+                raise RuntimeError("intervention next Fable child changed")
+            if binding.parent_question_id is not None:
+                outer = self._store.question(binding.parent_question_id)
+                if outer is None:
+                    raise RuntimeError("intervention next Fable parent changed")
+                invocation = InterventionInvocation(
+                    operation=InterventionOperation.FABLE_ANSWER_SOL_QUESTION,
+                    run_id=resume_run_id,
+                    expected_contract="FableClarification",
+                )
+                await self._answer_sol_question_with_fable(
+                    task, outer, self._context_from_task(task), run_id=resume_run_id,
+                    intervention_prompt=self._intervention_prompt(
+                        task, record, invocation, directed_question=outer,
+                    ),
+                    intervention_invocation=invocation,
+                )
+            else:
+                context = self._context_from_task(
+                    replace(task, continuation_state=task.state),
+                )
+                if context is None:
+                    raise RuntimeError("intervention next Fable context changed")
+                if isinstance(context, ClarificationContext):
+                    operation = InterventionOperation.FABLE_CLARIFY
+                    expected_contract: Literal[
+                        "TaskBrief", "FableClarification", "ReviewVerdict", "SolOutcome",
+                    ] = "FableClarification"
+                elif isinstance(context, ReviewContext):
+                    operation = InterventionOperation.FABLE_REVIEW
+                    expected_contract = "ReviewVerdict"
+                else:
+                    raise RuntimeError("intervention next Fable context changed")
+                invocation = InterventionInvocation(
+                    operation=operation,
+                    run_id=resume_run_id,
+                    expected_contract=expected_contract,
+                )
+                await self._run_context(
+                    task,
+                    context,
+                    self._intervention_prompt(
+                        task, record, invocation, directed_question=child,
+                    ),
+                    answer_source="sol",
+                    run_id=resume_run_id,
+                    intervention_invocation=invocation,
+                )
+        elif task.state is TaskState.AWAITING_USER_INPUT:
+            question = self._store.intervention_resume_question(intervention_id)
+            if question is None:
+                raise RuntimeError("intervention directed route changed")
+            if question.routed_to is ConversationTarget.FABLE:
+                operation = InterventionOperation.FABLE_ANSWER_SOL_QUESTION
+                expected_contract = "FableClarification"
+            elif question.routed_to is ConversationTarget.SOL:
+                operation = InterventionOperation.SOL_ANSWER_FABLE_QUESTION
+                expected_contract = "SolOutcome"
+            else:
+                raise RuntimeError("intervention directed route changed")
+            invocation = InterventionInvocation(
+                operation=operation,
+                run_id=resume_run_id,
+                expected_contract=expected_contract,
+            )
+            await self.answer_directed_question(
+                question,
+                run_id=resume_run_id,
+                intervention_prompt=self._intervention_prompt(
+                    task, record, invocation, directed_question=question,
+                ),
+                intervention_invocation=invocation,
+            )
+        elif record.routed_to is ConversationTarget.SOL:
+            if task.state not in _SOL_STATES:
+                raise RuntimeError("intervention Sol route changed")
+            if (
+                task.sol_thread_id is None
+                or record.sol_thread_id != task.sol_thread_id
+            ):
+                raise RuntimeError("intervention Sol thread changed")
+            self._validated_intervention_sol_thread(task.sol_thread_id)
+            invocation = InterventionInvocation(
+                operation=InterventionOperation.SOL_RESUME,
+                run_id=resume_run_id,
+                expected_contract="SolOutcome",
+            )
+            await self._resume_sol(
+                task,
+                self._intervention_prompt(task, record, invocation),
+                run_id=resume_run_id,
+                intervention_invocation=invocation,
+            )
+        elif record.routed_to is ConversationTarget.FABLE:
+            context_task = replace(task, continuation_state=task.state)
+            context = self._context_from_task(context_task)
+            if context is None:
+                if task.fable_session_id is None:
+                    if record.fable_session_id is not None:
+                        raise RuntimeError("intervention planning session changed")
+                    operation = InterventionOperation.FABLE_PLAN
+                else:
+                    if record.fable_session_id != task.fable_session_id:
+                        raise RuntimeError("intervention planning session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    operation = InterventionOperation.FABLE_RESUME_PLAN
+                invocation = InterventionInvocation(
+                    operation=operation,
+                    run_id=resume_run_id,
+                    expected_contract="TaskBrief",
+                )
+                await self._run_planning(
+                    task,
+                    self._intervention_prompt(task, record, invocation),
+                    resume_session_id=task.fable_session_id,
+                    run_id=resume_run_id,
+                    intervention_invocation=invocation,
+                )
+            else:
+                if isinstance(context, ClarificationContext):
+                    if (
+                        task.fable_session_id is None
+                        or record.fable_session_id != task.fable_session_id
+                    ):
+                        raise RuntimeError("intervention clarification session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    invocation = InterventionInvocation(
+                        operation=InterventionOperation.FABLE_CLARIFY,
+                        run_id=resume_run_id,
+                        expected_contract="FableClarification",
+                    )
+                    await self._run_context(
+                        task,
+                        context,
+                        self._intervention_prompt(task, record, invocation),
+                        run_id=resume_run_id,
+                        intervention_invocation=invocation,
+                    )
+                elif isinstance(context, ReviewContext):
+                    if (
+                        task.fable_session_id is None
+                        or record.fable_session_id != task.fable_session_id
+                    ):
+                        raise RuntimeError("intervention review session changed")
+                    self._validated_intervention_fable_session(task.fable_session_id)
+                    invocation = InterventionInvocation(
+                        operation=InterventionOperation.FABLE_REVIEW,
+                        run_id=resume_run_id,
+                        expected_contract="ReviewVerdict",
+                    )
+                    await self._run_context(
+                        task,
+                        context,
+                        self._intervention_prompt(task, record, invocation),
+                        run_id=resume_run_id,
+                        intervention_invocation=invocation,
+                    )
+                else:
+                    guidance = None if (
+                        record.continuation_state in _SOL_STATES
+                        and isinstance(context, ClarificationContext)
+                        and context.clarification_prompt == record.message
+                    ) else record.message
+                    await self._run_context(
+                        task, context, guidance, run_id=resume_run_id,
+                    )
+        else:
+            raise RuntimeError("intervention route changed")
+        current = self._store.intervention(intervention_id)
+        if (
+            current is not None
+            and current.status is InterventionStatus.RESUMING
+            and current.resume_attempt_id == resume_attempt_id
+            and current.resume_run_id == resume_run_id
+        ):
+            task = self._store.get_task(current.task_id, current.revision)
+            run = self._store.agent_run(resume_run_id)
+            if run.status != "completed" or task.state is TaskState.INTERRUPTED:
+                self._store.mark_resume_outcome_unknown(
+                    intervention_id,
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
+                return
+            self._store.complete_intervention(
+                intervention_id,
+                expected_resume_generation=current.resume_generation,
+                resume_attempt_id=resume_attempt_id,
+                resume_run_id=resume_run_id,
+            )
+
+    async def dispatch_ready_intervention(self, intervention_id: str) -> None:
+        """Allocate one durable owner and invoke its resumed adapter exactly once."""
+        record = self._store.intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        if record.status is not InterventionStatus.READY:
+            if record.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            raise RuntimeError("intervention is not ready to resume")
+        self._validate_ready_intervention_provider_identity(record)
+        record = self._store.authenticated_intervention(intervention_id)
+        if record is None:
+            raise RuntimeError("intervention binding is not authenticated")
+        resume_run_id = self._ids.new_run_id()
+        resume_attempt_id = f"intervention-{resume_run_id}"
+        await self.resume_intervention(
+            intervention_id,
+            resume_attempt_id=resume_attempt_id,
+            resume_run_id=resume_run_id,
+        )
+        try:
+            await self.run_intervention_resume(
+                intervention_id,
+                resume_attempt_id=resume_attempt_id,
+                resume_run_id=resume_run_id,
+            )
+        except BaseException:
+            current = self._store.intervention(intervention_id)
+            if (
+                current is not None
+                and current.status is InterventionStatus.RESUMING
+                and current.resume_attempt_id == resume_attempt_id
+                and current.resume_run_id == resume_run_id
+            ):
+                self._store.mark_resume_outcome_unknown(
+                    intervention_id,
+                    resume_attempt_id=resume_attempt_id,
+                    resume_run_id=resume_run_id,
+                )
+            raise
+
+    @staticmethod
+    def _intervention_stop_run_id(record: InterventionRecord) -> str | None:
+        binding = record.directed_binding
+        if binding is not None:
+            return (
+                binding.next_run_id
+                if binding.stage == "next_fable"
+                else binding.source_run_id
+            )
+        if record.status in {
+            InterventionStatus.RESUMING,
+            InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+            InterventionStatus.CANCELED_BY_STOP,
+        }:
+            return record.resume_run_id or record.run_id
+        if record.status is InterventionStatus.PENDING_STOP:
+            return record.run_id
+        return None
+
+    async def _signal_intervention_stop_run(self, run_id: str) -> None:
+        receipt = await self._runner.stop(
+            run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+        )
+        if not receipt.process_exited:
+            raise TimeoutError("stop process did not exit")
+        completion = self._run_completions.get(run_id)
+        if completion is not None:
+            await completion.wait()
+
+    async def _retire_terminal_retryable_stop_before(self, run_id: str | None) -> None:
+        """Clear only a different retry target with a proven exact local exit."""
+        retryable = self._retryable_stop_run_id
+        if retryable is None or retryable == run_id:
+            return
+        try:
+            await self._runner.wait_process_exit(
+                retryable, timeout_seconds=0,
+            )
+        except (KeyError, TimeoutError) as error:
+            raise RuntimeError(
+                "another exact Stop signal remains retryable"
+            ) from error
+        if self._runner.is_running(retryable):
+            raise RuntimeError("another exact Stop signal remains retryable")
+        self._retryable_stop_run_id = None
+
     async def stop_task(self, task_id: str) -> None:
         task = self._latest_required(task_id)
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        if intervention is None and task.state is TaskState.INTERRUPTED:
+            intervention = self._store.canceled_intervention_for_task(
+                task.task_id, task.revision,
+            )
+        if intervention is not None:
+            stop_run_id = self._intervention_stop_run_id(intervention)
+            await self._retire_terminal_retryable_stop_before(stop_run_id)
+            if (
+                self._retryable_stop_run_id is not None
+                and self._retryable_stop_run_id != stop_run_id
+            ):
+                raise RuntimeError("another exact Stop signal remains retryable")
+            stop_run_was_running = False
+            if stop_run_id is not None:
+                try:
+                    stop_run_was_running = (
+                        self._store.agent_run(stop_run_id).status == "running"
+                    )
+                except RuntimeError:
+                    pass
+            self._store.cancel_intervention_by_stop(
+                intervention.intervention_id,
+                expected_resume_generation=intervention.resume_generation,
+            )
+            should_signal = stop_run_id is not None and (
+                stop_run_was_running
+                or self._retryable_stop_run_id == stop_run_id
+                or self._runner.is_running(stop_run_id)
+            )
+            if should_signal:
+                try:
+                    await self._signal_intervention_stop_run(stop_run_id)
+                except BaseException:
+                    self._retryable_stop_run_id = stop_run_id
+                    self._store.append_event(
+                        task.session_id, task.task_id, "coordinator", "stop_error",
+                        {"run_id": stop_run_id},
+                    )
+                    raise
+                else:
+                    self._retryable_stop_run_id = None
+            return
+        if task.state is TaskState.INTERRUPTED:
+            pending = task.pending or {}
+            intervention_data = pending.get("intervention")
+            intervention_id = (
+                intervention_data.get("intervention_id")
+                if isinstance(intervention_data, Mapping)
+                else None
+            )
+            if not isinstance(intervention_id, str):
+                raise ValueError("task has no active phase to stop")
+            record = self._store.intervention(intervention_id)
+            if record is None or record.task_id != task.task_id:
+                raise ValueError("task has no active phase to stop")
+            canceled = self._store.cancel_intervention_by_stop(
+                record.intervention_id,
+                expected_resume_generation=record.resume_generation,
+            )
+            run_id = canceled.resume_run_id or canceled.run_id
+            try:
+                active = self._store.agent_run(run_id)
+            except RuntimeError:
+                active = None
+            if active is not None and active.status == "running":
+                await self._signal_intervention_stop_run(run_id)
+            return
+        if task.state is TaskState.AWAITING_USER_INPUT:
+            question = self._store.unanswered_question_for_task(
+                task.task_id, task.revision,
+            )
+            active = self._store.active_run_for_task(task.task_id, task.revision)
+            if (
+                question is None
+                or active is None
+                or question.routed_to not in {
+                    ConversationTarget.FABLE, ConversationTarget.SOL,
+                }
+                or active.agent != question.routed_to.value
+            ):
+                raise ValueError("task has no active phase to stop")
+            interrupted = self._store.interrupt_directed_answer_for_stop(
+                task.task_id, task.revision, run_id=active.run_id,
+            )
+            self._emit_state(interrupted)
+            try:
+                receipt = await self._runner.stop(
+                    active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+                )
+                if not receipt.process_exited:
+                    raise TimeoutError("stop process did not exit")
+                self._finish_interrupted_run(active.run_id, exit_code=-1)
+            except BaseException:
+                self._store.append_event(
+                    task.session_id, task.task_id, "coordinator", "stop_error",
+                    {"run_id": active.run_id},
+                )
+                raise
+            completion = self._run_completions.get(active.run_id)
+            if completion is not None:
+                await completion.wait()
+            return
         if task.state not in _ACTIVE_STATES:
             raise ValueError("task has no active phase to stop")
         active = self._store.active_run_for_task(task.task_id, task.revision)
@@ -815,9 +2089,12 @@ class Coordinator:
         )
         self._emit_state(interrupted)
         try:
-            await self._runner.stop(active.run_id)
+            receipt = await self._runner.stop(
+                active.run_id, timeout_seconds=_STOP_TIMEOUT_SECONDS,
+            )
+            if not receipt.process_exited:
+                raise TimeoutError("stop process did not exit")
         except BaseException:
-            self._finish_interrupted_run(active.run_id, exit_code=-1)
             self._store.append_event(
                 interrupted.session_id,
                 interrupted.task_id,
@@ -849,8 +2126,21 @@ class Coordinator:
         prompt: str,
         *,
         resume_session_id: str | None,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
+        if intervention_invocation is not None:
+            expected_operation = (
+                InterventionOperation.FABLE_PLAN
+                if resume_session_id is None
+                else InterventionOperation.FABLE_RESUME_PLAN
+            )
+            if (
+                intervention_invocation.operation is not expected_operation
+                or intervention_invocation.run_id != run_id
+            ):
+                raise RuntimeError("intervention planning invocation changed")
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
         completion = self._track_run(run_id)
         try:
@@ -869,6 +2159,20 @@ class Coordinator:
                     prompt=prompt,
                     context=self._repo_context(),
                 )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=resume_session_id,
+                )
+                if intervention_invocation is not None
+                else None
+            )
+            bound_fresh_session_task = self._bind_fresh_fable_session_after_stop(
+                task, result,
+            )
             self._persist_agent_result(
                 task,
                 "fable",
@@ -883,8 +2187,12 @@ class Coordinator:
             ):
                 raise RuntimeError("Fable resumed a different session than requested")
             if result.cli_session_id is not None:
-                task = self._store.set_fable_session(
-                    task.task_id, task.revision, result.cli_session_id
+                task = (
+                    bound_fresh_session_task
+                    if bound_fresh_session_task is not None
+                    else self._store.set_fable_session(
+                        task.task_id, task.revision, result.cli_session_id,
+                    )
                 )
             if result.interrupted:
                 self._finish_interrupted_run(run_id, exit_code=result.exit_code)
@@ -900,7 +2208,11 @@ class Coordinator:
                 return
             if result.payload is None or result.cli_session_id is None:
                 raise RuntimeError("Fable planning completed without a contract or session ID")
-            brief = TaskBrief.from_dict(result.payload)
+            brief = (
+                contract
+                if isinstance(contract, TaskBrief)
+                else TaskBrief.from_dict(result.payload)
+            )
             if brief.task_id != task.task_id or brief.revision != 1:
                 raise ValueError("Fable returned the wrong task identity")
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
@@ -917,12 +2229,67 @@ class Coordinator:
                 "task_brief",
                 {"brief": brief.to_dict()},
             )
+            if (
+                intervention_invocation is not None
+                and intervention_invocation.operation is InterventionOperation.FABLE_PLAN
+            ):
+                self._store.append_event(
+                    saved.session_id,
+                    saved.task_id,
+                    "system",
+                    "conversation",
+                    ConversationEnvelope(
+                        sender=ConversationActor.SYSTEM,
+                        addressed_to=ConversationTarget.USER,
+                        routed_to=ConversationTarget.USER,
+                        message_type=ConversationMessageType.STATUS,
+                        text=_FABLE_CONTINUITY_RESTARTED_TEXT,
+                        task_id=saved.task_id,
+                        revision=saved.revision,
+                        continuation_generation=saved.continuation_generation,
+                    ).to_dict(),
+                )
         except asyncio.CancelledError:
             self._interrupt_if_active(
                 run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING
             )
             raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_PLANNING,
+                    expected_fable_session_id=resume_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=resume_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING,
+            )
+            raise
         except BaseException as error:
+            if self._is_result_bearing_intervention_error(
+                task,
+                "fable",
+                error,
+                intervention_invocation,
+                expected_cli_session_id=resume_session_id,
+            ):
+                self._interrupt_if_active(
+                    run_id, task.task_id, task.revision, TaskState.FABLE_PLANNING,
+                )
+                raise _InterventionValidationError(
+                    "intervention adapter result failed"
+                ) from error
             self._record_agent_failure(
                 task,
                 "fable",
@@ -934,7 +2301,7 @@ class Coordinator:
         finally:
             self._complete_run(run_id, completion)
 
-    async def _start_sol(self, task: TaskRecord) -> None:
+    async def _start_sol(self, task: TaskRecord, *, run_id: str | None = None) -> None:
         if task.state is not TaskState.SOL_RUNNING:
             raise RuntimeError("Sol start requires persisted SOL_RUNNING state")
         if task.approved_at is None or task.baseline_id is None or task.brief is None:
@@ -943,14 +2310,33 @@ class Coordinator:
             task,
             resume_prompt=None,
             context=f"{self._repo_context()}\nApproved baseline: {task.baseline_id}",
+            run_id=run_id,
         )
 
-    async def _resume_sol(self, task: TaskRecord, prompt: str) -> None:
+    async def _resume_sol(
+        self,
+        task: TaskRecord,
+        prompt: str,
+        *,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
+    ) -> None:
         if task.state not in _SOL_STATES:
             raise RuntimeError("Sol resume requires a persisted Sol state")
         if task.sol_thread_id is None:
             raise RuntimeError("Sol resume requires the exact persisted thread ID")
-        await self._invoke_sol(task, resume_prompt=prompt, context=None)
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.SOL_RESUME
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention Sol invocation changed")
+        await self._invoke_sol(
+            task,
+            resume_prompt=prompt,
+            context=None,
+            run_id=run_id,
+            intervention_invocation=intervention_invocation,
+        )
 
     async def _invoke_sol(
         self,
@@ -958,10 +2344,16 @@ class Coordinator:
         *,
         resume_prompt: str | None,
         context: str | None,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         async with self._writing_lock:
             routed = await self._invoke_sol_locked(
-                task, resume_prompt=resume_prompt, context=context
+                task,
+                resume_prompt=resume_prompt,
+                context=context,
+                run_id=run_id,
+                intervention_invocation=intervention_invocation,
             )
         if routed is not None:
             await self._route_sol_outcome(routed[0], routed[1], routed[2])
@@ -972,18 +2364,27 @@ class Coordinator:
         *,
         resume_prompt: str | None,
         context: str | None,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> tuple[
         TaskRecord, SolOutcome, tuple[Mapping[str, object], ...]
     ] | None:
         if not self._writing_lock.locked():
             raise RuntimeError("Sol invocation requires the shared writer lock")
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
         completion: asyncio.Event | None = None
         try:
             current = self._store.get_task(task.task_id, task.revision)
             if current.state is not task.state:
                 return None
             task = current
+            if intervention_invocation is not None and (
+                intervention_invocation.operation is not InterventionOperation.SOL_RESUME
+                or intervention_invocation.run_id != run_id
+                or resume_prompt is None
+                or context is not None
+            ):
+                raise RuntimeError("intervention Sol invocation changed")
             self._store.start_agent_run(
                 run_id, task.task_id, task.revision, "sol"
             )
@@ -992,12 +2393,21 @@ class Coordinator:
                 if resume_prompt is not None
                 else self._original_user_message(task.session_id, task.task_id)
             )
-            task = self._store.set_pending_context(
-                task.task_id,
-                task.revision,
-                expected=task.state,
-                pending={"sol_run_id": run_id, "prompt": persisted_prompt},
-            )
+            pending = {"sol_run_id": run_id, "prompt": persisted_prompt}
+            if task.pending is None:
+                task = self._store.set_pending_context(
+                    task.task_id,
+                    task.revision,
+                    expected=task.state,
+                    pending=pending,
+                )
+            else:
+                task = self._store.replace_pending_context(
+                    task.task_id,
+                    task.revision,
+                    expected=task.state,
+                    pending=pending,
+                )
             completion = self._track_run(run_id)
             if resume_prompt is None:
                 if task.brief is None or context is None:
@@ -1008,11 +2418,25 @@ class Coordinator:
             else:
                 if task.sol_thread_id is None:
                     raise RuntimeError("Sol resume requires an exact thread")
+                self._store.set_agent_run_session(run_id, task.sol_thread_id)
                 result = await self._sol.resume(
                     run_id=run_id,
                     thread_id=task.sol_thread_id,
                     prompt=resume_prompt,
                 )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "sol",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=(
+                        task.sol_thread_id if resume_prompt is not None else None
+                    ),
+                )
+                if intervention_invocation is not None
+                else None
+            )
             observed_events = self._persist_agent_result(
                 task,
                 "sol",
@@ -1045,7 +2469,11 @@ class Coordinator:
                 return None
             if result.payload is None or result.cli_session_id is None:
                 raise RuntimeError("Sol completed without an outcome or thread ID")
-            outcome = SolOutcome.from_dict(result.payload)
+            outcome = (
+                contract
+                if isinstance(contract, SolOutcome)
+                else SolOutcome.from_dict(result.payload)
+            )
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
         except asyncio.CancelledError:
             if completion is not None:
@@ -1053,8 +2481,29 @@ class Coordinator:
                     run_id, task.task_id, task.revision, task.state
                 )
             raise
+        except _InterventionValidationError:
+            if completion is not None:
+                self._interrupt_if_active(
+                    run_id, task.task_id, task.revision, task.state,
+                )
+            raise
         except BaseException as error:
             if completion is not None:
+                if self._is_result_bearing_intervention_error(
+                    task,
+                    "sol",
+                    error,
+                    intervention_invocation,
+                    expected_cli_session_id=(
+                        task.sol_thread_id if resume_prompt is not None else None
+                    ),
+                ):
+                    self._interrupt_if_active(
+                        run_id, task.task_id, task.revision, task.state,
+                    )
+                    raise _InterventionValidationError(
+                        "intervention adapter result failed"
+                    ) from error
                 self._record_agent_failure(
                     task,
                     "sol",
@@ -1074,6 +2523,1025 @@ class Coordinator:
             observed_events,
         )
 
+    async def _route_directed_question(
+        self,
+        task: TaskRecord,
+        asked_by: ConversationActor,
+        directed: DirectedAgentQuestion,
+        *,
+        continuation: object | None = None,
+    ) -> None:
+        """Persist an exact visible directed question before any answering call."""
+        if not isinstance(asked_by, ConversationActor) or asked_by not in {
+            ConversationActor.FABLE,
+            ConversationActor.SOL,
+        }:
+            raise ValueError("directed questions must be asked by an agent")
+        if not isinstance(directed, DirectedAgentQuestion):
+            raise ValueError("directed question is invalid")
+        current = self._store.get_task(task.task_id, task.revision)
+        if (
+            current.session_id != task.session_id
+            or current.state not in _ACTIVE_STATES
+            or current.continuation_state is not None
+            or current.approved_at is None
+            or current.baseline_id is None
+        ):
+            raise RuntimeError("directed question continuation changed")
+        if continuation is None:
+            continuation = self._active_context_from_task(current)
+        if not self._context_matches_active_task(current, continuation):
+            raise RuntimeError("directed question continuation changed")
+        target = ConversationTarget(directed.addressed_to)
+        if target is ConversationTarget.USER:
+            question_id, _ = self._directed_question_identifiers(
+                current, asked_by, directed,
+            )
+            question = self._store.pause_for_question(
+                session_id=current.session_id,
+                task_id=current.task_id,
+                revision=current.revision,
+                expected_generation=current.continuation_generation,
+                question_id=question_id,
+                asked_by=asked_by,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                text=directed.text,
+                continuation_state=current.state,
+                pending_action=self._pending_for_directed_context(
+                    current, continuation,
+                ),
+                event=ConversationEnvelope(
+                    sender=asked_by,
+                    addressed_to=ConversationTarget.USER,
+                    routed_to=ConversationTarget.USER,
+                    message_type=ConversationMessageType.QUESTION,
+                    text=directed.text,
+                    task_id=current.task_id,
+                    revision=current.revision,
+                    continuation_generation=current.continuation_generation,
+                    question_id=question_id,
+                ),
+            )
+            self._emit_state(self._store.get_task(current.task_id, current.revision))
+            if question.routed_to is not ConversationTarget.USER:
+                raise RuntimeError("directed user question route changed")
+            return
+        if target is ConversationTarget.TEAM:
+            raise RuntimeError("directed question has no exact agent recipient")
+        if target.value == asked_by.value:
+            raise RuntimeError("directed question cannot route to its asking agent")
+        if current.exchange_allowance <= 0:
+            paused = self._store.pause_for_exchange_permission(
+                session_id=current.session_id,
+                task_id=current.task_id,
+                revision=current.revision,
+                expected_generation=current.continuation_generation,
+                attempted_question=directed,
+                continuation_state=current.state,
+                pending_action=self._pending_for_directed_context(
+                    current, continuation,
+                ),
+                event=ConversationEnvelope(
+                    sender=ConversationActor.SYSTEM,
+                    addressed_to=ConversationTarget.USER,
+                    routed_to=ConversationTarget.USER,
+                    message_type=ConversationMessageType.STATUS,
+                    text=_EXCHANGE_PERMISSION_TEXT,
+                    task_id=current.task_id,
+                    revision=current.revision,
+                    continuation_generation=current.continuation_generation,
+                ),
+            )
+            self._emit_state(paused)
+            return
+        question_id, request_key = self._directed_question_identifiers(
+            current, asked_by, directed,
+        )
+        _, question = self._store.reserve_internal_question(
+            session_id=current.session_id,
+            task_id=current.task_id,
+            revision=current.revision,
+            expected_generation=current.continuation_generation,
+            question_id=question_id,
+            request_key=request_key,
+            asked_by=asked_by,
+            addressed_to=target,
+            routed_to=target,
+            text=directed.text,
+            continuation_state=current.state,
+            pending_action=self._pending_for_directed_context(current, continuation),
+            event=ConversationEnvelope(
+                sender=asked_by,
+                addressed_to=target,
+                routed_to=target,
+                message_type=ConversationMessageType.QUESTION,
+                text=directed.text,
+                task_id=current.task_id,
+                revision=current.revision,
+                continuation_generation=current.continuation_generation,
+                question_id=question_id,
+            ),
+        )
+        self._emit_state(self._store.get_task(current.task_id, current.revision))
+        await self.answer_directed_question(question)
+
+    def _nested_intervention_preparation(
+        self, task: TaskRecord, *, outer_question_id: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Allocate a child identity only for the exact unbound cross-route resume."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        if (
+            intervention is None
+            or intervention.status is not InterventionStatus.RESUMING
+            or intervention.routed_to is not ConversationTarget.FABLE
+            or intervention.continuation_state not in _SOL_STATES
+            or intervention.resume_generation != task.continuation_generation
+        ):
+            return None, None
+        binding = intervention.directed_binding
+        if binding is not None and not (
+            outer_question_id is not None
+            and binding.kind == "initial"
+            and binding.question_id == outer_question_id
+            and binding.source_agent is ConversationTarget.FABLE
+        ) and not (
+            binding.kind == "nested_resume"
+            and binding.stage == "next_fable"
+            and binding.next_run_id is not None
+            and binding.next_provider_id == task.fable_session_id
+        ):
+            return None, None
+        return intervention.intervention_id, self._ids.new_run_id()
+
+    def _nested_sol_intervention_payload(
+        self,
+        task: TaskRecord,
+        question: QuestionRecord,
+        *,
+        intervention_id: str | None,
+        child_run_id: str | None,
+    ) -> tuple[str | None, InterventionInvocation | None]:
+        """Bind a persisted nested Sol child to its exact intervention contract."""
+        if intervention_id is None and child_run_id is None:
+            return None, None
+        if intervention_id is None or child_run_id is None:
+            raise RuntimeError("nested intervention child identity is incomplete")
+        record = self._store.authenticated_intervention(intervention_id)
+        binding = None if record is None else record.directed_binding
+        if (
+            record is None
+            or record.task_id != task.task_id
+            or record.revision != task.revision
+            or record.session_id != task.session_id
+            or record.status is not InterventionStatus.RESUMING
+            or record.routed_to is not ConversationTarget.FABLE
+            or record.continuation_state not in _SOL_STATES
+            or record.resume_generation != task.continuation_generation
+            or binding is None
+            or binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.question_id != question.question_id
+            or binding.source_agent is not ConversationTarget.SOL
+            or binding.source_run_id != child_run_id
+            or question.routed_to is not ConversationTarget.SOL
+        ):
+            raise RuntimeError("nested intervention child changed")
+        invocation = InterventionInvocation(
+            operation=InterventionOperation.SOL_ANSWER_FABLE_QUESTION,
+            run_id=child_run_id,
+            expected_contract="SolOutcome",
+        )
+        return (
+            self._intervention_prompt(
+                task, record, invocation, directed_question=question,
+            ),
+            invocation,
+        )
+
+    def _nested_intervention_next_fable_stage(
+        self, task: TaskRecord, question: QuestionRecord,
+    ) -> tuple[str | None, str | None]:
+        """Preallocate only the immediate Fable stage after one bound Sol child."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        binding = None if intervention is None else intervention.directed_binding
+        if (
+            intervention is None
+            or intervention.status is not InterventionStatus.RESUMING
+            or intervention.routed_to is not ConversationTarget.FABLE
+            or binding is None
+            or binding.kind != "nested_resume"
+            or binding.stage != "active_question"
+            or binding.question_id != question.question_id
+            or binding.source_agent is not ConversationTarget.SOL
+            or binding.source_run_id == intervention.resume_run_id
+        ):
+            return None, None
+        return intervention.intervention_id, self._ids.new_run_id()
+
+    def _active_context_from_task(self, task: TaskRecord) -> object:
+        pending = task.pending or {}
+        if task.state in _SOL_STATES:
+            prompt = pending.get("prompt")
+            return self._sol_context(task, prompt)
+        if task.state is TaskState.FABLE_CLARIFYING:
+            if not isinstance(task.fable_session_id, str):
+                raise RuntimeError("clarification is missing the exact Fable session")
+            prompt = pending.get("clarification_prompt")
+            if not isinstance(prompt, str):
+                raise RuntimeError("clarification is missing its exact prompt")
+            return ClarificationContext(
+                fable_session_id=task.fable_session_id,
+                clarification_prompt=prompt,
+                underlying_continuation=self._stored_sol_context(task),
+            )
+        if task.state is TaskState.FABLE_REVIEWING:
+            if not isinstance(task.fable_session_id, str):
+                raise RuntimeError("review is missing the exact Fable session")
+            prompt = pending.get("review_prompt")
+            completion_allowed = pending.get("completion_allowed")
+            if not isinstance(prompt, str) or not isinstance(completion_allowed, bool):
+                raise RuntimeError("review is missing its exact context")
+            return ReviewContext(
+                fable_session_id=task.fable_session_id,
+                review_prompt=prompt,
+                completion_allowed=completion_allowed,
+                underlying_continuation=self._scope_context(task),
+            )
+        raise RuntimeError("directed question has no active continuation")
+
+    @staticmethod
+    def _directed_question_identifiers(
+        task: TaskRecord,
+        asked_by: ConversationActor,
+        directed: DirectedAgentQuestion,
+    ) -> tuple[str, str]:
+        """Make reservation retries reuse one opaque ID without exposing text."""
+        seed = json.dumps(
+            {
+                "task_id": task.task_id,
+                "revision": task.revision,
+                "continuation_generation": task.continuation_generation,
+                "exchange_ordinal": task.exchange_consumed + 1,
+                "asked_by": asked_by.value,
+                "addressed_to": directed.addressed_to,
+                "text": directed.text,
+                "reason": directed.reason,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        return f"question-{digest[:48]}", f"exchange-{digest[:48]}"
+
+    @staticmethod
+    def _pending_for_directed_context(
+        task: TaskRecord, context: object,
+    ) -> Mapping[str, object]:
+        """Reuse the persisted pending snapshot, rebuilding only grant resumes."""
+        if task.pending is not None:
+            return dict(task.pending)
+        while isinstance(context, AnswerContext):
+            context = context.underlying_continuation
+        if isinstance(context, SolResumeContext):
+            return {"sol_run_id": context.sol_run_id, "prompt": context.prompt}
+        if isinstance(context, ScopeApprovalContext):
+            if context.underlying_continuation is None:
+                return {}
+            return {
+                "sol_run_id": context.underlying_continuation.sol_run_id,
+                "prompt": context.underlying_continuation.prompt,
+            }
+        if isinstance(context, ClarificationContext):
+            underlying = context.underlying_continuation
+            if not isinstance(underlying, SolResumeContext):
+                raise RuntimeError("clarification has no exact Sol continuation")
+            return {
+                "clarification_prompt": context.clarification_prompt,
+                "sol_run_id": underlying.sol_run_id,
+                "prompt": underlying.prompt,
+            }
+        if isinstance(context, ReviewContext):
+            return {
+                "review_prompt": context.review_prompt,
+                "completion_allowed": context.completion_allowed,
+            }
+        raise RuntimeError("directed question has no persisted continuation")
+
+    async def answer_directed_question(
+        self,
+        question: QuestionRecord,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
+        intervention_prompt: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
+    ) -> None:
+        """Answer one persisted agent-routed question; user questions stay human-only."""
+        if not isinstance(question, QuestionRecord):
+            raise ValueError("question must be a QuestionRecord")
+        persisted = self._store.question(question.question_id)
+        if persisted is None or persisted != question:
+            raise RuntimeError("directed question changed")
+        if persisted.routed_to is ConversationTarget.USER:
+            raise RuntimeError("user-routed questions require an exact user answer")
+        if persisted.answer_text is not None or persisted.answered_by is not None:
+            raise RuntimeError("directed question was already answered")
+        task = self._store.get_task(persisted.task_id, persisted.revision)
+        if (
+            task.session_id != persisted.session_id
+            or task.state is not TaskState.AWAITING_USER_INPUT
+            or task.continuation_state is None
+            or task.continuation_generation != persisted.continuation_generation
+            or task.approved_at is None
+            or task.baseline_id is None
+        ):
+            raise RuntimeError("directed question continuation changed")
+        continuation = (
+            None
+            if persisted.nested_parent_kind == "question"
+            else self._context_from_task(task)
+        )
+        if persisted.routed_to is ConversationTarget.FABLE:
+            if persisted.asked_by is not ConversationActor.SOL:
+                raise RuntimeError("Fable may answer only Sol's exact question")
+            await self._answer_sol_question_with_fable(
+                task,
+                persisted,
+                continuation,
+                run_id=run_id,
+                intervention_message=intervention_message,
+                intervention_prompt=intervention_prompt,
+                intervention_invocation=intervention_invocation,
+            )
+            return
+        if persisted.routed_to is ConversationTarget.SOL:
+            if persisted.asked_by is not ConversationActor.FABLE:
+                raise RuntimeError("Sol may answer only Fable's exact question")
+            if run_id is None:
+                prepared_run = self._store.prepared_nested_intervention_run(
+                    question_id=persisted.question_id,
+                )
+                if prepared_run is not None:
+                    run_id = prepared_run.run_id
+            await self._answer_fable_question_with_sol(
+                task,
+                persisted,
+                continuation,
+                run_id=run_id,
+                intervention_message=intervention_message,
+                intervention_prompt=intervention_prompt,
+                intervention_invocation=intervention_invocation,
+            )
+            return
+        raise RuntimeError("directed question has no exact answering agent")
+
+    def _start_or_reuse_fable_run(
+        self, task: TaskRecord, run_id: str | None,
+    ) -> str:
+        """Reuse only a Store-prepared Fable stage; ordinary calls allocate a run."""
+        run_id = self._ids.new_run_id() if run_id is None else run_id
+        try:
+            existing = self._store.agent_run(run_id)
+        except RuntimeError:
+            self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+            self._store.set_agent_run_session(run_id, task.fable_session_id)
+            return run_id
+        if (
+            existing.task_id != task.task_id
+            or existing.revision != task.revision
+            or existing.agent != "fable"
+            or existing.cli_session_id != task.fable_session_id
+            or existing.status != "running"
+        ):
+            raise RuntimeError("prepared Fable stage changed")
+        return run_id
+
+    def _finish_fable_run_before_downstream(
+        self, task: TaskRecord, run_id: str, exit_code: int,
+    ) -> None:
+        """Consume a bound next-Fable intervention stage before recursive routing."""
+        intervention = self._store.active_intervention_for_task(
+            task.task_id, task.revision,
+        )
+        binding = None if intervention is None else intervention.directed_binding
+        if (
+            intervention is not None
+            and intervention.status is InterventionStatus.RESUMING
+            and binding is not None
+            and binding.stage == "next_fable"
+            and binding.next_run_id == run_id
+        ):
+            self._store.finish_next_fable_intervention_stage(
+                intervention.intervention_id, run_id=run_id, exit_code=exit_code,
+            )
+            return
+        self._store.finish_agent_run(run_id, status="completed", exit_code=exit_code)
+
+    async def _answer_sol_question_with_fable(
+        self,
+        task: TaskRecord,
+        question: QuestionRecord,
+        continuation: object,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
+        intervention_prompt: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
+    ) -> None:
+        if task.fable_session_id is None:
+            raise RuntimeError("Fable answer requires the exact Fable session")
+        evidence = self._store.nested_evidence_for_parent(question.question_id)
+        if intervention_prompt is not None and intervention_message is not None:
+            raise RuntimeError("intervention directed prompt changed")
+        prompt = question.text if evidence is None else f"{question.text}\nSol evidence: {evidence}"
+        if intervention_message is not None:
+            prompt = f"{prompt}\n\nIntervention guidance:\n{intervention_message}"
+        elif intervention_prompt is not None:
+            prompt = intervention_prompt
+        run_id = self._start_or_reuse_fable_run(task, run_id)
+        if intervention_invocation is not None and (
+            intervention_invocation.operation
+            is not InterventionOperation.FABLE_ANSWER_SOL_QUESTION
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention Fable answer invocation changed")
+        completion = self._track_run(run_id)
+        completed_next_fable_intervention_id: str | None = None
+        completed_next_fable_exit_code: int | None = None
+        try:
+            result = await self._fable.answer_sol_question(
+                run_id=run_id,
+                session_id=task.fable_session_id,
+                task_id=task.task_id,
+                prompt=prompt,
+                context=self._repo_context(),
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.fable_session_id,
+                )
+                if intervention_invocation is not None
+                else None
+            )
+            self._persist_agent_result(
+                task,
+                "fable",
+                result,
+                run_id=run_id,
+                expected_cli_session_id=task.fable_session_id,
+            )
+            if result.interrupted:
+                self._finish_interrupted_run(run_id, exit_code=result.exit_code)
+                return
+            if result.payload is None:
+                raise RuntimeError("Fable answer completed without a contract")
+            clarification = (
+                contract
+                if isinstance(contract, FableClarification)
+                else FableClarification.from_dict(result.payload)
+            )
+            if clarification.status != "answered" or clarification.answer is None:
+                raise RuntimeError("Fable did not answer Sol's exact question")
+            intervention = self._store.active_intervention_for_task(
+                task.task_id, task.revision,
+            )
+            binding = None if intervention is None else intervention.directed_binding
+            if (
+                intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                completed_next_fable_intervention_id = intervention.intervention_id
+                completed_next_fable_exit_code = result.exit_code
+            else:
+                self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
+        except asyncio.CancelledError:
+            self._finish_interrupted_run(run_id, exit_code=-1)
+            raise
+        except _InterventionValidationError:
+            self._interrupt_intervention_invocation(
+                run_id, task.task_id, task.revision, task.state,
+            )
+            raise
+        except BaseException as error:
+            if self._is_result_bearing_intervention_error(
+                task,
+                "fable",
+                error,
+                intervention_invocation,
+                expected_cli_session_id=task.fable_session_id,
+            ):
+                self._interrupt_intervention_invocation(
+                    run_id, task.task_id, task.revision, task.state,
+                )
+                raise _InterventionValidationError(
+                    "intervention adapter result failed"
+                ) from error
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=task.fable_session_id,
+            )
+            raise
+        finally:
+            self._complete_run(run_id, completion)
+        if clarification.directed_question is not None and not clarification.scope_changed:
+            task = self._store.get_task(task.task_id, task.revision)
+            directed = clarification.directed_question
+            if directed.addressed_to != ConversationTarget.SOL.value:
+                raise RuntimeError("Fable evidence must target exact Sol")
+            if task.exchange_allowance <= 0:
+                paused = self._store.pause_fable_answer_evidence_permission(
+                    session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                    expected_generation=question.continuation_generation,
+                    outer_question_id=question.question_id, attempted_question=directed,
+                    event=ConversationEnvelope(
+                        sender=ConversationActor.SYSTEM, addressed_to=ConversationTarget.USER,
+                        routed_to=ConversationTarget.USER, message_type=ConversationMessageType.STATUS,
+                        text=_EXCHANGE_PERMISSION_TEXT, task_id=task.task_id,
+                        revision=task.revision, continuation_generation=question.continuation_generation,
+                    ),
+                    completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+                    completed_next_fable_run_id=(
+                        run_id if completed_next_fable_intervention_id is not None else None
+                    ),
+                    completed_next_fable_exit_code=completed_next_fable_exit_code,
+                    clarification=(
+                        clarification
+                        if completed_next_fable_intervention_id is not None else None
+                    ),
+                )
+                self._emit_state(paused)
+                return
+            question_id, request_key = self._directed_question_identifiers(
+                task, ConversationActor.FABLE, directed,
+            )
+            intervention_id, child_run_id = self._nested_intervention_preparation(
+                task, outer_question_id=question.question_id,
+            )
+            _, nested = self._store.reserve_fable_answer_evidence_question(
+                session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                expected_generation=question.continuation_generation,
+                outer_question_id=question.question_id, question_id=question_id,
+                request_key=request_key, text=directed.text,
+                event=ConversationEnvelope(
+                    sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                    routed_to=ConversationTarget.SOL,
+                    message_type=ConversationMessageType.QUESTION, text=directed.text,
+                    task_id=task.task_id, revision=task.revision,
+                    continuation_generation=question.continuation_generation,
+                    question_id=question_id,
+                ),
+                intervention_id=intervention_id,
+                child_run_id=child_run_id,
+                completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+                completed_next_fable_run_id=(
+                    run_id if completed_next_fable_intervention_id is not None else None
+                ),
+                completed_next_fable_exit_code=completed_next_fable_exit_code,
+                clarification=(
+                    clarification
+                    if completed_next_fable_intervention_id is not None else None
+                ),
+            )
+            self._emit_state(self._store.get_task(task.task_id, task.revision))
+            current = self._store.get_task(task.task_id, task.revision)
+            intervention_prompt, intervention_invocation = (
+                self._nested_sol_intervention_payload(
+                    current,
+                    nested,
+                    intervention_id=intervention_id,
+                    child_run_id=child_run_id,
+                )
+            )
+            await self.answer_directed_question(
+                nested,
+                run_id=child_run_id,
+                intervention_prompt=intervention_prompt,
+                intervention_invocation=intervention_invocation,
+            )
+            return
+        answer_event = ConversationEnvelope(
+            sender=ConversationActor.FABLE,
+            addressed_to=ConversationTarget.SOL,
+            routed_to=ConversationTarget.SOL,
+            message_type=ConversationMessageType.ANSWER,
+            text=clarification.answer,
+            task_id=task.task_id,
+            revision=task.revision,
+            continuation_generation=question.continuation_generation,
+            reply_to_question_id=question.question_id,
+        )
+        answer_pending = self._pending_for_directed_context(task, continuation)
+        if clarification.scope_changed:
+            checkpoint_record = (
+                None if self._claimed_preparation_id is None
+                else self._store.prepared_action(self._claimed_preparation_id)
+            )
+            if self._claimed_preparation_id is not None and checkpoint_record is None:
+                raise RuntimeError("Fable answer checkpoint preparation is missing")
+            if (
+                checkpoint_record is None
+                and completed_next_fable_intervention_id is not None
+            ):
+                checkpoint_record = self._store.latest_prepared_action_for_task(
+                    project_id=self.project_id,
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                    revision=task.revision,
+                )
+                if checkpoint_record is None:
+                    raise RuntimeError("staged Fable answer checkpoint preparation is missing")
+            if checkpoint_record is not None:
+                self._store.checkpoint_directed_fable_scope_answer(
+                    checkpoint_record,
+                    question_id=question.question_id,
+                    continuation_generation=question.continuation_generation,
+                    clarification=clarification,
+                    completed_next_fable_intervention_id=(
+                        completed_next_fable_intervention_id
+                    ),
+                    completed_next_fable_run_id=(
+                        run_id
+                        if completed_next_fable_intervention_id is not None
+                        else None
+                    ),
+                )
+            await self._route_directed_fable_answer(
+                task,
+                clarification,
+                checkpoint_record=checkpoint_record,
+                completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+                completed_next_fable_run_id=(
+                    run_id if completed_next_fable_intervention_id is not None else None
+                ),
+                completed_next_fable_exit_code=completed_next_fable_exit_code,
+                answered_question=question,
+                answered_pending=answer_pending,
+                answer_event=answer_event,
+            )
+            return
+        answered = self._store.answer_question_and_prepare_resume(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            question_id=question.question_id,
+            expected_generation=question.continuation_generation,
+            answer_text=clarification.answer,
+            answered_by=ConversationActor.FABLE,
+            pending_action=answer_pending,
+            event=answer_event,
+            fable_checkpoint=(
+                clarification if self._claimed_preparation_id is not None else None
+            ),
+            checkpoint_preparation_id=self._claimed_preparation_id,
+            completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+            completed_next_fable_run_id=(
+                run_id
+                if completed_next_fable_intervention_id is not None
+                else None
+            ),
+            completed_next_fable_exit_code=(
+                completed_next_fable_exit_code
+            ),
+        )
+        if answered.answered_by is not ConversationActor.FABLE:
+            raise RuntimeError("directed Fable answer changed")
+        resumed = self._store.get_task(task.task_id, task.revision)
+        if self._claimed_preparation_id is not None and not clarification.scope_changed:
+            claimed = self._store.prepared_action(self._claimed_preparation_id)
+            if claimed is None:
+                raise RuntimeError("Fable answer checkpoint preparation is missing")
+            handed_off = self._store.handoff_directed_fable_answer_same_scope(claimed)
+            await self._resume_sol(handed_off, clarification.answer or "")
+            return
+        await self._route_directed_fable_answer(
+            resumed,
+            clarification,
+        )
+
+    async def _route_directed_fable_answer(
+        self, task: TaskRecord, clarification: FableClarification,
+        *, checkpoint_record: PreparedActionRecord | None = None,
+        completed_next_fable_intervention_id: str | None = None,
+        completed_next_fable_run_id: str | None = None,
+        completed_next_fable_exit_code: int | None = None,
+        answered_question: QuestionRecord | None = None,
+        answered_pending: Mapping[str, object] | None = None,
+        answer_event: ConversationEnvelope | None = None,
+    ) -> None:
+        current = self._store.get_task(task.task_id, task.revision)
+        has_scope_answer = answered_question is not None
+        if has_scope_answer != (answered_pending is not None) or has_scope_answer != (
+            answer_event is not None
+        ):
+            raise ValueError("directed scope answer identity is incomplete")
+        if (
+            current.approved_at is None
+            or (
+                has_scope_answer
+                and (
+                    current.state is not TaskState.AWAITING_USER_INPUT
+                    or current.continuation_state not in _SOL_STATES
+                )
+            )
+            or (not has_scope_answer and current.state not in _SOL_STATES)
+        ):
+            raise RuntimeError("directed Fable answer continuation changed")
+        if clarification.scope_changed:
+            revised = clarification.revised_brief
+            if revised is None or (
+                revised.task_id != current.task_id
+                or revised.revision != current.revision + 1
+            ):
+                raise ValueError("scope change must create the exact next task revision")
+            if current.fable_session_id is None or current.sol_thread_id is None:
+                raise RuntimeError("scope change is missing exact agent continuation IDs")
+            sol_run_id = (current.pending or {}).get("sol_run_id")
+            if not isinstance(sol_run_id, str):
+                raise RuntimeError("scope change is missing the exact Sol run ID")
+            original_baseline = self._load_baseline(current)
+            widened_baseline = self._repository.widen_baseline(original_baseline, revised)
+            try:
+                saved = self._store.save_scope_revision(
+                    current.session_id,
+                    revised,
+                    fable_session_id=current.fable_session_id,
+                    sol_thread_id=current.sol_thread_id,
+                    correction_count=current.correction_count,
+                    continuation_state=(
+                        current.continuation_state if has_scope_answer else current.state
+                    ),
+                    pending={
+                        "answer": clarification.answer,
+                        "sol_run_id": sol_run_id,
+                        "prompt": self._scope_resume_prompt_for_brief(
+                            revised, clarification.answer or "",
+                        ),
+                    },
+                    baseline_id=original_baseline.baseline_id,
+                    setting=(
+                        self._baseline_key(current.task_id, revised.revision),
+                        self._baseline_setting_value(
+                            current.task_id, revised.revision, widened_baseline,
+                        ),
+                    ),
+                    directed_checkpoint=checkpoint_record,
+                    clarification=clarification,
+                    completed_next_fable_intervention_id=completed_next_fable_intervention_id,
+                    completed_next_fable_run_id=completed_next_fable_run_id,
+                    completed_next_fable_exit_code=completed_next_fable_exit_code,
+                    answered_question_id=(
+                        None if answered_question is None else answered_question.question_id
+                    ),
+                    answered_question_generation=(
+                        None
+                        if answered_question is None
+                        else answered_question.continuation_generation
+                    ),
+                    answered_pending=answered_pending,
+                    answer_event=answer_event,
+                )
+            except BaseException:
+                self._repository.discard_widening(original_baseline, widened_baseline)
+                raise
+            self._emit_state(saved)
+            return
+        resumed = self._store.clear_pending_context(
+            current.task_id,
+            current.revision,
+            expected=current.state,
+        )
+        self._emit_clarification(resumed, clarification)
+        await self._resume_sol(resumed, clarification.answer or "")
+
+    async def _answer_fable_question_with_sol(
+        self,
+        task: TaskRecord,
+        question: QuestionRecord,
+        continuation: object,
+        *,
+        run_id: str | None = None,
+        intervention_message: str | None = None,
+        intervention_prompt: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
+    ) -> None:
+        if task.sol_thread_id is None or task.brief is None:
+            raise RuntimeError("Sol answer requires the exact approved thread and brief")
+        run_id = self._ids.new_run_id() if run_id is None else run_id
+        prepared_run = self._store.prepared_nested_intervention_run(
+            question_id=question.question_id,
+            run_id=run_id,
+        )
+        if prepared_run is None:
+            self._store.start_agent_run(run_id, task.task_id, task.revision, "sol")
+            self._store.set_agent_run_session(run_id, task.sol_thread_id)
+        elif (
+            prepared_run.task_id != task.task_id
+            or prepared_run.revision != task.revision
+            or prepared_run.agent != "sol"
+            or prepared_run.cli_session_id != task.sol_thread_id
+        ):
+            raise RuntimeError("prepared nested Sol child changed")
+        completion = self._track_run(run_id)
+        try:
+            if intervention_prompt is not None and intervention_message is not None:
+                raise RuntimeError("intervention directed prompt changed")
+            prompt = (
+                question.text
+                if intervention_message is None and intervention_prompt is None
+                else intervention_prompt if intervention_prompt is not None
+                else f"{question.text}\n\nIntervention guidance:\n{intervention_message}"
+            )
+            if intervention_invocation is not None and (
+                intervention_invocation.operation
+                is not InterventionOperation.SOL_ANSWER_FABLE_QUESTION
+                or intervention_invocation.run_id != run_id
+            ):
+                raise RuntimeError("intervention Sol answer invocation changed")
+            result = await self._sol.answer_fable_question(
+                run_id=run_id,
+                thread_id=task.sol_thread_id,
+                brief=task.brief,
+                prompt=prompt,
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "sol",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.sol_thread_id,
+                )
+                if intervention_invocation is not None
+                else None
+            )
+            self._persist_agent_result(
+                task,
+                "sol",
+                result,
+                run_id=run_id,
+                expected_cli_session_id=task.sol_thread_id,
+            )
+            if result.interrupted:
+                self._finish_interrupted_run(run_id, exit_code=result.exit_code)
+                return
+            if result.payload is None:
+                raise RuntimeError("Sol answer completed without a contract")
+            outcome = (
+                contract
+                if isinstance(contract, SolOutcome)
+                else SolOutcome.from_dict(result.payload)
+            )
+            if outcome.status != "completed" or outcome.question is not None:
+                raise RuntimeError("Sol did not answer Fable's exact question")
+            self._store.finish_agent_run(
+                run_id, status="completed", exit_code=result.exit_code,
+            )
+        except asyncio.CancelledError:
+            if intervention_invocation is None:
+                self._finish_interrupted_run(run_id, exit_code=-1)
+            else:
+                self._interrupt_intervention_invocation(
+                    run_id, task.task_id, task.revision, task.state,
+                )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_intervention_invocation(
+                run_id, task.task_id, task.revision, task.state,
+            )
+            raise
+        except BaseException as error:
+            if self._is_result_bearing_intervention_error(
+                task,
+                "sol",
+                error,
+                intervention_invocation,
+                expected_cli_session_id=task.sol_thread_id,
+            ):
+                self._interrupt_intervention_invocation(
+                    run_id, task.task_id, task.revision, task.state,
+                )
+                raise _InterventionValidationError(
+                    "intervention adapter result failed"
+                ) from error
+            self._record_agent_failure(
+                task,
+                "sol",
+                run_id,
+                error,
+                expected_cli_session_id=task.sol_thread_id,
+            )
+            raise
+        finally:
+            self._complete_run(run_id, completion)
+        if question.nested_parent_kind == "clarification":
+            intervention_id, next_fable_run_id = self._nested_intervention_next_fable_stage(
+                task, question,
+            )
+            answered = self._store.answer_fable_clarification_evidence_question_and_resume(
+                session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                question_id=question.question_id,
+                expected_generation=question.continuation_generation,
+                answer_text=outcome.summary,
+                next_fable_run_id=next_fable_run_id,
+                event=ConversationEnvelope(
+                    sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+                    routed_to=ConversationTarget.FABLE,
+                    message_type=ConversationMessageType.ANSWER, text=outcome.summary,
+                    task_id=task.task_id, revision=task.revision,
+                    continuation_generation=question.continuation_generation,
+                    reply_to_question_id=question.question_id,
+                ),
+            )
+            if answered.answered_by is not ConversationActor.SOL:
+                raise RuntimeError("nested directed Sol answer changed")
+            resumed = self._store.get_task(task.task_id, task.revision)
+            if intervention_id is not None and next_fable_run_id is not None:
+                self._store.start_next_fable_intervention_stage(
+                    intervention_id, run_id=next_fable_run_id,
+                )
+            await self._run_context(
+                resumed, continuation, outcome.summary, answer_source="sol",
+                run_id=next_fable_run_id,
+            )
+            return
+        if question.nested_parent_kind == "question":
+            if question.parent_question_id is None:
+                raise RuntimeError("nested Fable evidence parent is missing")
+            intervention_id, next_fable_run_id = self._nested_intervention_next_fable_stage(
+                task, question,
+            )
+            answered = self._store.answer_fable_answer_evidence_question(
+                session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                outer_question_id=question.parent_question_id, question_id=question.question_id,
+                expected_generation=question.continuation_generation,
+                answer_text=outcome.summary,
+                next_fable_run_id=next_fable_run_id,
+                event=ConversationEnvelope(
+                    sender=ConversationActor.SOL, addressed_to=ConversationTarget.FABLE,
+                    routed_to=ConversationTarget.FABLE,
+                    message_type=ConversationMessageType.ANSWER, text=outcome.summary,
+                    task_id=task.task_id, revision=task.revision,
+                    continuation_generation=question.continuation_generation,
+                    reply_to_question_id=question.question_id,
+                ),
+            )
+            if answered.answered_by is not ConversationActor.SOL:
+                raise RuntimeError("nested directed Sol answer changed")
+            outer = self._store.question(question.parent_question_id)
+            if outer is None:
+                raise RuntimeError("nested Fable evidence parent changed")
+            resumed = self._store.get_task(task.task_id, task.revision)
+            if intervention_id is not None and next_fable_run_id is not None:
+                self._store.start_next_fable_intervention_stage(
+                    intervention_id, run_id=next_fable_run_id,
+                )
+            await self._answer_sol_question_with_fable(
+                resumed, outer, self._context_from_task(resumed), run_id=next_fable_run_id,
+            )
+            return
+        answered = self._store.answer_question_and_prepare_resume(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            question_id=question.question_id,
+            expected_generation=question.continuation_generation,
+            answer_text=outcome.summary,
+            answered_by=ConversationActor.SOL,
+            pending_action=self._pending_for_directed_context(task, continuation),
+            event=ConversationEnvelope(
+                sender=ConversationActor.SOL,
+                addressed_to=ConversationTarget.FABLE,
+                routed_to=ConversationTarget.FABLE,
+                message_type=ConversationMessageType.ANSWER,
+                text=outcome.summary,
+                task_id=task.task_id,
+                revision=task.revision,
+                continuation_generation=question.continuation_generation,
+                reply_to_question_id=question.question_id,
+            ),
+        )
+        if answered.answered_by is not ConversationActor.SOL:
+            raise RuntimeError("directed Sol answer changed")
+        resumed = self._store.get_task(task.task_id, task.revision)
+        await self._run_context(
+            resumed, continuation, outcome.summary, answer_source="sol",
+        )
+
     async def _route_sol_outcome(
         self,
         task: TaskRecord,
@@ -1087,6 +3555,14 @@ class Coordinator:
         if outcome.status == "question":
             if outcome.question is None:
                 raise RuntimeError("question outcome is missing its question")
+            if outcome.question.directed_question is not None:
+                self._emit_sol_outcome(task, outcome)
+                await self._route_directed_question(
+                    task,
+                    ConversationActor.SOL,
+                    outcome.question.directed_question,
+                )
+                return
             clarification_prompt = self._clarification_prompt(task, outcome)
             task = self._store.replace_pending_for_continuation(
                 task.task_id,
@@ -1149,6 +3625,8 @@ class Coordinator:
         prompt: str,
         *,
         underlying_continuation: SolResumeContext | None = None,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("clarification requires the exact Fable session")
@@ -1163,12 +3641,29 @@ class Coordinator:
                     "prompt": underlying_continuation.prompt,
                 },
             )
-        run_id = self._ids.new_run_id()
-        self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+        run_id = self._start_or_reuse_fable_run(task, run_id)
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.FABLE_CLARIFY
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention clarification invocation changed")
         completion = self._track_run(run_id)
+        handoff_intervention_id: str | None = None
+        directed_outcome_intervention_id: str | None = None
         try:
             result = await self._fable.clarify(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.fable_session_id,
+                )
+                if intervention_invocation is not None
+                else None
             )
             self._persist_agent_result(
                 task,
@@ -1193,8 +3688,45 @@ class Coordinator:
                 return
             if result.payload is None:
                 raise RuntimeError("Fable clarification completed without a contract")
-            clarification = FableClarification.from_dict(result.payload)
-            self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
+            clarification = (
+                contract
+                if isinstance(contract, FableClarification)
+                else FableClarification.from_dict(result.payload)
+            )
+            intervention = self._store.active_intervention_for_task(
+                task.task_id, task.revision,
+            )
+            binding = None if intervention is None else intervention.directed_binding
+            normal_sol_handoff = (
+                clarification.directed_question is None
+                and clarification.status != "escalate_to_user"
+                and clarification.answer is not None
+                and not clarification.scope_changed
+            )
+            if (
+                normal_sol_handoff
+                and intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                handoff_intervention_id = intervention.intervention_id
+            elif (
+                (
+                    (clarification.directed_question is not None and not clarification.scope_changed)
+                    or clarification.status == "escalate_to_user"
+                    or clarification.scope_changed
+                )
+                and intervention is not None
+                and intervention.status is InterventionStatus.RESUMING
+                and binding is not None
+                and binding.stage == "next_fable"
+                and binding.next_run_id == run_id
+            ):
+                directed_outcome_intervention_id = intervention.intervention_id
+            else:
+                self._finish_fable_run_before_downstream(task, run_id, result.exit_code)
         except asyncio.CancelledError:
             self._interrupt_if_active(
                 run_id,
@@ -1203,7 +3735,42 @@ class Coordinator:
                 TaskState.FABLE_CLARIFYING,
             )
             raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_CLARIFYING,
+                    expected_fable_session_id=task.fable_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=task.fable_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_CLARIFYING,
+            )
+            raise
         except BaseException as error:
+            if self._is_result_bearing_intervention_error(
+                task,
+                "fable",
+                error,
+                intervention_invocation,
+                expected_cli_session_id=task.fable_session_id,
+            ):
+                self._interrupt_if_active(
+                    run_id, task.task_id, task.revision, TaskState.FABLE_CLARIFYING,
+                )
+                raise _InterventionValidationError(
+                    "intervention adapter result failed"
+                ) from error
             self._record_agent_failure(
                 task,
                 "fable",
@@ -1218,6 +3785,16 @@ class Coordinator:
             self._store.get_task(task.task_id, task.revision),
             clarification,
             underlying_continuation=underlying_continuation,
+            handoff_intervention_id=handoff_intervention_id,
+            handoff_run_id=run_id if handoff_intervention_id is not None else None,
+            handoff_exit_code=result.exit_code if handoff_intervention_id is not None else None,
+            directed_outcome_intervention_id=directed_outcome_intervention_id,
+            directed_outcome_run_id=(
+                run_id if directed_outcome_intervention_id is not None else None
+            ),
+            directed_outcome_exit_code=(
+                result.exit_code if directed_outcome_intervention_id is not None else None
+            ),
         )
 
     async def _route_clarification(
@@ -1226,11 +3803,92 @@ class Coordinator:
         clarification: FableClarification,
         *,
         underlying_continuation: SolResumeContext | None = None,
+        handoff_intervention_id: str | None = None,
+        handoff_run_id: str | None = None,
+        handoff_exit_code: int | None = None,
+        directed_outcome_intervention_id: str | None = None,
+        directed_outcome_run_id: str | None = None,
+        directed_outcome_exit_code: int | None = None,
     ) -> None:
         current = self._store.get_task(task.task_id, task.revision)
         if current.state is not TaskState.FABLE_CLARIFYING:
             return
         task = current
+        if clarification.directed_question is not None and not clarification.scope_changed:
+            if task.approved_at is None or task.baseline_id is None:
+                raise RuntimeError("Fable evidence request requires exact approval")
+            if directed_outcome_intervention_id is None:
+                self._emit_clarification(task, clarification)
+            directed = clarification.directed_question
+            if directed.addressed_to != ConversationTarget.SOL.value:
+                raise RuntimeError("Fable clarification evidence must target exact Sol")
+            question_id, request_key = self._directed_question_identifiers(
+                task, ConversationActor.FABLE, directed,
+            )
+            if task.exchange_allowance <= 0:
+                paused = self._store.pause_fable_clarification_evidence_permission(
+                    session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                    expected_generation=task.continuation_generation,
+                    attempted_question=directed,
+                    event=ConversationEnvelope(
+                        sender=ConversationActor.SYSTEM, addressed_to=ConversationTarget.USER,
+                        routed_to=ConversationTarget.USER,
+                        message_type=ConversationMessageType.STATUS,
+                        text=_EXCHANGE_PERMISSION_TEXT, task_id=task.task_id,
+                        revision=task.revision,
+                        continuation_generation=task.continuation_generation,
+                    ),
+                    completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                    completed_next_fable_run_id=directed_outcome_run_id,
+                    completed_next_fable_exit_code=directed_outcome_exit_code,
+                    clarification=(
+                        clarification
+                        if directed_outcome_intervention_id is not None else None
+                    ),
+                )
+                self._emit_state(paused)
+                return
+            intervention_id, child_run_id = self._nested_intervention_preparation(task)
+            _, question = self._store.reserve_fable_clarification_evidence_question(
+                session_id=task.session_id, task_id=task.task_id, revision=task.revision,
+                expected_generation=task.continuation_generation, question_id=question_id,
+                request_key=request_key, text=directed.text,
+                event=ConversationEnvelope(
+                    sender=ConversationActor.FABLE, addressed_to=ConversationTarget.SOL,
+                    routed_to=ConversationTarget.SOL,
+                    message_type=ConversationMessageType.QUESTION, text=directed.text,
+                    task_id=task.task_id, revision=task.revision,
+                    continuation_generation=task.continuation_generation,
+                    question_id=question_id,
+                ),
+                intervention_id=intervention_id,
+                child_run_id=child_run_id,
+                completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                completed_next_fable_run_id=directed_outcome_run_id,
+                completed_next_fable_exit_code=directed_outcome_exit_code,
+                clarification=(
+                    clarification
+                    if directed_outcome_intervention_id is not None
+                    else None
+                ),
+            )
+            self._emit_state(self._store.get_task(task.task_id, task.revision))
+            current = self._store.get_task(task.task_id, task.revision)
+            intervention_prompt, intervention_invocation = (
+                self._nested_sol_intervention_payload(
+                    current,
+                    question,
+                    intervention_id=intervention_id,
+                    child_run_id=child_run_id,
+                )
+            )
+            await self.answer_directed_question(
+                question,
+                run_id=child_run_id,
+                intervention_prompt=intervention_prompt,
+                intervention_invocation=intervention_invocation,
+            )
+            return
         if clarification.status == "escalate_to_user":
             question = clarification.question_for_user
             if question is None:
@@ -1257,11 +3915,18 @@ class Coordinator:
                     task.revision,
                     expected=TaskState.FABLE_CLARIFYING,
                     target=TaskState.AWAITING_USER_INPUT,
-                    continuation_state=TaskState.FABLE_CLARIFYING,
+                    continuation_state=(
+                        task.continuation_state or TaskState.SOL_RUNNING
+                    ),
                     pending=pending,
+                    completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                    completed_next_fable_run_id=directed_outcome_run_id,
+                    completed_next_fable_exit_code=directed_outcome_exit_code,
+                    clarification=clarification,
                 )
             self._emit_state(task)
-            self._emit_clarification(task, clarification)
+            if directed_outcome_intervention_id is None:
+                self._emit_clarification(task, clarification)
             return
         if clarification.answer is None:
             raise RuntimeError("answered clarification is missing its answer")
@@ -1307,23 +3972,29 @@ class Coordinator:
                             task.task_id, revised.revision, widened_baseline
                         ),
                     ),
+                    completed_next_fable_intervention_id=directed_outcome_intervention_id,
+                    completed_next_fable_run_id=directed_outcome_run_id,
+                    completed_next_fable_exit_code=directed_outcome_exit_code,
+                    clarification=clarification,
                 )
             except BaseException:
                 self._repository.discard_widening(
                     original_baseline, widened_baseline
                 )
                 raise
-            self._store.append_event(
-                saved.session_id,
-                saved.task_id,
-                "fable",
-                "task_brief",
-                {"brief": revised.to_dict()},
-            )
             self._emit_state(saved)
-            self._emit_clarification(saved, clarification)
             return
-        if underlying_continuation is None:
+        if handoff_intervention_id is not None:
+            if handoff_run_id is None:
+                raise RuntimeError("next Fable handoff run is missing")
+            resumed = self._store.handoff_next_fable_intervention_clarification_to_sol(
+                handoff_intervention_id,
+                run_id=handoff_run_id,
+                exit_code=handoff_exit_code,
+                answer=clarification.answer,
+                clarification=clarification,
+            )
+        elif underlying_continuation is None:
             resumed = self._store.resume_continuation(
                 task.task_id, task.revision, expected=TaskState.FABLE_CLARIFYING
             )
@@ -1335,7 +4006,8 @@ class Coordinator:
                 target=TaskState.SOL_RUNNING,
             )
         self._emit_state(resumed)
-        self._emit_clarification(resumed, clarification)
+        if handoff_intervention_id is None:
+            self._emit_clarification(resumed, clarification)
         await self._resume_sol(resumed, clarification.answer)
 
     async def _review(
@@ -1374,6 +4046,8 @@ class Coordinator:
         prompt: str,
         *,
         completion_allowed: bool,
+        run_id: str | None = None,
+        intervention_invocation: InterventionInvocation | None = None,
     ) -> None:
         if task.fable_session_id is None:
             raise RuntimeError("review requires the exact Fable session")
@@ -1387,12 +4061,29 @@ class Coordinator:
                     "completion_allowed": completion_allowed,
                 },
             )
-        run_id = self._ids.new_run_id()
+        run_id = self._ids.new_run_id() if run_id is None else run_id
+        if intervention_invocation is not None and (
+            intervention_invocation.operation is not InterventionOperation.FABLE_REVIEW
+            or intervention_invocation.run_id != run_id
+        ):
+            raise RuntimeError("intervention review invocation changed")
         self._store.start_agent_run(run_id, task.task_id, task.revision, "fable")
+        self._store.set_agent_run_session(run_id, task.fable_session_id)
         completion = self._track_run(run_id)
         try:
             result = await self._fable.review(
                 run_id=run_id, session_id=task.fable_session_id, prompt=prompt
+            )
+            contract = (
+                self._validated_intervention_result(
+                    task,
+                    "fable",
+                    result,
+                    intervention_invocation,
+                    expected_cli_session_id=task.fable_session_id,
+                )
+                if intervention_invocation is not None
+                else None
             )
             self._persist_agent_result(
                 task,
@@ -1417,7 +4108,11 @@ class Coordinator:
                 return
             if result.payload is None:
                 raise RuntimeError("Fable review completed without a contract")
-            verdict = ReviewVerdict.from_dict(result.payload)
+            verdict = (
+                contract
+                if isinstance(contract, ReviewVerdict)
+                else ReviewVerdict.from_dict(result.payload)
+            )
             self._store.finish_agent_run(run_id, status="completed", exit_code=result.exit_code)
         except asyncio.CancelledError:
             self._interrupt_if_active(
@@ -1427,7 +4122,42 @@ class Coordinator:
                 TaskState.FABLE_REVIEWING,
             )
             raise
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                self._interrupt_fable_login_expired(
+                    task,
+                    run_id=run_id,
+                    continuation=TaskState.FABLE_REVIEWING,
+                    expected_fable_session_id=task.fable_session_id,
+                )
+                raise
+            self._record_agent_failure(
+                task,
+                "fable",
+                run_id,
+                error,
+                expected_cli_session_id=task.fable_session_id,
+            )
+            raise
+        except _InterventionValidationError:
+            self._interrupt_if_active(
+                run_id, task.task_id, task.revision, TaskState.FABLE_REVIEWING,
+            )
+            raise
         except BaseException as error:
+            if self._is_result_bearing_intervention_error(
+                task,
+                "fable",
+                error,
+                intervention_invocation,
+                expected_cli_session_id=task.fable_session_id,
+            ):
+                self._interrupt_if_active(
+                    run_id, task.task_id, task.revision, TaskState.FABLE_REVIEWING,
+                )
+                raise _InterventionValidationError(
+                    "intervention adapter result failed"
+                ) from error
             self._record_agent_failure(
                 task,
                 "fable",
@@ -1457,6 +4187,16 @@ class Coordinator:
         if current.state is not TaskState.FABLE_REVIEWING:
             return
         task = current
+        if verdict.directed_question is not None:
+            if task.approved_at is None or task.baseline_id is None:
+                raise RuntimeError("Fable evidence request requires exact approval")
+            self._emit_review(task, verdict)
+            await self._route_directed_question(
+                task,
+                ConversationActor.FABLE,
+                verdict.directed_question,
+            )
+            return
         if verdict.status == "approved" and completion_allowed:
             task = self._store.transition_task_clearing_pending(
                 task.task_id,
@@ -1790,6 +4530,157 @@ class Coordinator:
     def _baseline_key(task_id: str, revision: int) -> str:
         return f"agent_bridge.baseline.{task_id}.{revision}"
 
+    def _validated_intervention_result(
+        self,
+        task: TaskRecord,
+        actor: Literal["fable", "sol"],
+        result: AgentRunResult,
+        invocation: InterventionInvocation,
+        *,
+        expected_cli_session_id: str | None,
+    ) -> TaskBrief | FableClarification | ReviewVerdict | SolOutcome | None:
+        """Validate one named intervention result before persisting any evidence."""
+        if result.run_id != invocation.run_id:
+            raise _InterventionValidationError(
+                "intervention result identity is invalid"
+            )
+        if result.cli_session_id is None:
+            if not result.interrupted:
+                raise _InterventionValidationError(
+                    "intervention result identity is invalid"
+                )
+        else:
+            try:
+                self._validate_cli_session_id(
+                    actor,
+                    result.cli_session_id,
+                    expected=expected_cli_session_id,
+                )
+            except (RuntimeError, ValueError):
+                raise _InterventionValidationError(
+                    "intervention result identity is invalid"
+                ) from None
+        if result.interrupted:
+            return None
+        if result.payload is None:
+            raise _InterventionValidationError(
+                "intervention result contract is invalid"
+            )
+        try:
+            if invocation.expected_contract == "TaskBrief":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                brief = TaskBrief.from_dict(result.payload)
+                if brief.task_id != task.task_id or brief.revision != 1:
+                    raise ValueError("wrong task")
+                return brief
+            if invocation.expected_contract == "FableClarification":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                return FableClarification.from_dict(result.payload)
+            if invocation.expected_contract == "ReviewVerdict":
+                if actor != "fable":
+                    raise ValueError("wrong agent")
+                return ReviewVerdict.from_dict(result.payload)
+            if invocation.expected_contract == "SolOutcome":
+                if actor != "sol":
+                    raise ValueError("wrong agent")
+                return SolOutcome.from_dict(result.payload)
+        except (TypeError, ValueError):
+            raise _InterventionValidationError(
+                "intervention result contract is invalid"
+            ) from None
+        raise _InterventionValidationError("intervention result contract is invalid")
+
+    def _is_result_bearing_intervention_error(
+        self,
+        task: TaskRecord,
+        actor: Literal["fable", "sol"],
+        error: BaseException,
+        invocation: InterventionInvocation | None,
+        *,
+        expected_cli_session_id: str | None,
+    ) -> bool:
+        """Recognize one failed CLI result without exposing its partial evidence."""
+        if invocation is None or not isinstance(error, (ClaudeRunError, CodexRunError)):
+            return False
+        result = error.result
+        if result is None:
+            return False
+        try:
+            self._validated_intervention_result(
+                task,
+                actor,
+                result,
+                invocation,
+                expected_cli_session_id=expected_cli_session_id,
+            )
+        except _InterventionValidationError:
+            pass
+        return True
+
+    def _bind_fresh_fable_session_after_stop(
+        self,
+        task: TaskRecord,
+        result: AgentRunResult,
+    ) -> TaskRecord | None:
+        """Bind a first Fable session at a pending Stop or its fresh plan claim."""
+        if result.cli_session_id is None:
+            return None
+        current = self._store.get_task(task.task_id, task.revision)
+        stopped = (current.pending or {}).get("intervention")
+        source_stop_publication = (
+            current.state is TaskState.INTERRUPTED
+            and current.continuation_state is TaskState.FABLE_PLANNING
+            and current.fable_session_id is None
+            and isinstance(stopped, Mapping)
+        )
+        if source_stop_publication:
+            intervention_id = stopped.get("intervention_id")
+            if not isinstance(intervention_id, str):
+                raise RuntimeError("fresh Fable intervention identity changed")
+            record = self._store.intervention(intervention_id)
+            if record is None:
+                raise RuntimeError("fresh Fable intervention is missing")
+            if not result.interrupted or result.run_id != record.run_id:
+                raise RuntimeError("fresh Fable source result identity changed")
+        elif (
+            current.state is TaskState.FABLE_PLANNING
+            and current.continuation_state is None
+            and current.pending is None
+            and current.fable_session_id is None
+        ):
+            record = self._store.active_intervention_for_task(
+                current.task_id, current.revision,
+            )
+            if record is None:
+                return None
+            if (
+                record.status is not InterventionStatus.RESUMING
+                or record.continuation_state is not TaskState.FABLE_PLANNING
+                or record.resume_run_id != result.run_id
+                or record.resume_attempt_id is None
+            ):
+                raise RuntimeError("fresh Fable claim identity changed")
+        else:
+            return None
+        self._validate_cli_session_id("fable", result.cli_session_id, expected=None)
+        self._store.bind_fresh_fable_session_to_pending_intervention(
+            project_id=self.project_id,
+            intervention_id=record.intervention_id,
+            session_id=current.session_id,
+            task_id=current.task_id,
+            revision=current.revision,
+            expected_source_generation=record.source_generation,
+            expected_resume_generation=record.resume_generation,
+            source_run_id=record.run_id,
+            expected_resume_attempt_id=record.resume_attempt_id,
+            expected_resume_run_id=record.resume_run_id,
+            fable_session_id=result.cli_session_id,
+            continuation=TaskState.FABLE_PLANNING,
+        )
+        return self._store.get_task(current.task_id, current.revision)
+
     def _persist_agent_result(
         self,
         task: TaskRecord,
@@ -1975,6 +4866,47 @@ class Coordinator:
             self._finish_failed_run(run_id)
         self._fail_if_active(task.task_id, task.revision)
 
+    def _interrupt_fable_login_expired(
+        self,
+        task: TaskRecord,
+        *,
+        run_id: str,
+        continuation: TaskState,
+        expected_fable_session_id: str | None,
+    ) -> None:
+        """Retain one exact Fable continuation without provider-text leakage."""
+        record = self._store.latest_prepared_action_for_task(
+            project_id=self.project_id,
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+        )
+        if record is None or record.status != "CLAIMED":
+            raise RuntimeError("expired Fable login has no claimed preparation")
+        self._store.interrupt_fable_login_expired(
+            session_id=task.session_id,
+            task_id=task.task_id,
+            revision=task.revision,
+            expected_state=continuation,
+            expected_fable_session_id=expected_fable_session_id,
+            expected_pending=task.pending,
+            run_id=run_id,
+            event=ConversationEnvelope(
+                sender=ConversationActor.SYSTEM,
+                addressed_to=ConversationTarget.USER,
+                routed_to=ConversationTarget.USER,
+                message_type=ConversationMessageType.STATUS,
+                text=_FABLE_LOGIN_EXPIRED_TEXT,
+                task_id=None if task.revision == 0 else task.task_id,
+                revision=None if task.revision == 0 else task.revision,
+                continuation_generation=(
+                    None if task.revision == 0 else task.continuation_generation
+                ),
+            ),
+            preparation_id=record.preparation_id,
+            generation=record.generation,
+        )
+
     def _finish_failed_run(self, run_id: str, *, exit_code: int = 1) -> None:
         try:
             run = self._store.agent_run(run_id)
@@ -2003,6 +4935,8 @@ class Coordinator:
         completion.set()
         if self._run_completions.get(run_id) is completion:
             del self._run_completions[run_id]
+        if self._retryable_stop_run_id == run_id:
+            self._retryable_stop_run_id = None
 
     def _interrupt_if_active(
         self,
@@ -2020,6 +4954,42 @@ class Coordinator:
                 task.task_id, task.revision, continuation=continuation
             )
             self._emit_state(task)
+
+    def _interrupt_intervention_invocation(
+        self,
+        run_id: str,
+        task_id: str,
+        revision: int,
+        continuation: TaskState,
+    ) -> None:
+        """Terminalize a rejected claimed run without consuming a directed pause."""
+        task = self._store.get_task(task_id, revision)
+        if task.state is TaskState.AWAITING_USER_INPUT:
+            intervention = self._store.active_intervention_for_task(task_id, revision)
+            binding = None if intervention is None else intervention.directed_binding
+            question_id = (
+                binding.question_id
+                if (
+                    binding is not None
+                    and binding.kind == "nested_resume"
+                    and binding.stage == "active_question"
+                    and binding.source_agent is ConversationTarget.SOL
+                    and (
+                        binding.source_run_id == run_id
+                        or intervention.resume_run_id == run_id
+                    )
+                )
+                else None
+            )
+            interrupted = self._store.interrupt_directed_answer_for_stop(
+                task.task_id, task.revision, run_id=run_id, question_id=question_id,
+            )
+            self._emit_state(interrupted)
+            run = self._store.agent_run(run_id)
+            if run.status == "running":
+                self._finish_interrupted_run(run_id, exit_code=-1)
+            return
+        self._interrupt_if_active(run_id, task_id, revision, continuation)
 
     def _fail_if_active(self, task_id: str, revision: int) -> None:
         task = self._store.get_task(task_id, revision)
@@ -2111,15 +5081,166 @@ class Coordinator:
     def _repo_context(self) -> str:
         return f"Repository: {self._repo_root}\n{self._repo_context_text}"
 
+    def _intervention_prompt(
+        self,
+        task: TaskRecord,
+        record: InterventionRecord,
+        invocation: InterventionInvocation,
+        *,
+        directed_question: QuestionRecord | None = None,
+    ) -> str:
+        """Rebuild a bounded, structural continuation prompt without provider output."""
+        if (
+            invocation.operation not in {
+                InterventionOperation.FABLE_PLAN,
+                InterventionOperation.FABLE_RESUME_PLAN,
+                InterventionOperation.FABLE_CLARIFY,
+                InterventionOperation.FABLE_REVIEW,
+                InterventionOperation.SOL_RESUME,
+                InterventionOperation.FABLE_ANSWER_SOL_QUESTION,
+                InterventionOperation.SOL_ANSWER_FABLE_QUESTION,
+            }
+            or task.task_id != record.task_id
+            or task.revision != record.revision
+            or task.session_id != record.session_id
+        ):
+            raise RuntimeError("intervention prompt identity changed")
+        partial_evidence: list[dict[str, object]] = []
+        for event in self._store.events_after(task.session_id, 0):
+            if event.task_id != task.task_id or event.kind != "agent_event":
+                continue
+            if event.actor not in {"fable", "sol"} or not isinstance(event.payload, Mapping):
+                continue
+            safe_event = self._structural_agent_event(event.actor, event.payload)
+            if safe_event is None:
+                continue
+            partial_evidence.append({"actor": event.actor, "event": dict(safe_event)})
+            if len(partial_evidence) == _MAX_INTERVENTION_PARTIAL_EVENTS:
+                break
+        continuation: dict[str, object] = {
+            "kind": {
+                InterventionOperation.FABLE_PLAN: "fable_planning",
+                InterventionOperation.FABLE_RESUME_PLAN: "fable_planning",
+                InterventionOperation.FABLE_CLARIFY: "fable_clarification",
+                InterventionOperation.FABLE_REVIEW: "fable_review",
+                InterventionOperation.SOL_RESUME: "sol_resume",
+                InterventionOperation.FABLE_ANSWER_SOL_QUESTION: "fable_answer_sol_question",
+                InterventionOperation.SOL_ANSWER_FABLE_QUESTION: "sol_answer_fable_question",
+            }[invocation.operation],
+        }
+        if invocation.operation is InterventionOperation.FABLE_REVIEW:
+            completion_allowed = (task.pending or {}).get("completion_allowed")
+            if not isinstance(completion_allowed, bool):
+                raise RuntimeError("intervention review continuation changed")
+            continuation["completion_allowed"] = completion_allowed
+        if invocation.operation is InterventionOperation.SOL_RESUME:
+            if task.baseline_id is None:
+                raise RuntimeError("intervention Sol continuation has no baseline")
+            continuation["baseline_id"] = task.baseline_id
+        return json.dumps(
+            {
+                "operation": invocation.operation.value,
+                "original_request": self._original_user_message(
+                    task.session_id, task.task_id,
+                ),
+                "task": {
+                    "task_id": task.task_id,
+                    "revision": task.revision,
+                    "continuation_generation": task.continuation_generation,
+                    "state": task.state.value,
+                },
+                "approved_brief": None if task.brief is None else task.brief.to_dict(),
+                "continuation": continuation,
+                "directed_question": (
+                    None if directed_question is None else {
+                        "question_id": directed_question.question_id,
+                        "asked_by": directed_question.asked_by.value,
+                        "addressed_to": directed_question.addressed_to.value,
+                        "routed_to": directed_question.routed_to.value,
+                        "text": directed_question.text,
+                        "answer_text": directed_question.answer_text,
+                    }
+                ),
+                "partial_evidence": partial_evidence,
+                "intervention": record.message,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _validated_intervention_fable_session(session_id: object) -> str:
+        if not isinstance(session_id, str) or _SAFE_ID.fullmatch(session_id) is None:
+            raise RuntimeError("intervention Fable session is invalid")
+        return session_id
+
+    @staticmethod
+    def _validated_intervention_sol_thread(thread_id: object) -> str:
+        if not isinstance(thread_id, str):
+            raise RuntimeError("intervention Sol thread is invalid")
+        try:
+            canonical = str(UUID(thread_id))
+        except (ValueError, AttributeError):
+            raise RuntimeError("intervention Sol thread is invalid") from None
+        if canonical != thread_id:
+            raise RuntimeError("intervention Sol thread is invalid")
+        return thread_id
+
+    def _validate_ready_intervention_provider_identity(
+        self, record: InterventionRecord,
+    ) -> None:
+        """Reject forged durable IDs before claiming any resumed provider run."""
+        try:
+            task = self._store.get_task(record.task_id, record.revision)
+            if task.session_id != record.session_id:
+                raise ValueError("task session changed")
+            if record.fable_session_id is None:
+                if task.fable_session_id is not None:
+                    raise ValueError("Fable session changed")
+            elif task.fable_session_id != record.fable_session_id:
+                raise ValueError("Fable session changed")
+            else:
+                self._validated_intervention_fable_session(record.fable_session_id)
+            if record.sol_thread_id is None:
+                if task.sol_thread_id is not None:
+                    raise ValueError("Sol thread changed")
+            elif task.sol_thread_id != record.sol_thread_id:
+                raise ValueError("Sol thread changed")
+            else:
+                self._validated_intervention_sol_thread(record.sol_thread_id)
+        except (RuntimeError, ValueError):
+            raise _InterventionValidationError(
+                "intervention stored provider identity is invalid"
+            ) from None
+
     def _original_user_message(self, session_id: str, task_id: str) -> str:
         for event in self._store.events_after(session_id, 0):
-            if (
-                event.task_id == task_id
-                and event.actor == "user"
-                and event.kind == "message"
-                and isinstance(event.payload.get("text"), str)
-            ):
+            if event.task_id != task_id or event.actor != "user":
+                continue
+            if event.kind == "message" and isinstance(event.payload.get("text"), str):
                 return str(event.payload["text"])
+            if event.kind != "conversation":
+                continue
+            try:
+                envelope = ConversationEnvelope.from_dict(event.payload)
+            except ValueError:
+                continue
+            if (
+                envelope.sender is ConversationActor.USER
+                and envelope.addressed_to in {
+                    ConversationTarget.FABLE,
+                    ConversationTarget.SOL,
+                    ConversationTarget.TEAM,
+                }
+                and envelope.routed_to is ConversationTarget.FABLE
+                and envelope.message_type is ConversationMessageType.STATEMENT
+                and envelope.task_id is None
+                and envelope.revision is None
+                and envelope.continuation_generation is None
+                and envelope.question_id is None
+                and envelope.reply_to_question_id is None
+            ):
+                return envelope.text
         raise RuntimeError("interrupted planning task has no original user message")
 
     @staticmethod

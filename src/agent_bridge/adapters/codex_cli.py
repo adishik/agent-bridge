@@ -303,6 +303,31 @@ class CodexCLI:
             ),
         )
 
+    async def answer_fable_question(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        brief: TaskBrief,
+        prompt: str,
+    ) -> AgentRunResult:
+        if not isinstance(brief, TaskBrief):
+            raise ValueError("brief must be a TaskBrief")
+        thread_id = self._canonical_thread_id(thread_id)
+        return await self._run_with_sealed_schema(
+            run_id=run_id,
+            expected_thread_id=thread_id,
+            strict_thread_id=True,
+            build_argv=lambda schema_path: (
+                str(self.executable),
+                "exec", "resume", "--json",
+                "--model", "gpt-5.6-sol",
+                "--output-schema", schema_path,
+                thread_id,
+                self._answer_fable_question_prompt(brief, prompt),
+            ),
+        )
+
     def _materialize_schema(self) -> None:
         schema_dir = self.schema_path.parent
         schema_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +351,7 @@ class CodexCLI:
         run_id: str,
         expected_thread_id: str | None,
         build_argv: Callable[[str], tuple[str, ...]],
+        strict_thread_id: bool = False,
     ) -> AgentRunResult:
         schema_file_descriptor = _create_sealed_sol_schema_memfd()
         try:
@@ -334,6 +360,7 @@ class CodexCLI:
                 argv=build_argv(f"/proc/self/fd/{schema_file_descriptor}"),
                 expected_thread_id=expected_thread_id,
                 pass_fds=(schema_file_descriptor,),
+                strict_thread_id=strict_thread_id,
             )
         finally:
             os.close(schema_file_descriptor)
@@ -345,6 +372,7 @@ class CodexCLI:
         argv: tuple[str, ...],
         expected_thread_id: str | None,
         pass_fds: tuple[int, ...] = (),
+        strict_thread_id: bool = False,
     ) -> AgentRunResult:
         process_arguments: dict[str, object] = {
             "run_id": run_id,
@@ -361,7 +389,11 @@ class CodexCLI:
             parsed = self._parse_events(process.stdout, interrupted=process.interrupted)
         except _EventParseError as error:
             error_thread_id = error.thread_id
-            if (
+            events = error.events
+            if strict_thread_id:
+                error_thread_id = None
+                events = self._without_thread_ids(events)
+            elif (
                 expected_thread_id is not None
                 and error_thread_id != expected_thread_id
             ):
@@ -371,12 +403,28 @@ class CodexCLI:
                 result=self._failed_result(
                     run_id,
                     process,
-                    error.events,
+                    events,
                     error_thread_id,
                     interrupted=process.interrupted,
                 ),
             ) from None
 
+        if strict_thread_id and parsed.thread_id != expected_thread_id:
+            message = (
+                "Codex resumed a different thread than requested"
+                if parsed.thread_id is not None
+                else "Codex output is missing the required resumed thread ID"
+            )
+            raise CodexRunError(
+                message,
+                result=self._failed_result(
+                    run_id,
+                    process,
+                    self._without_thread_ids(parsed.audit_events),
+                    None,
+                    interrupted=process.interrupted,
+                ),
+            )
         if (
             expected_thread_id is not None
             and parsed.thread_id is not None
@@ -601,6 +649,20 @@ class CodexCLI:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _without_thread_ids(
+        events: tuple[Mapping[str, object], ...],
+    ) -> tuple[Mapping[str, object], ...]:
+        redacted_events: list[Mapping[str, object]] = []
+        for event in events:
+            redacted = freeze_json({
+                key: value for key, value in event.items() if key != "thread_id"
+            })
+            if not isinstance(redacted, Mapping):
+                raise RuntimeError("audit event normalization did not produce an object")
+            redacted_events.append(redacted)
+        return tuple(redacted_events)
+
+    @staticmethod
     def _start_prompt(brief: TaskBrief, context: str) -> str:
         brief_json = json.dumps(
             brief.to_dict(),
@@ -635,6 +697,28 @@ class CodexCLI:
                 "revision supplied in the conversation and workspace-write "
                 "authority. Do not commit, stage, push, use a paid service, "
                 "access credentials, or expand beyond that revision."
+            ),
+            (
+                "Required final contract: SolOutcome. The final response must be "
+                "only JSON matching the supplied output schema."
+            ),
+        ))
+
+    @staticmethod
+    def _answer_fable_question_prompt(brief: TaskBrief, prompt: str) -> str:
+        brief_json = json.dumps(
+            brief.to_dict(),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return "\n\n".join((
+            "The original approved TaskBrief revision is authoritative.",
+            "Sol may clarify approved execution but cannot widen scope.",
+            f"Original approved TaskBrief JSON:\n{brief_json}",
+            f"Fable's directed question:\n{prompt}",
+            (
+                "Do not commit, stage, push, use a paid service, access credentials, "
+                "or expand beyond the approved revision."
             ),
             (
                 "Required final contract: SolOutcome. The final response must be "

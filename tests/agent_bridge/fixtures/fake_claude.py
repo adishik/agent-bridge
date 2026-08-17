@@ -201,6 +201,7 @@ def _clarification() -> dict[str, object]:
         "scope_changed": False,
         "revised_brief": None,
         "question_for_user": None,
+        "directed_question": None,
     }
 
 
@@ -218,14 +219,25 @@ def _review() -> dict[str, object]:
         "remaining_risks": [],
         "corrections": [],
         "question_for_user": None,
+        "directed_question": None,
     }
 
 
 def _model_payload(argv: list[str]) -> dict[str, object]:
     kind = _contract_kind(argv)
-    return {"plan": _task_brief, "review": _review}.get(
+    payload = {"plan": _task_brief, "review": _review}.get(
         kind, _clarification
     )()
+    target = os.environ.get("FAKE_CLAUDE_DIRECTED_QUESTION_TARGET")
+    if target is not None:
+        if target not in {"user", "fable", "sol"}:
+            raise _FakeConfigurationError("directed question target is invalid")
+        payload["directed_question"] = {
+            "addressed_to": target,
+            "text": "Which focused test proves the answer?",
+            "reason": "The approved execution evidence is incomplete.",
+        }
+    return payload
 
 
 def _contract_kind(argv: list[str]) -> str:
@@ -370,6 +382,12 @@ def _main() -> int:
         return 0
     if mode != "missing_init":
         print(json.dumps(init, separators=(",", ":")), flush=True)
+    if mode == "conflicting_session":
+        print(json.dumps({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "fable-session-conflict",
+        }, separators=(",", ":")), flush=True)
     print(json.dumps(assistant, separators=(",", ":")), flush=True)
     if os.environ.get("FAKE_CLAUDE_SECRET_OUTPUT") == "1":
         print(json.dumps(user, separators=(",", ":")), flush=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
 import fcntl
 import os
 from pathlib import Path
@@ -12,12 +13,22 @@ import threading
 from typing import Protocol
 
 from agent_bridge.adapters.base import FableAdapter, SolAdapter
+from agent_bridge.adapters.claude_cli import (
+    ClaudeAuthFailureCategory,
+    SubscriptionAuthError,
+)
 from agent_bridge.app import EventBroadcaster
-from agent_bridge.coordinator import Coordinator, IdFactory
+from agent_bridge.contracts import ConversationTarget
+from agent_bridge.coordinator import Coordinator, IdFactory, InterventionIntent
 from agent_bridge.process import ProcessRunner
 from agent_bridge.projects import ProjectSpec
 from agent_bridge.repository import RepositoryTracker
-from agent_bridge.store import PreparedActionRecord, SQLiteStore
+from agent_bridge.store import (
+    InterventionRecord,
+    InterventionStatus,
+    PreparedActionRecord,
+    SQLiteStore,
+)
 
 
 _FABLE_STATUSES = frozenset({
@@ -27,6 +38,12 @@ _SOL_STATUSES = frozenset({"checking", "ready", "running", "blocked", "unavailab
 _SCHEDULER_UNAVAILABLE = "scheduler_unavailable"
 _TERMINAL_PREPARED_STATUSES = frozenset({
     "COMPLETED", "FAILED", "ABORTED", "INTERRUPTED", "RECOVERED",
+})
+_TERMINAL_INTERVENTION_STATUSES = frozenset({
+    InterventionStatus.RESUMED,
+    InterventionStatus.RESUME_OUTCOME_UNKNOWN,
+    InterventionStatus.CANCELED_BY_STOP,
+    InterventionStatus.FAILED,
 })
 
 
@@ -194,7 +211,32 @@ class OwnedProjectRuntime:
         return self.spec.branch
 
     def close(self) -> None:
-        """Release owned resources once, continuing cleanup after a close error."""
+        """Release resources only after synchronous provider teardown completes."""
+        if self._closed:
+            return
+        runner_close = getattr(self.runner, "close", None)
+        if callable(runner_close):
+            # A running asyncio loop must use ``aclose``.  Do not let a
+            # schedule-and-return runner permit dependent resources to close.
+            runner_close()
+        self._close_resources()
+
+    async def aclose(self) -> None:
+        """Await provider termination/reap before releasing dependent resources."""
+        if self._closed:
+            return
+        await self.aclose_provider()
+        self.close()
+
+    async def aclose_provider(self) -> None:
+        """Await only exact provider teardown while the app still owns its loop."""
+        if self._closed:
+            return
+        runner_aclose = getattr(self.runner, "aclose", None)
+        if callable(runner_aclose):
+            await runner_aclose()
+
+    def _close_resources(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -319,7 +361,7 @@ class ActiveAgentLease:
             return reservation._token
 
     def cancel_stop_reservation(self, reservation: StopReservation) -> None:
-        """Cancel only this reservation and apply any deferred owner release."""
+        """Clear this failed claim while retaining its exact owner for retry."""
         if not isinstance(reservation, StopReservation):
             raise ValueError("stop reservation is invalid")
         with self._lock:
@@ -329,8 +371,6 @@ class ActiveAgentLease:
                 raise RuntimeError("stop requires the exact active workflow")
             if self._active != reservation._token:
                 raise RuntimeError("stop requires the exact active workflow")
-            if self._pending_owner_release:
-                self._active = None
             self._stop_reservation = None
             self._pending_owner_release = False
 
@@ -406,12 +446,59 @@ class ProjectRegistry:
         if errors:
             raise errors[0]
 
+    async def aclose(self) -> None:
+        """Await completion-bearing runtime shutdown before marking closed."""
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        for runtime in reversed(self._runtimes):
+            aclose = getattr(runtime, "aclose", None)
+            close = getattr(runtime, "close", None)
+            try:
+                if callable(aclose):
+                    await aclose()
+                elif callable(close):
+                    close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+        self._closed = True
+
+    async def aclose_providers(self) -> None:
+        """Reap runtime provider groups without changing the app's resource ownership."""
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        for runtime in reversed(self._runtimes):
+            aclose_provider = getattr(runtime, "aclose_provider", None)
+            if not callable(aclose_provider):
+                continue
+            try:
+                await aclose_provider()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedWorkflow:
     preparation_id: str
     token: LeaseToken
     revision: int = 0
+
+
+class InterventionLeaseOrigin(str, Enum):
+    BORROWED_SOURCE = "borrowed_source"
+    RECOVERY_ACQUIRED = "recovery_acquired"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedIntervention:
+    record: InterventionRecord
+    lease_token: LeaseToken
+    lease_origin: InterventionLeaseOrigin
 
 
 class HubWorkflowOrchestrator:
@@ -434,6 +521,7 @@ class HubWorkflowOrchestrator:
         self._lease = lease
         self._usage_credits_acknowledged = usage_credits_acknowledged
         self._aborted_tokens: set[LeaseToken] = set()
+        self._intervention_continuations: dict[str, asyncio.Event] = {}
 
     def active_lease_snapshot(self) -> LeaseToken | None:
         """Return the current lease identity without exposing its owner."""
@@ -486,6 +574,165 @@ class HubWorkflowOrchestrator:
         """Release a failed Stop installation without disturbing its workflow."""
         self._lease.cancel_stop_reservation(reservation)
 
+    def prepare_intervention(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        intent: InterventionIntent,
+    ) -> PreparedIntervention:
+        """Commit an intervention while retaining its exact live source lease."""
+        if not isinstance(intent, InterventionIntent):
+            raise ValueError("intent must be an InterventionIntent")
+        runtime = self._runtime_for_session(project_id, session_id)
+        existing = runtime.store.authenticated_intervention(intent.intervention_id)
+        if existing is not None:
+            if (
+                existing.session_id != session_id
+                or existing.task_id != task_id
+                or existing.revision != intent.revision
+                or existing.source_generation != intent.continuation_generation
+                or existing.message != intent.message
+                or existing.addressed_to is not intent.addressed_to
+                or existing.routed_to is not intent.addressed_to
+            ):
+                raise RuntimeError("intervention identifier is already bound differently")
+            if existing.status in _TERMINAL_INTERVENTION_STATUSES:
+                return PreparedIntervention(
+                    record=existing,
+                    lease_token=LeaseToken(
+                        existing.source_generation,
+                        project_id,
+                        session_id,
+                        task_id,
+                    ),
+                    lease_origin=InterventionLeaseOrigin.BORROWED_SOURCE,
+                )
+        token = self.require_exact_stop_owner(
+            project_id=project_id, session_id=session_id, task_id=task_id,
+        )
+        record = runtime.coordinator.prepare_intervention(task_id, intent)
+        if (
+            record.session_id != session_id
+            or record.task_id != task_id
+            or record.revision != intent.revision
+            or record.source_generation != intent.continuation_generation
+            or self._lease.snapshot() != token
+        ):
+            raise RuntimeError("intervention does not match the active lease")
+        return PreparedIntervention(
+            record=record,
+            lease_token=token,
+            lease_origin=InterventionLeaseOrigin.BORROWED_SOURCE,
+        )
+
+    async def continue_intervention(self, prepared: PreparedIntervention) -> None:
+        """Stop, freshly gate, and dispatch one durable intervention while leased."""
+        if not isinstance(prepared, PreparedIntervention):
+            raise ValueError("prepared must be a PreparedIntervention")
+        runtime = self._runtime_for_session(
+            prepared.lease_token.project_id, prepared.lease_token.session_id,
+        )
+        current = runtime.store.authenticated_intervention(prepared.record.intervention_id)
+        if current is not None and current.status in _TERMINAL_INTERVENTION_STATUSES:
+            return
+        if self._lease.snapshot() != prepared.lease_token:
+            raise RuntimeError("intervention no longer owns the active lease")
+        existing = self._intervention_continuations.get(prepared.record.intervention_id)
+        if existing is not None:
+            await existing.wait()
+            return
+        completion = asyncio.Event()
+        self._intervention_continuations[prepared.record.intervention_id] = completion
+        release = prepared.lease_origin is InterventionLeaseOrigin.RECOVERY_ACQUIRED
+        try:
+            await runtime.coordinator.continue_intervention(prepared.record.intervention_id)
+            current = runtime.store.authenticated_intervention(
+                prepared.record.intervention_id,
+            )
+            if current is None or current.status is InterventionStatus.CANCELED_BY_STOP:
+                release = True
+                return
+            if current.status is not InterventionStatus.READY:
+                return
+            release = True
+            try:
+                await runtime.readiness.require_model_start_ready(
+                    usage_credits_acknowledged=self._usage_credits_acknowledged(),
+                )
+            except RuntimeError:
+                runtime.store.append_event(
+                    current.session_id, current.task_id, "coordinator", "intervention_waiting",
+                    {"status": "runtime_unavailable"},
+                )
+                return
+            current = runtime.store.authenticated_intervention(
+                prepared.record.intervention_id,
+            )
+            if current is None or current.status is InterventionStatus.CANCELED_BY_STOP:
+                return
+            if current.status is not InterventionStatus.READY:
+                raise RuntimeError("intervention readiness changed")
+            await runtime.coordinator.dispatch_ready_intervention(current.intervention_id)
+        finally:
+            if release and self._lease.snapshot() == prepared.lease_token:
+                self._lease.release(prepared.lease_token)
+            completion.set()
+            if self._intervention_continuations.get(prepared.record.intervention_id) is completion:
+                del self._intervention_continuations[prepared.record.intervention_id]
+
+    def abort_prepared_intervention(
+        self, prepared: PreparedIntervention, *, reason: str,
+    ) -> InterventionRecord:
+        """Undo only a failed recovery installation; a borrowed source stays pinned."""
+        if not isinstance(prepared, PreparedIntervention):
+            raise ValueError("prepared must be a PreparedIntervention")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be non-empty")
+        runtime = self._runtime_for_session(
+            prepared.lease_token.project_id, prepared.lease_token.session_id,
+        )
+        record = runtime.store.intervention(prepared.record.intervention_id)
+        if record is None:
+            raise RuntimeError("intervention not found")
+        if prepared.lease_origin is InterventionLeaseOrigin.RECOVERY_ACQUIRED:
+            self._lease.release(prepared.lease_token)
+        return record
+
+    def prepare_recovery_resume(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        intervention_id: str,
+        expected_resume_generation: int,
+    ) -> PreparedIntervention:
+        """Acquire a fresh lease for an installed recovery continuation only."""
+        self._require_positive_integer(
+            expected_resume_generation, "expected_resume_generation",
+        )
+        runtime = self._runtime_for_session(project_id, session_id)
+        record = runtime.store.intervention(intervention_id)
+        if (
+            record is None
+            or record.session_id != session_id
+            or record.resume_generation != expected_resume_generation
+            or record.status not in {
+                InterventionStatus.PENDING_STOP,
+                InterventionStatus.READY,
+            }
+        ):
+            raise RuntimeError("intervention recovery is unavailable")
+        token = self._lease.acquire(
+            project_id=project_id, session_id=session_id, task_id=record.task_id,
+        )
+        return PreparedIntervention(
+            record=record,
+            lease_token=token,
+            lease_origin=InterventionLeaseOrigin.RECOVERY_ACQUIRED,
+        )
+
     async def prepare_new_request(
         self,
         *,
@@ -493,9 +740,12 @@ class HubWorkflowOrchestrator:
         session_id: str,
         text: str,
         ids: IdFactory,
+        addressed_to: ConversationTarget = ConversationTarget.FABLE,
     ) -> PreparedWorkflow:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be non-empty")
+        if not isinstance(addressed_to, ConversationTarget):
+            raise ValueError("addressed_to must be a ConversationTarget")
         runtime = self._runtime_for_session(project_id, session_id)
         self._require_acknowledgement()
         token = self._lease.acquire_new(
@@ -510,6 +760,7 @@ class HubWorkflowOrchestrator:
                 task_id=token.task_id,
                 text=text,
                 generation=token.generation,
+                addressed_to=addressed_to,
             )
             record = self._bound_record(runtime, record.preparation_id, token)
             return PreparedWorkflow(
@@ -565,15 +816,120 @@ class HubWorkflowOrchestrator:
             ),
         )
 
+    async def prepare_continuation_message(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        text: str,
+        addressed_to: ConversationTarget,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare one exact routed user statement."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_continuation_message_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                text=text,
+                addressed_to=addressed_to,
+                generation=token.generation,
+            ),
+        )
+
+    async def prepare_question_answer(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        question_id: str,
+        answer: str,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare an exact user question answer."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_question_answer_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                question_id=question_id,
+                answer=answer,
+                generation=token.generation,
+            ),
+        )
+
+    async def prepare_exchange_grant(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        task_id: str,
+        revision: int,
+        continuation_generation: int,
+        request_id: str,
+    ) -> PreparedWorkflow:
+        """Lease, probe, and durably prepare one fixed exchange grant."""
+        self._require_positive_integer(
+            continuation_generation, "continuation_generation",
+        )
+        return await self._prepare_existing(
+            project_id=project_id,
+            session_id=session_id,
+            task_id=task_id,
+            revision=revision,
+            prepare=lambda runtime, token: runtime.coordinator._prepare_exchange_grant_action(
+                session_id=session_id,
+                task_id=task_id,
+                revision=revision,
+                continuation_generation=continuation_generation,
+                request_id=request_id,
+                generation=token.generation,
+            ),
+        )
+
     async def run(self, prepared: PreparedWorkflow) -> None:
         if not isinstance(prepared, PreparedWorkflow):
             raise ValueError("prepared must be a PreparedWorkflow")
         if self._lease.snapshot() != prepared.token:
             raise RuntimeError("prepared workflow no longer owns the active lease")
         runtime = self._registry.runtime(prepared.token.project_id)
-        self._bound_record(runtime, prepared.preparation_id, prepared.token)
+        record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
         try:
-            await runtime.coordinator.run_prepared_action(prepared.preparation_id)
+            if record.action in {
+                "continuation_message", "question_answer", "exchange_grant",
+            }:
+                await runtime.coordinator.run_prepared_conversation_action(
+                    record.task_id, record.action,
+                )
+            else:
+                await runtime.coordinator.run_prepared_action(prepared.preparation_id)
+        except SubscriptionAuthError as error:
+            if error.category is ClaudeAuthFailureCategory.LOGIN_REQUIRED:
+                runtime.readiness.invalidate_fable_subscription()
+            record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
+            if record.status in _TERMINAL_PREPARED_STATUSES:
+                self._lease.release(prepared.token)
+            raise
         except BaseException:
             record = self._bound_record(runtime, prepared.preparation_id, prepared.token)
             if record.status in _TERMINAL_PREPARED_STATUSES:
@@ -716,3 +1072,8 @@ class HubWorkflowOrchestrator:
     def _require_non_negative_integer(value: object, name: str) -> None:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+
+    @staticmethod
+    def _require_positive_integer(value: object, name: str) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
